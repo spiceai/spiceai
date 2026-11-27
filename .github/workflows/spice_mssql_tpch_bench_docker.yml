@@ -15,6 +15,15 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # Full-role benchmark jobs run this image as a service, pinned by digest, so only trunk's
+      # definition of it is published.
+      - name: Refuse a run off trunk
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/trunk ]; then
+            echo "::error::spice-mssql-bench is published only from trunk, not $GITHUB_REF."
+            exit 1
+          fi
+
       - name: Check disk space
         run: df . -h
 
@@ -72,8 +81,15 @@ jobs:
       - name: Install necessary tools
         run: |
           sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-          sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/20.04/prod.list)" -y
+          # Microsoft's apt key, checked against the SHA-256 pinned as microsoft-apt-key in
+          # .github/ci-cache/pins.json before apt trusts it, and trusted for its own repository only:
+          # this job publishes the image the benchmark jobs run.
+          microsoft_key="$(mktemp)"
+          curl -fsSL --retry 3 -o "$microsoft_key" https://packages.microsoft.com/keys/microsoft.asc
+          echo "2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6  $microsoft_key" | sha256sum -c -
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          sudo gpg --dearmor --yes -o /etc/apt/keyrings/microsoft-sqlcmd.gpg "$microsoft_key"
+          echo "deb [arch=amd64,armhf,arm64 signed-by=/etc/apt/keyrings/microsoft-sqlcmd.gpg] https://packages.microsoft.com/ubuntu/20.04/prod focal main" | sudo tee /etc/apt/sources.list.d/microsoft-sqlcmd.list > /dev/null
           sudo apt-get update
           sudo apt-get install sqlcmd -y
 
@@ -100,6 +116,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
+        id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./test/tpc-bench/mssql-tpch
@@ -109,3 +126,10 @@ jobs:
           tags: |
             ghcr.io/spiceai/spice-mssql-bench:latest
             ghcr.io/spiceai/spice-mssql-bench:${{ github.sha }}
+
+      # testoperator_run_bench_aws.yml and testoperator_run_schema_aws.yml run the image by
+      # digest; a new image reaches them only when a change moves that pin.
+      - name: Print the digest to pin
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "Pin ghcr.io/spiceai/spice-mssql-bench@${DIGEST} in testoperator_run_bench_aws.yml and testoperator_run_schema_aws.yml." | tee -a "$GITHUB_STEP_SUMMARY"

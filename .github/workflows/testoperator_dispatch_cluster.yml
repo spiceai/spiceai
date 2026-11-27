@@ -68,14 +68,37 @@ jobs:
       - name: Resolve commit + tag
         id: resolve
         env:
+          GH_TOKEN: ${{ github.token }}
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
           CUSTOM_IMAGE_TAG: ${{ github.event.inputs.custom_image_tag || '' }}
+          INPUT_SPICED_REF: ${{ github.event.inputs.spiced_ref || 'trunk' }}
         run: |
           set -euo pipefail
-          spiced_ref="${{ github.event.inputs.spiced_ref || 'trunk' }}"
+          # An image tag, as docker accepts one; it goes to GITHUB_OUTPUT and into image references.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ] && ! [[ "${CUSTOM_IMAGE_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::custom_image_tag must be an image tag (letters, digits, '_', '.' and '-', at most 128, not starting with '.' or '-')."
+            exit 1
+          fi
+          spiced_ref="${INPUT_SPICED_REF}"
           spiced_sha="$(git rev-parse HEAD)"
-          spiced_sha_short="$(git rev-parse --short=12 HEAD)"
-          image_tag="trunk-${spiced_sha_short}"
+          spiced_sha_short="${spiced_sha:0:12}"
+          # A trunk run benchmarks only a trunk commit's image: another ref's runs from that ref.
+          if [ "$GITHUB_REF" = refs/heads/trunk ] && [ -z "${CUSTOM_IMAGE_TAG}" ]; then
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/trunk...${spiced_sha}" --jq .status)"
+            case "$status" in
+              identical | behind) ;;
+              *)
+                echo "::error::This run is on trunk, so it benchmarks only a commit on trunk, and ${spiced_ref} (${spiced_sha}) is not one (${status}). Dispatch this workflow on that branch."
+                exit 1
+                ;;
+            esac
+          fi
+          # Only a trunk run builds and names a `trunk-` image (spiced_docker_dev builds only a
+          # trunk commit there); another ref's run names its image `dev-`.
+          case "$GITHUB_REF" in
+            refs/heads/trunk) image_tag="trunk-${spiced_sha_short}" ;;
+            *) image_tag="dev-${spiced_sha_short}" ;;
+          esac
           need_build="true"
 
           if [ -n "${CUSTOM_IMAGE_TAG}" ]; then

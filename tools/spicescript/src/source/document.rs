@@ -32,6 +32,11 @@ use crate::{
     script::SourceSpec,
 };
 
+/// The image each kind starts when its spec names no `version`.
+const KAFKA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.1.6";
+const MONGODB_IMAGE: &str = "docker.io/library/mongo:9.0";
+const DYNAMODB_IMAGE: &str = "docker.io/localstack/localstack:4.9";
+
 pub struct Document {
     inner: Generic,
     kind: String,
@@ -47,17 +52,17 @@ impl Document {
     ) -> Result<Self> {
         let spec = match kind {
             "kafka" => json!({
-                "kind": "docker", "image": format!("docker.redpanda.com/redpandadata/redpanda:{}", version.unwrap_or("v26.1.6")), "ports": [19092],
+                "kind": "docker", "image": super::at_version(KAFKA_IMAGE, version), "ports": [19092],
                 "command": ["redpanda", "start", "--smp", "1", "--overprovisioned", "--node-id", "0", "--mode", "dev-container", "--kafka-addr", "internal://0.0.0.0:9092,external://0.0.0.0:19092", "--advertise-kafka-addr", "internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}"],
                 "ready": "rpk cluster health | grep -E 'Healthy:.+true'"
             }),
             "mongodb" => json!({
-                "kind": "docker", "image": format!("docker.io/library/mongo:{}", version.unwrap_or("9.0")), "ports": [27017],
+                "kind": "docker", "image": super::at_version(MONGODB_IMAGE, version), "ports": [27017],
                 "command": ["mongod", "--replSet", "rs0", "--bind_ip_all"],
                 "ready": "mongosh --quiet --eval \"try { rs.status(); db.hello().isWritablePrimary ? 1 : 0 } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }\" | grep -qx 1"
             }),
             "dynamodb" => json!({
-                "kind": "docker", "image": format!("docker.io/localstack/localstack:{}", version.unwrap_or("4.9")), "ports": [4566],
+                "kind": "docker", "image": super::at_version(DYNAMODB_IMAGE, version), "ports": [4566],
                 "env": {"SERVICES": "dynamodb", "AWS_DEFAULT_REGION": "us-east-1"}, "ready": "awslocal dynamodb list-tables"
             }),
             _ => bail!("unknown document source '{kind}'"),

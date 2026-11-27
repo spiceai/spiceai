@@ -24,14 +24,53 @@ on:
       - '.github/scripts/test_mc_cp.py'
       - '.github/scripts/cached_fetch.sh'
       - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/fetch_pinned.sh'
+      - '.github/scripts/ghcr_digest.sh'
+      - '.github/scripts/image_tag_watch.sh'
+      - '.github/scripts/test_fetch_pinned.py'
+      - '.github/scripts/test_pinned_checkouts.py'
+      - '.github/scripts/test_install_protoc.py'
+      - '.github/scripts/test_mac_workspace.py'
+      - '.github/scripts/test_pinned_tools.py'
+      - 'test/container_images.json'
+      - '.github/scripts/rustfs_credentials.sh'
+      - '.github/scripts/test_rustfs_credentials.py'
+      - '.github/scripts/rust_dist_mirror.py'
+      - '.github/scripts/test_rust_dist_mirror.py'
+      - '.github/scripts/test_ci_role.py'
+      - '.github/scripts/test_verify_attestation.py'
+      - '.github/scripts/test_ci_store_prefix.py'
       - '.github/scripts/check_ci_cache_pins.py'
       - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
       - 'rust-toolchain.toml'
+      - 'test/tpc-bench/Makefile'
+      - '.github/requirements/**'
+      - 'test/object_store_occ/requirements.txt'
+      - 'test/source_versions.json'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
       - '.github/scripts/test_extract_snapshot_archives.py'
+      - '.github/scripts/test_install_spice.py'
+      - '.github/scripts/test_setup_nextest.py'
+      - '.github/scripts/test_setup_libduckdb.py'
+      - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_check_trusted_run.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
+      - '.github/scripts/test_setup_released_spiced.py'
+      - '.github/scripts/test_trunk_builds.py'
+      - '.github/release-digests.json'
+      - '.github/scripts/record_release_digests.py'
+      - '.github/scripts/test_record_release_digests.py'
+      - 'scripts/libduckdb.py'
+      - 'scripts/test_libduckdb.py'
+      - 'test/duckdb_versions.json'
+      - '**/Dockerfile*'
+      - '**/*.Dockerfile'
+      - '**/*.dockerfile'
+      - '**/Containerfile*'
+      - '**/*.containerfile'
   push:
     branches:
       - trunk
@@ -48,14 +87,53 @@ on:
       - '.github/scripts/test_mc_cp.py'
       - '.github/scripts/cached_fetch.sh'
       - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/fetch_pinned.sh'
+      - '.github/scripts/ghcr_digest.sh'
+      - '.github/scripts/image_tag_watch.sh'
+      - '.github/scripts/test_fetch_pinned.py'
+      - '.github/scripts/test_pinned_checkouts.py'
+      - '.github/scripts/test_install_protoc.py'
+      - '.github/scripts/test_mac_workspace.py'
+      - '.github/scripts/test_pinned_tools.py'
+      - 'test/container_images.json'
+      - '.github/scripts/rustfs_credentials.sh'
+      - '.github/scripts/test_rustfs_credentials.py'
+      - '.github/scripts/rust_dist_mirror.py'
+      - '.github/scripts/test_rust_dist_mirror.py'
+      - '.github/scripts/test_ci_role.py'
+      - '.github/scripts/test_verify_attestation.py'
+      - '.github/scripts/test_ci_store_prefix.py'
       - '.github/scripts/check_ci_cache_pins.py'
       - '.github/scripts/test_check_ci_cache_pins.py'
       - '.github/ci-cache/**'
       - 'rust-toolchain.toml'
+      - 'test/tpc-bench/Makefile'
+      - '.github/requirements/**'
+      - 'test/object_store_occ/requirements.txt'
+      - 'test/source_versions.json'
       - '.github/scripts/mssql_tpch_restore.sh'
       - '.github/scripts/test_mssql_tpch_restore.py'
       - '.github/scripts/extract_snapshot_archives.py'
       - '.github/scripts/test_extract_snapshot_archives.py'
+      - '.github/scripts/test_install_spice.py'
+      - '.github/scripts/test_setup_nextest.py'
+      - '.github/scripts/test_setup_libduckdb.py'
+      - '.github/scripts/test_setup_spiced.py'
+      - '.github/scripts/test_check_trusted_run.py'
+      - '.github/scripts/test_testoperator_dispatch.py'
+      - '.github/scripts/test_setup_released_spiced.py'
+      - '.github/scripts/test_trunk_builds.py'
+      - '.github/release-digests.json'
+      - '.github/scripts/record_release_digests.py'
+      - '.github/scripts/test_record_release_digests.py'
+      - 'scripts/libduckdb.py'
+      - 'scripts/test_libduckdb.py'
+      - 'test/duckdb_versions.json'
+      - '**/Dockerfile*'
+      - '**/*.Dockerfile'
+      - '**/*.dockerfile'
+      - '**/Containerfile*'
+      - '**/*.containerfile'
   workflow_dispatch:
 
 concurrency:
@@ -100,9 +178,29 @@ jobs:
           python .github/scripts/test_docker_pull.py -v
           python .github/scripts/test_mc_cp.py -v
           python .github/scripts/test_cached_fetch.py -v
+          python .github/scripts/test_fetch_pinned.py -v
+          python .github/scripts/test_pinned_checkouts.py -v
+          python .github/scripts/test_install_protoc.py -v
+          python .github/scripts/test_mac_workspace.py -v
+          python .github/scripts/test_pinned_tools.py -v
+          python .github/scripts/test_rustfs_credentials.py -v
+          python .github/scripts/test_rust_dist_mirror.py -v
+          python .github/scripts/test_ci_role.py -v
+          python .github/scripts/test_verify_attestation.py -v
+          python .github/scripts/test_ci_store_prefix.py -v
           python .github/scripts/test_check_ci_cache_pins.py -v
           python .github/scripts/test_mssql_tpch_restore.py -v
           python .github/scripts/test_extract_snapshot_archives.py -v
+          python .github/scripts/test_install_spice.py -v
+          python .github/scripts/test_setup_nextest.py -v
+          python .github/scripts/test_setup_libduckdb.py -v
+          python .github/scripts/test_setup_spiced.py -v
+          python .github/scripts/test_check_trusted_run.py -v
+          python .github/scripts/test_testoperator_dispatch.py -v
+          python .github/scripts/test_setup_released_spiced.py -v
+          python .github/scripts/test_trunk_builds.py -v
+          python .github/scripts/test_record_release_digests.py -v
+          python scripts/test_libduckdb.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
@@ -175,7 +273,9 @@ jobs:
           git -C "$copy" init --quiet
           find "$copy/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) \
             -exec sed -i -E 's#\$/\.github/#./.github/#g' {} +
-          if grep -rqF '$/.github/' "$copy/.github"; then
+          # Only the YAML files, which are what sed rewrote and actionlint reads: a script or the
+          # bytecode a test step above left behind can hold the text without being a call.
+          if grep -rqF --include='*.yml' --include='*.yaml' '$/.github/' "$copy/.github"; then
             echo "::error::A \`uses: \$/\` call was left in the copy, so its inputs would go unchecked."
             exit 1
           fi

@@ -137,7 +137,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile "${RUST_PROFILE}" --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -209,7 +209,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile "${RUST_PROFILE}" --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -255,6 +255,10 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Add nightly postfix to version in Cargo.toml
@@ -368,7 +372,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile "${RUST_PROFILE}" --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -432,7 +436,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl gnupg lsb-release
           sudo mkdir -m 0755 -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          # Docker's apt key, checked against the SHA-256 pinned as docker-apt-key in
+          # .github/ci-cache/pins.json before apt trusts it; written out here, not read through
+          # .github/scripts/fetch_pinned.sh, so the step works whichever commit is checked out.
+          docker_key="$(mktemp)"
+          curl -fsSL --retry 3 -o "$docker_key" https://download.docker.com/linux/ubuntu/gpg
+          echo "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570  $docker_key" | sha256sum -c -
+          sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg "$docker_key"
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin

@@ -316,6 +316,28 @@ class PinActionsToShaTest(unittest.TestCase):
             (out, err), (f"Every remote `uses:` is pinned to a full-length commit SHA, and {LOCK} is keyed by it.\n", "")
         )
 
+    def test_this_repositorys_reusable_workflow_at_trunk_needs_no_pin(self) -> None:
+        call = "  aws:\n    uses: spiceai/spiceai/.github/workflows/x_aws.yml@trunk\n"
+        repo(self.root, WORKFLOW_PINNED + call, ACTION_PINNED, LOCK_PINNED)
+        code, out, err = run(self.root, "--check")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(run(self.root)[0], 0)
+        self.assertEqual(self.read(WORKFLOW), WORKFLOW_PINNED + call)
+
+    def test_only_that_exact_form_is_exempt(self) -> None:
+        for uses in (
+            "spiceai/spiceai/.github/workflows/x_aws.yml@main",
+            "spiceai/other/.github/workflows/x_aws.yml@trunk",
+            "spiceai/spiceai/.github/workflows/x_aws.yml@trunkx",
+            "spiceai/spiceai@trunk",
+        ):
+            with self.subTest(uses=uses), tempfile.TemporaryDirectory() as tmp:
+                self.root = Path(tmp)
+                repo(self.root, WORKFLOW_PINNED + f"  aws:\n    uses: {uses}\n", ACTION_PINNED, LOCK_PINNED)
+                code, out, _ = run(self.root, "--check")
+                self.assertEqual(code, 1)
+                self.assertIn(f"uses: {uses} is not pinned to a full-length commit SHA", out)
+
     def test_tag_entry_landing_on_a_commit_key_keeps_the_commit_keyed_entry(self) -> None:
         # A workflow uses actions/cache@v5.0.3 and a composite pins the same
         # commit by SHA, recorded with the tag `v5`.

@@ -9,14 +9,16 @@ inputs:
       Where to install `spice` and `spiced` (not used on Windows, which always
       installs into `$HOME\.spice\bin`). `user` (the default) installs into
       `$HOME/.spice/bin`, the directory `spice install` and `spice upgrade` manage.
-      `job` installs into `spice/bin` under the runner's temporary directory
-      (`RUNNER_TEMP`), which belongs to this job alone. Pass `job` on a self-hosted
-      runner whose instances share a host and a user: two jobs installing into one
-      shared `$HOME/.spice/bin` replace each other's binaries, so a job can start
-      the other job's `spiced`. `spice run` starts the `spiced` beside the `spice`
-      it runs, so the two stay paired in either directory. The action picks the
-      directory itself rather than taking a path, so no caller-supplied string is
-      added to `PATH`.
+      `job` installs into a new directory that `mktemp -d` creates under the runner's
+      temporary directory (`RUNNER_TEMP`), so nothing an earlier job left there is
+      reused: the runner skips what it cannot delete when it empties `RUNNER_TEMP`.
+      The directory goes on `PATH` only once it holds exactly the two binaries this
+      step moved there. Pass `job` on a self-hosted runner whose instances share a
+      host and a user: two jobs installing into one shared `$HOME/.spice/bin`
+      replace each other's binaries, so a job can start the other job's `spiced`.
+      `spice run` starts the `spiced` beside the `spice` it runs, so the two stay
+      paired in either directory. The action picks the directory itself rather
+      than taking a path, so no caller-supplied string is added to `PATH`.
     required: false
     default: 'user'
 
@@ -31,25 +33,56 @@ runs:
         INPUT_BUILD_PATH: ${{ inputs.build-path }}
         INPUT_INSTALL_SCOPE: ${{ inputs.install-scope }}
       run: |
+        set -euo pipefail
+        file_sha256() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | awk '{print $1}'
+          else
+            shasum -a 256 "$1" | awk '{print $1}'
+          fi
+        }
         case "$INPUT_INSTALL_SCOPE" in
           user | '') install_dir="$HOME/.spice/bin" ;;
-          job) install_dir="${RUNNER_TEMP:?RUNNER_TEMP is not set}/spice/bin" ;;
+          job)
+            # Created here, exclusively and under a name no earlier job can know.
+            install_dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/spice-bin.XXXXXX")" || {
+              echo "::error::install-spice: could not create a directory under RUNNER_TEMP"
+              exit 1
+            }
+            ;;
           *)
             echo "::error::install-spice: install-scope must be 'user' or 'job'"
             exit 1
             ;;
         esac
-        echo "dir=$install_dir" >> "$GITHUB_OUTPUT"
         echo "Installing Spice from local folder: ${INPUT_BUILD_PATH}"
 
         chmod +x "${INPUT_BUILD_PATH}/spice"
         chmod +x "${INPUT_BUILD_PATH}/spiced"
+        spice_sha256="$(file_sha256 "${INPUT_BUILD_PATH}/spice")"
+        spiced_sha256="$(file_sha256 "${INPUT_BUILD_PATH}/spiced")"
 
         mkdir -p "$install_dir"
 
         mv "${INPUT_BUILD_PATH}/spice" "$install_dir"
         mv "${INPUT_BUILD_PATH}/spiced" "$install_dir"
 
+        # The job's directory goes on PATH only if it holds exactly the two files moved
+        # into it, as regular files with the bytes they had: anything else there would
+        # run ahead of the system's own commands.
+        if [ "$INPUT_INSTALL_SCOPE" = job ]; then
+          entries="$(find "$install_dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')"
+          if [ "$entries" != "spice spiced " ] ||
+            [ -L "$install_dir/spice" ] || [ ! -f "$install_dir/spice" ] ||
+            [ -L "$install_dir/spiced" ] || [ ! -f "$install_dir/spiced" ] ||
+            [ "$(file_sha256 "$install_dir/spice")" != "$spice_sha256" ] ||
+            [ "$(file_sha256 "$install_dir/spiced")" != "$spiced_sha256" ]; then
+            echo "::error::install-spice: $install_dir does not hold exactly the spice and spiced this step installed (it holds: ${entries}), so it is not put on PATH."
+            exit 1
+          fi
+        fi
+
+        echo "dir=$install_dir" >> "$GITHUB_OUTPUT"
         echo "$install_dir" >> "$GITHUB_PATH"
 
         echo "Spice binaries installed successfully into $install_dir."

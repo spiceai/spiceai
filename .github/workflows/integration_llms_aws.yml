@@ -1,0 +1,267 @@
+---
+# The jobs of integration_llms.yml that assume a CI AWS role.
+# integration_llms.yml calls this file at `@trunk`, so whichever ref it runs on, the definition
+# that chooses the role is trunk's.
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
+# the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
+name: integration tests (llms) (CI AWS role jobs)
+
+on:
+  workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      ANTHROPIC_FEDERATION_RULE_ID:
+        required: true
+      ANTHROPIC_ORGANIZATION_ID:
+        required: true
+      ANTHROPIC_SERVICE_ACCOUNT_ID:
+        required: true
+      ANTHROPIC_WORKSPACE_ID:
+        required: true
+      AZURE_OPENAI_CLIENT_ID:
+        required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: true
+      AZURE_OPENAI_TENANT_ID:
+        required: true
+      CI_AWS_BEDROCK_ROLE_ARN:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      OPENAI_IDENTITY_PROVIDER_ID:
+        required: true
+      OPENAI_SERVICE_ACCOUNT_ID:
+        required: true
+      SCP_SPICEHQ_SPICEIO_API_KEY:
+        required: true
+      SMB_PASSWORD:
+        required: true
+      SPICE_SECRET_XAI_API_KEY:
+        required: true
+      TYPESAFE_API_KEY:
+        required: true
+    inputs:
+      needs_setup_matrix_matrix:
+        type: string
+        required: false
+        default: ''
+      ref:
+        type: string
+        required: false
+        default: ''
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+
+jobs:
+  test:
+    runs-on: ${{ matrix.target.runner }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 90
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
+      TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      # Azure OpenAI authenticates as a managed identity whose federated credential trusts this
+      # job's GitHub OIDC token (subject `repo:spiceai/spiceai:environment:ci`).
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
+      AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
+      HAS_BEDROCK_ROLE: ${{ secrets.CI_AWS_BEDROCK_ROLE_ARN != '' }}
+    strategy:
+      # The two arms cover disjoint model sets — self-hosted local models and the hosted
+      # providers — so one arm's result says nothing about the other's, and cancelling the
+      # sibling on the first failure throws away half the signal this suite exists to give.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(inputs.needs_setup_matrix_matrix) }}
+    # Holds the OpenAI, Anthropic and Azure OpenAI workload identity federation IDs
+    # (`OPENAI_*`, `ANTHROPIC_*` and `AZURE_OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Exchanged for OpenAI, Anthropic and Microsoft Entra access tokens: workload identity
+      # federation.
+      id-token: write
+
+    steps:
+      # Which CI AWS role this job gets, and whether its writes run; see the action.
+      - name: Choose the CI role
+        id: ci-role
+        uses: $/.github/actions/ci-role
+        with:
+          pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}
+          builds: |
+            ref=${{ inputs.ref }}
+
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      # Bedrock: an IAM role that trusts this job's GitHub OIDC token (subject
+      # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials go
+      # to the test step alone, and are assumed before spiceio starts, so no build-cache endpoint
+      # can reach the STS call.
+      - name: Assume the Bedrock role
+        if: matrix.target.needs_env && env.HAS_BEDROCK_ROLE == 'true' && steps.ci-role.outputs.full == 'true' && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
+        id: bedrock-role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_BEDROCK_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-llms-bedrock-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Set up spiceio
+        # The macOS SMB share, which any `ci` job can write: never with the full CI roles, whose
+        # inputs must not come from it. A read-only run may use it. Trunk's own share is planned.
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && steps.ci-role.outputs.full != 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
+          token: ${{ github.token }}
+          bucket: build
+          region: us-west-1
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}-${{ strategy.job-index }}
+          machine: ${{ runner.name }}
+
+      - name: Download test binary from spiceio
+        if: steps.setup-spiceio.outputs.endpoint != '' && github.ref != 'refs/heads/trunk'
+        env:
+          SPICEIO_ENDPOINT: ${{ steps.setup-spiceio.outputs.endpoint }}
+        run: |
+          set -euo pipefail
+          : "${SPICEIO_ENDPOINT:?spiceio endpoint is required to download the LLM integration test binary}"
+          mkdir -p ./integration_test
+          test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
+          curl --fail --silent --show-error --output ./integration_test/llms_integration_test "$test_binary_url"
+
+      - name: Download test binary
+        if: steps.setup-spiceio.outputs.endpoint == '' || github.ref == 'refs/heads/trunk'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: llms-integration-test-binary
+          path: ./integration_test
+
+      # With the full CI roles, it runs only if the build job attested it on trunk.
+      - name: Verify the test binary's build attestation
+        if: steps.ci-role.outputs.full == 'true'
+        uses: $/.github/actions/verify-attestation
+        with:
+          file: ./integration_test/llms_integration_test
+          signer-workflow: .github/workflows/integration_llms.yml
+          source-commit: ${{ inputs.ref || github.sha }}
+
+      - name: Mark test binary as executable
+        run: chmod +x ./integration_test/llms_integration_test
+
+      - name: Run integration test
+        env:
+          ROLE_FULL: ${{ steps.ci-role.outputs.full }}
+          MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          SPICE_BEDROCK_REGION: us-east-1
+          SPICE_BEDROCK_ACCESS_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          SPICE_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
+        run: |
+          # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
+          # honours it for every service, so leaving it set sends this suite's Bedrock
+          # calls to the local build cache instead of AWS.
+          unset AWS_ENDPOINT_URL
+          # Bedrock runs as the CI role (`CI_AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
+          # one, or in a run with the read-only role (off trunk, release branches included), the other
+          # providers still run, and the run says Bedrock did not.
+          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && ( "${HAS_BEDROCK_ROLE}" != "true" || "${ROLE_FULL}" != "true" ) ]]; then
+            if [ "${HAS_BEDROCK_ROLE}" != "true" ]; then
+              echo "::warning::CI_AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            else
+              echo "::notice::This run has the read-only CI role, which has no Bedrock access, so it does not test Bedrock; trunk does."
+            fi
+            MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
+            if [ -z "$MODEL_ALLOWLIST" ]; then
+              echo "::error::This run tests only Bedrock, which needs CI_AWS_BEDROCK_ROLE_ARN."
+              exit 1
+            fi
+            export MODEL_ALLOWLIST
+          fi
+          # Each provider's credential is required only when the run tests that provider.
+          runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
+          for check in openai:OPENAI_IDENTITY_PROVIDER_ID anthropic:ANTHROPIC_FEDERATION_RULE_ID \
+            azure:AZURE_OPENAI_CLIENT_ID xai:SPICE_XAI_API_KEY typesafe:TYPESAFE_API_KEY; do
+            model="${check%%:*}"
+            variable="${check#*:}"
+            if runs "$model" && [ -z "${!variable:-}" ]; then
+              echo "Error: '${variable}' is not defined, so the ${model} tests cannot authenticate."
+              exit 1
+            fi
+          done
+          test_binary=./integration_test/llms_integration_test
+          # The live-provider tests live under `integration.rs`'s `llms` module; the
+          # binary's other modules are credential-free and run in `make nextest`.
+          filter='llms::'
+
+          # A filter that matches nothing makes libtest print `ok. 0 passed` and exit 0, so the
+          # suite reports success having tested nothing. The filter names test-code structure,
+          # which a refactor is free to move, so count the selection and refuse an empty one
+          # rather than trusting a green result. `--list` only enumerates — it runs no test body,
+          # so it costs no model call and needs none of the snapshot environment below. Its exit
+          # status is checked separately from the count, because a harness that cannot run also
+          # produces no output, and reporting that as a stale filter sends the reader to the
+          # wrong file.
+          if ! listed=$("$test_binary" --list "$filter"); then
+            echo "::error::The LLM integration test binary failed to list its tests, so the suite could not run. Check the build and download steps above."
+            exit 1
+          fi
+          # `grep -c` exits 1 on no match, which `-e` would otherwise turn into an abort before
+          # the branch below can report the real problem.
+          selected=$(printf '%s\n' "$listed" | grep -c ': test$' || true)
+          echo "Filter '$filter' selects ${selected} test(s)."
+          if [ "$selected" -eq 0 ]; then
+            echo "::error::The LLM integration filter '$filter' selected no tests, so this suite would report success without exercising any model. Point it at the current test module path under crates/llms/tests/."
+            exit 1
+          fi
+
+          # The binary is itself the libtest harness, so its options are passed directly. A `--`
+          # here would end option parsing, and libtest would read `--test-threads=2` as a second
+          # filter and silently keep its default thread count. `--test-threads` holds concurrent
+          # requests low enough to stay under the hosted providers' rate limits.
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" \
+            "$test_binary" --nocapture --test-threads=2 "$filter"
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

@@ -102,7 +102,7 @@ UNDERSIZED_CONFIG += RETENTION_OVERRIDE
 
 
 def workflow_with_step_bound(minutes: int | None) -> str:
-    """A cut-down integration.yml whose retention step carries the given bound."""
+    """A cut-down integration_aws.yml whose retention step carries the given bound."""
     bound = f"        timeout-minutes: {minutes}\n" if minutes is not None else ""
     return (
         "jobs:\n"
@@ -131,7 +131,7 @@ def write(tmp: str, text: str, step_bound: int | None = 25, workflow: str | None
     (root / ".config").mkdir(exist_ok=True)
     path = root / ".config" / "nextest.toml"
     path.write_text(text, encoding="utf-8")
-    workflow_path = root / ".github" / "workflows" / "integration.yml"
+    workflow_path = root / ".github" / "workflows" / "integration_aws.yml"
     workflow_path.parent.mkdir(parents=True, exist_ok=True)
     workflow_path.write_text(
         workflow if workflow is not None else workflow_with_step_bound(step_bound),
@@ -800,10 +800,10 @@ class MainTest(unittest.TestCase):
     def test_a_missing_workflow_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(tmp, FIXED_CONFIG)
-            (Path(tmp) / ".github" / "workflows" / "integration.yml").unlink()
+            (Path(tmp) / ".github" / "workflows" / "integration_aws.yml").unlink()
             problems = check_nextest_config.check_config(path)
         self.assertEqual(len(problems), 1, problems)
-        self.assertIn("integration.yml", problems[0])
+        self.assertIn("integration_aws.yml", problems[0])
 
     def test_a_budget_binary_without_a_ceiling_is_reported(self):
         config = FIXED_CONFIG + """\

@@ -25,8 +25,15 @@ runs:
     - name: Start MySQL for CH-benCH
       shell: bash
       env:
-        IMAGE: mysql:${{ inputs.version }}
+        VERSION: ${{ inputs.version }}
       run: |
+        # One image per MySQL line test/source_versions.json lists, pinned by the digest of its
+        # multi-arch index on Docker Hub.
+        case "${VERSION}" in
+          8.4) image=mysql:8.4@sha256:8c233bad33d520a7aae1c1e619c3a9775f4a1ba2d463d692fada04ec7f40be00 ;;
+          9.7) image=mysql:9.7@sha256:1f2ca53a9e94ff9f1f313099fa7dc7fb2f72e180ca5b2ef83574031e451bbbf1 ;;
+          *) echo "::error::No MySQL image is pinned for ${VERSION}; add its digest to this action." && exit 1 ;;
+        esac
         # The MySQL defaults already satisfy the CDC connector (log_bin=ON,
         # binlog_format=ROW, binlog_row_image=FULL); set them explicitly for
         # clarity. The connector and the CH-benCH driver authenticate with the
@@ -53,7 +60,7 @@ runs:
           -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=chbench \
           -e MYSQL_USER=bench -e MYSQL_PASSWORD=bench \
           -p 3306:3306 \
-          "${IMAGE}" \
+          "${image}" \
           --log-bin-trust-function-creators=1 \
           --binlog-format=ROW \
           --binlog-row-image=FULL \

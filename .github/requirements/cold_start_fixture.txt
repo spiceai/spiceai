@@ -1,0 +1,31 @@
+# What seed-cold-start-fixture's Delta Lake generator imports: pyspark and delta-spark.
+#
+# Every package and dependency at an exact version, with the SHA-256 of each file PyPI serves
+# for it, installed as
+#   python -m pip install --require-hashes --no-build-isolation --only-binary=:all: --no-binary=pyspark -r "$GITHUB_ACTION_PATH/../../requirements/cold_start_fixture.txt"
+# so pip installs these files and nothing else. uv cannot read pyspark's dependencies without
+# building its sdist, so this file is the dependencies compiled from pyspark's one dependency
+# and delta-spark's other,
+#   printf 'py4j==0.10.9.7\nimportlib_metadata>=1.0.0\n' | uv pip compile - --universal \
+#     --generate-hashes --no-header --no-annotate --python-version 3.11 \
+#     --exclude-newer <a date two weeks back>
+# with pyspark==3.5.5 and delta-spark==3.3.2 added by hand, at the hashes PyPI's JSON API lists
+# (https://pypi.org/pypi/<name>/<version>/json). --exclude-newer keeps each dependency to a
+# release at least two weeks old.
+delta-spark==3.3.2 \
+    --hash=sha256:0a34c720b4368f1655e2348e380b5b3baaca0f2b3d519a3198208f00f65e4062 \
+    --hash=sha256:f3e89ec4a15a541988f9d6496016a67cf619475e8eeca71da5e073f6ba0da845
+importlib-metadata==10.2.0 \
+    --hash=sha256:9413a2029fd9ca5669d27f1386071bbfe3c7ebca0545692ec975088241fe1d79 \
+    --hash=sha256:c7a4bf1c7479601f6b8e437cfc14f4f77028ba62a8f34ae95cd93d9774dfba51
+lazy-importer==0.1.0 ; python_full_version < '3.15' \
+    --hash=sha256:b2e296716ce015c0cd80e57b940e52727c5b934b34b8656d5ce06bdd0ee5fbdd \
+    --hash=sha256:bd93fab7bef18e842eea02b839410954d37889140dc64ca4d9680aec6880c739
+py4j==0.10.9.7 \
+    --hash=sha256:0b6e5315bb3ada5cf62ac651d107bb2ebc02def3dee9d9548e3baac644ea8dbb \
+    --hash=sha256:85defdfd2b2376eb3abf5ca6474b51ab7e0de341c75a02f46dc9b5976f5a5c1b
+zipp==4.1.2 \
+    --hash=sha256:b30cb6cd253122169c47de245ca24a86bac2a5d3802ba15bf7ba6414eb9e144d \
+    --hash=sha256:cf474b90b07ea932637e17c6b9479de2b2882900b0d311bdaf4f5c000a15a97f
+pyspark==3.5.5 \
+    --hash=sha256:6effc9ce98edf231f4d683fd14f7270629bf8458c628d6a2620ded4bb34f3cb9

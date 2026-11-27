@@ -1,0 +1,249 @@
+---
+# The jobs of trunk_tests.yml that assume a CI AWS role.
+# trunk_tests.yml calls this file at `@trunk`, so whichever ref it runs on, the definition
+# that chooses the role is trunk's.
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
+# the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
+name: Trunk tests (CI AWS role jobs)
+
+on:
+  workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      ANTHROPIC_FEDERATION_RULE_ID:
+        required: true
+      ANTHROPIC_ORGANIZATION_ID:
+        required: true
+      ANTHROPIC_SERVICE_ACCOUNT_ID:
+        required: true
+      ANTHROPIC_WORKSPACE_ID:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN:
+        required: true
+      OPENAI_IDENTITY_PROVIDER_ID:
+        required: true
+      OPENAI_SERVICE_ACCOUNT_ID:
+        required: true
+      OPENAI_WIF_AUDIENCE:
+        required: true
+      SPICE_SECRET_HF_TOKEN:
+        required: true
+    inputs:
+      needs_resolve_build_run:
+        type: string
+        required: false
+        default: ''
+      needs_resolve_sha:
+        type: string
+        required: false
+        default: ''
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+jobs:
+  spicescript:
+    environment: ci
+    name: ${{ matrix.name }}
+    runs-on: spiceai-dev-runners
+    permissions:
+      actions: read
+      contents: read
+      id-token: write  # RustFS and Docker Hub credentials, and the tokens of the live scripts
+    # A known-failing share takes about 25 minutes and the long scripts' own
+    # waits about 15; the rest is starting containers and building spicescript
+    # when no earlier run built it.
+    timeout-minutes: 90
+    env:
+      HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
+      HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every script in test/spicescript, `long` ones included.
+          - { name: 'spicescript: scripts (1/4)', shard: scripts-1, args: --partition 1/4 test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', shard: scripts-2, args: --partition 2/4 test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', shard: scripts-3, args: --partition 3/4 test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', shard: scripts-4, args: --partition 4/4 test/spicescript }
+          # --max-wait: a known-failing script otherwise waits out every
+          # limit of the checks it is expected to fail.
+          - { name: 'spicescript: known failing (1/2)', shard: known-failing-1, args: --partition 1/2 --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', shard: known-failing-2, args: --partition 2/2 --max-wait 30s test/spicescript/known-failing }
+          # The shards above read DuckDB and DuckLake sources with the newest
+          # release test/duckdb_versions.json lists; this one runs the scripts
+          # with DuckDB sources again on each older listed release.
+          - { name: 'spicescript: older DuckDB releases', shard: older-duckdb, older_duckdb: true }
+          # test/spicescript/live: real providers through static credential params, with
+          # tokens minted from this job's GitHub OIDC token just before the run.
+          - { name: 'spicescript: live', shard: live, live: true }
+    steps:
+      # Which CI AWS role this job gets, and whether its writes run; see the action.
+      - name: Choose the CI role
+        id: ci-role
+        uses: $/.github/actions/ci-role
+        with:
+          pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}
+          builds: |
+            sha=${{ inputs.needs_resolve_sha }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.needs_resolve_sha }}
+          persist-credentials: false
+
+      - name: Download the build of E2E Test CI
+        if: inputs.needs_resolve_build_run != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RUN: ${{ inputs.needs_resolve_build_run }}
+        run: gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" -n build_linux_x86_64 -D ./build
+
+      - name: Download this run's build
+        if: inputs.needs_resolve_build_run == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: $/.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Set up spicescript
+        id: spicescript
+        uses: $/.github/actions/setup-spicescript
+        with:
+          minio-endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          dockerhub-username: ${{ vars.DOCKERHUB_ORGANIZATION }}
+          dockerhub-oidc-connection-id: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          hf-token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+
+      # Upgrade scripts start on the release their `from:` names; the token is
+      # for the releases API's rate limit.
+      - name: Run scripts
+        if: ${{ !matrix.older_duckdb && !matrix.live }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --spiced "$(command -v spiced)" \
+            --spice-cli "$(command -v spice)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            ${{ matrix.args }}
+
+      # Each minted token expires about 5 minutes later, so all are minted right before the
+      # one run, which runs the scripts side by side.
+      - name: Mint an OpenAI access token
+        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
+        uses: $/.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
+      - name: Mint an Anthropic access token
+        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: $/.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        if: ${{ matrix.live }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_NEW_AWS_DATABRICKS_DELTA_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Run live scripts
+        if: ${{ !cancelled() && matrix.live }}
+        env:
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+        run: |
+          DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
+          export DATABRICKS_TOKEN
+          # --require-all-env: this job is meant to hold every live script's
+          # credentials, so a script whose `requires-env` finds one unset (a
+          # secret gone, a token step skipped) fails the job rather than
+          # quietly testing less.
+          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+            --require-all-env \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            test/spicescript/live
+
+      # The combinations whose source is DuckDB or DuckLake (matrix keys
+      # backend, src and source), then the DuckDB and DuckLake scripts without
+      # such a key, on each older listed release.
+      - name: Run DuckDB scripts on older DuckDB releases
+        if: ${{ matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=0
+          for version in $(jq -r '.versions[:-1][].version' test/duckdb_versions.json); do
+            for args in "--matrix backend=duckdb test/spicescript" \
+              "--matrix src=duckdb test/spicescript" \
+              "--matrix source=duckdb test/spicescript" \
+              "--matrix backend=ducklake test/spicescript" \
+              "--matrix src=ducklake test/spicescript" \
+              "--matrix source=ducklake test/spicescript" \
+              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
+              # shellcheck disable=SC2086 # args holds several words
+              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+                --duckdb-version "$version" \
+                --spiced "$(command -v spiced)" \
+                --spice-cli "$(command -v spice)" \
+                --work-dir "$RUNNER_TEMP/spicescript" \
+                --results "$RUNNER_TEMP/spicescript-results-duckdb-$version-$((++run)).json" \
+                --log-capture "$RUNNER_TEMP/spicescript-logs" \
+                $args || status=1
+            done
+          done
+          exit $status
+
+      # Every script's outcome, passes included: a script's failure rate
+      # across runs, and the CI durations update_durations.py records, are
+      # read off these.
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spicescript-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-results*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # A directory per script with a failure: the script, what the run
+      # printed for it, its source containers' output and its instances' logs.
+      - name: Upload captured logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spicescript-logs-${{ matrix.shard }}
+          path: ${{ runner.temp }}/spicescript-logs
+          if-no-files-found: warn
+          retention-days: 7

@@ -141,7 +141,7 @@ jobs:
       redis:
         # GitHub service containers require Linux. An empty image skips macOS. A service
         # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
-        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -168,6 +168,10 @@ jobs:
       WAL_PREFIX: object_store_wal/${{ github.run_id }}-${{ github.run_attempt }}
       WAL_CONTAINER: wal-${{ matrix.store }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -194,7 +198,7 @@ jobs:
           done
           : "${python:?The independent oracles need Python 3.10 or newer on PATH}"
           "$python" -m venv "$RUNNER_TEMP/wal-oracle"
-          "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+          "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --require-hashes --only-binary=:all: -r test/object_store_occ/requirements.txt
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
       # Every store-independent test binary; s3_integration runs on the service legs.
       - name: Test state protocol, cancellation, faults and model replays

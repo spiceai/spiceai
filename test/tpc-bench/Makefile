@@ -97,21 +97,31 @@ TPCH_FLEET_DIR ?= ./tmp/fleet
 # row-for-row identical (0 rows differing in either direction, 6,001,215 lineitem
 # rows). DuckDB 1.x writes different free-text columns (c_address, s_address and
 # every *_comment), which changes the answers to Q2, Q10, Q13, Q15 and Q20.
-# Override TPCH_DUCKDB to use an already-installed CLI.
+# Override TPCH_DUCKDB to use an already-installed CLI. Each release asset is
+# checked against its SHA-256 below before it is extracted, so only a version with
+# pins here is downloaded; to pin another, take each asset's `digest` from
+# `gh api repos/duckdb/duckdb/releases/tags/<version>` and check it against a download.
 TPCH_DUCKDB_VERSION ?= v2.0.0
 TPCH_DUCKDB ?= ./tmp/bin-$(TPCH_DUCKDB_VERSION)/duckdb
 
 $(TPCH_DUCKDB):
 	@mkdir -p "$(dir $(TPCH_DUCKDB))"
 	@OS=`uname`; ARCH=`uname -m`; \
-	case "$$OS/$$ARCH" in \
-		Linux/x86_64) ASSET=duckdb-cli-linux-amd64.tar.gz ;; \
-		Linux/aarch64 | Linux/arm64) ASSET=duckdb-cli-linux-arm64.tar.gz ;; \
-		Darwin/*) ASSET=duckdb-cli-osx-universal.tar.gz ;; \
-		*) echo "No DuckDB CLI release asset for $$OS/$$ARCH - install duckdb $(TPCH_DUCKDB_VERSION) and re-run with TPCH_DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
+	case "$(TPCH_DUCKDB_VERSION)/$$OS/$$ARCH" in \
+		v2.0.0/Linux/x86_64) ASSET=duckdb-cli-linux-amd64.tar.gz; SHA256=c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc ;; \
+		v2.0.0/Linux/aarch64 | v2.0.0/Linux/arm64) ASSET=duckdb-cli-linux-arm64.tar.gz; SHA256=859e1875d2a9515fbb4bf8871061437a14af82320da68c753f094c4b776348fe ;; \
+		v2.0.0/Darwin/*) ASSET=duckdb-cli-osx-universal.tar.gz; SHA256=8a8f67e7c7f7d1392fa63ba3971948391392fe2a25fca63e7008e33c50beb4c2 ;; \
+		*) echo "No pinned DuckDB CLI $(TPCH_DUCKDB_VERSION) release asset for $$OS/$$ARCH - install duckdb $(TPCH_DUCKDB_VERSION) and re-run with TPCH_DUCKDB=\`command -v duckdb\`"; exit 1 ;; \
 	esac; \
 	echo "Downloading DuckDB CLI $(TPCH_DUCKDB_VERSION) ($$ASSET)..."; \
-	curl -fsSL --retry 3 -o "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" "https://github.com/duckdb/duckdb/releases/download/$(TPCH_DUCKDB_VERSION)/$$ASSET"
+	curl -fsSL --retry 3 -o "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" "https://github.com/duckdb/duckdb/releases/download/$(TPCH_DUCKDB_VERSION)/$$ASSET" || exit 1; \
+	if command -v sha256sum >/dev/null 2>&1; then GOT=`sha256sum "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" | cut -d' ' -f1`; \
+	else GOT=`shasum -a 256 "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" | cut -d' ' -f1`; fi; \
+	if [ "$$GOT" != "$$SHA256" ]; then \
+		rm -f "$(dir $(TPCH_DUCKDB))duckdb.tar.gz"; \
+		echo "$$ASSET does not match its pinned SHA-256: expected $$SHA256, got $$GOT. It was not used."; \
+		exit 1; \
+	fi
 	@tar -xzf "$(dir $(TPCH_DUCKDB))duckdb.tar.gz" -C "$(dir $(TPCH_DUCKDB))"
 	@rm -f "$(dir $(TPCH_DUCKDB))duckdb.tar.gz"
 	@chmod +x "$(TPCH_DUCKDB)"

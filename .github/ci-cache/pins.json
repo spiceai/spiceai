@@ -1,5 +1,5 @@
 {
-  "description": "SHA-256 pins of the files CI downloads through .github/scripts/cached_fetch.sh. A pin is what makes a cached copy safe to use: every copy, from the CI cache or the source, is checked against it, and a job that downloads a pinned file from its source writes it back to the cache. See .github/ci-cache/README.md.",
+  "description": "SHA-256 pins of the files CI downloads through .github/scripts/cached_fetch.sh. A pin is what makes a cached copy safe to use: every copy, from the CI cache or the source, is checked against it, and a job with an OIDC token that downloads a pinned file from its source writes it back to the cache. See .github/ci-cache/README.md.",
   "rust": {
     "components": [
       "rustc",
@@ -23,5 +23,105 @@
       "aarch64-apple-darwin": "1eca0934ec7bf12d8b9a8303335e1fff8bcc0767476947a50d3357858eded222",
       "x86_64-apple-darwin": "2526753e4f10ce8a0c9c45ba634e59d7c07e4aace9a21304a0fa86fb089b7039"
     }
+  },
+  "cargo-nextest": {
+    "version": "0.9.89",
+    "url": "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{target}.tar.gz",
+    "sha256": {
+      "x86_64-unknown-linux-gnu": "d90785677e767a0b8b50fbaffc465f3ab2d67d1f692137898130ae9d338070b9",
+      "aarch64-unknown-linux-gnu": "8f00921063058b650e44246549c476e42e850a4925892b0b1a4f9b2b45bb7035",
+      "universal-apple-darwin": "e7686274224c5e32469cd1da66495663b87620cf2bf800d7b406fb58f4938b82"
+    }
+  },
+  "rustup-init": {
+    "version": "1.29.3",
+    "url": "https://static.rust-lang.org/rustup/archive/{version}/{target}/rustup-init",
+    "sha256": {
+      "x86_64-unknown-linux-gnu": "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55",
+      "aarch64-unknown-linux-gnu": "9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282",
+      "aarch64-apple-darwin": "63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f",
+      "x86_64-apple-darwin": "bc107f1fb0228de7fa32413c89c1b305cea9cd256e94b01150cd054128145429"
+    }
+  },
+  "mc": {
+    "version": "RELEASE.2025-08-13T08-35-41Z",
+    "url": "https://public-data.spiceai.org/mc.{target}.{version}",
+    "sha256": {
+      "linux-amd64": "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
+    }
+  },
+  "sccache": {
+    "version": "0.9.1",
+    "url": "https://github.com/mozilla/sccache/releases/download/v{version}/sccache-v{version}-{target}",
+    "sha256": {
+      "x86_64-unknown-linux-musl.tar.gz": "911f611db54e48dc50c32232462a99848824be5ba0f6f52cc33903712cd78715",
+      "x86_64-pc-windows-msvc.zip": "9c862bcaef62804f2124dfc2605a0204f4fe0c5fa337ba4264e9bcae9d2ba487",
+      "aarch64-apple-darwin.tar.gz": "a2725e27c12961301834fe4c56ab982af6e8eb86fd51b82179369f1682776800",
+      "x86_64-apple-darwin.tar.gz": "14495d2db913d4d0e1ab4b44a3e1d2c3d44693a5a405deb5a1b5c05e8f34af37"
+    }
+  },
+  "protoc": {
+    "version": "36.2",
+    "url": "https://github.com/protocolbuffers/protobuf/releases/download/v{version}/protoc-{version}-{target}.zip",
+    "sha256": {
+      "linux-x86_64": "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278",
+      "linux-aarch_64": "8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a",
+      "linux-s390_64": "6ef625085cc7eb42521192f52185c4a9211d5b4721cd104f923494dffbe1c836",
+      "linux-ppcle_64": "0eb8eff1b90b1f06e5dc9aa29aa9e313daba51dd33a3166636d53ea1142228bc",
+      "osx-x86_64": "228cc7add4616cc14ca5e80dee83209d44449a7aee95a914ae748fa374efb078",
+      "osx-aarch_64": "9cd98a532c5c5e0c4161314de0225de27e4c8a323917b6ea7b1b714d3ae23466",
+      "win64": "f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3",
+      "win32": "031777688173e6414cfaead74da4c16d7cf2da490bca4e0d0c2458008587f105"
+    }
+  },
+  "oracle-instantclient": {
+    "url": "https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.x64-23.26.4.0.0.zip",
+    "sha256": "cab59aa3b411b3b50898e456fa9aabfe48d67e25cbc1bb23303800390ce7de26"
+  },
+  "simba-spark-odbc": {
+    "url": "https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip",
+    "sha256": "1d719810b18160e933a48d4868c3a688f2edb44b9b5ff927b1789d48906fc3c8"
+  },
+  "athena-odbc": {
+    "url": "https://downloads.athena.us-east-1.amazonaws.com/drivers/ODBC/v2.0.3.0/Linux/AmazonAthenaODBC-2.0.3.0.rpm",
+    "sha256": "6b4b306f5ebb67ecebdd8a98808a7e33a60bb01f40dcf12c41685ac1b95e37bc"
+  },
+  "awscli": {
+    "url": "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.40.1.zip",
+    "sha256": "fddb097a8ea197dc9beed9e4426ef99aded612a52df64581e079b6e8817e1d24"
+  },
+  "duckdb-cli": {
+    "url": "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip",
+    "sha256": "08c0ca117111fcede14239d0093792352befdc174218c344d232c13279643d05"
+  },
+  "docker-apt-key": {
+    "url": "https://download.docker.com/linux/ubuntu/gpg",
+    "sha256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
+  },
+  "microsoft-apt-key": {
+    "url": "https://packages.microsoft.com/keys/microsoft.asc",
+    "sha256": "2fa9c05d591a1582a9aba276272478c262e95ad00acf60eaee1644d93941e3c6"
+  },
+  "gh": {
+    "version": "2.103.3",
+    "url": "https://github.com/cli/cli/releases/download/v{version}/gh_{version}_{target}",
+    "sha256": {
+      "linux_amd64.tar.gz": "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d",
+      "linux_arm64.tar.gz": "ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63",
+      "macOS_amd64.zip": "a2f86418f4350ae6e9ec60d5000bdf7665728436946a97fc27fe50e6ae752682",
+      "macOS_arm64.zip": "d700207eae9ae98fe2b89535c2c087c07823d4628c56364695a5a07ef311c062"
+    }
+  },
+  "delta-spark-jar": {
+    "url": "https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.3.2/delta-spark_2.12-3.3.2.jar",
+    "sha256": "4e92085d5d794cf949c50bb665b91384857cad58680c2d0bfc9c7ad353e98e85"
+  },
+  "delta-storage-jar": {
+    "url": "https://repo1.maven.org/maven2/io/delta/delta-storage/3.3.2/delta-storage-3.3.2.jar",
+    "sha256": "c096975a2ca97ccc9b4005aa5cce16c9ac3903139d340da6665b66ace67d7c36"
+  },
+  "antlr4-runtime-jar": {
+    "url": "https://repo1.maven.org/maven2/org/antlr/antlr4-runtime/4.9.3/antlr4-runtime-4.9.3.jar",
+    "sha256": "131a6594969bc4f321d652ea2a33bc0e378ca312685ef87791b2c60b29d01ea5"
   }
 }

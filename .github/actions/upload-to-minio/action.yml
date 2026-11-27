@@ -32,12 +32,20 @@ runs:
         MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
         MINIO_SESSION_TOKEN: ${{ inputs.minio_session_token }}
       run: |
-        if ! command -v mc &> /dev/null; then
-          sudo apt update && sudo apt install wget -y
-          # Mirror of mc; dl.min.io currently serves an expired TLS cert.
-          sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
+        set -euo pipefail
+        # The mc release pinned in .github/ci-cache/pins.json, installed as setup-minio
+        # installs it: checked against its SHA-256 first, into a new directory of the job's
+        # own, first on PATH, whatever mc the runner already has. The pin is for Linux
+        # x86_64, the only platform this action runs on.
+        if [ "$(uname -s)-$(uname -m)" != Linux-x86_64 ]; then
+          echo "::error::.github/ci-cache/pins.json pins a MinIO client for Linux x86_64 only; run this job on Linux x86_64."
+          exit 1
         fi
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/mc.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" mc "$dir/mc" linux-amd64
+        chmod 0755 "$dir/mc"
+        echo "$dir" >> "$GITHUB_PATH"
+        export PATH="$dir:$PATH"
         if [[ -n "$MINIO_SESSION_TOKEN" ]]; then
           # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
           for value in "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" "${MINIO_SESSION_TOKEN}"; do

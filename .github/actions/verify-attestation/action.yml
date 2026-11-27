@@ -1,0 +1,108 @@
+name: Verify a build attestation
+description: >-
+  Fails unless the file carries a build provenance attestation that this repository's
+  `signer-workflow` made on trunk (`gh attestation verify --repo <this repository>
+  --signer-workflow <it> --source-ref refs/heads/trunk`). A job with the full CI roles runs it on
+  every binary or archive it downloads from the CI object store, before running it: anything
+  built off trunk, or not attested at all, fails here. Given `release: true` instead, the file
+  must carry the attestation a published release's files carry: `build_release.yml` on a release
+  branch, on a GitHub-hosted runner (`--cert-identity-regex ... --deny-self-hosted-runners`, as
+  the install scripts check it).
+
+inputs:
+  file:
+    description: The downloaded file. Give this or `image`.
+    required: false
+    default: ''
+  image:
+    description: A container image by digest (`registry/name@sha256:<digest>`). Give this or `file`.
+    required: false
+    default: ''
+  signer-workflow:
+    description: The workflow that builds and attests it on trunk, e.g. `.github/workflows/build_release.yml`. Not used with `release`.
+    required: false
+    default: ''
+  release:
+    description: '`true` for a file of a published release, attested by build_release.yml on a release branch.'
+    required: false
+    default: 'false'
+  source-commit:
+    description: The commit the file must have been built from (`--source-digest`), so an older trunk build cannot stand in for it.
+    required: false
+    default: ''
+  token:
+    description: A token that can read this repository's attestations.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # The check runs the gh this action installs, from its pin, never a gh the runner already has.
+    - name: Install the GitHub CLI
+      id: gh
+      uses: $/.github/actions/install-gh-cli
+
+    - name: Verify the build attestation
+      shell: bash
+      env:
+        GH_BIN: ${{ steps.gh.outputs.path }}
+        GH_CONFIG_DIR: ${{ steps.gh.outputs.config-dir }}
+        FILE: ${{ inputs.file }}
+        IMAGE: ${{ inputs.image }}
+        SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
+        RELEASE: ${{ inputs.release }}
+        SOURCE_COMMIT: ${{ inputs.source-commit }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        IMAGE="${IMAGE:-}"
+        if [ -n "$IMAGE" ]; then
+          if [ -n "$FILE" ]; then
+            echo "::error::verify-attestation: give file or image, not both."
+            exit 1
+          fi
+          # By digest only: a tag can move after the check.
+          if ! [[ "$IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::verify-attestation: image '$IMAGE' is not a registry/name@sha256:<digest> reference."
+            exit 1
+          fi
+          FILE="oci://$IMAGE"
+        elif [ ! -f "$FILE" ]; then
+          echo "::error::$FILE does not exist, so its attestation cannot be verified."
+          exit 1
+        fi
+        GH_BIN="${GH_BIN:-}"
+        if [ -z "$GH_BIN" ] || [ ! -x "$GH_BIN" ] || [ -z "${GH_CONFIG_DIR:-}" ] || [ ! -d "$GH_CONFIG_DIR" ]; then
+          echo "::error::The pinned GitHub CLI (gh) is not installed, so $FILE's attestation cannot be verified; not running it."
+          exit 1
+        fi
+        if [ "${RELEASE:-false}" = true ]; then
+          if [ -n "$SIGNER_WORKFLOW" ]; then
+            echo "::error::verify-attestation: give signer-workflow or release, not both."
+            exit 1
+          fi
+          # Every published release file is attested by build_release.yml on a release branch.
+          repository_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}"
+          identity="^${repository_url//./\\.}/\\.github/workflows/build_release\\.yml@refs/heads/release/"
+          if ! out="$("$GH_BIN" attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+            --cert-identity-regex "$identity" --deny-self-hosted-runners ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
+            printf '%s\n' "$out"
+            echo "::error::$FILE has no build attestation from build_release.yml on a release branch; not running it."
+            exit 1
+          fi
+          echo "$FILE: attested by build_release.yml on a release branch."
+          exit 0
+        fi
+        if [ -z "$SIGNER_WORKFLOW" ]; then
+          echo "::error::verify-attestation: signer-workflow is required."
+          exit 1
+        fi
+        signer="${GITHUB_REPOSITORY}/${SIGNER_WORKFLOW#./}"
+        if ! out="$("$GH_BIN" attestation verify "$FILE" --repo "$GITHUB_REPOSITORY" \
+          --signer-workflow "$signer" --source-ref refs/heads/trunk ${SOURCE_COMMIT:+--source-digest "$SOURCE_COMMIT"} 2>&1)"; then
+          printf '%s\n' "$out"
+          echo "::error::$FILE has no build attestation from $signer on trunk; not running it."
+          exit 1
+        fi
+        echo "$FILE: attested by $signer on trunk."

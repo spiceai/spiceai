@@ -215,6 +215,19 @@ pub async fn start(
     Ok(source)
 }
 
+/// `image` (`repository:tag`) with its tag replaced by `version`, if given.
+/// Either way the harness starts it only from the digest
+/// `test/container_images.json` pins for that tag.
+pub fn at_version(image: &str, version: Option<&str>) -> String {
+    // The tag follows the last `:` after the last `/`; a `:` before that
+    // separates a registry's port.
+    let name = image.rfind('/').map_or(0, |slash| slash + 1);
+    match (version, image[name..].rfind(':')) {
+        (Some(version), Some(colon)) => format!("{}:{version}", &image[..name + colon]),
+        _ => image.to_string(),
+    }
+}
+
 /// The image for a source: `version` if given, otherwise the newest version
 /// `test/source_versions.json` lists.
 pub fn image(source: &str, version: Option<&str>) -> Result<String> {
@@ -303,7 +316,23 @@ fn take_field(field: &mut String, quoted: &mut bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_csv;
+    use super::{at_version, parse_csv};
+
+    #[test]
+    fn a_version_replaces_only_the_tag() {
+        assert_eq!(
+            at_version("clickhouse/clickhouse-server:24.8", Some("26.3")),
+            "clickhouse/clickhouse-server:26.3"
+        );
+        assert_eq!(
+            at_version("localhost:5000/team/app:1", Some("2")),
+            "localhost:5000/team/app:2"
+        );
+        assert_eq!(
+            at_version("clickhouse/clickhouse-server:24.8", None),
+            "clickhouse/clickhouse-server:24.8"
+        );
+    }
 
     #[test]
     fn csv_keeps_null_apart_from_empty_and_quoted_text_intact() {

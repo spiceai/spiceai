@@ -10,7 +10,7 @@ description: >
 sources:
   mssql:
     kind: docker
-    image: mcr.microsoft.com/mssql/server:2022-latest
+    image: mcr.microsoft.com/mssql/server:2022-CU28-ubuntu-22.04
     ports: [1433]
     env: { ACCEPT_EULA: 'Y', MSSQL_SA_PASSWORD: '1StrongPwd!!' }
     ready: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b -Q 'SELECT 1'

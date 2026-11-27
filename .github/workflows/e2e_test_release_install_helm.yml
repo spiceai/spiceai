@@ -139,6 +139,10 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
 
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -167,12 +171,19 @@ jobs:
       # Install Helm
       # helm_version 'latest' leaves this empty, and the installer then picks the
       # newest Helm 3 release. The installer script comes from the v3.22.1 release
-      # commit rather than the helm main branch.
+      # commit rather than the helm main branch, is checked against its SHA-256, and
+      # runs from the file; the script checks the Helm archive's own checksum.
       - name: Install Helm
         env:
           HELM_VERSION: ${{ steps.chart-version.outputs.helm_version }}
+          GET_HELM_SHA256: e4a604efcff328eef2b2c7e67445d609f333e3875b34420ebf4e5ae379d259bb
         run: |
-          curl -fsSL https://raw.githubusercontent.com/helm/helm/d6c1a0e4027caa6abc7892e7ea9f0cda7447baa3/scripts/get-helm-3 | bash -s -- ${HELM_VERSION:+--version "$HELM_VERSION"}
+          set -euo pipefail
+          installer="$RUNNER_TEMP/get-helm-3"
+          curl -fsSL -o "$installer" https://raw.githubusercontent.com/helm/helm/d6c1a0e4027caa6abc7892e7ea9f0cda7447baa3/scripts/get-helm-3
+          echo "${GET_HELM_SHA256}  $installer" | sha256sum --check --status \
+            || { echo "::error::get-helm-3 does not match its pinned SHA-256; it was not run."; exit 1; }
+          bash "$installer" ${HELM_VERSION:+--version "$HELM_VERSION"}
           helm version
 
       # Create kind cluster

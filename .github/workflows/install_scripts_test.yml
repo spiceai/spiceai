@@ -77,6 +77,10 @@ jobs:
             runner: macos-latest
             shell: zsh
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,6 +131,10 @@ jobs:
             runner: macos-latest
             shell: zsh
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -212,6 +220,10 @@ jobs:
           - os: macos-arm64
             runner: macos-latest
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -280,6 +292,10 @@ jobs:
             runner: macos-latest
             variant: metal
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -317,6 +333,10 @@ jobs:
         # A release with SHA256SUMS joins this list once one is published.
         version: [latest, 2.4.1, 1.11.6]
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -389,6 +409,10 @@ jobs:
           - os: macos-arm64
             runner: macos-latest
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -551,6 +575,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-latest]
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

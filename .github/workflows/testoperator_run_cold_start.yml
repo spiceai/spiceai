@@ -61,7 +61,7 @@ jobs:
     # The only writer of the fixture: two concurrent first seeds would interleave
     # their Delta logs under one prefix.
     concurrency:
-      group: cold-start-fixture-seed
+      group: cold-start-fixture-seed-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,22 +134,37 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # The build of the code under test: a pull request reads its base branch's, a release
+          # branch's run its own (once a release branch is cut from trunk, this file is its), and
+          # any other run trunk's.
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || startsWith(github.ref, 'refs/heads/release/') && github.ref || 'refs/heads/trunk' }}
 
-      - name: Download the baseline release
+      # The baseline is a recorded release (.github/release-digests.json): the input, or by
+      # default the newest recorded one. setup-released-spiced verifies it before it runs.
+      - name: Choose the baseline release
         id: baseline
+        env:
+          INPUT_BASELINE_VERSION: ${{ github.event.inputs.baseline_version }}
         run: |
-          version="${{ github.event.inputs.baseline_version }}"
+          set -euo pipefail
+          version="${INPUT_BASELINE_VERSION}"
           if [ -z "$version" ]; then
-            latest=$(curl -sSLI -o /dev/null -w '%{url_effective}' https://github.com/spiceai/spiceai/releases/latest)
-            version="${latest##*/}"
+            version="$(python3 -c 'import json; tags = json.load(open(".github/release-digests.json"))["releases"]; print(max(tags, key=lambda t: tuple(int(p) for p in t[1:].split("."))))')"
           fi
-          mkdir -p "${RUNNER_TEMP}/baseline"
-          curl -sSfL -o "${RUNNER_TEMP}/baseline/spiced.tar.gz" \
-            "https://github.com/spiceai/spiceai/releases/download/${version}/spiced_linux_x86_64.tar.gz"
-          tar -xzf "${RUNNER_TEMP}/baseline/spiced.tar.gz" -C "${RUNNER_TEMP}/baseline"
-          chmod +x "${RUNNER_TEMP}/baseline/spiced"
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::baseline_version '$version' is not a release tag such as v2.3.1."
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "path=${RUNNER_TEMP}/baseline/spiced" >> "$GITHUB_OUTPUT"
+
+      - name: Install the baseline release
+        id: baseline-spiced
+        uses: $/.github/actions/setup-released-spiced
+        with:
+          release: ${{ steps.baseline.outputs.version }}
+          spicepod_file: test/spicepods/cold_start/${{ matrix.spicepod }}
+          github_token: ${{ github.token }}
+          destination: ${{ runner.temp }}/baseline/spiced
 
       - name: Build Testoperator
         uses: $/.github/actions/build-testoperator
@@ -159,14 +174,20 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
+      # The fixture's location for this run, in the spicepod (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: $/.github/actions/ci-store-prefix
+        with:
+          spicepod: test/spicepods/cold_start/${{ matrix.spicepod }}
+
       - name: Run the cold-start test (candidate ${{ steps.setup-spiced.outputs.SPICED_COMMIT }} vs ${{ steps.baseline.outputs.version }})
         run: |
           testoperator run cold-start \
             -s /usr/local/bin/spiced \
             -p "test/spicepods/cold_start/${{ matrix.spicepod }}" \
-            --baseline-spiced-path "${{ steps.baseline.outputs.path }}" \
-            --runs "${{ github.event.inputs.runs || '3' }}" \
-            --max-ready-ratio "${{ github.event.inputs.max_ready_ratio || '2.0' }}" \
+            --baseline-spiced-path "${BASELINE_PATH}" \
+            --runs "${INPUT_RUNS}" \
+            --max-ready-ratio "${INPUT_MAX_READY_RATIO}" \
             ${{ matrix.max_full_compactions != '' && format('--max-full-compactions {0}', matrix.max_full_compactions) || '' }} \
             --ready-wait 600 \
             --disable-progress-bars \
@@ -177,6 +198,9 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          BASELINE_PATH: ${{ steps.baseline-spiced.outputs.path }}
+          INPUT_RUNS: ${{ github.event.inputs.runs || '3' }}
+          INPUT_MAX_READY_RATIO: ${{ github.event.inputs.max_ready_ratio || '2.0' }}
 
       - name: Upload results
         if: always()

@@ -9,8 +9,10 @@
 #      environment a job names that does not exist yet, with no protection rules,
 #      so a misspelled or new name silently gets an unprotected environment). 
 #   2. If `secret-free` environment, no secrets are provided.
-#   3. A job calling a reusable workflow uses a local `./.github/workflows/` file, so its jobs are
-#      checked too (`secrets: inherit` would otherwise hand an unscanned workflow every secret).
+#   3. A job calling a reusable workflow uses a local `./.github/workflows/` file, or this
+#      repository's own copy of one at trunk (`spiceai/spiceai/.github/workflows/<file>@trunk`,
+#      which is the same file once merged), so its jobs are checked too (`secrets: inherit`
+#      would otherwise hand an unscanned workflow every secret).
 
 """Require every workflow job to select an environment, and keep `secret-free` jobs free of secrets."""
 
@@ -44,6 +46,10 @@ ALLOWED_ENVIRONMENTS = frozenset(
 ALLOWED_SECRETS = frozenset({"GITHUB_TOKEN"})
 
 LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
+
+# This repository's own reusable workflow at trunk: the CI AWS role jobs are called this way
+# (check_workflow_yaml.py), and the file is checked here as a local one.
+SAME_REPOSITORY_TRUNK = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@trunk")
 
 # GitHub expressions quote string literals with `'`, doubling it to escape. They
 # are blanked first so `contains(github.ref, 'secrets.X')` is not a secret use,
@@ -162,7 +168,9 @@ def secret_references(node: object, *, job: bool = False) -> list[str]:
     return sorted(found)
 
 
-def check_workflow(document: dict) -> list[str]:
+def check_workflow(document: dict, local_workflows: frozenset[str] | None = None) -> list[str]:
+    """Problems in one workflow. `local_workflows` names the files under `.github/workflows/`,
+    which a same-repository `@trunk` call must name; None skips that check."""
     jobs = document.get("jobs")
     if not isinstance(jobs, dict):
         return []
@@ -179,6 +187,14 @@ def check_workflow(document: dict) -> list[str]:
                     "which GitHub rejects; select the environment in the called workflow's jobs instead"
                 )
             uses = job["uses"]
+            trunk_copy = SAME_REPOSITORY_TRUNK.fullmatch(uses) if isinstance(uses, str) else None
+            if trunk_copy:
+                if local_workflows is not None and trunk_copy.group(1) not in local_workflows:
+                    problems.append(
+                        f"job '{job_id}' calls '{uses}', but this repository has no "
+                        f".github/workflows/{trunk_copy.group(1)} to check"
+                    )
+                continue
             if not (isinstance(uses, str) and uses.startswith(LOCAL_WORKFLOW_PREFIX)):
                 problems.append(
                     f"job '{job_id}' calls reusable workflow '{uses}', which is not a local "
@@ -231,6 +247,7 @@ def check_workflow(document: dict) -> list[str]:
 
 def check_definitions(github_dir: Path) -> list[str]:
     problems = []
+    local = frozenset(path.name for path in workflow_files(github_dir))
     for path in workflow_files(github_dir):
         try:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -241,7 +258,7 @@ def check_definitions(github_dir: Path) -> list[str]:
             continue
         if not isinstance(document, dict):
             continue
-        problems.extend(f"{path}: {problem}" for problem in check_workflow(document))
+        problems.extend(f"{path}: {problem}" for problem in check_workflow(document, local))
     return problems
 
 

@@ -1,0 +1,57 @@
+name: Install the GitHub CLI
+description: >-
+  Install the gh release pinned in .github/ci-cache/pins.json, checked against its SHA-256, into
+  a new directory of the job's own, first on PATH for the rest of the job. A gh already on the
+  runner is never what the job runs: on the self-hosted Macs every job can write the host's.
+  The pin and the helper come from this action's own copy of the repository, so a workflow
+  called at @trunk installs trunk's pin whatever commit it checked out.
+
+outputs:
+  path:
+    description: The installed gh binary.
+    value: ${{ steps.install.outputs.path }}
+  config-dir:
+    description: The empty config directory gh runs with (GH_CONFIG_DIR).
+    value: ${{ steps.install.outputs.config-dir }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install the GitHub CLI
+      id: install
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target=linux_amd64.tar.gz ;;
+          Linux-aarch64) target=linux_arm64.tar.gz ;;
+          Darwin-x86_64) target=macOS_amd64.zip ;;
+          Darwin-arm64) target=macOS_arm64.zip ;;
+          *)
+            echo "::error::.github/ci-cache/pins.json pins no gh for $(uname -s) $(uname -m)."
+            exit 1
+            ;;
+        esac
+        dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/gh.XXXXXX")"
+        bash "$GITHUB_ACTION_PATH/../../scripts/fetch_pinned.sh" gh "$dir/archive" "$target"
+        mkdir "$dir/src" "$dir/bin"
+        case "$target" in
+          *.tar.gz) tar -xzf "$dir/archive" -C "$dir/src" ;;
+          *.zip) unzip -q "$dir/archive" -d "$dir/src" ;;
+        esac
+        found=("$dir"/src/gh_*/bin/gh)
+        if [ "${#found[@]}" -ne 1 ] || [ ! -f "${found[0]}" ] || [ -L "${found[0]}" ]; then
+          echo "::error::The pinned gh archive holds no single bin/gh."
+          exit 1
+        fi
+        install -m 0755 "${found[0]}" "$dir/bin/gh"
+        rm -rf "$dir/archive" "$dir/src"
+        # A config directory of the job's own, empty: gh reads settings such as
+        # `http_unix_socket` from ~/.config/gh otherwise, which every job on a self-hosted
+        # Mac can write, and would send its token wherever that names.
+        mkdir -m 0700 "$dir/config"
+        echo "$dir/bin" >> "$GITHUB_PATH"
+        echo "GH_CONFIG_DIR=$dir/config" >> "$GITHUB_ENV"
+        echo "path=$dir/bin/gh" >> "$GITHUB_OUTPUT"
+        echo "config-dir=$dir/config" >> "$GITHUB_OUTPUT"
+        "$dir/bin/gh" --version | head -1

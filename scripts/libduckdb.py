@@ -15,8 +15,13 @@
 # is checked against the SHA-256 recorded there before anything is extracted;
 # a release or platform with no recorded checksum is an error, never an
 # unchecked download. The library is cached under
-# `${LIBDUCKDB_CACHE_DIR:-~/.cache/spice/libduckdb}/<version>/`, so only the
-# first run downloads.
+# `${LIBDUCKDB_CACHE_DIR:-~/.cache/spice/libduckdb}/<version>/`, with the archive
+# it came from, so only the first run downloads. A cached install is never taken
+# on trust, since CI keeps it in a directory another job on the host can write:
+# each run hashes the kept archive against the recorded SHA-256, and reuses the
+# install only when its library is the one that archive holds, byte for byte,
+# and its manifest is the one this script writes. Anything else is replaced from
+# a fresh, checked download.
 #
 # Usage:
 #   scripts/libduckdb.py [--version VERSION] [--cache-dir DIR]
@@ -45,6 +50,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSIONS_FILE = REPO_ROOT / "test" / "duckdb_versions.json"
 MANIFEST = "duckdb.toml"
+# The verified release archive, kept beside the library it was extracted from.
+ARCHIVE = "release-archive"
 
 
 class Error(Exception):
@@ -129,6 +136,13 @@ def extract(archive: bytes, url: str, library: str) -> bytes:
 
 def install(version: str | None, cache_dir: Path) -> Path:
     cache_dir = cache_dir.expanduser().resolve()
+    # The directory printed goes into ADBC_DRIVER_PATH, a list of directories that CI
+    # writes as one line of GITHUB_ENV, so a path that could break that line or add a
+    # directory to the list is refused.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch == os.pathsep for ch in str(cache_dir)):
+        raise Error(
+            f"the cache directory {str(cache_dir)!r} has a control character or {os.pathsep!r} in its path"
+        )
     entry = listed_release(version)
     version = entry["version"]
     release, library = release_platform()
@@ -144,24 +158,40 @@ def install(version: str | None, cache_dir: Path) -> Path:
     if installed(target, library, expected):
         return target
 
-    # One run installs a release at a time. Without the lock, a run that found
-    # no install could publish over one another run had just returned, and the
-    # caller of that run would find its manifest gone.
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(cache_dir / f".{version}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # One run installs at a time. Without the lock, a run that found no install
+    # could publish over one another run had just returned, and the caller of that
+    # run would find its manifest gone. The cache directory itself is the lock, so
+    # no file in it is opened for locking: nothing left there, a symbolic link
+    # included, can redirect the lock, and concurrent runs never remove one.
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(cache_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Error(f"cannot open the cache directory {cache_dir} to lock it: {e}") from e
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         if installed(target, library, expected):
             return target
         publish(target, library, expected, version, release)
+    finally:
+        os.close(fd)
     return target
 
 
 def publish(target: Path, library: str, expected: str, version: str, release: str) -> None:
     """Download, check and install the release at `target`. The caller holds
-    the release's lock and found no complete install there."""
+    the cache's lock and found no complete install there. A file system error is
+    reported as an Error, in one line."""
+    try:
+        _publish(target, library, expected, version, release)
+    except OSError as e:
+        raise Error(f"could not install DuckDB {version} into {target}: {e}") from e
+
+
+def _publish(target: Path, library: str, expected: str, version: str, release: str) -> None:
     url = archive_url(version, release)
     archive = download(url, version)
-    actual = hashlib.sha256(archive).hexdigest()
+    actual = sha256(archive)
     if actual != expected:
         raise Error(
             f"DuckDB {version} archive {url} has sha256 {actual}, but "
@@ -175,18 +205,17 @@ def publish(target: Path, library: str, expected: str, version: str, release: st
     old = None
     try:
         (staging / library).write_bytes(extract(archive, url, library))
-        # A JSON string is a valid TOML basic string, so a quote or backslash in
-        # the cache path is escaped rather than ending the value.
-        shared = json.dumps(str(target / library), ensure_ascii=False)
-        (staging / MANIFEST).write_text(
-            "[Driver]\n"
-            f"shared = {shared}\n"
-            'entrypoint = "duckdb_adbc_init"\n'
-        )
-        (staging / ".sha256").write_text(expected + "\n")
+        (staging / MANIFEST).write_text(manifest(target, library))
+        # Written last: `installed` needs the archive, so an install without it
+        # is incomplete and replaced.
+        (staging / ARCHIVE).write_bytes(archive)
         # An incomplete install is renamed aside, not deleted in place, so the
-        # directory is only ever absent between two renames.
-        if target.exists():
+        # directory is only ever absent between two renames. An old install that is a
+        # directory first gets its owner's permissions back, so even an unreadable one
+        # moves aside; a symbolic link moves as it is.
+        if target.is_symlink() or target.exists():
+            if not target.is_symlink():
+                target.chmod(0o755)
             old = Path(tempfile.mkdtemp(prefix=f".{version}-old-", dir=target.parent))
             target.rename(old / "old")
         staging.rename(target)
@@ -196,18 +225,45 @@ def publish(target: Path, library: str, expected: str, version: str, release: st
             shutil.rmtree(old, ignore_errors=True)
 
 
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def manifest(target: Path, library: str) -> str:
+    """The driver manifest for the library at `target`."""
+    # A JSON string is a valid TOML basic string, so a quote or backslash in
+    # the cache path is escaped rather than ending the value.
+    shared = json.dumps(str(target / library), ensure_ascii=False)
+    return f'[Driver]\nshared = {shared}\nentrypoint = "duckdb_adbc_init"\n'
+
+
 def installed(target: Path, library: str, expected: str) -> bool:
-    """Whether `target` holds a complete install of the archive with SHA-256
-    `expected`. The stamp is written last, so it marks a finished install; the
-    library is checked too, so an install whose library was deleted since is
-    replaced rather than reused."""
-    stamp = target / ".sha256"
-    return (
-        (target / library).is_file()
-        and (target / MANIFEST).is_file()
-        and stamp.is_file()
-        and stamp.read_text().strip() == expected
-    )
+    """Whether `target` holds a complete, unaltered install of the archive with
+    SHA-256 `expected`. Nothing there is taken on trust: the kept archive is
+    hashed against `expected`, the library must be the one that archive holds,
+    byte for byte, and the manifest the one `publish` writes. A symbolic link,
+    a missing or extra file, or any difference means the install is replaced."""
+    files = [target / ARCHIVE, target / library, target / MANIFEST]
+    if target.is_symlink() or not target.is_dir():
+        return False
+    # Nothing else either: the directory goes first on ADBC_DRIVER_PATH, where another
+    # driver manifest would be found. Anything that cannot be read is not a usable
+    # install either, so it is replaced.
+    try:
+        if sorted(os.listdir(target)) != sorted(path.name for path in files):
+            return False
+        if any(path.is_symlink() or not path.is_file() for path in files):
+            return False
+        archive = (target / ARCHIVE).read_bytes()
+        if sha256(archive) != expected:
+            return False
+        held = extract(archive, archive_url(target.name, release_platform()[0]), library)
+        return (
+            sha256((target / library).read_bytes()) == sha256(held)
+            and (target / MANIFEST).read_text() == manifest(target, library)
+        )
+    except (Error, OSError, ValueError, EOFError, UnicodeDecodeError, zipfile.BadZipFile, tarfile.TarError):
+        return False
 
 
 def main() -> int:
@@ -224,8 +280,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         print(install(args.version, args.cache_dir))
-    except Error as e:
-        print(f"error: {e}", file=sys.stderr)
+    except (Error, OSError) as e:
+        print(f"error: {e}".replace("\n", " "), file=sys.stderr)
         return 1
     return 0
 

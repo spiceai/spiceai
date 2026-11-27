@@ -254,7 +254,7 @@ For release lines 2.4 and earlier, follow the release steps in that branch's cop
 In these steps, `{version}` is the version in `version.txt` on the release branch, without a leading `v` (for example `1.0.0-rc.1`).
 
 - [ ] Cherry-pick the release notes (`docs/release_notes/v{version}.md`) onto the release branch. Without them, `publish_release` publishes a stable version as a pre-release.
-- [ ] Check the release branch head has a green `trunk-tests` status, the full post-merge suite. If it has none yet, run `gh workflow run trunk_tests.yml -f branch=release/{major.minor}` and wait for it.
+- [ ] Check the release branch head has a green `trunk-tests` status, the full post-merge suite. If it has none yet, run `gh workflow run trunk_tests.yml --ref release/{major.minor} -f branch=release/{major.minor}` and wait for it.
 - [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it. Its `Release health` job refuses a commit without a green `trunk-tests` status; set `unhealthy_reason` only for a known flake or infrastructure fault.
   - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully.
 - [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes. Don't set the pre-release or latest options: `publish_release` sets them when it publishes.

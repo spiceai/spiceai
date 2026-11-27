@@ -3,6 +3,8 @@ name: spicescript dispatch
 
 # Runs this ref's spicescript and scripts against another run's Linux spiced, such as a
 # release branch's build_and_release. Scripts for features that build predates fail; triage by hand.
+# A run on trunk takes only a build of a trunk commit, so a release branch's build is tested from
+# a run on that branch.
 
 run-name: spicescript dispatch - spiced from run ${{ inputs.run_id }}
 
@@ -48,6 +50,7 @@ jobs:
         with:
           run-id: ${{ inputs.run_id }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          for-ref: ${{ github.ref }}
 
       - name: Find the build's artifacts
         id: find
@@ -200,20 +203,22 @@ jobs:
           username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Install the AWS CLI
-        run: |
-          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
-          if ! command -v aws >/dev/null; then
-            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
-            sudo "$RUNNER_TEMP/aws/install"
-          fi
+        uses: $/.github/actions/install-aws-cli
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
-          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
-          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+          set -euo pipefail
+          if [ "$(uname -s)-$(uname -m)" != Linux-x86_64 ]; then
+            echo "::error::.github/ci-cache/pins.json pins the DuckDB CLI for Linux x86_64 only; run this job on Linux x86_64."
+            exit 1
+          fi
+          # DuckDB CLI v1.5.5, pinned in .github/ci-cache/pins.json and checked against its
+          # SHA-256, unpacked into a new directory of the job's own.
+          dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/duckdb.XXXXXX")"
+          bash .github/scripts/fetch_pinned.sh duckdb-cli "$dir/duckdb.zip"
+          unzip -q "$dir/duckdb.zip" -d "$dir/bin"
+          rm -f "$dir/duckdb.zip"
+          echo "$dir/bin" >> "$GITHUB_PATH"
 
       - name: Authenticate the Hugging Face cache
         uses: $/.github/actions/hf-cache-auth

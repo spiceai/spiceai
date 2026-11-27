@@ -57,6 +57,10 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -66,7 +70,7 @@ jobs:
         uses: $/.github/actions/setup-rust
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true' && github.ref != 'refs/heads/trunk'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc # spiceio#49 merge on trunk (same action tree as orphaned dd13a600); v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -90,12 +94,13 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
+          # setup-sccache sets RUSTC_WRAPPER itself, to the sccache it installs and checks; until
+          # then nothing wraps rustc, least of all this Mac's own sccache.
+          echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           if [ -z "${{ vars.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
             echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
           fi
 
       - name: Set up sccache
@@ -104,11 +109,13 @@ jobs:
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
+      # Into the job's own CARGO_HOME (setup-rust), where `cargo install` below puts it
+      # too, not the Mac's shared ~/.cargo/bin.
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cargo/bin/cargo-hack
+          path: ${{ env.CARGO_HOME || '~/.cargo' }}/bin/cargo-hack
           key: cargo-hack-${{ runner.os }}-${{ runner.arch }}-0.6.31
 
       - name: Install cargo-hack

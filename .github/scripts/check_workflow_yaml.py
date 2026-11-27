@@ -27,16 +27,52 @@
 # runtime's S3 traffic to the cache and reports as a dataset that never loads
 # (#12624).
 #
-# Finally, it requires a nightly's later test suites to survive an earlier one's
+# It requires a nightly's later test suites to survive an earlier one's
 # failure. A step's default condition is `success()`, so in a job that runs its
 # suites as a sequence of steps the first red suite skips every suite behind it:
 # their state stops being reported and nobody is told it stopped (#12625).
+#
+# Finally, in a workflow that holds `id-token: write`, it rejects a script that
+# expands a value its dispatcher or a branch name chooses in place: GitHub pastes
+# `${{ }}` into the script before the shell parses it, so `$(…)` in a dispatch
+# input runs as code, with the token the job can trade for the store's
+# credentials.
+#
+# And it keeps every job that assumes a CI AWS role in a reusable workflow (`on:
+# workflow_call` only), called at trunk (`spiceai/spiceai/.github/workflows/<file>@trunk`)
+# by every caller except the two the merge queue tests, which call theirs with `./`. Each
+# such job chooses its role in its first step (`.github/actions/ci-role`), asks for the
+# read-only pull request role off trunk, gives that step every other build it runs, and
+# writes to the repository only with the full roles. The roles' AWS trust policies make the
+# same split by `job_workflow_ref` and `ref`; this keeps the workflows asking for what AWS
+# would grant. Every call to a reusable workflow passes each secret that workflow reads, by
+# name for a CI AWS role workflow: one it is not passed reads as empty, with no error.
+#
+# And no script under `.github/` (a workflow or composite action `run:`, or a shell or
+# PowerShell file), and no Dockerfile or Containerfile in the repository, runs a download
+# as code: piped into a shell, read through `<(curl …)`, passed to
+# `sh -c "$(curl …)"`, or given to PowerShell's `iex`, nor names the unpinned rustup
+# installers (sh.rustup.rs, win.rustup.rs). A download is kept as a file, checked against
+# a pinned SHA-256, and then run.
+#
+# And every container image a workflow or composite action starts is pinned by digest
+# (`name[:tag]@sha256:<digest>`): a job's `services:` and `container:`, a `uses: docker://`
+# step, and the image of a `docker run`, `docker create` or `docker pull` in a `run:` script
+# (see `check_container_images`).
+#
+# And a job that holds a credential (an environment other than `secret-free`, a write or
+# `id-token` permission, or a secret other than GITHUB_TOKEN), and every composite action,
+# installs Python packages only from a hashed requirements file (`pip install
+# --require-hashes -r`), so what it runs is exactly the files those hashes name.
 """Validate the repository's GitHub Actions workflow and composite action YAML."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -135,6 +171,32 @@ DROPS_CACHE_ENDPOINT = re.compile(
 # runtime invocation, so a command named in a comment does not read as one.
 COMMENT_LINE = re.compile(r"^[ \t]*#[^\n]*$", re.MULTILINE)
 
+# A download run as code without being kept or checked first: piped into a shell (`curl …
+# | sh`, `| sudo -E bash`, `| /bin/bash`), read through a process substitution (`bash
+# <(curl …)`, `source <(curl …)`), handed to `sh -c "$(curl …)"`, or PowerShell's `iex` of
+# one, or `eval "$(curl …)"`. A cut-off download runs half a script, and nothing pins what ran. The rustup
+# installers are refused by name too: setup-rust installs rustup only from the
+# rustup-init .github/ci-cache/pins.json pins.
+_SHELL = (
+    r"(?<![\w.-])(?:(?:(?:/usr)?/bin/)?env(?:\s+(?:-\S+|\w+=\S*))*\s+|/usr/local/bin/|/usr/bin/|/bin/)?"
+    r"(?:ba|da|k|z)?sh\b"
+)
+_PS_DOWNLOAD = r"(?:DownloadString|DownloadFile|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)"
+DOWNLOAD_EXECUTION = re.compile(
+    rf"(?<!\|)\|&?(?!\|)\s*(?:sudo(?:\s+-\S+(?:\s+(?!-)[^\s|;&]+)?)*\s+)?{_SHELL}"
+    rf"|(?:{_SHELL}|(?<![\w.-])(?:source|\.))[^\n|;&]*<\(\s*(?:curl|wget)\b"
+    rf"|{_SHELL}\s+-c\s+[\"']?\$\(\s*(?:curl|wget)\b"
+    r"|\beval\s+[\"']?(?:\$\(|`)\s*(?:curl|wget)\b"
+    rf"|\b(?:iex|Invoke-Expression)\b[^\n]*{_PS_DOWNLOAD}"
+    rf"|{_PS_DOWNLOAD}[^\n]*\|\s*(?:iex|Invoke-Expression)\b"
+    r"|\b(?:sh|win)\.rustup\.rs\b",
+    re.IGNORECASE,
+)
+DOWNLOAD_EXECUTION_REMEDY = (
+    "download it to a file, check it against a pinned SHA-256 (cached_fetch.sh does both), and "
+    "run the file; rustup comes only from setup-rust's pinned rustup-init"
+)
+
 
 # A step that runs a test suite. Both spellings reach the same place: a suite
 # whose result the run exists to report.
@@ -148,6 +210,726 @@ SNAPSHOT_ACTION = "push-snap-changes"
 # `always()` also survives cancellation; `!cancelled()` does not, and is the
 # better default — a cancelled run should stop.
 SURVIVES_FAILURE = re.compile(r"(?:!\s*cancelled|always)\s*\(\s*\)")
+
+# Values whoever starts the run chooses: dispatch and call inputs (one of them or the
+# whole object), the branch and ref names, an event's free text, and the `github` or
+# `github.event` object as a whole. Matched in an expression after `_expression_text`,
+# so bracket reads count as dot reads and a string literal never matches. Inside
+# `${{ }}` in a script they become code; through a step's `env:` they stay values.
+UNTRUSTED_CONTEXT = re.compile(
+    r"(?<![\w.-])(?:inputs\b|github\b(?!\s*\.)|github\.event\b(?!\s*\.)|toJSON\(\s*github\b"
+    r"|github\.event\.inputs\b|github\.(?:head_ref|ref_name|ref|base_ref)\b"
+    r"|github\.event\.(?:ref|release|merge_group|pull_request|issue|comment|review|review_comment"
+    r"|head_commit|commits|pages|workflow_run|discussion|client_payload)\b)",
+    re.IGNORECASE,
+)
+# In one left-to-right pass over an expression: a literal-key bracket read, `x['y']`,
+# which reads the same value as `x.y`, and a string literal, with `''` for a quote.
+# One pass, so a `[` inside one literal never pairs with a `]` inside another.
+EXPRESSION_TOKEN = re.compile(r"\s*\[\s*'((?:[^']|'')*)'\s*\]|'(?:[^']|'')*'")
+
+
+# A CI AWS role, read from its secret. The read-only pull request role is the one every such
+# job may fall back to, so it alone does not make a job a CI role job.
+CI_ROLE_SECRET = re.compile(r"secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)\b")
+PULL_REQUEST_ROLE = "CI_AWS_PULL_REQUEST_ROLE_ARN"
+CI_ROLE_ACTION = "$/.github/actions/ci-role"
+# The one `role-to-assume` a CI role job may write: the full role only when the first step
+# chose it, else the read-only one. `&&`/`||` with the full role first, so an unset full
+# role falls back to the read-only one and never the other way.
+ROLE_CHOICE = re.compile(
+    r"\$\{\{\s*steps\.ci-role\.outputs\.full\s*==\s*'true'\s*&&\s*secrets\.(CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN)"
+    r"\s*\|\|\s*secrets\.CI_AWS_PULL_REQUEST_ROLE_ARN\s*\}\}"
+)
+# Steps that write to the repository: a snapshot branch or pull request. Only the role step's
+# `full` output may gate them, which no later step can change.
+REPOSITORY_WRITES = re.compile(r"push-snap-changes|\bgh\s+pr\s+create\b|\bgit\s+push\b")
+ROLE_PRESENCE = re.compile(r"secrets\.CI_(?:NEW_)?AWS_[A-Z0-9_]*ROLE_ARN\s*!=\s*''")
+FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'")
+# Uploads to the artifact store, directly or through mc_cp.sh, which counts when the
+# destination, the argument after the source, is the store. These may also be gated on the
+# read-only flag the role step sets.
+STORE_WRITES = re.compile(
+    r"upload-to-minio"
+    r"|\b(?:mc\s+(?:cp|mirror|put)|mc_cp\.sh)\s+(?:-\S+\s+)*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"']+)\s+[\"']?spice-minio/"
+)
+# A download of a binary or archive from the CI object store (or the build bucket's spiceio
+# mirror), which a job with the full roles must verify before it runs it: the store takes
+# writes from more than trunk. `actions/download-artifact` is the same file's fallback in the
+# same step pair. setup-spiced verifies inside the action, and the build actions build their
+# tools from the checkout with the full roles, so neither counts.
+STORE_DOWNLOAD = re.compile(
+    r"(?:\bmc\s+cp|mc_cp\.sh)\s+(?:-\S+\s+)*[\"']?spice-minio/(?:build|artifacts)/"
+    r"|ARCHIVE_S3_URI|TEST_BINARY_OBJECT_KEY"
+)
+VERIFY_ACTION = "$/.github/actions/verify-attestation"
+SETUP_SPICED = "$/.github/actions/setup-spiced"
+WRITE_GATE = re.compile(r"steps\.ci-role\.outputs\.full\s*==\s*'true'|env\.CI_CACHE_READ_ONLY\s*!=\s*'true'")
+# Inputs that name a build other than the run's own commit, which a job has to hand to the
+# role step: commits and refs as `builds`, which keep the full roles only for trunk's, and
+# container images as `images`, which never do.
+BUILD_INPUTS = {
+    "spiced_commit": "builds",
+    "spiced_ref": "builds",
+    "ref": "builds",
+    "needs_resolve_sha": "builds",
+    "custom_image_tag": "images",
+    "ec2_images": "images",
+    "channel": "images",
+}
+# This repository's reusable workflow at trunk, as CI role jobs are called.
+TRUNK_CALL = re.compile(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@trunk")
+LOCAL_CALL = re.compile(r"\./\.github/workflows/([\w.-]+\.ya?ml)")
+# The caller whose runs are a required merge-queue check. A `@trunk` call there would test
+# trunk's copy of the called jobs, never the pull request's, so it calls its own with `./`. A
+# queue run gets the read-only role; only its trunk runs get the full roles.
+LOCAL_CI_ROLE_CALLERS = {"integration.yml": "integration_aws.yml"}
+
+
+def _triggers(document: dict) -> object:
+    return next((document[key] for key in TRIGGER_KEYS if key in document), None)
+
+
+def ci_role_jobs(document: dict) -> list[str]:
+    """The jobs of a workflow that assume a CI AWS role."""
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    return [
+        name
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and any(role != PULL_REQUEST_ROLE for role in CI_ROLE_SECRET.findall(yaml.safe_dump(job.get("steps") or [])))
+    ]
+
+
+def check_ci_role_jobs(document: dict) -> list[str]:
+    """Report a CI role job outside a reusable workflow, or one that does not choose its role."""
+    names = ci_role_jobs(document)
+    if not names:
+        return []
+    triggers = _triggers(document)
+    problems = []
+    if not (isinstance(triggers, dict) and set(triggers) == {"workflow_call"}):
+        problems.extend(
+            f"job `{name}` assumes a CI AWS role in a workflow with triggers of its own; move it into a "
+            "reusable workflow (`on: workflow_call` only) and call that at "
+            "`spiceai/spiceai/.github/workflows/<file>@trunk`"
+            for name in names
+        )
+        return problems
+    call = triggers.get("workflow_call") or {}
+    declared = set((call.get("inputs") or {}) if isinstance(call, dict) else {})
+    for name in names:
+        steps = [s for s in document["jobs"][name].get("steps") or [] if isinstance(s, dict)]
+        first = steps[0] if steps else {}
+        if first.get("uses") != CI_ROLE_ACTION or first.get("id") != "ci-role":
+            problems.append(
+                f"job `{name}` assumes a CI AWS role but does not choose it first; make its first step "
+                f"`id: ci-role`, `uses: {CI_ROLE_ACTION}`"
+            )
+            continue
+        given = first.get("with") or {}
+        for build in sorted(declared & set(BUILD_INPUTS)):
+            key = BUILD_INPUTS[build]
+            if not re.search(rf"\binputs\.{re.escape(build)}\b", str(given.get(key, ""))):
+                problems.append(
+                    f"job `{name}` takes input `{build}`, which names another build, but does not give it to "
+                    f"the `ci-role` step's `{key}`, so it would get the full roles for a build off trunk"
+                )
+        # `role-to-assume` has its own rule below; everything else is checked here.
+        others = dict(document["jobs"][name])
+        others["steps"] = [
+            {k: ({kk: vv for kk, vv in v.items() if kk != "role-to-assume"} if k == "with" and isinstance(v, dict) else v)
+             for k, v in s.items()}
+            for s in steps
+        ]
+        for whole, inner in _expansions(yaml.safe_dump(others, width=10**6)):
+            if not any(role != PULL_REQUEST_ROLE for role in CI_ROLE_SECRET.findall(inner)):
+                continue
+            if ROLE_CHOICE.fullmatch(whole.strip()) or ROLE_PRESENCE.fullmatch(inner.strip()):
+                continue
+            problems.append(
+                f"job `{name}` uses `{whole.strip()}`; a CI role ARN may appear only in the role choice "
+                "(`steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN`) "
+                "or as a test that it is set (`secrets.<ROLE> != ''`)"
+            )
+        downloaded_if: list[str] = []
+        for position, step in enumerate(steps, start=1):
+            label = step.get("name") or f"step {position}"
+            if STORE_DOWNLOAD.search(str(step.get("run", ""))):
+                downloaded_if = _conjuncts(step.get("if", "")) or []
+                rest = steps[position:]
+                while rest and (
+                    "actions/download-artifact" in str(rest[0].get("uses", ""))
+                    or STORE_DOWNLOAD.search(str(rest[0].get("run", "")))
+                ):
+                    rest = rest[1:]
+                if not rest or rest[0].get("uses") != VERIFY_ACTION:
+                    problems.append(
+                        f"job `{name}` step `{label}` downloads from the CI object store, and the next step "
+                        f"does not verify it with `{VERIFY_ACTION}`, so a full-role job would run a file "
+                        "the store took from off trunk"
+                    )
+            if step.get("uses") == SETUP_SPICED and str((step.get("with") or {}).get("verify", "")).strip() != (
+                "${{ steps.ci-role.outputs.full }}"
+            ):
+                problems.append(
+                    f"job `{name}` step `{label}` runs setup-spiced without `verify: ${{{{ steps.ci-role.outputs.full }}}}`, "
+                    "so with the full roles it would run a spiced nobody checked"
+                )
+            condition = str(step.get("if", "")).strip()
+            conjuncts = _conjuncts(condition)
+            if step.get("uses") == VERIFY_ACTION and step.get("if") is not None and (
+                conjuncts is None
+                or conjuncts[0] not in ("steps.ci-role.outputs.full == 'true'", "github.ref == 'refs/heads/trunk'")
+                # Past the gate, only a test that a step produced something to verify, or a condition
+                # the download it verifies also runs only under.
+                or not all(
+                    re.fullmatch(r"steps\.[\w-]+\.outputs\.[\w-]+ != ''", c) or c in downloaded_if
+                    for c in conjuncts[1:]
+                )
+                or re.search(r"(?<![\w.-])env\s*[.\[]", condition)
+            ):
+                problems.append(
+                    f"job `{name}` step `{label}` verifies only `if: {step.get('if')}`; gate it on "
+                    "`steps.ci-role.outputs.full == 'true'` or `github.ref == 'refs/heads/trunk'` first and on no "
+                    "`env` value, which an earlier step can change"
+                )
+            if "aws-actions/configure-aws-credentials" in str(step.get("uses", "")):
+                role = str((step.get("with") or {}).get("role-to-assume", ""))
+                if not ROLE_CHOICE.fullmatch(role.strip()):
+                    problems.append(
+                        f"job `{name}` step `{label}` sets `role-to-assume: {role}`; write "
+                        "`${{ steps.ci-role.outputs.full == 'true' && secrets.<ROLE> || "
+                        "secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}`"
+                    )
+            else:
+                body = f"{step.get('uses', '')}\n{step.get('run', '')}\n{yaml.safe_dump(step.get('with') or {})}"
+                condition = str(step.get("if", ""))
+                if (REPOSITORY_WRITES.search(body) and not FULL_ROLE.search(condition)) or (
+                    STORE_WRITES.search(body) and not WRITE_GATE.search(condition)
+                ):
+                    problems.append(
+                        f"job `{name}` step `{label}` writes to shared state without "
+                        "`steps.ci-role.outputs.full == 'true'` in its `if:`, so it would write off trunk too"
+                    )
+    return problems
+
+
+# The compiler cache and the macOS SMB share take writes from more than trunk. A job that attests
+# what it builds must not use them on trunk, or a planted object ends up in an attested file.
+SHARED_BUILD_CACHES = ("$/.github/actions/setup-sccache", "spiceai/spiceio/.github/actions/setup")
+OFF_TRUNK = re.compile(r"github\.ref\s*!=\s*'refs/heads/trunk'")
+
+
+def _split_top_level(condition: str, operator: str) -> list[str]:
+    """`condition`'s operands of `operator` (`&&` or `||`) outside parentheses and string literals."""
+    parts, depth, start, i, in_string = [], 0, 0, 0, False
+    while i < len(condition):
+        c = condition[i]
+        if in_string:
+            if c == "'" and condition[i + 1 : i + 2] == "'":
+                i += 2
+                continue
+            in_string = c != "'"
+        elif c == "'":
+            in_string = True
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif depth == 0 and condition.startswith(operator, i):
+            parts.append(condition[start:i].strip())
+            i += len(operator)
+            start = i
+            continue
+        i += 1
+    parts.append(condition[start:].strip())
+    return parts
+
+
+def _conjuncts(condition: object) -> list[str] | None:
+    """The top-level `&&` operands of an `if:`, or None when a top-level `||` could make it true alone."""
+    text = str(condition or "").strip()
+    match = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.S)
+    text = (match.group(1) if match else text).strip()
+    if len(_split_top_level(text, "||")) > 1:
+        return None
+    return [re.sub(r"\s+", " ", part) for part in _split_top_level(text, "&&")]
+
+
+def _requires(condition: object, required: str) -> bool:
+    """Whether `condition` holds only when `required` (one comparison) does: it is a top-level conjunct."""
+    conjuncts = _conjuncts(condition)
+    return conjuncts is not None and re.sub(r"\s+", " ", required) in conjuncts
+
+
+def _steps(job: object) -> list[dict]:
+    return [s for s in (job.get("steps") or []) if isinstance(s, dict)] if isinstance(job, dict) else []
+
+
+# The macOS SMB share serves the compiler cache to every ref's macOS jobs, so a trunk build, whose
+# output trunk-credentialed and full-role jobs run, never mounts it.
+SPICEIO_SETUP = "spiceai/spiceio/.github/actions/setup"
+NOT_FULL_ROLE = re.compile(r"steps\.ci-role\.outputs\.full\s*!=\s*'true'")
+
+
+def _chooses_a_role_for_builds_only(job: object) -> bool:
+    """Whether the job's first step is ci-role without `images`, so `full != 'true'` holds off trunk only."""
+    steps = _steps(job)
+    return (
+        bool(steps)
+        and steps[0].get("uses") == "$/.github/actions/ci-role"
+        and steps[0].get("id") == "ci-role"
+        and not (steps[0].get("with") or {}).get("images")
+    )
+
+
+def check_share_off_trunk(jobs: dict) -> list[str]:
+    """Report a step that sets up the macOS share without keeping it off trunk.
+
+    The guard must be a top-level `&&` operand of the step's `if:`, with no top-level `||`, so
+    nothing else in the condition can make it true on trunk.
+    """
+    problems = []
+    for name, job in jobs.items():
+        for position, step in enumerate(_steps(job), start=1):
+            if not str(step.get("uses", "")).startswith(SPICEIO_SETUP):
+                continue
+            condition = step.get("if", "")
+            if _requires(condition, "github.ref != 'refs/heads/trunk'") or (
+                _requires(condition, "steps.ci-role.outputs.full != 'true'") and _chooses_a_role_for_builds_only(job)
+            ):
+                continue
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"job `{name}` step `{label}` sets up the macOS share without "
+                "`github.ref != 'refs/heads/trunk'` in its `if:`; any ref's jobs write it, so a trunk "
+                "build must not compile through it"
+            )
+    return problems
+
+
+# `pip`, `pip3`, `pip3.12` or `-m pip`, then any options before the `install` subcommand.
+PIP_INSTALL = re.compile(r"(?<![\w-])pip(?:3(?:\.\d+)?)?(?:\s+-[\w-]+(?:[= ](?!install\b)[^\s-]\S*)?)*\s+install\b")
+REQUIRE_HASHES = re.compile(r"(?:^|\s)--require-hashes(?:\s|$)")
+SECRET_OTHER_THAN_TOKEN = re.compile(r"\bsecrets\s*(?:\.\s*(?!GITHUB_TOKEN\b)[A-Za-z_]|\[)")
+
+
+def _pip_installs_without_hashes(script: str) -> list[str]:
+    """The `pip install` commands in a script that do not pass --require-hashes."""
+    text = re.sub(r"^[ \t]*#[^\n]*\n", "", script, flags=re.M).replace("\\\n", " ")
+    found = []
+    for line in text.splitlines():
+        # A comment after the command says nothing about what pip is told.
+        line = re.sub(r"(?:^|\s)#.*$", "", line)
+        for command in re.split(r"&&|\|\||;|\|", line):
+            if PIP_INSTALL.search(command) and not REQUIRE_HASHES.search(command):
+                found.append(command.strip())
+    return found
+
+
+def _job_credentials(job: dict) -> str | None:
+    """What credential a job holds, or None when it holds none but a read-only token."""
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        environment = environment.get("name")
+    if environment is not None and str(environment) != "secret-free":
+        return f"runs in the `{environment}` environment"
+    if SECRET_OTHER_THAN_TOKEN.search(json.dumps(job, default=str)):
+        return "reads a secret"
+    permissions = job.get("permissions")
+    if permissions == "write-all":
+        return "has `permissions: write-all`"
+    if permissions == "read-all":
+        return None
+    if not isinstance(permissions, dict):
+        return "has no job-level `permissions:`, so it gets the workflow's"
+    for scope, level in permissions.items():
+        if str(level) == "write":
+            return f"has `{scope}: write`"
+    return None
+
+
+def check_hashed_python_installs(jobs: dict, workflow_permissions: object) -> list[str]:
+    """Report a `pip install` without --require-hashes in a job that holds a credential."""
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        scoped = dict(job)
+        if "permissions" not in scoped and workflow_permissions is not None:
+            scoped["permissions"] = workflow_permissions
+        why = None
+        for position, step in enumerate(_steps(job), start=1):
+            for command in _pip_installs_without_hashes(str(step.get("run", ""))):
+                why = why or _job_credentials(scoped)
+                if why is None:
+                    break
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` step `{label}` runs `{command[:80]}` without --require-hashes, and the job "
+                    f"{why}; install from a hashed requirements file under .github/requirements/ instead"
+                )
+    return problems
+
+
+def _action_python_installs(steps: object) -> list[str]:
+    """Report a `pip install` without --require-hashes in a composite action, which any job may call."""
+    problems = []
+    for position, step in enumerate(steps if isinstance(steps, list) else [], start=1):
+        if not isinstance(step, dict):
+            continue
+        for command in _pip_installs_without_hashes(str(step.get("run", ""))):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"step `{label}` runs `{command[:80]}` without --require-hashes; a composite action can run in a "
+                "job that holds credentials, so install from a hashed requirements file under .github/requirements/"
+            )
+    return problems
+
+
+def check_attested_builds(jobs: dict) -> list[str]:
+    """Report a build whose output is attested and that sets up a shared build cache on trunk.
+
+    An attested build is a job that attests its own output, or a job that an attesting job
+    `needs`: an attest job of its own signs what the build job it waits on built.
+    """
+    attested: dict[str, str] = {}
+    for name, job in jobs.items():
+        if not any("actions/attest-build-provenance" in str(s.get("uses", "")) for s in _steps(job)):
+            continue
+        attested.setdefault(name, f"job `{name}` attests its output")
+        needs = job.get("needs") or []
+        for need in [needs] if isinstance(needs, str) else needs:
+            attested.setdefault(str(need), f"job `{need}`'s output is attested by job `{name}`")
+    problems = []
+    for name, why in attested.items():
+        for position, step in enumerate(_steps(jobs.get(name)), start=1):
+            uses = str(step.get("uses", ""))
+            if uses.startswith(SHARED_BUILD_CACHES) and not _requires(step.get("if", ""), "github.ref != 'refs/heads/trunk'"):
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"{why}, but step `{label}` of `{name}` sets up a shared build cache without "
+                    "`github.ref != 'refs/heads/trunk'` in its `if:`; other refs can write that cache, "
+                    "so trunk's attested build must not read it"
+                )
+    return problems
+
+
+# spidapter hands the spicepod's store credentials to a Spice Cloud app, which runs whatever image
+# the run names. So a step that runs it takes them only from an exchange whose session policy
+# reads the benchmark data and allows nothing else; the job's own credentials write its store keys.
+RUSTFS_ACTION = "$/.github/actions/rustfs-credentials"
+READ_ONLY_POLICY = "benchmark-data-read-only"
+READ_ONLY_POLICY_JSON = (
+    '{"Version":"2012-10-17","Statement":[{"Sid":"BenchmarkDataBuckets","Effect":"Allow",'
+    '"Action":["s3:GetBucketLocation","s3:ListBucket"],"Resource":["arn:aws:s3:::benchmarks",'
+    '"arn:aws:s3:::iceberg"]},{"Sid":"BenchmarkDataRead","Effect":"Allow","Action":["s3:GetObject"],'
+    '"Resource":["arn:aws:s3:::benchmarks/tpch_sf*","arn:aws:s3:::benchmarks/tpcds_sf*",'
+    '"arn:aws:s3:::benchmarks/clickbench/*","arn:aws:s3:::benchmarks/delta/*",'
+    '"arn:aws:s3:::benchmarks/hadoop/*","arn:aws:s3:::iceberg/*"]}]}'
+)
+# The macOS NAS benchmark job runs on a self-hosted Mac, whose own mc and other tools every job on
+# that host can replace, so its store credentials read its builds, the compiler cache and the
+# benchmark data, and nothing else.
+NAS_READ_ONLY_POLICY = "nas-bench-read-only"
+NAS_READ_ONLY_POLICY_JSON = (
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Buckets\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetBucketLo"
+    "cation\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::artifacts\",\"arn:aws:s3:::benchmarks\",\"arn:aws"
+    ":s3:::sccache\"]},{\"Sid\":\"BuildsRead\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn"
+    ":aws:s3:::artifacts/spiced/*\",\"arn:aws:s3:::artifacts/testoperator/*\",\"arn:aws:s3:::artifacts/sp"
+    "icepod-validator/*\",\"arn:aws:s3:::artifacts/untrusted/*\",\"arn:aws:s3:::sccache/*\"]},{\"Sid\":\"Benc"
+    "hmarkDataRead\",\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::benchmarks/t"
+    "pch_sf*\",\"arn:aws:s3:::benchmarks/tpcds_sf*\",\"arn:aws:s3:::benchmarks/clickbench/*\"]}]}"
+)
+READ_ONLY_POLICIES = {READ_ONLY_POLICY: READ_ONLY_POLICY_JSON, NAS_READ_ONLY_POLICY: NAS_READ_ONLY_POLICY_JSON}
+STORE_CREDENTIAL_OUTPUTS = ("access-key-id", "secret-access-key", "session-token")
+APP_STORE_CREDENTIALS = {"S3_KEY": "access-key-id", "S3_SECRET": "secret-access-key", "S3_SESSION_TOKEN": "session-token"}
+STEP_OUTPUT = re.compile(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}")
+# spidapter as the system adapter testoperator deploys the app through, or run as one directly.
+RUNS_SPIDAPTER = re.compile(r"--system-adapter-stdio-cmd\s+['\"]?spidapter\b|(?:^|[\s;&|(])spidapter\s+(?:stdio|deploy)\b")
+
+
+def check_app_store_credentials(jobs: dict) -> list[str]:
+    """Report a step that runs spidapter with store credentials from anything but the read-only exchange."""
+    problems = []
+    for name, job in jobs.items():
+        steps = _steps(job)
+        for position, step in enumerate(steps, start=1):
+            if not RUNS_SPIDAPTER.search(str(step.get("run", ""))):
+                continue
+            label = step.get("name") or f"step {position}"
+            earlier = {s.get("id"): s for s in steps[: position - 1] if s.get("id")}
+            env = step.get("env") if isinstance(step.get("env"), dict) else {}
+            for variable, output in APP_STORE_CREDENTIALS.items():
+                value = str(env.get(variable, ""))
+                match = STEP_OUTPUT.fullmatch(value.strip())
+                source = earlier.get(match.group(1)) if match else None
+                if (
+                    match
+                    and match.group(2) == output
+                    and source is not None
+                    and source.get("uses") == RUSTFS_ACTION
+                    and (source.get("with") or {}).get("session-policy") == READ_ONLY_POLICY
+                ):
+                    continue
+                problems.append(
+                    f"job `{name}` step `{label}` runs spidapter, which hands {variable} to a Spice Cloud "
+                    f"app, but takes it from `{value or '(unset)'}`; take it from `steps.<id>.outputs.{output}` "
+                    f"of an earlier `{RUSTFS_ACTION}` step with `session-policy: {READ_ONLY_POLICY}`"
+                )
+    return problems
+
+
+def check_store_policies(github_dir: Path) -> list[str]:
+    """Report a read-only session policy file whose content is not the one the store side expects,
+    or that is missing while a workflow names it."""
+    problems = []
+    for name, expected in READ_ONLY_POLICIES.items():
+        path = github_dir / "store-policies" / f"{name}.json"
+        if not path.is_file():
+            named = any(
+                re.search(rf"session-policy:\s*['\"]?{name}\b", workflow.read_text(encoding="utf-8"))
+                for workflow in workflow_files(github_dir)
+            )
+            if named:
+                problems.append(f"{path}: missing, and a workflow names it as a session policy")
+        elif path.read_bytes() != expected.encode() + b"\n":
+            problems.append(
+                f"{path}: is not the {name} session policy, compact on one line; the store side keeps "
+                "the same policy, so change both together"
+            )
+    return problems
+
+
+SELF_HOSTED_MAC = re.compile(r"\bspiceai-macos")
+CLEAN_MAC_WORKSPACE = "$/.github/actions/clean-mac-workspace"
+
+
+def check_mac_workspace(jobs: dict) -> list[str]:
+    """Report a job on a self-hosted Mac that checks out over a workspace an earlier job left.
+
+    Each runner instance there reuses its workspace across jobs of every ref, and actions/checkout
+    keeps an existing repository's local config and hooks, which run in the next job. So such a job
+    runs `clean-mac-workspace` before its first checkout. A job may be on such a Mac when its
+    `runs-on` or its matrix names a `spiceai-macos` runner, when `runs-on` is an expression, when
+    it is a label list that asks for a self-hosted or macOS runner, or when it picks a runner group.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        runs_on = job.get("runs-on", "")
+        runners = json.dumps(runs_on) + json.dumps((job.get("strategy") or {}).get("matrix", {}))
+        # A runner chosen by an expression (a matrix value, an input) can be one of those Macs, and
+        # so can a label list that asks for a self-hosted or macOS runner.
+        # `runs-on` may also be a mapping: `labels` (a label or a list of them) and `group`, a runner
+        # group, which can hold those Macs whatever its name.
+        labels = runs_on.get("labels", []) if isinstance(runs_on, dict) else runs_on
+        may_be_mac = (
+            SELF_HOSTED_MAC.search(runners)
+            or "${{" in json.dumps(runs_on)
+            or (isinstance(runs_on, dict) and "group" in runs_on)
+            or any(str(label).lower() in ("self-hosted", "macos") for label in (labels if isinstance(labels, list) else [labels]))
+        )
+        if not may_be_mac:
+            continue
+        cleaned = False
+        for position, step in enumerate(_steps(job), start=1):
+            uses = str(step.get("uses", ""))
+            if uses == CLEAN_MAC_WORKSPACE:
+                cleaned = True
+            elif uses.startswith("actions/checkout@") and not cleaned:
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` runs on a self-hosted Mac and checks out at step `{label}` over the workspace "
+                    f"an earlier job left; run `{CLEAN_MAC_WORKSPACE}` before it"
+                )
+                break
+    return problems
+
+
+def check_mac_store_credentials(jobs: dict) -> list[str]:
+    """Report a job on a self-hosted Mac that takes store credentials from anything but a read-only exchange.
+
+    Every job on such a host can replace its tools, mc included, so a Mac job's exchanges each carry
+    a read-only session policy, and every store credential it passes on comes from one of them.
+    """
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict) or "macos" not in str(job.get("runs-on", "")).lower():
+            continue
+        steps = _steps(job)
+        exchanges = {s.get("id"): s for s in steps if s.get("uses") == RUSTFS_ACTION}
+        for position, step in enumerate(steps, start=1):
+            label = step.get("name") or f"step {position}"
+            if step.get("uses") == RUSTFS_ACTION and (step.get("with") or {}).get("session-policy") not in READ_ONLY_POLICIES:
+                problems.append(
+                    f"job `{name}` runs on a self-hosted Mac, and step `{label}` exchanges store credentials "
+                    f"without a read-only `session-policy` ({', '.join(sorted(READ_ONLY_POLICIES))})"
+                )
+            text = json.dumps({k: step.get(k) for k in ("env", "with", "run")}, default=str)
+            for source, output in re.findall(r"steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", text):
+                if output in STORE_CREDENTIAL_OUTPUTS and source not in exchanges:
+                    problems.append(
+                        f"job `{name}` runs on a self-hosted Mac, and step `{label}` passes `steps.{source}.outputs.{output}`, "
+                        "which is not a read-only exchange's credential"
+                    )
+    return problems
+
+
+def check_ci_role_calls(workflows: dict[str, dict]) -> list[str]:
+    """Report a call to a CI role workflow that is not at trunk, or one that names it wrongly,
+    and a CI role workflow that only a call can start but nothing here calls.
+
+    `workflows` maps each file name under `.github/workflows/` to its parsed document.
+    """
+    reusable = {name for name, document in workflows.items() if ci_role_jobs(document)}
+    problems = []
+    called_here = set()
+    for caller, document in sorted(workflows.items()):
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, job in jobs.items():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            if not isinstance(uses, str):
+                continue
+            trunk, local = TRUNK_CALL.fullmatch(uses), LOCAL_CALL.fullmatch(uses)
+            target = (trunk or local).group(1) if (trunk or local) else None
+            # A call at another ref still calls it (and is reported below).
+            any_ref = re.fullmatch(r"spiceai/spiceai/\.github/workflows/([\w.-]+\.ya?ml)@.+", uses)
+            called_here.add(target or (any_ref.group(1) if any_ref else None))
+            where = f"{caller}: job `{job_name}`"
+            if trunk and target not in workflows:
+                problems.append(f"{where} calls `{uses}`, but there is no .github/workflows/{target}")
+                continue
+            if target not in reusable:
+                other_ref = next(
+                    (name for name in reusable if uses.startswith(f"spiceai/spiceai/.github/workflows/{name}@")), None
+                )
+                if other_ref:
+                    problems.append(
+                        f"{where} calls the CI AWS role workflow `{uses}`; call "
+                        f"`spiceai/spiceai/.github/workflows/{other_ref}@trunk`, so trunk's definition chooses the role"
+                    )
+                continue
+            if LOCAL_CI_ROLE_CALLERS.get(caller) == target:
+                if not local:
+                    problems.append(
+                        f"{where} calls `{uses}`; {caller} is a required merge-queue check, so it calls "
+                        f"`./.github/workflows/{target}`, which the queue then tests"
+                    )
+            elif not trunk:
+                problems.append(
+                    f"{where} calls the CI AWS role workflow `{uses}`; call "
+                    f"`spiceai/spiceai/.github/workflows/{target}@trunk`, so trunk's definition chooses the role"
+                )
+            called = _triggers(workflows[target])
+            spec = (called.get("workflow_call") or {}) if isinstance(called, dict) else {}
+            declared = (spec.get("inputs") or {}) if isinstance(spec, dict) else {}
+            given = job.get("with") if isinstance(job.get("with"), dict) else {}
+            for key in sorted(set(given) - set(declared)):
+                problems.append(f"{where} passes input `{key}`, which {target} does not declare")
+            for key, value in sorted(declared.items()):
+                if isinstance(value, dict) and value.get("required") and key not in given:
+                    problems.append(f"{where} does not pass `{key}`, which {target} requires")
+    # A role workflow left behind when its caller's job went away still holds a role.
+    for name in sorted(reusable - called_here):
+        triggers = _triggers(workflows[name])
+        events = set(triggers) if isinstance(triggers, (dict, list)) else {triggers}
+        if events == {"workflow_call"}:
+            problems.append(
+                f"{name} assumes a CI AWS role and only a call can start it, but no workflow here calls it; "
+                "delete it, its actions.lock entry and any caller mapping"
+            )
+    return problems
+
+
+# A secret a workflow reads, in dot or bracket form. GITHUB_TOKEN reaches every called
+# workflow without being passed.
+SECRET_READ = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)|\bsecrets\[\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*\]")
+ALWAYS_PASSED = frozenset({"GITHUB_TOKEN"})
+
+
+def _secrets_read(document: dict) -> set[str]:
+    """The secrets a workflow's jobs read, from the parsed document (comments do not count)."""
+    text = yaml.safe_dump(document.get("jobs") or {})
+    return {a or b for a, b in SECRET_READ.findall(text)} - ALWAYS_PASSED
+
+
+def check_reusable_secrets(workflows: dict[str, dict]) -> list[str]:
+    """Report a call to a reusable workflow that does not pass a secret the workflow reads.
+
+    A reusable workflow gets only the secrets its caller passes, environment secrets
+    included, and one it is not passed reads as an empty string with no error: the queue's
+    CI AWS role jobs once assumed no role at all that way. So every call passes by name each
+    secret the called workflow reads, which that workflow declares under
+    `on.workflow_call.secrets`; a CI AWS role workflow declares each as required, so GitHub
+    refuses a call that drops one, and never gets `secrets: inherit`, which would hand it
+    every secret. Another reusable workflow may take `inherit`.
+    """
+    role_workflows = {name for name, document in workflows.items() if ci_role_jobs(document)}
+    problems = []
+    for name in sorted(role_workflows):
+        spec = _triggers(workflows[name])
+        call = (spec.get("workflow_call") or {}) if isinstance(spec, dict) else {}
+        declared = (call.get("secrets") or {}) if isinstance(call, dict) else {}
+        for secret, value in sorted(declared.items()):
+            if not (isinstance(value, dict) and value.get("required") is True):
+                problems.append(
+                    f"{name}: secret `{secret}` is not declared `required: true`, so a caller that "
+                    "drops it would run with it empty"
+                )
+    for caller, document in sorted(workflows.items()):
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, job in jobs.items():
+            uses = job.get("uses") if isinstance(job, dict) else None
+            if not isinstance(uses, str):
+                continue
+            match = TRUNK_CALL.fullmatch(uses) or LOCAL_CALL.fullmatch(uses)
+            if not match or match.group(1) not in workflows:
+                continue
+            target = match.group(1)
+            where = f"{caller}: job `{job_name}`"
+            passed = job.get("secrets")
+            if passed == "inherit":
+                if target in role_workflows:
+                    problems.append(
+                        f"{where} passes `secrets: inherit` to the CI AWS role workflow {target}, which "
+                        "would hand it every secret; pass each secret it declares by name"
+                    )
+                continue
+            spec = _triggers(workflows[target])
+            call = (spec.get("workflow_call") or {}) if isinstance(spec, dict) else {}
+            declared = set((call.get("secrets") or {}) if isinstance(call, dict) else {})
+            given = set(passed) if isinstance(passed, dict) else set()
+            for secret in sorted((_secrets_read(workflows[target]) | declared) - given):
+                problems.append(
+                    f"{where} does not pass secret `{secret}`, which {target} reads: a reusable workflow "
+                    f"gets only the secrets its caller passes, so it would read as empty with no error. "
+                    f"Pass `{secret}: ${{{{ secrets.{secret} }}}}`, and declare it in {target}'s "
+                    "on.workflow_call.secrets"
+                )
+            for secret in sorted(given - declared):
+                problems.append(
+                    f"{where} passes secret `{secret}`, which {target} does not declare in "
+                    "on.workflow_call.secrets"
+                )
+            # A role workflow gets each secret under its own name, so a role ARN cannot be fed
+            # another secret's value by a mapping nobody reads closely.
+            if target in role_workflows:
+                for secret in sorted(given & declared):
+                    if re.sub(r"\s+", "", str(passed[secret])) != f"${{{{secrets.{secret}}}}}":
+                        problems.append(
+                            f"{where} passes `{secret}: {passed[secret]}`; pass the secret of the same "
+                            f"name, `{secret}: ${{{{ secrets.{secret} }}}}`"
+                        )
+    return problems
 
 
 def workflow_files(github_dir: Path) -> list[Path]:
@@ -198,6 +980,16 @@ def check_workflow(text: str) -> list[str]:
         problems.extend(check_workflow_conditions(jobs))
         problems.extend(check_cache_endpoint_isolation(jobs))
         problems.extend(check_suite_visibility(jobs, is_scheduled(document)))
+        problems.extend(check_untrusted_expansions(document, jobs))
+        problems.extend(check_ci_role_jobs(document))
+        problems.extend(check_attested_builds(jobs))
+        problems.extend(check_share_off_trunk(jobs))
+        problems.extend(check_app_store_credentials(jobs))
+        problems.extend(check_mac_store_credentials(jobs))
+        problems.extend(check_mac_workspace(jobs))
+        problems.extend(check_download_execution(jobs))
+        problems.extend(check_container_images(document))
+        problems.extend(check_hashed_python_installs(jobs, document.get("permissions")))
 
     return problems
 
@@ -419,6 +1211,317 @@ def check_suite_visibility(jobs: dict, scheduled: bool) -> list[str]:
     return problems
 
 
+def _holds_id_token(permissions: object) -> bool:
+    return permissions == "write-all" or (
+        isinstance(permissions, dict) and permissions.get("id-token") == "write"
+    )
+
+
+def _ref(term: str) -> str:
+    return rf"(?<![\w.-]){term}"
+
+
+def _expression_text(expression: str) -> str:
+    """An expression as the taint patterns read it.
+
+    `x['y']` becomes `x.y`, so a bracket read matches the pattern its dot form does,
+    and every string literal is emptied, so a literal such as `'github'` never does.
+    A bracket with any other key (`env[matrix.k]`) is kept, and the patterns treat it
+    as reading every member.
+    """
+    def token(match: re.Match) -> str:
+        if match.group(1) is not None:
+            return "." + match.group(1).replace("''", "'")
+        return "''"
+
+    return EXPRESSION_TOKEN.sub(token, expression)
+
+
+def _expansions(text: object) -> list[tuple[str, str]]:
+    """(whole, inner) for each `${{ … }}` in a text.
+
+    An expansion ends at the first `}}` outside a string literal, as GitHub reads it, so
+    `format('{{"k":"{0}"}}', inputs.x)` keeps its `inputs.x`. An unterminated one ends
+    the text.
+    """
+    s, found, i = str(text or ""), [], 0
+    while (start := s.find("${{", i)) >= 0:
+        j, quoted = start + 3, False
+        while j < len(s):
+            if quoted:
+                if s.startswith("''", j):
+                    j += 2
+                    continue
+                quoted = s[j] != "'"
+            elif s[j] == "'":
+                quoted = True
+            elif s.startswith("}}", j):
+                break
+            j += 1
+        found.append((s[start : j + 2], s[start + 3 : j]))
+        i = j + 2
+    return found
+
+
+def _expressions(value: object) -> str:
+    """The `${{ }}` expressions in a value, each as `_expression_text` reads it."""
+    return " ".join(_expression_text(inner) for _, inner in _expansions(value))
+
+
+def _tainted_references(document: dict, jobs: dict) -> dict[str, re.Pattern]:
+    """Per job, the references whose value carries something the dispatcher chose.
+
+    Starts from UNTRUSTED_CONTEXT and follows the value, to a fixpoint, into an `env`
+    entry (read later as `${{ env.X }}`), into a step's outputs when the step reads
+    such a value (as `${{ }}` or as `$X` from its environment), into a job's outputs
+    and so `needs.<job>.outputs`, and into a job's `matrix`. A github-script step's
+    outputs are not followed: its script decides what it outputs, and the matrices
+    built that way here hold only literals.
+    """
+    global_terms: set[str] = set()
+    job_terms: dict[str, set[str]] = {name: set() for name in jobs}
+
+    def pattern(job_name: str, extra: tuple = ()) -> re.Pattern:
+        terms = [
+            UNTRUSTED_CONTEXT.pattern,
+            *sorted(global_terms),
+            *sorted(job_terms.get(job_name, ())),
+            *extra,
+        ]
+        return re.compile("|".join(terms), re.IGNORECASE)
+
+    workflow_env = document.get("env") if isinstance(document.get("env"), dict) else {}
+    # Until a pass adds nothing. Each pass can carry the value one job further, so a
+    # chain of jobs declared last-first needs a pass per link; a fixed number of passes
+    # would let a longer chain through. Terms are only added, and there are finitely
+    # many (one per env key, step id and job output), so the loop ends.
+    while True:
+        before = (len(global_terms), sum(len(t) for t in job_terms.values()))
+        anywhere = pattern("")
+        tainted_workflow_env = {
+            key for key, value in workflow_env.items() if anywhere.search(_expressions(value))
+        }
+        global_terms.update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_workflow_env)
+        if tainted_workflow_env:
+            global_terms.add(_ref(r"env\s*\["))
+        for name, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            here = pattern(name)
+            job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+            tainted_env = tainted_workflow_env | {
+                k for k, v in job_env.items() if here.search(_expressions(v))
+            }
+            job_terms[name].update(_ref(rf"env\.{re.escape(key)}\b") for key in tainted_env)
+            if tainted_env:
+                job_terms[name].add(_ref(r"env\s*\["))
+            strategy = job.get("strategy")
+            if isinstance(strategy, dict) and here.search(_expressions(strategy.get("matrix", ""))):
+                job_terms[name].add(_ref(r"matrix\s*[.\[]"))
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict) or not step.get("id"):
+                    continue
+                if "github-script" in str(step.get("uses", "")):
+                    continue
+                step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
+                names = tainted_env | {k for k, v in step_env.items() if here.search(_expressions(v))}
+                run = str(step.get("run", ""))
+                reads = any(re.search(rf"\$\{{?{re.escape(n)}\b", run) for n in names)
+                read_here = " ".join(_expressions(step.get(k, "")) for k in ("run", "env", "with"))
+                if reads or here.search(read_here):
+                    job_terms[name].add(_ref(rf"steps\.{re.escape(str(step['id']))}\.outputs\b"))
+                    job_terms[name].add(_ref(r"steps\s*\["))
+            outputs = job.get("outputs") if isinstance(job.get("outputs"), dict) else {}
+            here = pattern(name)
+            for key, value in outputs.items():
+                if here.search(_expressions(value)):
+                    global_terms.add(_ref(rf"needs\.{re.escape(name)}\.outputs\.{re.escape(key)}\b"))
+                    global_terms.add(_ref(rf"needs\.{re.escape(name)}\.outputs\s*\["))
+                    global_terms.add(_ref(r"needs\s*\["))
+        if before == (len(global_terms), sum(len(t) for t in job_terms.values())):
+            break
+    return {name: pattern(name) for name in jobs}
+
+
+def _script_expansions(step: dict, tainted: re.Pattern) -> list[tuple[str, str]]:
+    """(key, expansion) for each tainted `${{ }}` in a step's `run:` or github-script `script:`."""
+    scripts = [("run", step.get("run"))]
+    if "github-script" in str(step.get("uses", "")) and isinstance(step.get("with"), dict):
+        scripts.append(("script", step["with"].get("script")))
+    step_env = step.get("env") if isinstance(step.get("env"), dict) else {}
+    local = [_ref(rf"env\.{re.escape(k)}\b") for k, v in step_env.items() if tainted.search(_expressions(v))]
+    if local:
+        tainted = re.compile("|".join([tainted.pattern, *local, _ref(r"env\s*\[")]), re.IGNORECASE)
+    found = []
+    for key, script in scripts:
+        for whole, inner in _expansions(script):
+            if tainted.search(_expression_text(inner)):
+                found.append((key, whole.strip()))
+    return found
+
+
+def check_untrusted_expansions(document: dict, jobs: dict) -> list[str]:
+    """Report scripts that expand a dispatcher's or a branch's value in place.
+
+    Scoped to workflows where some job can mint an OIDC token (`id-token: write`),
+    because that token buys the repository's store credentials. Every job of such a
+    workflow is checked, since one job's outputs feed the next. A `run:` script and a
+    github-script `script:` are code; `name:`, `if:`, `with:` and `env:` are not, and
+    `env:` is the fix: `NAME: ${{ inputs.x }}` there, `"$NAME"` in the script.
+
+    The value is followed through `env`, step and job outputs and the matrix
+    (`_tainted_references`). What this does not follow: a github-script step's
+    outputs, and a value a third-party action passes through. Composite actions in
+    this repository are checked by `check_action_expansions`.
+    """
+    workflow_permissions = document.get("permissions")
+    if not (
+        _holds_id_token(workflow_permissions)
+        or any(isinstance(job, dict) and _holds_id_token(job.get("permissions")) for job in jobs.values())
+    ):
+        return []
+    tainted = _tainted_references(document, jobs)
+    problems = []
+    for name, job in jobs.items():
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            continue
+        for position, step in enumerate(job["steps"], start=1):
+            if not isinstance(step, dict):
+                continue
+            for key, expansion in _script_expansions(step, tainted[name]):
+                label = step.get("name") or f"step {position}"
+                problems.append(
+                    f"job `{name}` step `{label}` expands `{expansion}` inside its `{key}:`, where a "
+                    f"value with `$(…)` runs as code in a workflow that holds `id-token: write` — pass "
+                    f"it through the step's `env:` and read the variable"
+                )
+    return problems
+
+
+def check_action_expansions(document: dict) -> list[str]:
+    """Report a composite action script that expands one of its inputs in place.
+
+    A caller decides an action's inputs, and the workflows that hold `id-token: write`
+    pass dispatch inputs to these actions, so an action reads its inputs through
+    `env:` as a workflow step does.
+    """
+    runs = document.get("runs")
+    if not isinstance(runs, dict) or not isinstance(runs.get("steps"), list):
+        return []
+    tainted = _tainted_references({}, {"action": {"steps": runs["steps"]}})["action"]
+    problems = []
+    for position, step in enumerate(runs["steps"], start=1):
+        if not isinstance(step, dict):
+            continue
+        for key, expansion in _script_expansions(step, tainted):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"step `{label}` expands `{expansion}` inside its `{key}:`, where a caller's value "
+                f"with `$(…)` runs as code — pass it through the step's `env:` and read the variable"
+            )
+    return problems
+
+
+# A read of a spiced build under the reader's own CI store prefix. A build lives where the ref
+# that built it stored it, so trunk's builds are at trunk's keys whoever reads them; reading them
+# under this run's `untrusted/<repository id>/<ref>/` finds nothing, or a copy no trunk run made.
+# setup-spiced reads from the build's ref, and verifies a build of trunk's against its attestation.
+OWN_PREFIX_SPICED_READ = re.compile(
+    r"\bmc\s+(?:stat|cp|cat|get|ls|mirror|find)(?:\s+-{1,2}[A-Za-z][\w-]*(?:=\S+)?)*\s+[\"']?spice-minio/artifacts/"
+    r"(?:\$\{?CI_STORE_PREFIX(?::-|-|\?)?\}?|\$\{\{\s*env\.CI_STORE_PREFIX\s*\}\})spiced/"
+)
+
+
+def check_own_prefix_spiced_reads(steps: object, where: str) -> list[str]:
+    """Report a step that reads a spiced build under this run's own store prefix."""
+    if not isinstance(steps, list):
+        return []
+    problems = []
+    for position, step in enumerate(steps, start=1):
+        script = step.get("run") if isinstance(step, dict) else None
+        if isinstance(script, str) and OWN_PREFIX_SPICED_READ.search(COMMENT_LINE.sub("", script)):
+            label = step.get("name") or f"step {position}"
+            problems.append(
+                f"{where}step `{label}` reads a spiced build under this run's own CI store prefix, but a build "
+                "lives where the ref that built it stored it; read spiced with setup-spiced, which reads trunk's "
+                "builds at trunk's keys and verifies their attestation"
+            )
+    return problems
+
+
+def download_executions(script: object) -> list[tuple[int, str]]:
+    """The (line number, line) of each line of a script that runs a download as code.
+
+    Whole-line comments are skipped, so a command a comment names does not count.
+    """
+    if not isinstance(script, str):
+        return []
+    found = []
+    for number, line in enumerate(script.splitlines(), start=1):
+        if COMMENT_LINE.fullmatch(line) is None and DOWNLOAD_EXECUTION.search(line):
+            text = line.strip()
+            found.append((number, text if len(text) <= 160 else text[:157] + "..."))
+    return found
+
+
+def _step_download_executions(steps: object, where: str) -> list[str]:
+    if not isinstance(steps, list):
+        return []
+    problems = []
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        label = step.get("name") or f"step {position}"
+        for _, line in download_executions(step.get("run")):
+            problems.append(f"{where}step `{label}` runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}")
+    return problems
+
+
+def check_download_execution(jobs: dict) -> list[str]:
+    """Report a workflow step that runs a download as code (DOWNLOAD_EXECUTION), or reads a
+    spiced build under the run's own store prefix (OWN_PREFIX_SPICED_READ)."""
+    problems = []
+    for job_name, job in jobs.items():
+        if isinstance(job, dict):
+            problems.extend(_step_download_executions(job.get("steps"), f"job `{job_name}` "))
+            problems.extend(check_own_prefix_spiced_reads(job.get("steps"), f"job `{job_name}` "))
+    return problems
+
+
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".ps1")
+# Directories a container file search skips: git's own, and build output. Hidden
+# directories such as .devcontainer are searched.
+NOT_SOURCE = frozenset({".git", "target", "node_modules"})
+
+
+def is_container_file(name: str) -> bool:
+    """Dockerfile, Dockerfile.<x>, Dockerfile-<x>, Containerfile[.<x>], <x>.dockerfile or <x>.containerfile."""
+    return name.startswith(("Dockerfile", "Containerfile")) or name.lower().endswith((".dockerfile", ".containerfile"))
+
+
+def repository_container_files(root: Path) -> list[Path]:
+    """Every Dockerfile and Containerfile under `root`, outside git's directory and build output."""
+    found = []
+    for directory, subdirectories, files in os.walk(root):
+        subdirectories[:] = [d for d in subdirectories if d not in NOT_SOURCE]
+        found.extend(Path(directory, name) for name in files if is_container_file(name))
+    return sorted(found)
+
+
+def check_script_downloads(github_dir: Path) -> list[str]:
+    """Report a shell or PowerShell script under the .github directory, or a Dockerfile or
+    Containerfile in the repository, that runs a download as code."""
+    problems = []
+    scripts = [p for p in github_dir.rglob("*") if p.suffix in SCRIPT_SUFFIXES]
+    for path in sorted(scripts) + repository_container_files(github_dir.resolve().parent):
+        if path.is_file():
+            problems.extend(
+                f"{path}:{number}: runs a download as code (`{line}`): {DOWNLOAD_EXECUTION_REMEDY}"
+                for number, line in download_executions(path.read_text(encoding="utf-8", errors="replace"))
+            )
+    return problems
+
+
 def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
     """Report steps that run the Spice runtime with the compiler cache's S3 endpoint set.
 
@@ -477,6 +1580,308 @@ def check_cache_endpoint_isolation(jobs: dict) -> list[str]:
     return problems
 
 
+# Container images. A tag is a name the registry can point at other bytes at any time, so a
+# job that starts `postgres:16` runs whatever the registry serves under it that day, with
+# the job's credentials beside it. A digest names the bytes. The exception is an image the
+# job built itself and pushed to a registry on the runner, such as the `localhost:5000`
+# registry the image workflows start: its digest does not exist until the job builds it. It
+# is told apart by its registry host, `localhost` or `127.0.0.1` (with any port), which no
+# image from elsewhere can have.
+#
+# What is read: `jobs.<job>.services.<name>.image`, `jobs.<job>.container` (or its `image`),
+# `uses: docker://…` steps, and in every `run:` script of a workflow or composite action, the
+# image argument of `docker run`, `docker create` and `docker pull` (also `docker container
+# run|create` and `docker image pull`, after `sudo`, `env`, `timeout`, `!`, `if`, `&&` and the like). An image
+# argument that is a shell variable (`"$image"`) is read from the literal assignments of that
+# variable in the same script (`image=…`, case arms included) and from the step's, job's and
+# workflow's `env:`; every value must be pinned. A `${{ }}` expression (in `image:` or in an
+# assigned value) is read through its string literals: each literal that looks like an image
+# (it has a `/`, `:` or `@`), and each string value of a `fromJSON('{…}')` literal, must be
+# pinned, and an expression that builds the name with `format()`, names no image literal at all,
+# or can yield a context's value instead of a literal (`inputs.image || 'x@sha256:…'`), is
+# reported, since its image cannot be checked.
+#
+# What it does not catch: an image a script under .github/scripts, a Makefile, a compose
+# file, a Helm chart or test code starts (including through .github/scripts/docker_pull.sh,
+# whose arguments are not read); `docker` run through a variable, function or alias, inside
+# backticks, or in a quoted `sh -c` string; `docker compose`, `docker build` base images and
+# buildx driver images; an image named in an expression without a `/`, `:` or `@`
+# (`'redis'`); and options it does not know to take a value, which can make it read the
+# option's value as the image (and report it, so it fails closed).
+DOCKER_IMAGE_COMMANDS = {("run",), ("create",), ("pull",), ("container", "run"), ("container", "create"), ("image", "pull")}
+# Options of `docker run`/`create`/`pull` that take no value; every other option does,
+# unless it is written `--name=value` or as a cluster of these short flags (`-dit`).
+DOCKER_FLAGS = frozenset(
+    "--rm -d --detach -i --interactive -t --tty --init --privileged -P --publish-all --read-only "
+    "--oom-kill-disable --no-healthcheck -q --quiet --disable-content-trust --help -a --all-tags "
+    "--use-api-socket".split()
+)
+DOCKER_SHORT_FLAGS = frozenset("ditPqa")
+# Docker's own options before the subcommand that take a value.
+DOCKER_GLOBAL_OPTIONS = frozenset({"--context", "-c", "--host", "-H", "--config", "--log-level", "-l"})
+COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "!", "{", "}", "then", "do", "else", "elif", "if", "while", "until", "time", "exec", "command", "nohup", "$"})
+# Commands that run the rest of their line as a command of its own.
+COMMAND_WRAPPERS = frozenset({"sudo", "env", "timeout", "nice", "stdbuf", "nohup", "command", "exec", "time"})
+PINNED_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
+LOCAL_IMAGE = re.compile(r"(?:localhost|127\.0\.0\.1)(?::\d+)?/\S+")
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+EXPRESSION_LITERAL = re.compile(r"'((?:[^']|'')*)'")
+EXPR_PLACEHOLDER = "__GITHUB_EXPRESSION__"
+ASSIGNMENT_VALUE = r"""("[^"\n]*"|'[^'\n]*'|[^\s;&|)]*)"""
+
+
+def _image_problem(image: str) -> str | None:
+    """Why a literal image reference is not acceptable, or None when it is pinned or local."""
+    if not image or PINNED_IMAGE.fullmatch(image) or LOCAL_IMAGE.fullmatch(image):
+        return None
+    return (
+        f"`{image}`, which is not pinned by digest; pin it as `{image.split('@')[0]}@sha256:<digest>`, "
+        "with the digest of its multi-arch index as the registry serves it"
+    )
+
+
+def _looks_like_image(text: str) -> bool:
+    return bool(text) and not re.search(r"\s", text) and any(c in text for c in "/:@")
+
+
+def _json_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _json_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _json_strings(v)]
+    return []
+
+
+def _expression_image_problems(value: str) -> list[str]:
+    """The problems with an image named through `${{ }}`, read through its string literals."""
+    shown = f"`{value.strip()}`"
+    if EXPRESSION.sub("", value).strip():
+        return [
+            f"{shown}, which builds its image name around an expression this check cannot read; name each image "
+            "it can be as a digest-pinned literal"
+        ]
+    problems, images = [], 0
+    for expression in EXPRESSION.findall(value):
+        if re.search(r"\bformat\s*\(", expression):
+            problems.append(
+                f"{shown}, which builds its image name with format(), which this check cannot read; map each "
+                "allowed value to a digest-pinned literal (fromJSON('{...}')[...])"
+            )
+            continue
+        for literal in (m.replace("''", "'") for m in EXPRESSION_LITERAL.findall(expression)):
+            candidates = [literal]
+            if literal.lstrip().startswith(("{", "[")):
+                try:
+                    candidates = _json_strings(json.loads(literal))
+                except ValueError:
+                    # Not JSON after all: check the literal itself as one image name.
+                    candidates = [literal]
+            for candidate in candidates:
+                if _looks_like_image(candidate):
+                    images += 1
+                    problem = _image_problem(candidate)
+                    if problem:
+                        problems.append(problem)
+    if images and not problems:
+        # Each `||` operand's value, the last of its `&&` chain, must be a literal or a
+        # fromJSON(...)[...] lookup; a context there (`inputs.image || 'x@sha256:…'`) can be any image.
+        for expression in EXPRESSION.findall(value):
+            for operand in _split_top_level(expression.strip(), "||"):
+                chosen = _split_top_level(operand, "&&")[-1].strip()
+                # `(cond && 'image')` is the same choice in parentheses.
+                while chosen.startswith("(") and chosen.endswith(")") and len(_split_top_level(chosen[1:-1], "||")) == 1:
+                    chosen = _split_top_level(chosen[1:-1].strip(), "&&")[-1].strip()
+                if not (
+                    re.fullmatch(r"'(?:[^']|'')*'", chosen)
+                    or re.fullmatch(r"fromJSON\(\s*'(?:[^']|'')*'\s*\)\s*\[.*\]", chosen, re.S)
+                ):
+                    problems.append(
+                        f"{shown}, which can take its image from `{chosen}`, which this check cannot read; name "
+                        "each image it can be as a digest-pinned literal"
+                    )
+    if images == 0 and not problems:
+        problems.append(
+            f"{shown}, which names its image only through an expression this check cannot read; name each image "
+            "it can be as a digest-pinned literal"
+        )
+    return problems
+
+
+def _value_problems(value: str) -> list[str]:
+    """The problems with an image given as a YAML value or an assigned shell value."""
+    value = value.strip()
+    if "${{" in value:
+        return _expression_image_problems(value)
+    if "$" in value:
+        return [f"`{value}`, which is built from shell variables this check cannot read; assign the image a digest-pinned literal"]
+    problem = _image_problem(value)
+    return [problem] if problem else []
+
+
+def _logical_lines(script: str) -> list[str]:
+    """The script's lines, with comment lines dropped, continuations joined, and each `${{ }}`
+    replaced by one placeholder word so the shell tokenizer keeps it whole."""
+    script = COMMENT_LINE.sub("", script)
+    script = EXPRESSION.sub(EXPR_PLACEHOLDER, script)
+    return script.replace("\\\n", " ").splitlines()
+
+
+def _tokens(line: str) -> list[str]:
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        return list(lexer)
+    except ValueError:
+        # An unbalanced quote, as in prose a heredoc carries: split on whitespace instead.
+        return [t.strip("'\"") for t in line.split()]
+
+
+def docker_images(script: object) -> list[str]:
+    """The image argument of each `docker run|create|pull` in a script, as written (after the
+    shell removes its quotes)."""
+    if not isinstance(script, str):
+        return []
+    images = []
+    lines = _logical_lines(script)
+    while lines:
+        line = lines.pop(0)
+        if "docker" not in line:
+            continue
+        tokens = _tokens(line)
+        # A command substitution inside quotes (`id="$(docker run …)"`) is one shell word;
+        # its command is read as a line of its own.
+        lines.extend(token.split("$(", 1)[1].rstrip(")") for token in tokens if "$(" in token)
+        for i, token in enumerate(tokens):
+            if token != "docker":
+                continue
+            # The command position: the line's start, after a separator or keyword, after a
+            # command that runs the rest of its line (`sudo`, `env`, `timeout 60`, ...) with its
+            # options and arguments, or after `NAME=value` prefixes.
+            j = i - 1
+            while j >= 0 and (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[j])
+                or tokens[j] in COMMAND_WRAPPERS
+                or (tokens[j].startswith("-") and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
+                # An option's value of a wrapper: `sudo -u runner`, `nice -n 5`.
+                or (j > 0 and tokens[j - 1].startswith("-") and any(w in tokens[: j - 1] for w in COMMAND_WRAPPERS))
+                # A wrapper's numeric argument: `timeout 60`, `timeout -k 5 60`, `nice -n 5`.
+                or (re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", tokens[j]) and any(w in tokens[:j] for w in COMMAND_WRAPPERS))
+            ):
+                j -= 1
+            if j >= 0 and tokens[j] not in COMMAND_SEPARATORS:
+                continue
+            k = i + 1
+            while k < len(tokens) and tokens[k].startswith("-"):
+                k += 2 if tokens[k] in DOCKER_GLOBAL_OPTIONS else 1
+            command = next(
+                (c for c in sorted(DOCKER_IMAGE_COMMANDS, key=len, reverse=True) if tuple(tokens[k : k + len(c)]) == c),
+                None,
+            )
+            if command is None:
+                continue
+            k += len(command)
+            while k < len(tokens):
+                option = tokens[k]
+                if option == "--":
+                    k += 1
+                    break
+                if not option.startswith("-") or option == "-":
+                    break
+                if "=" in option or option in DOCKER_FLAGS or (
+                    re.fullmatch(r"-[A-Za-z]+", option) and set(option[1:]) <= DOCKER_SHORT_FLAGS
+                ):
+                    k += 1
+                else:
+                    k += 2
+            if k < len(tokens) and tokens[k] not in COMMAND_SEPARATORS:
+                images.append(tokens[k])
+    return images
+
+
+def _assigned_values(script: str, name: str) -> list[str]:
+    """The values a script assigns to shell variable `name` literally: `name=value`, also in a
+    `case` arm, after `export`/`local`/`readonly`, or as a command prefix."""
+    script = COMMENT_LINE.sub("", script)
+    values = []
+    for match in re.finditer(rf"(?:^|[\s;&|(]){re.escape(name)}={ASSIGNMENT_VALUE}", script, re.M):
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values.append(value)
+    return values
+
+
+def _script_image_problems(step: dict, envs: list[dict]) -> list[str]:
+    script = step.get("run")
+    problems = []
+    for image in docker_images(script):
+        variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", image)
+        if variable is None:
+            if EXPR_PLACEHOLDER in image:
+                problems.append(
+                    f"`{image.replace(EXPR_PLACEHOLDER, '${{ }}')}`, which names the image with an expression in the "
+                    "script; assign the image a digest-pinned literal"
+                )
+            else:
+                problems.extend(_value_problems(image))
+            continue
+        name = variable.group(1)
+        values = _assigned_values(script, name)
+        for env in [step.get("env"), *envs]:
+            if isinstance(env, dict) and name in env:
+                values.append(str(env[name]))
+        if not values:
+            problems.append(
+                f"the image in `${name}`, which this check cannot resolve to a literal; assign it a digest-pinned "
+                "image in the same script or the step's `env:`"
+            )
+        for value in values:
+            problems.extend(_value_problems(value))
+    return problems
+
+
+def _steps_image_problems(steps: object, where: str, envs: list[dict]) -> list[str]:
+    problems = []
+    if not isinstance(steps, list):
+        return problems
+    for position, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        label = step.get("name") or f"step {position}"
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("docker://"):
+            problems.extend(f"{where}step `{label}` runs {p}" for p in _value_problems(uses[len("docker://") :]))
+        problems.extend(f"{where}step `{label}` runs {p}" for p in _script_image_problems(step, envs))
+    return problems
+
+
+def check_container_images(document: dict) -> list[str]:
+    """Report a container image a workflow starts by tag: in a job's `services:` or
+    `container:`, a `uses: docker://` step, or a `docker run|create|pull` in a script.
+    The module comment above `DOCKER_IMAGE_COMMANDS` says what is read and what is not."""
+    problems = []
+    workflow_env = document.get("env") if isinstance(document.get("env"), dict) else {}
+    jobs = document.get("jobs")
+    for job_name, job in (jobs.items() if isinstance(jobs, dict) else []):
+        if not isinstance(job, dict):
+            continue
+        services = job.get("services")
+        for service, spec in (services.items() if isinstance(services, dict) else []):
+            image = spec.get("image") if isinstance(spec, dict) else spec
+            if isinstance(image, str):
+                problems.extend(f"job `{job_name}` service `{service}` runs {p}" for p in _value_problems(image))
+        container = job.get("container")
+        image = container.get("image") if isinstance(container, dict) else container
+        if isinstance(image, str):
+            problems.extend(f"job `{job_name}` container runs {p}" for p in _value_problems(image))
+        job_env = job.get("env") if isinstance(job.get("env"), dict) else {}
+        problems.extend(_steps_image_problems(job.get("steps"), f"job `{job_name}` ", [job_env, workflow_env]))
+    return problems
+
+
 def check_action_descriptions(document: dict) -> list[str]:
     """Report a `${{` in an action's descriptions.
 
@@ -510,7 +1915,16 @@ def check_action(text: str) -> list[str]:
     if "runs" not in document:
         return ["has no `runs:` block"]
 
-    return check_action_descriptions(document) + check_action_conditions(document["runs"])
+    runs = document["runs"]
+    return (
+        check_action_descriptions(document)
+        + check_action_conditions(runs)
+        + check_action_expansions(document)
+        + _step_download_executions(runs.get("steps") if isinstance(runs, dict) else None, "")
+        + check_own_prefix_spiced_reads(runs.get("steps") if isinstance(runs, dict) else None, "")
+        + _steps_image_problems(runs.get("steps") if isinstance(runs, dict) else None, "", [])
+        + _action_python_installs(runs.get("steps") if isinstance(runs, dict) else None)
+    )
 
 
 def _format_yaml_error(error: yaml.YAMLError) -> str:
@@ -534,6 +1948,15 @@ def check_definitions(github_dir: Path) -> list[str]:
                 f"{path}: {problem}"
                 for problem in check(path.read_text(encoding="utf-8"))
             )
+    workflows = {}
+    for path in workflow_files(github_dir):
+        document, _ = _parse_mapping(path.read_text(encoding="utf-8"))
+        if document is not None:
+            workflows[path.name] = document
+    failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_ci_role_calls(workflows))
+    failures.extend(f"{github_dir / 'workflows'}/{problem}" for problem in check_reusable_secrets(workflows))
+    failures.extend(check_script_downloads(github_dir))
+    failures.extend(check_store_policies(github_dir))
     return failures
 
 

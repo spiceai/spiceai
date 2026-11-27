@@ -385,3 +385,36 @@ async fn a_pull_sends_the_stored_login() -> anyhow::Result<()> {
     assert!(sent[1].is_empty(), "{sent:?}");
     Ok(())
 }
+
+#[test]
+fn a_container_runs_only_from_a_pinned_image() -> anyhow::Result<()> {
+    let runner = ContainerRunnerBuilder::new("runtime-integration-test-pin")
+        .image("postgres:18".into())
+        .build()?;
+    let image = runner.builder.image.as_deref().unwrap_or_default();
+    assert!(
+        image.starts_with("docker.io/library/postgres:18@sha256:"),
+        "{image}"
+    );
+    // Under a reserved domain, so nothing could be pulled even if it were not
+    // refused.
+    for (image, refusal) in [
+        (
+            "registry.invalid/nosuch/image:1",
+            "is not pinned: test/container_images.json records no digest",
+        ),
+        (
+            "registry.invalid/nosuch/image:latest",
+            "names `latest`, a tag that moves",
+        ),
+    ] {
+        let Err(err) = ContainerRunnerBuilder::new("runtime-integration-test-pin")
+            .image(image.into())
+            .build()
+        else {
+            panic!("{image} was not refused");
+        };
+        assert!(err.to_string().contains(refusal), "{err}");
+    }
+    Ok(())
+}

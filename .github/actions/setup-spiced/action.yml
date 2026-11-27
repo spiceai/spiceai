@@ -1,7 +1,15 @@
 name: Setup spiced
 description: 'composite action'
 
-# Downloads the most recent spiced build from MinIO, within the last 10 commits
+# Downloads the most recent spiced build from MinIO, within the last 10 commits. A build lives
+# where the ref that built it stores it (.github/actions/ci-store-prefix): trunk's builds at the
+# shared keys, another ref's under `artifacts/untrusted/<repository id>/<ref>/`. So the place to
+# read is the build's ref, never the reader's: trunk's builds, and a `spiced_commit` on trunk,
+# are read at trunk's keys from any ref, and every one of them runs only once build_release.yml's
+# trunk attestation of it, for that commit, verifies. Any ref may write those keys until the store
+# limits them to trunk, so the attestation is what makes such a read safe. Another ref's build
+# has no attestation, and runs only in a run of that same ref, whose store credentials write only
+# that ref's keys; a job with the full CI roles (`verify`) never runs one.
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
@@ -9,18 +17,29 @@ inputs:
     description: 'spiced build commit'
     required: false
   ref: # optionally override the branch to fetch latest 10 commits from
-    description: 'target ref'
+    description: 'target ref: trunk, or the ref this run is on'
     required: false
     default: 'refs/heads/trunk'
+  verify: # `steps.ci-role.outputs.full` in a job with a CI AWS role
+    description: '`true` in a job with the full CI roles, which runs only a spiced that build_release.yml built and attested on trunk; a CI role job passes its role step''s `full` output'
+    required: false
+    default: 'false'
   with_odbc: # whether to download the ODBC-enabled binary
     description: 'download the ODBC-enabled spiced binary'
     required: false
+  token:
+    description: A token that can read this repository, to check whether `spiced_commit` is on trunk and to read its attestations.
+    required: false
+    default: ${{ github.token }}
 outputs:
   spiced_commit:
     value: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT }}
 runs:
   using: 'composite'
   steps:
+    - name: Choose the CI store prefix
+      uses: $/.github/actions/ci-store-prefix
+
     - name: Determine platform
       id: platform
       shell: bash
@@ -42,17 +61,141 @@ runs:
           exit 1
         fi
 
+    # Which ref built the spiced to read, and so where it is stored: trunk for the latest build of
+    # trunk and for a `spiced_commit` on trunk; otherwise `ref`, or this run's own ref when `ref`
+    # is trunk. That ref must be trunk or this run's own: a ref's build runs only in a run of that
+    # ref, whose credentials write only that ref's keys. Outputs `prefix` (empty for trunk) and
+    # `trunk`.
+    - name: Locate spiced's build
+      id: locate
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        INPUT_SPICED_COMMIT: ${{ inputs.spiced_commit }}
+        INPUT_VERIFY: ${{ inputs.verify }}
+        GH_TOKEN: ${{ inputs.token }}
+        # From the event itself, not the environment an earlier step can add to.
+        RUN_EVENT: ${{ github.event_name }}
+        PULL_REQUEST_BASE: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
+      run: |
+        set -euo pipefail
+        # Trunk's commit history (no trees or blobs), fetched into a scratch repository and never
+        # run, as the ci-role action fetches it. The token goes to git through GIT_CONFIG_*.
+        on_trunk() {
+          local git_dir server auth fetched=""
+          git_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/setup-spiced.XXXXXX")"
+          # Only git's own defaults: a self-hosted Mac's ~/.gitconfig, which any job there can write, could
+          # point the fetch at another history (url.*.insteadOf) or another proxy.
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+          git init -q --bare "$git_dir"
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          for attempt in 1 2 3; do
+            if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git --git-dir "$git_dir" fetch -q --no-tags --filter=tree:0 "$server/$GITHUB_REPOSITORY.git" \
+                '+refs/heads/trunk:refs/remotes/origin/trunk'; then
+              fetched=1
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+          if [ -z "$fetched" ]; then
+            echo "::error::Could not fetch trunk to tell whether spiced_commit $1 is trunk's build. Re-run the job."
+            exit 1
+          fi
+          # GIT_NO_LAZY_FETCH keeps a commit trunk lacks missing, so: not on trunk.
+          GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
+        }
+
+        # Builds are stored under the full hash of the commit that built them, and the commit is
+        # part of a store key and of later steps' outputs, so anything else is refused first.
+        if [ -n "$INPUT_SPICED_COMMIT" ] && ! [[ "$INPUT_SPICED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::setup-spiced: spiced_commit must be a full 40-character commit hash."
+          exit 1
+        fi
+        # A bare branch name is that branch (`trunk`, `release/2.4`), as the dispatch inputs
+        # document it. A ref becomes part of a store key and of this step's outputs, so anything
+        # but a plain ref is refused.
+        plain_ref() {
+          [[ "$1" =~ ^refs/[A-Za-z0-9._/-]+$ ]] && [[ "$1" != *..* && "$1" != *//* && "$1" != */ ]]
+        }
+        case "$REF" in
+          refs/*) ;;
+          *) REF="refs/heads/$REF" ;;
+        esac
+        if ! plain_ref "$REF"; then
+          echo "::error::setup-spiced: ref '$REF' is not a plain ref."
+          exit 1
+        fi
+        if [ -z "$INPUT_SPICED_COMMIT" ]; then
+          source_ref="$REF"
+        elif on_trunk "$INPUT_SPICED_COMMIT"; then
+          source_ref=refs/heads/trunk
+        elif [ "$REF" != refs/heads/trunk ]; then
+          source_ref="$REF"
+        elif [ "$GITHUB_REF" != refs/heads/trunk ]; then
+          source_ref="$GITHUB_REF"
+        else
+          # Trunk's keys hold no build of a commit trunk lacks.
+          echo "::error::This run, on refs/heads/trunk, runs only a spiced that trunk or this run's own ref built, and $INPUT_SPICED_COMMIT is not on trunk. Run the workflow on the ref that built it."
+          exit 1
+        fi
+        if ! plain_ref "$source_ref"; then
+          echo "::error::setup-spiced: '$source_ref' is not a plain ref."
+          exit 1
+        fi
+        # A pull request's run may also read its base branch's builds, as a pull request into trunk
+        # reads trunk's: its store credentials write only its own prefix, a job with the full CI
+        # roles still takes only trunk's attested builds (below), and the build is one the base
+        # branch's own runs made.
+        pull_request_base() {
+          [ "${RUN_EVENT:-}" = pull_request ] && [ -n "${PULL_REQUEST_BASE:-}" ] &&
+            [ "$1" = "refs/heads/${PULL_REQUEST_BASE}" ]
+        }
+        if [ "$source_ref" != refs/heads/trunk ] && [ "$source_ref" != "$GITHUB_REF" ] && ! pull_request_base "$source_ref"; then
+          echo "::error::This run, on $GITHUB_REF, runs only a spiced that trunk or this run's own ref built (or, for a pull request, its base branch), and $source_ref built this one. Run the workflow on that ref instead: its build runs only with that ref's own credentials."
+          exit 1
+        fi
+        case "$source_ref" in
+          refs/heads/trunk) prefix='' trunk=true ;;
+          refs/*)
+            if ! [[ "${GITHUB_REPOSITORY_ID:-}" =~ ^[0-9]+$ ]]; then
+              echo "::error::GITHUB_REPOSITORY_ID is '${GITHUB_REPOSITORY_ID:-}', not a repository id."
+              exit 1
+            fi
+            prefix="untrusted/${GITHUB_REPOSITORY_ID}/${source_ref}/" trunk=false
+            ;;
+          *)
+            echo "::error::setup-spiced: '$source_ref' is not a ref."
+            exit 1
+            ;;
+        esac
+        if [ "$INPUT_VERIFY" = true ] && [ "$trunk" != true ]; then
+          echo "::error::This job holds the full CI roles, so it runs only a spiced built and attested on trunk, and $source_ref's build is not."
+          exit 1
+        fi
+        {
+          echo "ref=$REF"
+          echo "prefix=$prefix"
+          echo "trunk=$trunk"
+        } >> "$GITHUB_OUTPUT"
+        echo "Reading the spiced that $source_ref built, at artifacts/${prefix}spiced/."
+
     - name: Find the latest built spiced commit
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       env:
-        REF: ${{ inputs.ref }}
+        REF: ${{ steps.locate.outputs.ref }}
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
         INPUT_WITH_ODBC: ${{ inputs.with_odbc }}
         PLATFORM_OS: ${{ steps.platform.outputs.os }}
         PLATFORM_ARCH: ${{ steps.platform.outputs.arch }}
         PLATFORM_EXT: ${{ steps.platform.outputs.ext }}
       run: |
-        git fetch --depth=10 origin -- "$REF"
+        # git's own defaults, not a self-hosted Mac's shared ~/.gitconfig, as on_trunk above.
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git fetch --depth=10 origin -- "$REF"
         echo "Fetching latest 10 commits from $REF"
 
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
@@ -68,14 +211,14 @@ runs:
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO for $PLATFORM"
-          if mc stat "spice-minio/artifacts/spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$hash/spiced_${features}${PLATFORM}.${EXT}"; then
+          if mc stat "spice-minio/artifacts/${SOURCE_PREFIX}spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$hash/spiced_${features}${PLATFORM}.${EXT}"; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
           fi
         done
 
-        echo "Could not find any recently built spiced commit in MinIO for $PLATFORM"
+        echo "::error::No spiced build of $REF's last 10 commits is stored for $PLATFORM, under artifacts/${SOURCE_PREFIX}spiced/. A run reads only builds of trunk, its own ref, or a pull request's base branch: run build_release.yml on $REF first, or run this workflow on a ref that has a build."
         exit 1
 
     - name: Set SPICED_COMMIT from workflow input
@@ -94,11 +237,19 @@ runs:
     - name: Output SPICED_COMMIT
       id: output_spiced_commit
       shell: bash
-      run: echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
+      run: |
+        # The attestation is checked for this commit, so there must be one.
+        if [ -z "${SPICED_COMMIT:-}" ]; then
+          echo "::error::setup-spiced: no spiced commit was chosen."
+          exit 1
+        fi
+        echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
 
     - name: Download spiced from MinIO
+      id: download
       shell: bash
       env:
+        SOURCE_PREFIX: ${{ steps.locate.outputs.prefix }}
         INPUT_WITH_ODBC: ${{ inputs.with_odbc }}
         PLATFORM_OS: ${{ steps.platform.outputs.os }}
         PLATFORM_ARCH: ${{ steps.platform.outputs.arch }}
@@ -111,6 +262,26 @@ runs:
         fi
         PLATFORM="${PLATFORM_OS}_${PLATFORM_ARCH}"
         EXT="${PLATFORM_EXT}"
-        mc cp "spice-minio/artifacts/spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
-        tar -xzf spiced_${features}${PLATFORM}.${EXT}
+        archive="spiced_${features}${PLATFORM}.${EXT}"
+        mc cp "spice-minio/artifacts/${SOURCE_PREFIX}spiced/${PLATFORM_OS}-${PLATFORM_ARCH}/$SPICED_COMMIT/${archive}" "${archive}"
+        echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+    # Every spiced read at trunk's keys runs only if build_release.yml built and attested it on
+    # trunk, for that commit, whatever the reader's role: any ref may write those keys until the
+    # store limits them to trunk.
+    - name: Verify spiced's build attestation
+      if: steps.locate.outputs.trunk == 'true' || inputs.verify == 'true'
+      uses: $/.github/actions/verify-attestation
+      with:
+        file: ${{ steps.download.outputs.archive }}
+        signer-workflow: .github/workflows/build_release.yml
+        source-commit: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT }}
+        token: ${{ inputs.token }}
+
+    - name: Install spiced
+      shell: bash
+      env:
+        ARCHIVE: ${{ steps.download.outputs.archive }}
+      run: |
+        tar -xzf "${ARCHIVE}"
         sudo cp ./spiced /usr/local/bin/spiced

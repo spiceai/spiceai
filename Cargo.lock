@@ -5248,6 +5248,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "container-images"
+version = "2.5.0-unstable"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "yaml",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17668,6 +17678,7 @@ dependencies = [
  "connector-snowflake",
  "connector-spark",
  "connector-spiceai",
+ "container-images",
  "cpu-budget",
  "criterion 0.7.0",
  "csv",
@@ -20722,6 +20733,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "container-images",
  "flate2",
  "flight_client",
  "futures",
@@ -20739,6 +20751,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqllogictest",
  "sqlparser",
  "tokio",

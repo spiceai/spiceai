@@ -1,0 +1,166 @@
+name: Choose the CI role
+description: >-
+  Says which CI AWS role a job that assumes one gets, as the first step of every such job (they
+  live in the `*_aws.yml` reusable workflows; check_workflow_yaml.py keeps them there). The full
+  roles go only to a run on trunk (`refs/heads/trunk`; a merge-queue run is not one) that runs
+  nothing but trunk's code: each other build the job runs (`builds`) must be `trunk` or a commit
+  on trunk, checked with `git merge-base --is-ancestor` against trunk itself. Anything else gets
+  the read-only pull request role (`full` is `false`), except that a trunk run naming a build off
+  trunk fails instead (its token still names trunk), and the job skips the steps that write:
+  this action sets CI_CACHE_READ_ONLY=true for the rest of the job, which setup-rust,
+  setup-sccache and the build actions read. With the full roles it sets CI_ROLE_FULL=true
+  instead: the build actions then build their tools from the checkout rather than download them,
+  and setup-spiced and the test-archive downloads verify the file's build attestation. The roles' AWS trust policies make the same split by
+  `job_workflow_ref` and `ref`; this only asks for the role AWS would grant. A job that runs a
+  container image (`images`) always gets the read-only role: an image tag can be published from
+  any branch, so it names no trunk commit. A run that needs the read-only role fails here when
+  its secret is not set, rather than later with no credentials.
+
+inputs:
+  pull-request-role-set:
+    description: "`true` when the CI_AWS_PULL_REQUEST_ROLE_ARN secret is set: `secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != ''`."
+    required: true
+  builds:
+    description: >-
+      One `name=value` line for each other build the job runs besides this run's own commit,
+      such as `spiced_commit=<sha>`: a commit (40 hex characters), `trunk`, or anything else
+      that names a build (a branch, tag or image). An empty value is no build. Only `trunk` and
+      commits on trunk keep the full roles.
+    required: false
+    default: ''
+  images:
+    description: >-
+      One `name=value` line for each container image the job runs, such as
+      `custom_image_tag=<tag>`. Any non-empty value gets the read-only role.
+    required: false
+    default: ''
+  token:
+    description: A token that can read this repository's contents, to fetch trunk's history.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  full:
+    description: "`true` for the full CI roles, `false` for the read-only pull request role."
+    value: ${{ steps.choose.outputs.full }}
+
+runs:
+  using: composite
+  steps:
+    - name: Choose the CI role
+      id: choose
+      shell: bash
+      env:
+        PULL_REQUEST_ROLE_SET: ${{ inputs.pull-request-role-set }}
+        BUILDS: ${{ inputs.builds }}
+        IMAGES: ${{ inputs.images }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # The full roles are granted only at the end, once every check below has run on trunk
+        # and found nothing: a check that does not run leaves the read-only role.
+        full=false
+        reason=""
+        checked=0
+        case "$GITHUB_REF" in
+          refs/heads/trunk) ;;
+          *) reason="$GITHUB_REF is not trunk" ;;
+        esac
+
+        # Trunk's commit history (no trees or blobs), fetched once into a scratch repository
+        # and never run. The token goes to git through GIT_CONFIG_* for this one command.
+        git_dir=""
+        on_trunk() {
+          if [ -z "$git_dir" ]; then
+            git_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ci-role.XXXXXX")"
+            # Only git's own defaults: a self-hosted Mac's ~/.gitconfig, which any job there can write, could
+            # point the fetch at another history (url.*.insteadOf) or another proxy.
+            export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+            git init -q --bare "$git_dir"
+            server="${GITHUB_SERVER_URL:-https://github.com}"
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+            echo "::add-mask::$auth"
+            fetched=""
+            for attempt in 1 2 3; do
+              if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+                GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+                git --git-dir "$git_dir" fetch -q --no-tags --filter=tree:0 "$server/$GITHUB_REPOSITORY.git" \
+                  '+refs/heads/trunk:refs/remotes/origin/trunk'; then
+                fetched=1
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep 5
+            done
+            if [ -z "$fetched" ]; then
+              echo "::error::Could not fetch trunk to check this job's builds against it, so the CI role cannot be chosen. Re-run the job."
+              exit 1
+            fi
+          fi
+          # GIT_NO_LAZY_FETCH keeps a commit trunk lacks missing, so: not on trunk.
+          GIT_NO_LAZY_FETCH=1 git --git-dir "$git_dir" merge-base --is-ancestor "$1" refs/remotes/origin/trunk 2>/dev/null
+        }
+
+        # Each list is split into its lines here, in this shell, with no here-string, pipe or
+        # temporary file: a Mac's /bin/bash 3.2 skips a loop whose here-string file it cannot
+        # make, and carries on.
+        old_ifs="$IFS"
+        IFS=$'\n'
+        set -f
+        # shellcheck disable=SC2206 # split on newlines only, with globbing off
+        images=($IMAGES)
+        # shellcheck disable=SC2206 # split on newlines only, with globbing off
+        builds=($BUILDS)
+        IFS="$old_ifs"
+        set +f
+
+        # An image tag can be published from any branch, so no image counts as trunk's.
+        if [ -z "$reason" ]; then
+          for line in ${images[@]+"${images[@]}"}; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            name="${line%%=*}"
+            value="${line#*=}"
+            [ -n "$value" ] || continue
+            reason="$name is $value, an image, which names no trunk commit"
+            break
+          done
+          checked=$((checked + 1))
+        fi
+
+        if [ -z "$reason" ]; then
+          for line in ${builds[@]+"${builds[@]}"}; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            name="${line%%=*}"
+            value="${line#*=}"
+            [ -n "$value" ] || continue
+            case "$value" in
+              trunk | refs/heads/trunk) continue ;;
+            esac
+            if [[ "$value" =~ ^[0-9a-f]{40}$ ]] && on_trunk "$value"; then
+              continue
+            fi
+            # The job's token still names trunk, so a build off trunk could assume a full role
+            # itself: refuse it rather than run it with the read-only one.
+            echo "::error::$name is $value, which is not trunk or a commit on trunk. A trunk run runs only trunk's builds; dispatch from the branch that holds it instead."
+            exit 1
+          done
+          checked=$((checked + 1))
+        fi
+
+        if [ -z "$reason" ] && [ "$checked" = 2 ]; then
+          full=true
+        elif [ -z "$reason" ]; then
+          reason="the checks of this job's images and builds did not all run"
+        fi
+
+        if [ "$full" = false ] && [ "$PULL_REQUEST_ROLE_SET" != true ]; then
+          echo "::error::$reason, so this job assumes the read-only pull request role, but the CI_AWS_PULL_REQUEST_ROLE_ARN secret is not set. A maintainer has to add it to the ci environment."
+          exit 1
+        fi
+        echo "full=$full" >> "$GITHUB_OUTPUT"
+        if [ "$full" = true ]; then
+          echo "CI_ROLE_FULL=true" >> "$GITHUB_ENV"
+          echo "$GITHUB_REF runs only trunk's code: this job assumes the full CI roles."
+        else
+          echo "CI_CACHE_READ_ONLY=true" >> "$GITHUB_ENV"
+          echo "::notice::$reason: this job assumes the read-only pull request role and skips the steps that write."
+        fi

@@ -91,6 +91,10 @@ jobs:
       - name: system info
         run: uname -m
 
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - name: checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -119,11 +123,16 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          set -eo pipefail
+          installer="$(mktemp)"
           if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
-            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+            curl -fsSL -H "Cache-Control: no-cache" -o "$installer" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh"
           else
-            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
+            curl -fsSL -H "Cache-Control: no-cache" -o "$installer" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh"
           fi
+          # On stdin, as `curl https://install.spiceai.org | /bin/bash` runs it, once the whole
+          # file has arrived: a failed download fails the step instead of running part of it.
+          /bin/bash < "$installer"
 
       - name: add Spice bin to PATH
         run: |
@@ -348,11 +357,16 @@ jobs:
           # WSLENV lists which vars to forward across the interop boundary so the script below can read them.
           WSLENV: GITHUB_TOKEN:INSTALL_SCRIPT_BRANCH:HEAD_REPO:HEAD_SHA
         run: |
+          set -eo pipefail
+          installer="$(mktemp)"
           if [ -n "${INSTALL_SCRIPT_BRANCH:-}" ]; then
-            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+            curl -fsSL -H "Cache-Control: no-cache" -o "$installer" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh"
           else
-            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
+            curl -fsSL -H "Cache-Control: no-cache" -o "$installer" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh"
           fi
+          # On stdin, as `curl https://install.spiceai.org | /bin/bash` runs it, once the whole
+          # file has arrived: a failed download fails the step instead of running part of it.
+          /bin/bash < "$installer"
 
       - name: check installation
         shell: wsl-bash {0}

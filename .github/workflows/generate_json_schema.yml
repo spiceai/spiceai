@@ -41,6 +41,10 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -117,7 +121,8 @@ jobs:
         run: |
           set +e
           python3 -m venv .venv
-          .venv/bin/python -m pip install check-jsonschema
+          # Every package at the version and hashes .github/requirements/check_jsonschema.txt pins.
+          .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/check_jsonschema.txt
 
           echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

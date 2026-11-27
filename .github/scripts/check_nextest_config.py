@@ -129,7 +129,8 @@ ZERO_RETRY_BINARIES = frozenset(
 # worst-case wall clock — every attempt killed at the ceiling — to fit inside
 # that step's `timeout-minutes`, or the step reports no verdict at all.
 STEP_BUDGETS = {
-    "retention_oom": (".github/workflows/integration.yml", "Run retention OOM regression test"),
+    # In the `test-partitions` jobs integration.yml calls, which assume a CI AWS role.
+    "retention_oom": (".github/workflows/integration_aws.yml", "Run retention OOM regression test"),
 }
 
 # What nextest spends inside the step before the first attempt starts —

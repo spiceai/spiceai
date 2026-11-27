@@ -37,6 +37,14 @@ inputs:
   token:
     description: Token that can read this repository's Actions runs, tags and contents.
     required: true
+  for-ref:
+    description: >-
+      The ref of the run that will run the build (`github.ref`). On refs/heads/trunk the build must
+      also be trunk's own: a push or schedule run of the trunk branch, or a merge_group run of
+      trunk's queue, of a commit on trunk. A trunk run's credentials write trunk's keys, so it runs
+      only trunk's builds, and another ref's build runs in a run of that ref. Empty adds no rule.
+    required: false
+    default: ''
 
 outputs:
   workflow:
@@ -55,6 +63,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.token }}
         RUN_ID: ${{ inputs.run-id }}
+        FOR_REF: ${{ inputs.for-ref }}
       run: |
         set -euo pipefail
         [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a numeric run ID, got '$RUN_ID'"; exit 1; }
@@ -104,6 +113,9 @@ runs:
         fetch_branches() {
           [ -z "$git_dir" ] || return 0
           git_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/check-trusted-run.XXXXXX")
+          # Only git's own defaults: a self-hosted Mac's ~/.gitconfig, which any job there can write, could
+          # point the fetch at another history (url.*.insteadOf) or another proxy.
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
           git init -q --bare "$git_dir"
           server="${GITHUB_SERVER_URL:-https://github.com}"
           git --git-dir "$git_dir" remote add origin "$server/$GITHUB_REPOSITORY.git"
@@ -160,6 +172,18 @@ runs:
           head_branch="$head_branch (on $trusted)"
         else
           refuse "was built from $head_branch, not trunk, a release branch or a release tag"
+        fi
+        if [ "$FOR_REF" = refs/heads/trunk ]; then
+          # A run of another ref used that ref's caches and store keys, even for a commit on trunk.
+          # A dispatch can run on a tag, and a tag can be called `trunk`, so only a push, a schedule
+          # (default branch only) or a merge_group run of trunk's queue is trunk's.
+          case "$event" in
+            push | schedule) [ "$head_branch" = trunk ] ;;
+            merge_group) [[ "$head_branch" =~ ^gh-readonly-queue/trunk/pr-[0-9]+-[0-9a-f]+$ ]] ;;
+            *) false ;;
+          esac || refuse "is not a push, schedule or merge-queue run of trunk. A trunk run runs only trunk's builds; run this workflow on the ref that built it."
+          fetch_branches
+          on_branch trunk || refuse "built $head_sha, which is not on trunk. A trunk run runs only trunk's builds; run this workflow on the branch that built it."
         fi
 
         echo "Run $RUN_ID is a $workflow $event run of $GITHUB_REPOSITORY @ $head_branch"

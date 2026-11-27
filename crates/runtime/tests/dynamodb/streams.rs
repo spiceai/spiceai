@@ -52,7 +52,7 @@ const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 #[instrument]
 pub async fn start_dynamodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(DYNAMODB_DOCKER_CONTAINER)
-        .image("amazon/dynamodb-local:latest".to_string())
+        .image("amazon/dynamodb-local:3.3.2".to_string())
         .publish_port(8000)
         .healthcheck(HealthConfig {
             test: Some(vec![

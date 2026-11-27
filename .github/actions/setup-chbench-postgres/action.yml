@@ -26,13 +26,23 @@ runs:
     - name: Start PostgreSQL for CH-benCH
       shell: bash
       env:
-        IMAGE: postgres:${{ inputs.version }}
+        VERSION: ${{ inputs.version }}
       run: |
+        # One image per PostgreSQL line test/source_versions.json lists, pinned by the digest of
+        # its multi-arch index on Docker Hub.
+        case "${VERSION}" in
+          14) image=postgres:14@sha256:c0e9c0e9bac7e4c1834b698217a03ee5c708de30d313c84a506972de0e24b059 ;;
+          15) image=postgres:15@sha256:91b9edc40277faf94bc1e3d7ae621b185fa70f3099b94309c4731a8296114870 ;;
+          16) image=postgres:16@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8 ;;
+          17) image=postgres:17@sha256:87c8b42f423b45d5247e6aa8fdb2e7762fec164c68a50fe3eb07e7bfcaf4dbcf ;;
+          18) image=postgres:18@sha256:c699303802144847d238196173655dbbecf7a96aeca1565f2b02eb671a1f0b6b ;;
+          *) echo "::error::No PostgreSQL image is pinned for ${VERSION}; add its digest to this action." && exit 1 ;;
+        esac
         docker run -d --name chbench-pg \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 \
           --shm-size=4g \
-          "${IMAGE}" \
+          "${image}" \
           -c max_connections=200 \
           -c wal_level=logical \
           -c synchronous_commit=off \

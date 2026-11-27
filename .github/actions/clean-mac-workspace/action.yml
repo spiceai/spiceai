@@ -1,0 +1,49 @@
+name: Empty the workspace on a self-hosted Mac
+description: >-
+  Every runner instance on a self-hosted Mac reuses its workspace across jobs of every ref, and
+  actions/checkout keeps an existing repository's local config and hooks, and any file git does
+  not track. Run before actions/checkout, this removes everything in GITHUB_WORKSPACE, so the job
+  starts from nothing an earlier job left. On any other runner it does nothing.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Empty the workspace
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Any Mac that is not GitHub-hosted, as setup-rust counts them: one that does not say
+        # where it runs is emptied too.
+        if [ "${RUNNER_OS:-}" != macOS ] || [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+          exit 0
+        fi
+        workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is not set}"
+        if [ ! -e "$workspace" ] && [ ! -L "$workspace" ]; then
+          exit 0
+        fi
+        if [ -d "$workspace" ] && [ ! -L "$workspace" ] && [ -z "$(ls -A "$workspace")" ]; then
+          echo "The workspace is empty."
+          exit 0
+        fi
+        # An earlier job can lock what it leaves inside (immutable or append-only flags, ACLs,
+        # modes), so the workspace is moved aside whole, which needs only its own flags, ACL and
+        # mode cleared, and a new one is made. A link left as the workspace is moved aside itself,
+        # never followed. What was moved aside is never used, and removing it is best-effort.
+        parent="$(dirname "$workspace")"
+        chflags nouchg,nouappnd "$parent" 2>/dev/null || true
+        chmod -N "$parent" 2>/dev/null || true
+        chmod u+rwx "$parent" 2>/dev/null || true
+        chflags -h nouchg,nouappnd "$workspace" 2>/dev/null || true
+        chmod -h -N "$workspace" 2>/dev/null || true
+        [ -L "$workspace" ] || chmod u+rwx "$workspace" 2>/dev/null || true
+        aside="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/workspace.leftover.XXXXXX")"
+        if ! mv "$workspace" "$aside/"; then
+          echo "::error::Could not move aside $workspace, which an earlier job left; not checking out over it."
+          exit 1
+        fi
+        mkdir "$workspace"
+        chflags -R nouchg,nouappnd "$aside" 2>/dev/null || true
+        chmod -R -N "$aside" 2>/dev/null || true
+        chmod -R u+rwx "$aside" 2>/dev/null || true
+        rm -rf "$aside" 2>/dev/null || echo "::notice::Left what an earlier job locked in $aside; nothing uses it."
+        echo "Emptied $workspace."

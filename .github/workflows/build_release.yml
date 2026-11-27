@@ -153,7 +153,7 @@ jobs:
             exit 0
           fi
           if [ -z "$status" ]; then
-            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml -f branch=$REF, then build again once it passes."
+            problem="Commit $SHA has no trunk-tests result, so it has not been through the full post-merge suite. Run it with: gh workflow run trunk_tests.yml --ref $REF -f branch=$REF, then build again once it passes."
           else
             problem="Commit $SHA failed trunk tests ($state): $url. Fix the failure on $REF, or, if it is a known flake or infrastructure fault, build again with unhealthy_reason set."
           fi
@@ -300,7 +300,8 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     permissions:
       contents: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS credentials, and signing the CI store's spiced attestations
+      attestations: write  # the attestations setup-spiced verifies before a full-role job runs spiced
     needs: setup-matrix
     # Trunk macOS builds run one at a time on `spiceai-macos-large`: a newer push replaces the
     # build still waiting, never the one running, so a burst of merges builds its first and
@@ -322,6 +323,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -455,7 +460,7 @@ jobs:
       - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows'
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features "$SPICED_FEATURES" -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile "${RUST_PROFILE}" --features "$SPICED_FEATURES" -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -483,6 +488,19 @@ jobs:
           duration-seconds: '21600'
           export-env: 'false'
 
+      # Off trunk, the store keeps this run's uploads under `artifacts/untrusted/<repository id>/<ref>/`.
+      - name: Choose the CI store prefix
+        if: matrix.target.use_minio
+        uses: $/.github/actions/ci-store-prefix
+
+      # On trunk, the CI store's spiced carries this workflow's attestation: a job with the full
+      # CI roles runs it only if `gh attestation verify` accepts it (setup-spiced).
+      - name: Attest spiced for the CI store
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default') && env.CI_STORE_PREFIX == ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: spiced_linux_x86_64.tar.gz
+
       - name: Upload spiced to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: $/.github/actions/upload-to-minio
@@ -492,7 +510,7 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spiced_linux_x86_64.tar.gz
-          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
+          destination_path: spice-minio/artifacts/${{ env.CI_STORE_PREFIX }}spiced/linux-x86_64/${{ github.sha }}/
 
       ## ODBC variant - for internal testing
       # Keep the CLI selected so shared dependency features match the default build.
@@ -518,6 +536,12 @@ jobs:
           name: spiced_odbc_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_odbc_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      - name: Attest spiced_odbc for the CI store
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc') && env.CI_STORE_PREFIX == ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: spiced_odbc_linux_x86_64.tar.gz
+
       - name: Upload spiced_odbc to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc')
         uses: $/.github/actions/upload-to-minio
@@ -527,7 +551,7 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spiced_odbc_linux_x86_64.tar.gz
-          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
+          destination_path: spice-minio/artifacts/${{ env.CI_STORE_PREFIX }}spiced/linux-x86_64/${{ github.sha }}/
 
       ## Metal variant (macOS with Metal GPU acceleration, models included by default)
       - name: Build spiced (metal)
@@ -572,7 +596,8 @@ jobs:
       ## Windows CLI - build and package (runtime not supported on Windows, CLI only)
       - name: Build spice CLI (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
-        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+        # Windows runs this step in pwsh, where the job's env reads as $env:NAME.
+        run: cargo build --profile $env:RUST_PROFILE -p spice --target-dir target
 
       - name: tar CLI binary (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
@@ -609,7 +634,7 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spice_linux_x86_64.tar.gz
-          destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
+          destination_path: spice-minio/artifacts/${{ env.CI_STORE_PREFIX }}spice/linux-x86_64/${{ github.sha }}/
 
   # The CUDA binaries of a release are built in this run, so one run holds every
   # binary publish_release needs. Trunk pushes build CUDA in

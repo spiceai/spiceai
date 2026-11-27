@@ -1,0 +1,836 @@
+---
+# The jobs of testoperator_run_cluster_bench.yml that assume a CI AWS role.
+# testoperator_run_cluster_bench.yml calls this file at `@trunk`, so whichever ref it runs on, the definition
+# that chooses the role is trunk's.
+# A job here assumes the full roles only on trunk (a merge-queue run is not trunk) and
+# the read-only pull request role anywhere else, and skips its writes there (the `Choose
+# the CI role` step). check_workflow_yaml.py keeps every such job in a file like this.
+name: cluster benchmark e2e tests (CI AWS role jobs)
+
+on:
+  workflow_call:
+    # The secrets the jobs below read. A reusable workflow gets only the secrets its
+    # caller passes, environment secrets included, and one it is not passed reads as
+    # empty with no error, so each is required and every caller passes it by name.
+    # check_workflow_yaml.py keeps this list and the callers' `secrets:` complete.
+    secrets:
+      CI_AWS_EC2_BENCH_ROLE_ARN:
+        required: true
+      CI_AWS_ICEBERG_ROLE_ARN:
+        required: true
+      CI_AWS_PULL_REQUEST_ROLE_ARN:
+        required: true
+      SPICEAI_BENCHMARK_METRICS_KEY:
+        required: true
+      SPICE_MANAGEMENT_CLIENT_ID_PROD:
+        required: true
+      SPICE_MANAGEMENT_CLIENT_SECRET_PROD:
+        required: true
+    inputs:
+      app_storage_size_gb:
+        type: string
+        required: false
+        default: ''
+      cayenne_file_path:
+        type: string
+        required: false
+        default: ''
+      cayenne_metadata_dir:
+        type: string
+        required: false
+        default: ''
+      channel:
+        type: string
+        required: false
+        default: ''
+      cluster_name:
+        type: string
+        required: false
+        default: ''
+      compute:
+        type: string
+        required: false
+        default: ''
+      custom_image_tag:
+        type: string
+        required: false
+        default: ''
+      ec2_images:
+        type: string
+        required: false
+        default: ''
+      ephemeral_storage_limit:
+        type: string
+        required: false
+        default: ''
+      executor_replicas:
+        type: string
+        required: false
+        default: ''
+      executor_storage_size_gb:
+        type: string
+        required: false
+        default: ''
+      organization_tag:
+        type: string
+        required: false
+        default: ''
+      query_set:
+        type: string
+        required: false
+        default: ''
+      query_temp_directory:
+        type: string
+        required: false
+        default: ''
+      query_transport:
+        type: string
+        required: false
+        default: ''
+      ready_wait:
+        type: string
+        required: false
+        default: ''
+      runner_type:
+        type: string
+        required: false
+        default: ''
+      scale_factor:
+        type: string
+        required: false
+        default: ''
+      scenario_query_file:
+        type: string
+        required: false
+        default: ''
+      shuffle_location:
+        type: string
+        required: false
+        default: ''
+      spicepod_path:
+        type: string
+        required: false
+        default: ''
+      update_snapshots:
+        type: string
+        required: false
+        default: ''
+      validate_results:
+        type: string
+        required: false
+        default: ''
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+env:
+  CB_SPICEPOD_PATH: ${{ inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}
+  CB_QUERY_SET: ${{ inputs.query_set || 'tpch' }}
+  CB_SCENARIO_QUERY_FILE: ${{ inputs.scenario_query_file || '' }}
+  CB_QUERY_TRANSPORT: ${{ inputs.query_transport || 'v1-queries' }}
+  CB_EXECUTOR_REPLICAS: ${{ inputs.executor_replicas || '3' }}
+  CB_ORGANIZATION_TAG: ${{ inputs.organization_tag || 'spicehq' }}
+  CB_CHANNEL: ${{ inputs.channel || 'nightly' }}
+  CB_CUSTOM_IMAGE_TAG: ${{ inputs.custom_image_tag || '' }}
+  CB_SHUFFLE_LOCATION: ${{ inputs.shuffle_location || '' }}
+  CB_QUERY_TEMP_DIRECTORY: ${{ inputs.query_temp_directory || '' }}
+  CB_APP_STORAGE_SIZE_GB: ${{ inputs.app_storage_size_gb || '' }}
+  CB_EXECUTOR_STORAGE_SIZE_GB: ${{ inputs.executor_storage_size_gb || '' }}
+  CB_EPHEMERAL_STORAGE_LIMIT: ${{ inputs.ephemeral_storage_limit || '' }}
+  CB_CAYENNE_FILE_PATH: ${{ inputs.cayenne_file_path || '' }}
+  CB_CAYENNE_METADATA_DIR: ${{ inputs.cayenne_metadata_dir || '' }}
+  CB_CLUSTER_NAME: ${{ inputs.cluster_name || '' }}
+  CB_SCALE_FACTOR: ${{ inputs.scale_factor || '1' }}
+  CB_VALIDATE_RESULTS: ${{ inputs.validate_results || 'false' }}
+  CB_UPDATE_SNAPSHOTS: ${{ inputs.update_snapshots || 'default' }}
+  CB_READY_WAIT: ${{ inputs.ready_wait || '600' }}
+  CB_RUNNER_TYPE: ${{ inputs.runner_type || 'spiceai-dev-runners' }}
+  CB_COMPUTE: ${{ inputs.compute || 'scp' }}
+  CB_EC2_IMAGES: ${{ inputs.ec2_images || '' }}
+  CB_EC2_REGION: us-west-2
+
+jobs:
+  run-cluster-bench:
+    environment: ci
+    permissions:
+      # `write` on contents + pull-requests so the "Open snapshot-update PR" step
+      # can push a branch and open a PR. `packages: read` covers the spidapter
+      # GHCR image pull.
+      contents: write
+      packages: read
+      pull-requests: write
+      # `actions: write` approves the PR's held pull_request runs
+      # (.github/scripts/approve_bot_pr_runs.sh).
+      actions: write
+      # `compute: ec2` assumes the sandbox benchmark role over OIDC.
+      id-token: write
+    name: Run cluster benchmark
+    runs-on: ${{ inputs.runner_type || 'spiceai-dev-runners' }}
+    timeout-minutes: 600
+    steps:
+      # Which CI AWS role this job gets, and whether its writes run; see the action.
+      - name: Choose the CI role
+        id: ci-role
+        uses: $/.github/actions/ci-role
+        with:
+          pull-request-role-set: ${{ secrets.CI_AWS_PULL_REQUEST_ROLE_ARN != '' }}
+          images: |
+            custom_image_tag=${{ inputs.custom_image_tag }}
+            ec2_images=${{ inputs.ec2_images }}
+            channel=${{ inputs.channel || 'nightly' }}
+
+      # A self-hosted Mac reuses its workspace across jobs of every ref: start from an empty one.
+      - name: Empty the workspace (self-hosted Macs)
+        uses: $/.github/actions/clean-mac-workspace
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        uses: $/.github/actions/setup-rust
+
+      - name: Determine snapshot update mode
+        id: determine_update_snapshots
+        run: |
+          # `default` → branch-based: release/* never updates, anything else
+          # always updates. Mirrors testoperator_run_bench.yml so cluster-bench
+          # snapshot policy is consistent with the single-node bench.
+          update_mode="${CB_UPDATE_SNAPSHOTS}"
+          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+            branch_name="${GITHUB_REF_NAME}"
+            if [[ "${branch_name}" == "release/"* ]]; then
+              update_mode="no"
+            else
+              update_mode="always"
+            fi
+          fi
+
+          echo "Using update_snapshots=${update_mode}" >&2
+          echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${CB_QUERY_SET}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${CB_SCALE_FACTOR}/${CB_SPICEPOD_PATH}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+        run: |
+          if [ ! -f "${SPICEPOD_PATH}" ]; then
+            echo "Error: Spicepod file not found at ${SPICEPOD_PATH}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${SPICEPOD_PATH}"
+
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Build spicepod validator
+        uses: $/.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Validate spicepod
+        env:
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+        run: |
+          spicepod-validator "${SPICEPOD_PATH}"
+
+      - name: Build Testoperator
+        uses: $/.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Setup Testoperator
+        uses: $/.github/actions/setup-testoperator-data
+        with:
+          query_set: ${{ env.CB_QUERY_SET }}
+
+      - name: Build Spidapter
+        uses: $/.github/actions/build-spidapter
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      - name: Management login (prod)
+        if: env.CB_COMPUTE == 'scp'
+        uses: $/.github/actions/management-login
+        with:
+          token-url: https://spice.ai/api/oauth/token
+          client-id: ${{ secrets.SPICE_MANAGEMENT_CLIENT_ID_PROD }}
+          client-secret: ${{ secrets.SPICE_MANAGEMENT_CLIENT_SECRET_PROD }}
+          # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
+          # spicebench's run_spicebench.yml uses.
+
+      - name: Install AWS CLI
+        if: env.CB_COMPUTE == 'ec2'
+        uses: $/.github/actions/install-aws-cli
+
+      # Credentials must outlast every image's run and its teardown, so they
+      # match the job timeout rather than the 1-hour default.
+      - name: Authorize with the benchmark role
+        if: env.CB_COMPUTE == 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_EC2_BENCH_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-ballista-bench-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: ${{ env.CB_EC2_REGION }}
+
+      - name: Resolve the EC2 cluster inputs
+        if: env.CB_COMPUTE == 'ec2'
+        env:
+          SUBNET_ID: ${{ vars.CI_BALLISTA_BENCH_SUBNET_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CB_EC2_IMAGES}" ]; then
+            echo "::error::compute: ec2 needs at least one image in ec2_images"
+            exit 1
+          fi
+          if [ -z "${SUBNET_ID}" ]; then
+            echo "::error::Variable CI_BALLISTA_BENCH_SUBNET_ID is not set in the ci environment"
+            exit 1
+          fi
+          ami_id="$(aws ssm get-parameters --region "${CB_EC2_REGION}" \
+            --names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+            --query 'Parameters[0].Value' --output text)"
+          echo "Ubuntu 24.04 AMI: ${ami_id}"
+          {
+            echo "SPIDAPTER_EC2_REGION=${CB_EC2_REGION}"
+            echo "SPIDAPTER_EC2_SUBNET_ID=${SUBNET_ID}"
+            echo "SPIDAPTER_EC2_AMI_ID=${ami_id}"
+            echo "SPIDAPTER_EC2_EXECUTOR_COUNT=${CB_EXECUTOR_REPLICAS}"
+          } >> "${GITHUB_ENV}"
+
+      # Off EC2 the benchmark reads S3 with the Iceberg role. On EC2 it keeps the benchmark role
+      # assumed above, which is in the job's environment.
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.CB_COMPUTE != 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_ICEBERG_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      # On trunk the app runs only an image spiced_docker_dev built and attested on trunk: the tag
+      # is resolved to its digest here and that digest's attestation checked, and the tag must still
+      # name that digest when the app starts and when the run ends. The dev channel's own default
+      # image is checked by nothing, so a trunk run does not take it. A release channel or EC2
+      # release image is published by the release process, not this check.
+      - name: Refuse an unverified cluster app image on trunk
+        if: github.ref == 'refs/heads/trunk' && env.CB_CUSTOM_IMAGE_TAG == '' && env.CB_CHANNEL == 'internal'
+        run: |
+          echo "::error::On trunk the internal channel runs only a custom_image_tag, whose attestation this run verifies; give the trunk-<commit> image to run."
+          exit 1
+
+      - name: Resolve the cluster app image
+        id: app-image
+        if: env.CB_CUSTOM_IMAGE_TAG != '' && github.ref == 'refs/heads/trunk'
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          digest="$(bash .github/scripts/ghcr_digest.sh spiceai/spiceai-dev "${IMAGE_TAG}")"
+          {
+            echo "digest=${digest}"
+            echo "image=ghcr.io/spiceai/spiceai-dev@${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the cluster app image's attestation
+        if: github.ref == 'refs/heads/trunk' && steps.app-image.outputs.image != ''
+        uses: $/.github/actions/verify-attestation
+        with:
+          image: ${{ steps.app-image.outputs.image }}
+          signer-workflow: .github/workflows/spiced_docker_dev.yml
+
+      # spidapter hands the spicepod's store credentials to a Spice Cloud app that runs whatever
+      # image the run names, so the app gets only credentials that read the benchmark data: a
+      # second exchange whose session policy (.github/store-policies/benchmark-data-read-only.json)
+      # allows nothing else. The job's own credentials, which write this run's store keys, stay in
+      # the job. A refused exchange fails the job; there is no fallback.
+      - name: Get read-only RustFS credentials for the cluster app
+        id: rustfs-app
+        uses: $/.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          session-policy: benchmark-data-read-only
+          export-env: 'false'
+
+      # Sent by tag, the tag must still name the digest this run verified when the app starts.
+      # Deployed by digest, the tag no longer decides what runs, so a moved tag is only noted.
+      - name: Check the cluster app image before the app starts
+        if: steps.app-image.outputs.digest != ''
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          VERIFIED: ${{ steps.app-image.outputs.digest }}
+          BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
+        run: |
+          set -euo pipefail
+          if moved="$(bash .github/scripts/image_tag_watch.sh check spiceai/spiceai-dev "${IMAGE_TAG}" "${VERIFIED}")"; then
+            echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${VERIFIED}, the digest this run verified."
+          elif [ "${BY_DIGEST}" = true ]; then
+            echo "::warning::${moved} The app is deployed by the verified digest."
+          else
+            echo "::error::${moved} That is not the image this run verified."
+            exit 1
+          fi
+
+      - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
+        env:
+          SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
+          SPICE_CLOUD_API_URL: https://api.spice.ai
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs-app.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs-app.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs-app.outputs.session-token }}
+          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SESSION_TOKEN || steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
+          AWS_DEFAULT_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
+          # Select the nodegroup for the spidapter cluster app via tags.organization.
+          # Defaults to the dedicated spicehq nodegroup; without it the app lands on
+          # the shared default nodegroup.
+          SPIDAPTER_ORGANIZATION_TAG: ${{ env.CB_ORGANIZATION_TAG }}
+          SCHEDULER_STATE_LOCATION: 's3://spiceai-ci-testing-cluster-state/testoperator-cluster-bench-${{ github.run_id }}/'
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
+          CHANNEL: ${{ env.CB_CHANNEL }}
+          CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          # The digest this run verified for CUSTOM_IMAGE_TAG (on trunk). spidapter deploys by it once
+          # CLUSTER_APP_IMAGE_BY_DIGEST is true, the switch for a Spice Cloud that deploys a
+          # `<tag>@<digest>` reference; until then it sends the tag, and the tag is checked below.
+          SPIDAPTER_IMAGE_DIGEST: ${{ steps.app-image.outputs.digest }}
+          SPIDAPTER_IMAGE_BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
+          SHUFFLE_LOCATION: ${{ env.CB_SHUFFLE_LOCATION }}
+          QUERY_TEMP_DIRECTORY: ${{ env.CB_QUERY_TEMP_DIRECTORY }}
+          APP_STORAGE_SIZE_GB: ${{ env.CB_APP_STORAGE_SIZE_GB }}
+          EXECUTOR_STORAGE_SIZE_GB: ${{ env.CB_EXECUTOR_STORAGE_SIZE_GB }}
+          EPHEMERAL_STORAGE_LIMIT: ${{ env.CB_EPHEMERAL_STORAGE_LIMIT }}
+          CAYENNE_FILE_PATH: ${{ env.CB_CAYENNE_FILE_PATH }}
+          CAYENNE_METADATA_DIR: ${{ env.CB_CAYENNE_METADATA_DIR }}
+          CLUSTER_NAME: ${{ env.CB_CLUSTER_NAME }}
+          QUERY_SET: ${{ env.CB_QUERY_SET }}
+          QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
+          SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
+          VALIDATE_RESULTS: ${{ env.CB_VALIDATE_RESULTS }}
+          READY_WAIT: ${{ env.CB_READY_WAIT }}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots }}
+          SPICEPOD_PATH: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          SCENARIO_QUERY_FILE: ${{ env.CB_SCENARIO_QUERY_FILE }}
+        run: |
+          set -euo pipefail
+
+          # Translate the abstract transport name into the concrete testoperator
+          # flag. `--distributed` selects the existing DistributedExecutor that
+          # POSTs to /v1/queries; the default (no flag) keeps the Flight SQL
+          # path that exercises distributed accelerations.
+          TRANSPORT_FLAG=""
+          if [ "${QUERY_TRANSPORT}" = "v1-queries" ]; then
+            TRANSPORT_FLAG="--distributed"
+          fi
+
+          # Optional scenario query file (only used when --query-set scenario).
+          SCENARIO_ARG=""
+          if [ -n "${SCENARIO_QUERY_FILE}" ]; then
+            SCENARIO_ARG="--scenario-query-file ./test/scenario/${SCENARIO_QUERY_FILE}"
+          fi
+
+          # Run the freshly-built spidapter binary as the JSON-RPC adapter.
+          # spidapter reads its config from SPIDAPTER_*/SPICEAI_*/AWS_*/SCHEDULER_*
+          # env vars, which testoperator's child process inherits from this step's
+          # env block.
+          export SPIDAPTER_EXECUTOR_REPLICAS="${EXECUTOR_REPLICAS}"
+
+          resolve_spidapter_template() {
+            local value="$1"
+            value="${value//\{github_run_id\}/${GITHUB_RUN_ID}}"
+            value="${value//\{github_run_attempt\}/${GITHUB_RUN_ATTEMPT}}"
+            echo "${value}"
+          }
+
+          export_spidapter_env_if_set() {
+            local env_name="$1"
+            local raw_value="$2"
+            if [ -n "${raw_value}" ]; then
+              local resolved_value
+              resolved_value="$(resolve_spidapter_template "${raw_value}")"
+              export "${env_name}=${resolved_value}"
+              echo "${env_name}=${resolved_value}"
+            fi
+          }
+
+          export_spidapter_env_if_set SPIDAPTER_SHUFFLE_LOCATION "${SHUFFLE_LOCATION}"
+          export_spidapter_env_if_set SPIDAPTER_QUERY_TEMP_DIRECTORY "${QUERY_TEMP_DIRECTORY}"
+          export_spidapter_env_if_set SPIDAPTER_APP_STORAGE_SIZE_GB "${APP_STORAGE_SIZE_GB}"
+          export_spidapter_env_if_set SPIDAPTER_EXECUTOR_STORAGE_SIZE_GB "${EXECUTOR_STORAGE_SIZE_GB}"
+          export_spidapter_env_if_set SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB "${EPHEMERAL_STORAGE_LIMIT}"
+          export_spidapter_env_if_set SPIDAPTER_CAYENNE_FILE_PATH "${CAYENNE_FILE_PATH}"
+          export_spidapter_env_if_set SPIDAPTER_CAYENNE_METADATA_DIR "${CAYENNE_METADATA_DIR}"
+          export_spidapter_env_if_set SPIDAPTER_CLUSTER_NAME "${CLUSTER_NAME}"
+
+          # When a custom image tag is provided (e.g. a `trunk-<sha>` image
+          # freshly published by `spiced_docker_dev`), pin spidapter to that
+          # tag via SPIDAPTER_IMAGE_TAG AND flip the channel to `internal` so
+          # the Spice Cloud control plane resolves the image against the dev
+          # GHCR registry (`ghcr.io/spiceai/spiceai-dev`) instead of the
+          # enterprise ECR. Matches spicebench's `run_spicebench_debug_spice_cloud.yml`
+          # pattern — `nightly` is for default channel-published runtimes;
+          # `internal` is for the per-commit images we build ourselves.
+          ADAPTER_CHANNEL="${CHANNEL}"
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            echo "Pinning spidapter to image tag: ${CUSTOM_IMAGE_TAG} (channel: internal)"
+            export SPIDAPTER_IMAGE_TAG="${CUSTOM_IMAGE_TAG}"
+            ADAPTER_CHANNEL="internal"
+          fi
+          # Sent by tag, the app pulls whatever the tag names whenever it or an executor starts, so
+          # the tag is watched for the whole run; the check after the run fails on any move seen.
+          watcher=""
+          if [ -n "${SPIDAPTER_IMAGE_DIGEST}" ] && [ "${SPIDAPTER_IMAGE_BY_DIGEST}" != true ]; then
+            bash .github/scripts/image_tag_watch.sh watch spiceai/spiceai-dev "${CUSTOM_IMAGE_TAG}" \
+              "${SPIDAPTER_IMAGE_DIGEST}" "${RUNNER_TEMP}/cluster-app-image-moves" >/dev/null 2>&1 &
+            watcher=$!
+            trap '[ -z "${watcher}" ] || kill "${watcher}" 2>/dev/null || true' EXIT
+          fi
+          echo "Deploying by digest: ${SPIDAPTER_IMAGE_BY_DIGEST}"
+          # spidapter reads the channel from the SPIDAPTER_CHANNEL env var (applied
+          # to the SCP compute config in stdio_server). The `stdio` subcommand no
+          # longer accepts a --channel flag.
+          export SPIDAPTER_CHANNEL="${ADAPTER_CHANNEL}"
+          echo "SPIDAPTER_CHANNEL=${ADAPTER_CHANNEL}"
+
+          run_bench() {
+            local scenario="$1"
+            local image_label="$2"
+            rm -rf .spice/data
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+              -p "${SPICEPOD_PATH}" \
+              --query-set "${QUERY_SET}" \
+              --scale-factor "${SCALE_FACTOR}" \
+              --ready-wait "${READY_WAIT}" \
+              --disable-progress-bars \
+              --validate="${VALIDATE_RESULTS}" \
+              --metrics \
+              ${TRANSPORT_FLAG} \
+              ${SCENARIO_ARG} \
+              --system-adapter-stdio-cmd spidapter \
+              --system-adapter-stdio-args "stdio --verbose --scenario ${scenario} --scenario-base-path tools/spidapter/scenarios" \
+              --system-adapter-param channel="${CHANNEL}" \
+              --system-adapter-param executor_replicas="${EXECUTOR_REPLICAS}" \
+              --system-adapter-param custom_image_tag="${image_label}" \
+              --system-adapter-param query_transport="${QUERY_TRANSPORT}"
+          }
+
+          if [ "${CB_COMPUTE}" = "ec2" ]; then
+            # A failing query on one release must not skip the releases after it.
+            failed_images=()
+            IFS=',' read -ra images <<< "${CB_EC2_IMAGES}"
+            for image in "${images[@]}"; do
+              image="$(echo "${image}" | xargs)"
+              echo "::group::Cluster benchmark on ${image}"
+              if ! SPIDAPTER_EC2_IMAGE="${image}" run_bench federated-direct-ec2 "${image}"; then
+                failed_images+=("${image}")
+              fi
+              echo "::endgroup::"
+            done
+            if [ "${#failed_images[@]}" -gt 0 ]; then
+              echo "::error::Failed on: ${failed_images[*]}"
+              exit 1
+            fi
+          else
+            run_bench federated-direct "${CUSTOM_IMAGE_TAG}"
+          fi
+
+      # The tag must have named the verified digest for the whole run: a tag pushed again while the
+      # app ran means its results are not this image's.
+      - name: Check the cluster app image did not move
+        if: always() && steps.app-image.outputs.digest != ''
+        env:
+          IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          VERIFIED: ${{ steps.app-image.outputs.digest }}
+          BY_DIGEST: ${{ vars.CLUSTER_APP_IMAGE_BY_DIGEST == 'true' }}
+        run: |
+          set -euo pipefail
+          moves="${RUNNER_TEMP}/cluster-app-image-moves"
+          if moved="$(bash .github/scripts/image_tag_watch.sh check spiceai/spiceai-dev "${IMAGE_TAG}" "${VERIFIED}")" && [ ! -s "${moves}" ]; then
+            echo "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} named ${VERIFIED}, the digest this run verified, for the whole run."
+          elif [ "${BY_DIGEST}" = true ]; then
+            echo "::warning::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} moved during the run; the app was deployed by ${VERIFIED}, the digest this run verified."
+          else
+            [ -z "${moved:-}" ] || echo "Now: ${moved}"
+            [ ! -s "${moves}" ] || { echo "The tag named, while the app ran:"; cat "${moves}"; }
+            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} did not name ${VERIFIED}, the digest this run verified, for the whole run, so the app may have run another image; its results are not this image's."
+            exit 1
+          fi
+
+      - name: Re-authorize for cleanup
+        if: always() && env.CB_COMPUTE == 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.ci-role.outputs.full == 'true' && secrets.CI_AWS_EC2_BENCH_ROLE_ARN || secrets.CI_AWS_PULL_REQUEST_ROLE_ARN }}
+          role-session-name: gha-ballista-bench-cleanup-${{ github.run_id }}
+          aws-region: ${{ env.CB_EC2_REGION }}
+
+      - name: Remove EC2 cluster resources left by this run
+        if: always() && env.CB_COMPUTE == 'ec2'
+        run: |
+          set -uo pipefail
+          filters=(
+            "Name=tag:spice:purpose,Values=ballista-bench"
+            "Name=tag:spice:github-run-id,Values=${GITHUB_RUN_ID}"
+          )
+          failed=0
+          instance_ids="$(aws ec2 describe-instances --region "${CB_EC2_REGION}" \
+            --filters "${filters[@]}" "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)" || failed=1
+          if [ -n "${instance_ids}" ]; then
+            echo "Terminating ${instance_ids}"
+            # shellcheck disable=SC2086
+            aws ec2 terminate-instances --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} >/dev/null || failed=1
+            # shellcheck disable=SC2086
+            aws ec2 wait instance-terminated --region "${CB_EC2_REGION}" --instance-ids ${instance_ids} || failed=1
+          fi
+          group_ids="$(aws ec2 describe-security-groups --region "${CB_EC2_REGION}" \
+            --filters "${filters[@]}" --query 'SecurityGroups[].GroupId' --output text)" || failed=1
+          for group_id in ${group_ids}; do
+            echo "Deleting security group ${group_id}"
+            deleted=0
+            # A terminated instance's network interface can hold the group for a short while.
+            for _ in $(seq 1 30); do
+              if aws ec2 delete-security-group --region "${CB_EC2_REGION}" --group-id "${group_id}"; then
+                deleted=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "${deleted}" -eq 0 ]; then
+              echo "::error::Could not delete security group ${group_id}"
+              failed=1
+            fi
+          done
+          exit "${failed}"
+
+      - name: Install gh CLI
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
+        uses: $/.github/actions/install-gh-cli
+
+      - name: Open snapshot-update PR
+        # Writes to the repository: only with the full CI roles.
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always' && steps.ci-role.outputs.full == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICEPOD_PATH_DISPLAY: ${{ env.CB_SPICEPOD_PATH }}
+          QUERY_SET: ${{ env.CB_QUERY_SET }}
+          SCALE_FACTOR: ${{ env.CB_SCALE_FACTOR }}
+          QUERY_TRANSPORT: ${{ env.CB_QUERY_TRANSPORT }}
+          EXECUTOR_REPLICAS: ${{ env.CB_EXECUTOR_REPLICAS }}
+          CHANNEL: ${{ env.CB_CHANNEL }}
+          CUSTOM_IMAGE_TAG: ${{ env.CB_CUSTOM_IMAGE_TAG }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
+        run: |
+          set -euo pipefail
+          git fetch --unshallow || true
+
+          # Categorize snap-file changes from the working tree. `git status -s`
+          # output starts with status codes: `??` for untracked (new baselines),
+          # `M ` for modified (drift updates), etc. Restrict to `.snap` files so
+          # we don't accidentally sweep up build artifacts.
+          mapfile -t new_files < <(git status -s -- '*.snap' | awk '/^\?\?/ { print $2 }')
+          mapfile -t modified_files < <(git status -s -- '*.snap' | awk '/^.M/ || /^M / { print $2 }')
+
+          new_count=${#new_files[@]}
+          modified_count=${#modified_files[@]}
+          total=$((new_count + modified_count))
+
+          if [ "$total" -eq 0 ]; then
+            echo "No snapshot changes; skipping PR"
+            exit 0
+          fi
+
+          # Branch name keyed on the image tag (if pinned) or the run id, so
+          # repeat runs against the same image converge on one PR.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            BRANCH_ID="${CUSTOM_IMAGE_TAG}"
+          else
+            BRANCH_ID="${{ github.run_id }}"
+          fi
+          # Sanitize the spicepod path for use in the branch name (slashes/
+          # brackets aren't great ref characters).
+          slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
+          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}"
+
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+          git checkout -b "${BRANCH_NAME}"
+          git add '*.snap'
+
+          if git diff --cached --quiet; then
+            echo "No staged changes after git add; nothing to commit"
+            exit 0
+          fi
+
+          # Short summary line for the commit message.
+          if [ "$modified_count" -eq 0 ]; then
+            commit_summary="create ${new_count} baseline$( [ "$new_count" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          elif [ "$new_count" -eq 0 ]; then
+            commit_summary="update ${modified_count} snapshot$( [ "$modified_count" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          else
+            commit_summary="${new_count} new + ${modified_count} updated snapshot$( [ "$total" -ne 1 ] && echo s ) for ${SPICEPOD_PATH_DISPLAY}"
+          fi
+
+          git commit -m "fix(cluster-bench): ${commit_summary}"
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
+            # Move only the snapshot commit. Runs against one image can check
+            # out different trunk heads, and `git pull --rebase` would also
+            # replay every trunk commit between them onto the branch as new
+            # commits, putting unrelated source changes in the PR.
+            git fetch origin "refs/heads/${BRANCH_NAME}"
+            if ! git rebase --onto FETCH_HEAD HEAD^; then
+              git rebase --abort || true
+              echo "::error::This run's snapshots conflict with snapshots another run already pushed to ${BRANCH_NAME}; resolve the .snap conflict on that branch by hand."
+              exit 1
+            fi
+          fi
+          # Non-interactive: a credential helper on the runner can otherwise intercept
+          # this push and block on a prompt forever. See
+          # scripts/check_ci_git_push_noninteractive.py.
+          git -c credential.helper='' -c credential.interactive=false \
+            push origin "${BRANCH_NAME}"
+
+          PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
+          if [ -n "${PR_URL}" ]; then
+            echo "PR already exists -> ${PR_URL}"
+            # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
+            bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+            exit 0
+          fi
+
+          # Image identifier: pinned tag if the workflow was given one,
+          # otherwise the channel.
+          if [ -n "${CUSTOM_IMAGE_TAG}" ]; then
+            image_descriptor="\`ghcr.io/spiceai/spiceai-dev:${CUSTOM_IMAGE_TAG}\` (pinned)"
+          else
+            image_descriptor="channel \`${CHANNEL}\`"
+          fi
+
+          # Extract the affected `tpch_qN` / `tpcds_qN` / `clickbench_qN` query slugs from the
+          # snap filenames so reviewers can see which queries drifted at a
+          # glance. Snap names look like:
+          #   test_framework__snapshot__<spicepod>_<query>_<kind>_sf<N>.snap
+          extract_query() {
+            local f="$1"
+            basename "$f" .snap | grep -oE '(tp(ch|cds)|clickbench)_q[0-9]+' | head -n 1
+          }
+
+          uniq_queries() {
+            local -a names=()
+            for f in "$@"; do
+              local q
+              q="$(extract_query "$f")"
+              [ -n "$q" ] && names+=("$q")
+            done
+            printf '%s\n' "${names[@]}" | sort -u | tr '\n' ' '
+          }
+
+          new_query_list="$(uniq_queries "${new_files[@]:-}")"
+          mod_query_list="$(uniq_queries "${modified_files[@]:-}")"
+
+          # Build the PR body. Use printf so heredoc indentation doesn't sneak
+          # into the rendered markdown.
+          body_file="$(mktemp)"
+          {
+            printf '**%s** by run [#%s](%s/%s/actions/runs/%s).\n\n' \
+              "${commit_summary}" \
+              "${{ github.run_id }}" \
+              "${{ github.server_url }}" \
+              "${{ github.repository }}" \
+              "${{ github.run_id }}"
+
+            printf '### Run configuration\n\n'
+            printf '| Field | Value |\n| --- | --- |\n'
+            printf '| Spicepod | `%s` |\n' "${SPICEPOD_PATH_DISPLAY}"
+            printf '| Query set | `%s` |\n' "${QUERY_SET}"
+            printf '| Scale factor | `%s` |\n' "${SCALE_FACTOR}"
+            printf '| Query transport | `%s` |\n' "${QUERY_TRANSPORT}"
+            printf '| Cluster | %s executor replica(s), %s |\n' \
+              "${EXECUTOR_REPLICAS}" "${image_descriptor}"
+            printf '\n'
+
+            if [ "$new_count" -gt 0 ]; then
+              printf '### New baselines (%s file' "${new_count}"
+              [ "$new_count" -ne 1 ] && printf 's'
+              printf ')\n\n'
+              if [ -n "${new_query_list}" ]; then
+                printf 'Queries: %s\n\n' "${new_query_list}"
+              fi
+              printf '<details><summary>Files</summary>\n\n```\n'
+              printf '%s\n' "${new_files[@]}"
+              printf '```\n\n</details>\n\n'
+            fi
+
+            if [ "$modified_count" -gt 0 ]; then
+              printf '### Updated snapshots (%s file' "${modified_count}"
+              [ "$modified_count" -ne 1 ] && printf 's'
+              printf ')\n\n'
+              if [ -n "${mod_query_list}" ]; then
+                printf 'Queries: %s\n\n' "${mod_query_list}"
+              fi
+              printf '<details><summary>Files</summary>\n\n```\n'
+              printf '%s\n' "${modified_files[@]}"
+              printf '```\n\n</details>\n\n'
+            fi
+
+            printf '### Review hints\n\n'
+            # `printf -- …` so leading `-` in the format string isn't parsed
+            # as an option flag.
+            printf -- '- **New baselines**: expected when a spicepod is added or the snapshot predicate changes — confirm the queries shown look sane (correct row count, ordered output, no transient values) before merging.\n'
+            printf -- '- **Updated snapshots**: indicate planner or execution drift. Inspect the diff and cross-reference recent trunk commits touching the runtime / federation / acceleration layer to confirm the change is intentional.\n'
+            printf -- '- The cluster-bench harness only opens this PR when `update_snapshots=always` (the default for non-`release/*` branches). To gate snapshot drift in CI, set `update_snapshots=no` on the dispatch.\n'
+          } > "${body_file}"
+
+          # Title carries the same summary that's in the commit message — short
+          # but specifies cluster-bench, file counts, spicepod, and query set
+          # so it stands apart in the auto-PR list.
+          title="snapshot(cluster-bench): ${commit_summary} (${QUERY_SET} sf${SCALE_FACTOR})"
+
+          # enforce-pull-with-spice, a required check, fails a PR without both a kind/
+          # and an area/ label.
+          gh pr create \
+            --title "${title}" \
+            --body-file "${body_file}" \
+            --base "${GITHUB_REF_NAME}" \
+            --head "${BRANCH_NAME}" \
+            --label kind/bug \
+            --label area/ci
+          bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"

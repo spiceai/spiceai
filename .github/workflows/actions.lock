@@ -31,7 +31,6 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
     '.github/workflows/cayenne_object_native.yml':
-        - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
     '.github/workflows/changelog_script_test.yml':
@@ -111,11 +110,11 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4'
     '.github/workflows/integration.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-        - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
         - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
     '.github/workflows/integration_adbc.yml':
@@ -123,27 +122,43 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'columnar-tech/setup-dbc@4d83cce5bf2aa1e46eedbe44f13b57bbef8f2baf'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
+    '.github/workflows/integration_aws.yml':
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
+        - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+        - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
+        - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
     '.github/workflows/integration_elasticsearch.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
     '.github/workflows/integration_llms.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+        - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
+    '.github/workflows/integration_llms_aws.yml':
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
         - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
     '.github/workflows/integration_management_api.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
     '.github/workflows/integration_models.yml':
-        - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+        - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
+    '.github/workflows/integration_models_aws.yml':
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
         - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
     '.github/workflows/integration_nightly.yml': []
-    '.github/workflows/integration_search.yml':
+    '.github/workflows/integration_search.yml': []
+    '.github/workflows/integration_search_aws.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
     '.github/workflows/license_check.yml':
@@ -163,7 +178,6 @@ workflows:
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
     '.github/workflows/pr-develop.yml':
-        - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
@@ -195,7 +209,6 @@ workflows:
     '.github/workflows/setup_cc_script_test.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
     '.github/workflows/signoff.yml':
-        - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'spiceai/spiceio@6b5eff2b2c10111ba66076dd8fe9abfb87b6a1fc'
     '.github/workflows/signoff_cancelled_correction_test.yml':
@@ -206,7 +219,6 @@ workflows:
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
     '.github/workflows/signoff_script_test.yml':
-        - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
     '.github/workflows/signoff_trusted_helpers_test.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
@@ -234,6 +246,7 @@ workflows:
         - 'docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550'
         - 'docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069'
     '.github/workflows/spiced_docker_dev.yml':
+        - 'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
@@ -286,7 +299,8 @@ workflows:
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-    '.github/workflows/testoperator_run_bench.yml':
+    '.github/workflows/testoperator_run_bench.yml': []
+    '.github/workflows/testoperator_run_bench_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e'
@@ -294,7 +308,8 @@ workflows:
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
         - 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093'
-    '.github/workflows/testoperator_run_cluster_bench.yml':
+    '.github/workflows/testoperator_run_cluster_bench.yml': []
+    '.github/workflows/testoperator_run_cluster_bench_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
@@ -305,7 +320,8 @@ workflows:
         - 'actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78'
         - 'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-    '.github/workflows/testoperator_run_data_consistency.yml':
+    '.github/workflows/testoperator_run_data_consistency.yml': []
+    '.github/workflows/testoperator_run_data_consistency_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
@@ -314,7 +330,8 @@ workflows:
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-    '.github/workflows/testoperator_run_load.yml':
+    '.github/workflows/testoperator_run_load.yml': []
+    '.github/workflows/testoperator_run_load_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e'
@@ -325,23 +342,27 @@ workflows:
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-    '.github/workflows/testoperator_run_schema.yml':
+    '.github/workflows/testoperator_run_schema.yml': []
+    '.github/workflows/testoperator_run_schema_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
-    '.github/workflows/testoperator_run_search.yml':
+    '.github/workflows/testoperator_run_search.yml': []
+    '.github/workflows/testoperator_run_search_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
-    '.github/workflows/testoperator_run_streaming_bench.yml':
+    '.github/workflows/testoperator_run_streaming_bench.yml': []
+    '.github/workflows/testoperator_run_streaming_bench_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         - 'aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd'
-    '.github/workflows/testoperator_run_streaming_correctness.yml':
+    '.github/workflows/testoperator_run_streaming_correctness.yml': []
+    '.github/workflows/testoperator_run_streaming_correctness_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
@@ -350,7 +371,8 @@ workflows:
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
-    '.github/workflows/testoperator_run_throughput.yml':
+    '.github/workflows/testoperator_run_throughput.yml': []
+    '.github/workflows/testoperator_run_throughput_aws.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e'
@@ -363,6 +385,9 @@ workflows:
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'
     '.github/workflows/trunk_tests.yml':
         - 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+        - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        - 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9'
+    '.github/workflows/trunk_tests_aws.yml':
         - 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3'

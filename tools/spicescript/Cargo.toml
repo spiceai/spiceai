@@ -20,6 +20,7 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
+container-images = { path = "../../crates/container-images" }
 flate2 = "1.1"
 flight_client = { path = "../../crates/flight_client" }
 futures.workspace = true
@@ -33,6 +34,7 @@ parquet = { workspace = true, features = ["arrow"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 regex.workspace = true
 secrecy.workspace = true
+sha2.workspace = true
 reqwest.workspace = true
 result-compare = { path = "../../crates/result-compare" }
 serde.workspace = true

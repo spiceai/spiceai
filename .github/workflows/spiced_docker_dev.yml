@@ -94,9 +94,16 @@ jobs:
 
       - name: Set image metadata
         id: set_image_metadata
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          echo "image=ghcr.io/spiceai/spiceai-dev:${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          # An image tag: it is written to GITHUB_OUTPUT and passed to `docker buildx` unquoted.
+          if ! [[ "${INPUT_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::'${INPUT_TAG}' is not an image tag (letters, digits, _, . and -, at most 128)."
+            exit 1
+          fi
+          echo "image=ghcr.io/spiceai/spiceai-dev:${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Set version
         id: set_version
@@ -118,6 +125,8 @@ jobs:
 
       - name: Determine build provenance
         id: provenance
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Raw commit actually built (HEAD = `inputs.ref || github.sha`).
           revision="$(git rev-parse HEAD)"
@@ -133,13 +142,32 @@ jobs:
           echo "revision=${revision}" >> "$GITHUB_OUTPUT"
           echo "on_trunk=${on_trunk}" >> "$GITHUB_OUTPUT"
           echo "Provenance: revision=${revision} on_trunk=${on_trunk} ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}"
+          # The build jobs hold this run's OIDC token, which on trunk is trunk's store and
+          # registry identity, so a trunk run builds only trunk's code. Build another ref's
+          # commit from a run on that ref.
+          if [ "$GITHUB_REF" = refs/heads/trunk ] && [ "$on_trunk" != true ]; then
+            echo "::error::This run is on trunk, so it builds only a commit on trunk, and ${revision} is not one (within trunk's last 100 commits). Dispatch spiced_docker_dev on the branch that has it."
+            exit 1
+          fi
+          # A `trunk-` tag names trunk's image of one commit: only a trunk run publishes one, as
+          # `trunk-<the first 12 characters of the commit it built>`.
+          case "$INPUT_TAG" in
+            trunk-*)
+              if [ "$GITHUB_REF" != refs/heads/trunk ] || [ "$INPUT_TAG" != "trunk-${revision:0:12}" ]; then
+                echo "::error::Only a run on trunk publishes a trunk- tag, and only as trunk-${revision:0:12} for this commit, not ${INPUT_TAG}."
+                exit 1
+              fi
+              ;;
+          esac
 
       - name: Set target architectures
         id: set_targets
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
         run: |
           # When invoked via workflow_call, `inputs.target` is unset and we
           # always build amd64 only — cluster-bench callers don't need arm.
-          target="${{ inputs.target }}"
+          target="${INPUT_TARGET}"
           if [ -z "$target" ]; then
             target="amd64"
           fi
@@ -201,9 +229,11 @@ jobs:
       RUST_PROFILE: release
 
     steps:
+      # The commit setup checked, not `ref` again: a branch can move in between.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.setup.outputs.revision }}
+          persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -223,7 +253,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl gnupg lsb-release
           sudo mkdir -m 0755 -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          # Docker's apt key, checked against the SHA-256 pinned as docker-apt-key in
+          # .github/ci-cache/pins.json before apt trusts it; written out here, not read through
+          # .github/scripts/fetch_pinned.sh, so the step works whichever commit is checked out.
+          docker_key="$(mktemp)"
+          curl -fsSL --retry 3 -o "$docker_key" https://download.docker.com/linux/ubuntu/gpg
+          echo "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570  $docker_key" | sha256sum -c -
+          sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg "$docker_key"
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -296,9 +332,11 @@ jobs:
       RUST_PROFILE: release
 
     steps:
+      # The commit setup checked, not `ref` again: a branch can move in between.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.setup.outputs.revision }}
+          persist-credentials: false
 
       - name: Add dev postfix to version in Cargo.toml
         env:
@@ -369,6 +407,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      attestations: write  # trunk's images, which the cluster benchmark verifies before running one
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -410,6 +449,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Import images and create manifest
+        id: push
         env:
           IMAGE_TAG: ${{ inputs.tag }}
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -419,35 +459,63 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG}"
           echo "REL_VERSION=${REL_VERSION}"
 
-          sources=""
+          sources=()
 
           if [ -f /tmp/image-amd64.tar ]; then
             echo "Loading AMD64 image"
             docker load -i /tmp/image-amd64.tar
             docker push localhost:5000/spiceai:dev-amd64
-            sources="$sources localhost:5000/spiceai:dev-amd64"
+            sources+=(localhost:5000/spiceai:dev-amd64)
           fi
 
           if [ -f /tmp/image-arm64.tar ]; then
             echo "Loading ARM64 image"
             docker load -i /tmp/image-arm64.tar
             docker push localhost:5000/spiceai:dev-arm64
-            sources="$sources localhost:5000/spiceai:dev-arm64"
+            sources+=(localhost:5000/spiceai:dev-arm64)
           fi
 
-          if [ -z "$sources" ]; then
+          if [ "${#sources[@]}" -eq 0 ]; then
             echo "No images to publish!"
             exit 1
           fi
 
-          echo "Creating and pushing multi-arch manifest"
-          docker buildx imagetools create \
-            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} \
-            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION} \
-            $sources
+          # The multi-arch index is made in this job's own registry first, so its digest is the
+          # digest of what this job built. It is then copied to ghcr.io as is, and the tag must
+          # name that digest once pushed: any workflow of this repository can push a tag there,
+          # so a digest read back from the tag alone could be another run's image.
+          echo "Creating the multi-arch manifest"
+          docker buildx imagetools create -t localhost:5000/spiceai:dev-index "${sources[@]}"
+          digest="$(docker buildx imagetools inspect localhost:5000/spiceai:dev-index --format '{{json .Manifest}}' | jq -r .digest)"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the digest of the manifest this job built."
+            exit 1
+          fi
+
+          echo "Pushing $digest"
+          docker buildx imagetools create --prefer-index=false \
+            -t "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" \
+            -t "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION}" \
+            "localhost:5000/spiceai@${digest}"
 
           echo "Verifying image:"
-          docker buildx imagetools inspect ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}
+          docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}"
+          pushed="$(docker buildx imagetools inspect "ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "$pushed" != "$digest" ]; then
+            echo "::error::ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} names ${pushed:-nothing}, not ${digest}, the manifest this job pushed; another run pushed the same tag."
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # A trunk run's image carries this workflow's attestation, which the cluster benchmark
+      # verifies on trunk before the app runs it.
+      - name: Attest the image
+        if: github.ref == 'refs/heads/trunk'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/spiceai/spiceai-dev
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
       - name: Summary
         env:

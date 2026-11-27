@@ -1,0 +1,51 @@
+# What setup-scylladb's TPC-H export imports: duckdb.
+#
+# Every package and dependency at an exact version, with the SHA-256 of each file PyPI serves
+# for it, installed as
+#   python -m pip install --require-hashes --only-binary=:all: -r "$GITHUB_ACTION_PATH/../../requirements/scylladb_bootstrap.txt"
+# so pip installs these files and nothing else. To change it, regenerate the whole file:
+#   printf 'duckdb==1.4.4\n' | uv pip compile - --universal --generate-hashes --no-header \
+#     --no-annotate --python-version 3.12 --exclude-newer <a date two weeks back>
+# (--exclude-newer keeps each dependency to a release at least two weeks old.)
+duckdb==1.4.4 \
+    --hash=sha256:0509b39ea7af8cff0198a99d206dca753c62844adab54e545984c2e2c1381616 \
+    --hash=sha256:0d636ceda422e7babd5e2f7275f6a0d1a3405e6a01873f00d38b72118d30c10b \
+    --hash=sha256:1af6e76fe8bd24875dc56dd8e38300d64dc708cd2e772f67b9fbc635cc3066a3 \
+    --hash=sha256:1f8d55843cc940e36261689054f7dfb6ce35b1f5b0953b0d355b6adb654b0d52 \
+    --hash=sha256:25874f8b1355e96178079e37312c3ba6d61a2354f51319dae860cf21335c3a20 \
+    --hash=sha256:337f8b24e89bc2e12dadcfe87b4eb1c00fd920f68ab07bc9b70960d6523b8bc3 \
+    --hash=sha256:452c5b5d6c349dc5d1154eb2062ee547296fcbd0c20e9df1ed00b5e1809089da \
+    --hash=sha256:453b115f4777467f35103d8081770ac2f223fb5799178db5b06186e3ab51d1f2 \
+    --hash=sha256:47dd4162da6a2be59a0aef640eb08d6360df1cf83c317dcc127836daaf3b7f7c \
+    --hash=sha256:49123b579e4a6323e65139210cd72dddc593a72d840211556b60f9703bda8526 \
+    --hash=sha256:4c25d5b0febda02b7944e94fdae95aecf952797afc8cb920f677b46a7c251955 \
+    --hash=sha256:50f2eb173c573811b44aba51176da7a4e5c487113982be6a6a1c37337ec5fa57 \
+    --hash=sha256:53cd6423136ab44383ec9955aefe7599b3fb3dd1fe006161e6396d8167e0e0d4 \
+    --hash=sha256:5536eb952a8aa6ae56469362e344d4e6403cc945a80bc8c5c2ebdd85d85eb64b \
+    --hash=sha256:59c8d76016dde854beab844935b1ec31de358d4053e792988108e995b18c08e7 \
+    --hash=sha256:5ba684f498d4e924c7e8f30dd157da8da34c8479746c5011b6c0e037e9c60ad2 \
+    --hash=sha256:5cdc4126ec925edf3112bc656ac9ed23745294b854935fa7a643a216e4455af6 \
+    --hash=sha256:5e1933fac5293fea5926b0ee75a55b8cfe7f516d867310a5b251831ab61fe62b \
+    --hash=sha256:6703dd1bb650025b3771552333d305d62ddd7ff182de121483d4e042ea6e2e00 \
+    --hash=sha256:6792ca647216bd5c4ff16396e4591cfa9b4a72e5ad7cdd312cec6d67e8431a7c \
+    --hash=sha256:6cb357cfa3403910e79e2eb46c8e445bb1ee2fd62e9e9588c6b999df4256abc1 \
+    --hash=sha256:6fb1225a9ea5877421481d59a6c556a9532c32c16c7ae6ca8d127e2b878c9389 \
+    --hash=sha256:707530f6637e91dc4b8125260595299ec9dd157c09f5d16c4186c5988bfbd09a \
+    --hash=sha256:7df7351328ffb812a4a289732f500d621e7de9942a3a2c9b6d4afcf4c0e72526 \
+    --hash=sha256:7eec0bf271ac622e57b7f6554a27a6e7d1dd2f43d1871f7962c74bcbbede15ba \
+    --hash=sha256:8097201bc5fd0779d7fcc2f3f4736c349197235f4cb7171622936343a1aa8dbf \
+    --hash=sha256:8bba52fd2acb67668a4615ee17ee51814124223de836d9e2fdcbc4c9021b3d3c \
+    --hash=sha256:8e5c2d8a0452df55e092959c0bfc8ab8897ac3ea0f754cb3b0ab3e165cd79aff \
+    --hash=sha256:a3c8542db7ffb128aceb7f3b35502ebaddcd4f73f1227569306cc34bad06680c \
+    --hash=sha256:b297eff642503fd435a9de5a9cb7db4eccb6f61d61a55b30d2636023f149855f \
+    --hash=sha256:bf138201f56e5d6fc276a25138341b3523e2f84733613fc43f02c54465619a95 \
+    --hash=sha256:c65d15c440c31e06baaebfd2c06d71ce877e132779d309f1edf0a85d23c07e92 \
+    --hash=sha256:c9566a4ed834ec7999db5849f53da0a7ee83d86830c33f471bf0211a1148ca12 \
+    --hash=sha256:cd1be3d48577f5b40eb9706c6b2ae10edfe18e78eb28e31a3b922dcff1183597 \
+    --hash=sha256:d0440f59e0cd9936a9ebfcf7a13312eda480c79214ffed3878d75947fc3b7d6d \
+    --hash=sha256:d525de5f282b03aa8be6db86b1abffdceae5f1055113a03d5b50cd2fb8cf2ef8 \
+    --hash=sha256:ddcfd9c6ff234da603a1edd5fd8ae6107f4d042f74951b65f91bc5e2643856b3 \
+    --hash=sha256:e041f2fbd6888da090eca96ac167a7eb62d02f778385dd9155ed859f1c6b6dc8 \
+    --hash=sha256:e870a441cb1c41d556205deb665749f26347ed13b3a247b53714f5d589596977 \
+    --hash=sha256:f28a18cc790217e5b347bb91b2cab27aafc557c58d3d8382e04b4fe55d0c3f66 \
+    --hash=sha256:fb94de6d023de9d79b7edc1ae07ee1d0b4f5fa8a9dcec799650b5befdf7aafec

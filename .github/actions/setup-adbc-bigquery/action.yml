@@ -4,8 +4,8 @@ description: 'Build and install the ADBC BigQuery driver from source'
 inputs:
   adbc_bigquery_commit:
     description: >-
-      Commit of spiceai/bigquery to build the driver from: upstream go/v1.15.0
-      plus the Spice patches docs/dev/fork_patches.md lists.
+      Full commit SHA of spiceai/bigquery to build the driver from: upstream go/v1.15.0
+      plus the Spice patches docs/dev/fork_patches.md lists. Only that commit is fetched.
     required: false
     default: '5bf335f677816f0f39d1a2557fc402ba93895764'
   go_version:
@@ -45,10 +45,30 @@ runs:
         set -eu
         DRIVER_DIR="/etc/adbc/drivers"
 
-        git clone --depth=1 https://github.com/spiceai/bigquery.git /tmp/adbc-bigquery
-        cd /tmp/adbc-bigquery
+        case "$ADBC_BIGQUERY_COMMIT" in
+          *[!0-9a-f]* | '')
+            echo "::error::adbc_bigquery_commit must be a full commit SHA of spiceai/bigquery, got '${ADBC_BIGQUERY_COMMIT}'."
+            exit 1
+            ;;
+        esac
+        if [ "${#ADBC_BIGQUERY_COMMIT}" -ne 40 ]; then
+          echo "::error::adbc_bigquery_commit must be a full, 40-character commit SHA of spiceai/bigquery, got '${ADBC_BIGQUERY_COMMIT}'."
+          exit 1
+        fi
+
+        # Only the pinned commit is fetched, by its SHA, into a new directory of the job's own;
+        # nothing reads the default branch, and git checks every object it fetches against the
+        # SHA that names it.
+        work="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/adbc-bigquery.XXXXXX")"
+        git init -q "$work/src"
+        cd "$work/src"
+        git remote add origin https://github.com/spiceai/bigquery.git
         git fetch --depth=1 origin "$ADBC_BIGQUERY_COMMIT"
-        git checkout "$ADBC_BIGQUERY_COMMIT"
+        git checkout -q --detach FETCH_HEAD
+        if [ "$(git rev-parse HEAD)" != "$ADBC_BIGQUERY_COMMIT" ]; then
+          echo "::error::Checked out $(git rev-parse HEAD), not the pinned ${ADBC_BIGQUERY_COMMIT}."
+          exit 1
+        fi
         cd go
 
         # A driver without these patches still builds and loads, so check for
@@ -87,12 +107,11 @@ runs:
         fi
 
         CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
-          -o /tmp/libadbc_driver_bigquery.so ./pkg/
-        rm -f /tmp/libadbc_driver_bigquery.h
+          -o "$work/libadbc_driver_bigquery.so" ./pkg/
 
         sudo mkdir -p "${DRIVER_DIR}"
-        sudo cp /tmp/libadbc_driver_bigquery.so "${DRIVER_DIR}/"
+        sudo cp "$work/libadbc_driver_bigquery.so" "${DRIVER_DIR}/"
         printf '[Driver]\nshared = "%s/libadbc_driver_bigquery.so"\n' "${DRIVER_DIR}" | sudo tee "${DRIVER_DIR}/bigquery.toml"
 
         echo "ADBC BigQuery driver installed to ${DRIVER_DIR}/libadbc_driver_bigquery.so"
-        rm -rf /tmp/adbc-bigquery /tmp/libadbc_driver_bigquery.so
+        rm -rf "$work"

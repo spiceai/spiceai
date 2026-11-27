@@ -411,8 +411,12 @@ impl ContainerRunnerBuilder {
         self
     }
 
-    pub fn build(self) -> Result<ContainerRunner, anyhow::Error> {
-        anyhow::ensure!(self.image.is_some(), "Image must be set");
+    /// The runner for this container. Its image runs by the digest
+    /// `test/container_images.json` pins for its tag; an image the file does
+    /// not pin is refused here, before any slot or pull is waited on.
+    pub fn build(mut self) -> Result<ContainerRunner, anyhow::Error> {
+        let image = self.image.as_deref().context("Image must be set")?;
+        self.image = Some(container_images::pinned(image)?);
         Ok(ContainerRunner {
             builder: self,
             docker: Docker::connect_with_local_defaults()?,
@@ -511,13 +515,9 @@ impl ContainerRunner {
             .image
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Image must be set"))?;
-        if self
-            .docker
-            .list_images::<&str>(None)
-            .await?
-            .iter()
-            .any(|entry| entry.repo_tags.contains(image))
-        {
+        // By the pinned digest: an image pulled earlier under the same tag but
+        // another digest is not the one to run.
+        if self.docker.inspect_image(image).await.is_ok() {
             return Ok(());
         }
         let credentials = match docker_config_path() {

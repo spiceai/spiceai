@@ -60,7 +60,7 @@ const ROWS_PER_OBJECT: i64 = 50;
 
 async fn start_object_store(name: &str) -> Result<RunningContainer, anyhow::Error> {
     let container = ContainerRunnerBuilder::new(name)
-        .image("rustfs/rustfs:latest".to_string())
+        .image("rustfs/rustfs:1.0.6".to_string())
         .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)

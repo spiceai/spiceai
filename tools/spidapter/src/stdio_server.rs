@@ -630,16 +630,58 @@ struct SpidapterHandler {
     scenario: ScenarioConfig,
 }
 
+/// The image tag spidapter gives Spice Cloud, from `SPIDAPTER_IMAGE_TAG`, `SPIDAPTER_IMAGE_DIGEST`
+/// and `SPIDAPTER_IMAGE_BY_DIGEST`.
+///
+/// A digest is the one the workflow verified for that tag. With `by_digest`, the app is deployed
+/// by it (`<tag>@sha256:<digest>`, which the registry resolves by digest alone), so a tag pushed
+/// again after the check cannot change what runs. Without it, the bare tag is sent, and the
+/// workflow checks that the tag still names the digest it verified.
+fn scp_image_tag(
+    tag: Option<&str>,
+    digest: Option<&str>,
+    by_digest: bool,
+) -> anyhow::Result<Option<String>> {
+    let tag = tag.filter(|t| !t.is_empty());
+    let digest = digest.filter(|d| !d.is_empty());
+    let Some(tag) = tag else {
+        if digest.is_some() {
+            anyhow::bail!("SPIDAPTER_IMAGE_DIGEST is set without SPIDAPTER_IMAGE_TAG");
+        }
+        return Ok(None);
+    };
+    if tag.contains('@') {
+        anyhow::bail!("SPIDAPTER_IMAGE_TAG must be a tag, not a reference with a digest: {tag}");
+    }
+    let Some(digest) = digest else {
+        return Ok(Some(tag.to_string()));
+    };
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        anyhow::bail!("SPIDAPTER_IMAGE_DIGEST must be sha256:<64 lowercase hex>, not {digest}");
+    }
+    Ok(Some(if by_digest {
+        format!("{tag}@{digest}")
+    } else {
+        tag.to_string()
+    }))
+}
+
 impl SpidapterHandler {
-    fn new(args: &StdioArgs, mut scenario: ScenarioConfig) -> Self {
+    fn new(args: &StdioArgs, mut scenario: ScenarioConfig) -> anyhow::Result<Self> {
         // Apply env var overrides for SCP image tag and channel so the workflow
         // can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL without modifying the
         // scenario YAML.
         if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
-            if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG")
-                && !tag.is_empty()
-            {
-                scp.image_tag = Some(tag);
+            let tag = std::env::var("SPIDAPTER_IMAGE_TAG").ok();
+            let digest = std::env::var("SPIDAPTER_IMAGE_DIGEST").ok();
+            let by_digest = std::env::var("SPIDAPTER_IMAGE_BY_DIGEST").is_ok_and(|v| v == "true");
+            if let Some(image_tag) = scp_image_tag(tag.as_deref(), digest.as_deref(), by_digest)? {
+                scp.image_tag = Some(image_tag);
             }
             if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL")
                 && !channel.is_empty()
@@ -648,13 +690,13 @@ impl SpidapterHandler {
                 scp.channel = channel.parse::<UpdateChannel>().ok();
             }
         }
-        Self {
+        Ok(Self {
             runs: HashMap::new(),
             run_datasets: HashMap::new(),
             pending: HashMap::new(),
             args: args.clone(),
             scenario,
-        }
+        })
     }
 
     /// Return the SCP config from the scenario, if present.
@@ -1797,7 +1839,7 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
         }
     };
 
-    let handler = SpidapterHandler::new(args, scenario);
+    let handler = SpidapterHandler::new(args, scenario)?;
     let mut server = Server::new(handler);
     let result = tokio::select! {
         r = server.run_stdio() => {
@@ -2192,6 +2234,54 @@ async fn generate_initial_spicepod(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_tag_carries_the_verified_digest_only_when_deploying_by_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(scp_image_tag(None, None, true).ok().flatten(), None);
+        assert_eq!(
+            scp_image_tag(Some("trunk-0123456789ab"), None, true)
+                .ok()
+                .flatten(),
+            Some("trunk-0123456789ab".to_string())
+        );
+        assert_eq!(
+            scp_image_tag(Some("trunk-0123456789ab"), Some(&digest), false)
+                .ok()
+                .flatten(),
+            Some("trunk-0123456789ab".to_string())
+        );
+        assert_eq!(
+            scp_image_tag(Some("trunk-0123456789ab"), Some(&digest), true)
+                .ok()
+                .flatten(),
+            Some(format!("trunk-0123456789ab@{digest}"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_image_digest_or_tag_is_refused() {
+        let refusal = |tag: Option<&str>, digest: Option<&str>| {
+            scp_image_tag(tag, digest, true)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for bad in [
+            "sha256:abc".to_string(),
+            "md5:00".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("{digest}x"),
+        ] {
+            assert!(
+                refusal(Some("trunk-x"), Some(&bad)).contains("must be sha256:"),
+                "{bad}"
+            );
+        }
+        assert!(refusal(None, Some(&digest)).contains("without SPIDAPTER_IMAGE_TAG"));
+        assert!(refusal(Some(&format!("trunk-x@{digest}")), None).contains("must be a tag"));
+    }
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 

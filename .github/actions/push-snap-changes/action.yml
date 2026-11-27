@@ -16,28 +16,50 @@ runs:
   using: 'composite'
   steps:
     - name: Install GH CLI if not installed
-      shell: bash
-      run: |
-        if ! command -v gh &> /dev/null; then
-          (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
-            && sudo mkdir -p -m 755 /etc/apt/keyrings \
-            && out=$(mktemp) && wget -nv -O"$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-            && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
-            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-            && sudo apt update \
-            && sudo apt install gh -y
-        else
-          echo "GH CLI is already installed"
-        fi
+      uses: $/.github/actions/install-gh-cli
+
     - name: Upload snapshots to branch
       shell: bash
       run: |
         set -euo pipefail
-
-        git add '*.snap'
-        if git diff --cached --quiet; then
+        # The snapshot commit is made and pushed from a repository of this step's own, and git
+        # runs no command in the checkout's: on a self-hosted Mac another job can write the
+        # checkout's .git, and git keeps adding config that runs a program (hooks,
+        # `hook.<name>.command`, fsmonitor, filters, a partial clone's fetch command) or sends a
+        # push elsewhere (`url.<x>.insteadOf`). The step's repository only borrows the checkout's
+        # objects, which their hashes fix, and has no config, hooks or attribute drivers of its own.
+        # Neither git's global and system config nor the user's git attributes and ignore files
+        # are read, and nothing is fetched.
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_LAZY_FETCH=1
+        workspace="$(pwd -P)"
+        checkout_git="$workspace/.git"
+        if [ ! -d "$checkout_git/objects" ]; then
+          echo "::error::$workspace has no .git directory to take the tested commit's objects from; not pushing."
+          exit 1
+        fi
+        # The tested commit is the run's own: every caller checks it out (test_mac_workspace.py
+        # checks that), and nothing in the checkout can name another parent.
+        base="${GITHUB_SHA:-}"
+        if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::GITHUB_SHA is '$base', not a commit; not pushing."
+          exit 1
+        fi
+        snap_git="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is not set}/snap-push.XXXXXX")"
+        git init -q --bare --template= "$snap_git"
+        mkdir "$snap_git/xdg"
+        printf '%s\n' "$checkout_git/objects" > "$snap_git/objects/info/alternates"
+        if [ -f "$checkout_git/shallow" ]; then
+          cp "$checkout_git/shallow" "$snap_git/shallow"
+        fi
+        export GIT_DIR="$snap_git" GIT_WORK_TREE="$workspace" GIT_INDEX_FILE="$snap_git/index" \
+          XDG_CONFIG_HOME="$snap_git/xdg"
+        if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          echo "::error::The checkout does not hold $base, the commit this run tested; not pushing."
+          exit 1
+        fi
+        git read-tree "$base"
+        git add -- '*.snap'
+        if git diff --cached --quiet "$base"; then
           echo "No changes to commit"
           exit 0
         fi
@@ -53,17 +75,25 @@ runs:
         # commits) instead of always diffing against trunk.
         BASE_BRANCH="${GITHUB_REF_NAME:-trunk}"
 
-        git config --global user.name 'Spice Snapshot Update Bot'
-        git config --global user.email 'spiceaibot@spice.ai'
-        AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-        git remote set-url origin "${AUTHENTICATED_REMOTE_URL}"
-        git checkout -b "${BRANCH_NAME}"
-        git commit -m "${PR_TITLE}"
+        commit="$(GIT_AUTHOR_NAME='Spice Snapshot Update Bot' GIT_AUTHOR_EMAIL='spiceaibot@spice.ai' \
+          GIT_COMMITTER_NAME='Spice Snapshot Update Bot' GIT_COMMITTER_EMAIL='spiceaibot@spice.ai' \
+          git commit-tree "$(git write-tree)" -p "$base" -m "${PR_TITLE}")"
+
+        # The token reaches git as a header for each push, never in a file or a URL.
+        server="${GITHUB_SERVER_URL:-https://github.com}"
+        remote="$server/${GITHUB_REPOSITORY}.git"
+        auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth"
         # Non-interactive: a credential helper on the runner can otherwise intercept
-        # this push and block on a prompt forever. See
+        # a push and block on a prompt forever. See
         # scripts/check_ci_git_push_noninteractive.py.
-        git -c credential.helper='' -c credential.interactive=false \
-          push origin "HEAD:${BRANCH_NAME}"
+        push() {
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$server/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git -c credential.helper='' -c credential.interactive=false \
+              push "$remote" "$@"
+        }
+        push "${commit}:refs/heads/${BRANCH_NAME}"
 
         BODY="${PR_DESCRIPTION}"
         if [[ -z "${BODY}" ]]; then
@@ -75,14 +105,15 @@ runs:
         echo "Created snapshot update PR -> ${PR_URL}"
         gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
         # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
-        bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
+        # This action's own copy, not the checkout's.
+        bash "$GITHUB_ACTION_PATH/../../scripts/approve_bot_pr_runs.sh" "${BRANCH_NAME}" "${commit}"
 
         # Close any earlier open snapshot-update PR this job opened against the same
         # base with the same title: the one above supersedes it. Matching the base keeps
         # a manual branch run from closing the scheduled trunk PRs (or vice versa), and
         # matching this job's branches keeps jobs that share the default title
         # (integration_models.yml) from closing each other's PRs, which hold other files.
-        EXISTING_PR_JSON="$(mktemp)"
+        EXISTING_PR_JSON="$(mktemp "$snap_git/prs.XXXXXX")"
         gh pr list --state open --base "${BASE_BRANCH}" --limit 100 --json number,title,headRefName,author,body,url > "${EXISTING_PR_JSON}"
         jq -r --arg title "${PR_TITLE}" --arg url "${PR_URL}" --arg prefix "${BRANCH_PREFIX}" '
           [.[]
@@ -102,9 +133,8 @@ runs:
           echo "Closing superseded snapshot update PR #${OLD_PR_NUMBER}"
           gh pr close "${OLD_PR_NUMBER}" --comment "Superseded by ${PR_URL} (fresher snapshot diff against current ${BASE_BRANCH})." || true
           # `|| true` bounds the exit status, not the wall clock: the same credential
-          # helper can block this push too, so it needs the same guard.
-          git -c credential.helper='' -c credential.interactive=false \
-            push origin --delete "${OLD_BRANCH}" || true
+          # helper can block this push too, so it needs the same guard (in push above).
+          push --delete "${OLD_BRANCH}" || true
         done
       env:
         GH_TOKEN: ${{ inputs.token }}
