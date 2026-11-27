@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: duckdb-arrow
+name: duckdb-cayenne-memory
 datasets:
   - from: duckdb:customer
     name: customer
@@ -8,7 +8,8 @@ datasets:
       duckdb_open: ./data/tpch.db
     acceleration: &acceleration
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
   - from: duckdb:lineitem
     name: lineitem
     params: *duckdb_params
