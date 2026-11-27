@@ -248,6 +248,14 @@ impl SpicedInstance {
         }
 
         let ports = start_request.ports;
+        anyhow::ensure!(
+            ports.http != Some(0),
+            "Invalid HTTP port 0. Set the HTTP port to a value between 1 and 65535."
+        );
+        anyhow::ensure!(
+            ports.flight != Some(0),
+            "Invalid Flight port 0. Set the Flight port to a value between 1 and 65535."
+        );
         let http_base_url = ports.http_base_url();
         let client = reqwest::Client::new();
         let health_url = format!("{http_base_url}{HEALTH_ENDPOINT}");
