@@ -1,4 +1,5 @@
 name: sidecar-cluster
+duration: 119s
 tags: [long]
 description: >
   An application sidecar (`spiced --role sidecar`) in front of a Spice

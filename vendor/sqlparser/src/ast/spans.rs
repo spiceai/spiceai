@@ -23,6 +23,8 @@ use crate::{
     },
     tokenizer::TokenWithSpan,
 };
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::iter;
 
 use crate::tokenizer::Span;
@@ -221,12 +223,22 @@ impl Spanned for SetExpr {
         match self {
             SetExpr::Select(select) => select.span(),
             SetExpr::Query(query) => query.span(),
-            SetExpr::SetOperation {
-                op: _,
-                set_quantifier: _,
-                left,
-                right,
-            } => left.span().union(&right.span()),
+            SetExpr::SetOperation { .. } => {
+                // A chain of set operations is a left-deep tree as deep as the
+                // chain is long, and planners take its span at every level, often
+                // with little stack left: walk its left spine in a loop instead
+                // of recursing once per operation.
+                let mut rights = Vec::new();
+                let mut leftmost = self;
+                while let SetExpr::SetOperation { left, right, .. } = leftmost {
+                    rights.push(right.as_ref());
+                    leftmost = left.as_ref();
+                }
+                rights
+                    .into_iter()
+                    .rev()
+                    .fold(leftmost.span(), |span, right| span.union(&right.span()))
+            }
             SetExpr::Values(values) => values.span(),
             SetExpr::Insert(statement) => statement.span(),
             SetExpr::Table(_) => Span::empty(),
@@ -2648,6 +2660,50 @@ pub mod tests {
             test.get_source(select_span),
             "SELECT a FROM postgres.public.source UNION SELECT a FROM postgres.public.source"
         );
+    }
+
+    #[test]
+    pub fn test_set_operation_chain_span() {
+        let dialect = &GenericDialect;
+        let sql = "SELECT a FROM t1 UNION ALL SELECT b FROM t2 INTERSECT SELECT c FROM t3 \
+                   EXCEPT SELECT d FROM t4 UNION (SELECT e FROM t5 UNION SELECT f FROM t6)";
+        fn recursive_span(expr: &SetExpr) -> Span {
+            match expr {
+                SetExpr::SetOperation { left, right, .. } => {
+                    recursive_span(left).union(&recursive_span(right))
+                }
+                other => other.span(),
+            }
+        }
+        let mut test = SpanTest::new(dialect, sql);
+        let query = test.0.parse_query().unwrap();
+        assert_eq!(query.body.span(), recursive_span(&query.body));
+        assert_eq!(
+            test.get_source(query.body.span()),
+            sql.strip_suffix(')').unwrap()
+        );
+
+        // Spanning a chain at the parser's depth bound must not recurse once
+        // per operation: it runs here on a stack far too small for that.
+        let chain = vec!["SELECT a FROM t"; 2048].join(" UNION ALL ");
+        let body = Parser::new(dialect)
+            .try_with_sql(&chain)
+            .unwrap()
+            .parse_query()
+            .unwrap()
+            .body;
+        let span = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let span = body.span();
+                core::mem::forget(body);
+                span
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(span.start, Location::new(1, 1));
+        assert_eq!(span.end, Location::new(1, chain.len() as u64 + 1));
     }
 
     #[test]

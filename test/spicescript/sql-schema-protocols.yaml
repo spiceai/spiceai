@@ -1,4 +1,5 @@
 name: sql-schema-protocols
+duration: 1s
 description: >
   Flight SQL advertises the schema it streams for literal-sensitive decimal
   expressions and bound parameters, including NULLs and empty results.

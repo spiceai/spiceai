@@ -1,4 +1,5 @@
 name: full-refresh-outage
+duration: 57s
 tags: [long]
 description: >
   A full refresh never serves partial or empty data when its source fails: a

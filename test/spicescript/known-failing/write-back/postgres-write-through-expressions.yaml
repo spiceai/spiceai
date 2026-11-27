@@ -4,6 +4,7 @@
 # cannot express the cast.
 # Move this script to test/spicescript/ once it passes.
 name: postgres-write-through-expressions
+duration: 4s
 description: >
   An UPDATE through a write-through Postgres dataset may compute each column
   from its own value, for every common column type, and the source then holds

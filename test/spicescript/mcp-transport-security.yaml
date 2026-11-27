@@ -1,4 +1,5 @@
 name: mcp-transport-security
+duration: 1s
 description: >
   A Streamable HTTP MCP tool sends its credentials and results over plaintext
   HTTP only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), decided

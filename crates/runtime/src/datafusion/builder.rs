@@ -1416,6 +1416,7 @@ impl DataFusionBuilder {
             datafusion_ref,
             caching,
             plans_generation: TokioRwLock::new(0),
+            federated_templates: super::federated_template::FederatedTemplates::default(),
             results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
                 super::query::ResultsCacheWarmer::new_unloaded(
                     self.results_cache_warmup_store
@@ -1424,6 +1425,7 @@ impl DataFusionBuilder {
                 )
             }),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
+            append_queues: parking_lot::Mutex::new(HashMap::new()),
             change_generations: super::change_generations::ChangeGenerations::default(),
             bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
             snapshot_writers: parking_lot::Mutex::new(HashMap::new()),

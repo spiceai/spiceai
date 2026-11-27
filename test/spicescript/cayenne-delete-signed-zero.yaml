@@ -1,4 +1,5 @@
 name: cayenne-delete-signed-zero
+duration: 14s
 description: >
   A DELETE on a Cayenne acceleration without a primary key removes exactly the rows
   its predicate is true for when one float column holds -0.0 and another 0.0: SQL

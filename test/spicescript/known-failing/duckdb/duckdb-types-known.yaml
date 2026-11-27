@@ -1,4 +1,5 @@
 name: duckdb-types-known
+duration: 187s
 description: >
   The types `duckdb-types-acceleration.yaml` leaves out because some engine or
   protocol cannot carry them yet. An INTERVAL column answers as the DuckDB CLI

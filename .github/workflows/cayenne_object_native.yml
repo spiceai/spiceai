@@ -57,9 +57,10 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTC_WRAPPER: ''
   RUSTC_WORKSPACE_WRAPPER: ''
-  # The suites that read and write data files: the property and model fuzz
-  # lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
+  # The suites that read and write data files: every `test_on_data_store!` test, the property
+  # and model fuzz lanes, deletion vectors, reclamation, per-dataset stores and object-native data.
   SUITES: >-
+    test(/_on_data_store$/) |
     test(/^mutation_property_test::/) | test(/^mutation_model_test::/) |
     test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
     test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |

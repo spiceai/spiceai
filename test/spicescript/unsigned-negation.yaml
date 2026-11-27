@@ -1,4 +1,5 @@
 name: unsigned-negation
+duration: 8s
 description: >
   Ranking results remain unsigned. Unary negation produces a checked signed
   result, including Int64's minimum, without wrapping or decimal results.

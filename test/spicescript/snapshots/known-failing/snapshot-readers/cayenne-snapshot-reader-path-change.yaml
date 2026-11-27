@@ -1,4 +1,5 @@
 name: cayenne-snapshot-reader-path-change
+duration: 7s
 description: >
   A Cayenne reader that bootstrapped from snapshots keeps serving its rows
   when its `cayenne_file_path` changes while the snapshot store is down, and

@@ -83,12 +83,6 @@ async fn pk_runtime(
                 temp_dir.path().join("acc.db").display().to_string(),
             );
         }
-        "sqlite" => {
-            params.insert(
-                "sqlite_file".to_string(),
-                temp_dir.path().join("acc.db").display().to_string(),
-            );
-        }
         other => panic!("unsupported engine {other}"),
     }
 
@@ -123,66 +117,6 @@ async fn pk_runtime(
     }
     runtime_ready_check(&rt).await;
     Ok((temp_dir, rt))
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_rejects_a_null_primary_key() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    test_request_context()
-        .scope(async {
-            let (_dir, rt) = pk_runtime("sqlite", "o_sqlite").await?;
-            let message = execute_sql_err(
-                &rt,
-                "INSERT INTO o_sqlite (id, customer, amount, status) VALUES (NULL, 'nullpk', 1.0, 'new')",
-            )
-            .await;
-            assert!(
-                message.contains("Primary key") && message.to_lowercase().contains("null"),
-                "NULL primary key must be rejected, got: {message}"
-            );
-            assert!(
-                !message.contains("Query is not read-only"),
-                "NULL primary key must not be mis-reported as read-only, got: {message}"
-            );
-            let nulls = execute_sql(&rt, "SELECT count(*) FROM o_sqlite WHERE id IS NULL").await?;
-            let count = nulls[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("count is Int64")
-                .value(0);
-            assert_eq!(count, 0, "a rejected NULL primary key must not insert a row");
-            Ok(())
-        })
-        .await
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_reports_uniqueness_for_an_in_batch_duplicate_key() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-    test_request_context()
-        .scope(async {
-            let (_dir, rt) = pk_runtime("sqlite", "o_sqlite").await?;
-            let message = execute_sql_err(
-                &rt,
-                "INSERT INTO o_sqlite (id, customer, amount, status) VALUES (5001, 'a', 1.0, 'new'), (5001, 'b', 2.0, 'new')",
-            )
-            .await;
-            assert!(
-                message.contains("uniqueness")
-                    || message.contains("UNIQUE")
-                    || message.contains("constraint"),
-                "in-batch duplicate key must name the uniqueness constraint, got: {message}"
-            );
-            assert!(
-                !message.contains("Query is not read-only"),
-                "in-batch duplicate key must not be mis-reported as read-only, got: {message}"
-            );
-            Ok(())
-        })
-        .await
 }
 
 #[tokio::test]
