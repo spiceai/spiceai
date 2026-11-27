@@ -161,6 +161,23 @@ mod tests {
         SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
     }
 
+    /// A `SqlTable` whose only column is a list, so a `count(*)` over `unnest(li)`
+    /// is a legal statement against it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: each test chooses the policy it exercises"
+    )]
+    fn list_column_sql_table() -> SqlTable<(), &'static dyn ToString> {
+        let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
+            Arc::new(MockPool {});
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "li",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )]));
+        SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
+    }
+
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
         Arc::new(create_udf(
             name,
@@ -2914,6 +2931,92 @@ mod tests {
                 "{dialect_name}: an empty select list is not a statement this engine will parse: {sql}"
             );
         }
+    }
+
+    /// Regression test for spiceai/datafusion#274: `count(*)` over `unnest(li)`
+    /// empties the Unnest's projection, and that empty projection must still
+    /// unparse as `UNNEST` under `__unnest_rows`. Without the patch the unparser
+    /// collapses it to `SELECT 1 FROM t`, so a federated query counts input rows
+    /// rather than list elements.
+    #[test]
+    fn count_over_unnest_keeps_unnest_under_an_empty_projection() {
+        let plan = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![Field::new(
+                "li",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            )]),
+            None,
+        )
+        .expect("scan t")
+        .project(vec![col("t.li")])
+        .expect("project li so Unnest sits on a Projection")
+        .unnest_column("t.li")
+        .expect("unnest")
+        .project(Vec::<Expr>::new())
+        .expect("empty projection")
+        .aggregate(Vec::<Expr>::new(), vec![count(lit(1u8)).alias("n")])
+        .expect("count")
+        .build()
+        .expect("build");
+
+        let sql = federated_sql(&plan);
+        assert!(
+            sql.contains("UNNEST") && sql.contains("__unnest_rows"),
+            "count over UNNEST must keep the UNNEST under the empty projection: {sql}"
+        );
+    }
+
+    /// The same shape as a user statement, through the federation analyzer: a
+    /// `count(*)` over `SELECT unnest(li)` must send `UNNEST` to the remote
+    /// engine. Without spiceai/datafusion#274 the pushed SQL is
+    /// `SELECT count(1) AS "n" FROM (SELECT 1 FROM "t")`.
+    #[tokio::test]
+    async fn count_over_an_unnest_subquery_keeps_unnest_in_pushed_sql() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion_federation::FederatedQueryPlanner;
+        use datafusion_federation::sql::federation_analyzer_rule;
+
+        let table = list_column_sql_table();
+        let schema = table.schema();
+        let provider = Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            TableReference::bare("t"),
+            None,
+        ));
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(federation_analyzer_rule()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("t", provider)
+            .expect("register the federated table");
+
+        let sql = "SELECT count(*) AS n FROM (SELECT unnest(li) AS u FROM t)";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("plan {sql}: {e}"))
+            .create_physical_plan()
+            .await
+            .unwrap_or_else(|e| panic!("physical plan for {sql}: {e}"));
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let pushed = all_pushed_sql(&plan);
+        assert_eq!(
+            pushed.len(),
+            1,
+            "count over UNNEST must federate as one remote scan; plan:\n{rendered}"
+        );
+        let pushed_sql = &pushed[0];
+        assert!(
+            pushed_sql.contains("UNNEST") && pushed_sql.contains("__unnest_rows"),
+            "federated count over UNNEST must keep the UNNEST: {pushed_sql}; plan:\n{rendered}"
+        );
     }
 
     /// A projection casting `ts` to a timestamp carrying `tz`, which is the shape

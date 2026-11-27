@@ -38,6 +38,11 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Off trunk, the store keeps this run's keys under `artifacts/untrusted/<repository id>/<ref>/`,
+    # the only ones it may write; trunk's are the shared keys.
+    - name: Choose the CI store prefix
+      uses: ./.github/actions/ci-store-prefix
+
     - name: Detect OS
       id: detect-os
       shell: bash
@@ -83,10 +88,10 @@ runs:
       id: minio-download
       shell: bash
       run: |
-        if mc stat spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}; then
+        if mc stat "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}"; then
           echo "Found spicepod-validator in MinIO"
           mkdir -p target/release
-          mc cp spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }} target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
+          mc cp "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}" target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
           chmod +x target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
           echo "found=true" >> $GITHUB_OUTPUT
         else
@@ -166,7 +171,7 @@ runs:
       if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-validator.outputs.cache-hit != 'true')
       shell: bash
       run: |
-        mc cp target/release/spicepod-validator${{ steps.detect-os.outputs.ext }} spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}
+        mc cp target/release/spicepod-validator${{ steps.detect-os.outputs.ext }} "spice-minio/artifacts/${CI_STORE_PREFIX}spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}"
 
     - name: Install spicepod-validator to system path (Linux/macOS)
       if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'

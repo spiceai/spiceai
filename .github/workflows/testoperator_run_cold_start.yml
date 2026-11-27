@@ -59,7 +59,7 @@ jobs:
     # The only writer of the fixture: two concurrent first seeds would interleave
     # their Delta logs under one prefix.
     concurrency:
-      group: cold-start-fixture-seed
+      group: cold-start-fixture-seed-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,6 +131,9 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          # The branch's own build: a run on the branch reads its own ref's, and a pull request
+          # its base branch's, never trunk's, whose runtime is another release's.
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
 
       - name: Download the baseline release
         id: baseline
@@ -155,6 +158,12 @@ jobs:
           minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
+      # The fixture's location for this run, in the spicepod (.github/actions/ci-store-prefix).
+      - name: Choose the CI store prefix
+        uses: ./.github/actions/ci-store-prefix
+        with:
+          spicepod: test/spicepods/cold_start/${{ matrix.spicepod }}
 
       - name: Run the cold-start test (candidate ${{ steps.setup-spiced.outputs.SPICED_COMMIT }} vs ${{ steps.baseline.outputs.version }})
         run: |

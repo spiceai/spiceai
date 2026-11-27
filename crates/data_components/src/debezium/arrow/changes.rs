@@ -18,7 +18,7 @@ use crate::{
     arrow::struct_builder::StructBuilder,
     cdc::{ChangeBatch, changes_schema},
     debezium::{
-        arrow::downcast_builder,
+        arrow::{ColumnDefaults, downcast_builder},
         change_event::{ChangeEvent, Op},
     },
     schema_projection::SchemaProjection,
@@ -46,6 +46,7 @@ pub fn to_change_batch(
         primary_key,
         change,
         projection,
+        &ColumnDefaults::new(),
     )?;
 
     let struct_array = struct_builder.finish();
@@ -66,6 +67,24 @@ pub fn vector_to_change_batch(
     changes: &[&ChangeEvent],
     projection: Option<&SchemaProjection>,
 ) -> super::Result<ChangeBatch> {
+    vector_to_change_batch_with_defaults(
+        table_schema,
+        primary_key,
+        changes,
+        projection,
+        &ColumnDefaults::new(),
+    )
+}
+
+/// [`vector_to_change_batch`], where a required column an event does not carry
+/// takes its value from `defaults` (see [`super::column_defaults`]).
+pub fn vector_to_change_batch_with_defaults(
+    table_schema: &SchemaRef,
+    primary_key: &[String],
+    changes: &[&ChangeEvent],
+    projection: Option<&SchemaProjection>,
+    defaults: &ColumnDefaults,
+) -> super::Result<ChangeBatch> {
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
@@ -77,6 +96,7 @@ pub fn vector_to_change_batch(
             primary_key,
             change,
             projection,
+            defaults,
         )?;
     }
 
@@ -98,6 +118,7 @@ fn append_change_event(
     primary_key: &[String],
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
+    defaults: &ColumnDefaults,
 ) -> super::Result<()> {
     if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
         let before = change
@@ -105,7 +126,15 @@ fn append_change_event(
             .before
             .clone()
             .context(super::UpdateOpWithoutBeforeFieldSnafu)?;
-        append_change_row(struct_builder, schema, primary_key, "d", before, projection)?;
+        append_change_row(
+            struct_builder,
+            schema,
+            primary_key,
+            "d",
+            before,
+            projection,
+            defaults,
+        )?;
         append_change_row(
             struct_builder,
             schema,
@@ -113,6 +142,7 @@ fn append_change_event(
             "c",
             change.payload.after.clone(),
             projection,
+            defaults,
         )?;
         return Ok(());
     }
@@ -134,6 +164,7 @@ fn append_change_event(
         op,
         change_data,
         projection,
+        defaults,
     )
 }
 
@@ -144,6 +175,7 @@ fn append_change_row(
     op: &str,
     change_data: serde_json::Value,
     projection: Option<&SchemaProjection>,
+    defaults: &ColumnDefaults,
 ) -> super::Result<()> {
     struct_builder.append(true);
     // Apply JSON nesting: fold non-declared fields of the `before`/`after`
@@ -183,7 +215,11 @@ fn append_change_row(
                         .context(super::InvalidChangeEventSchemaSnafu {
                             reason: "data field appears more than once",
                         })?;
-                super::append_value_to_struct_builder(change_data, data_struct_builder)?;
+                super::append_value_to_struct_builder_with_defaults(
+                    change_data,
+                    data_struct_builder,
+                    defaults,
+                )?;
             }
             _ => unreachable!("Unexpected field in changes schema {}", field.name()),
         }
@@ -595,5 +631,145 @@ mod tests {
             .expect("change batch");
 
         assert_eq!(name_of(&batch.data(0)), None);
+    }
+
+    /// A Debezium envelope for one row whose embedded row schema is
+    /// `row_fields`, as a JSON-converter event carries it.
+    fn apps_event(row_fields: &serde_json::Value, after: &serde_json::Value) -> ChangeEvent {
+        let value = serde_json::json!({
+            "schema": {"type": "struct", "optional": false, "fields": [
+                {"field": "before", "type": "struct", "optional": true, "fields": row_fields},
+                {"field": "after", "type": "struct", "optional": true, "fields": row_fields},
+            ]},
+            "payload": {"before": null, "after": after, "op": "u", "ts_ms": 0},
+        });
+        serde_json::from_value(value).expect("valid change event")
+    }
+
+    /// The table schema and declared defaults the connector adopts from the
+    /// newest event.
+    fn adopted(event: &ChangeEvent) -> (SchemaRef, crate::debezium::arrow::ColumnDefaults) {
+        let row_fields: Vec<crate::debezium::change_event::Field> = event
+            .get_schema_fields()
+            .expect("row fields")
+            .into_iter()
+            .cloned()
+            .collect();
+        let schema = Arc::new(
+            crate::debezium::arrow::convert_fields_to_arrow_schema(row_fields.iter().collect())
+                .expect("schema"),
+        );
+        (schema, crate::debezium::arrow::column_defaults(&row_fields))
+    }
+
+    /// `ALTER TABLE apps ADD COLUMN flag boolean NOT NULL DEFAULT false`
+    /// rewrites no row, so a row unchanged since keeps its older change event,
+    /// which has no `flag`. The table schema comes from the newest event, where
+    /// `flag` is required and Debezium declares its default. Replaying the
+    /// topic must give the old row the default, as Postgres does, instead of
+    /// failing the batch that holds it.
+    #[test]
+    fn an_event_from_before_a_not_null_column_was_added_takes_its_default() {
+        let old_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "string", "optional": true, "field": "name"},
+        ]);
+        let new_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "string", "optional": true, "field": "name"},
+            {"type": "boolean", "optional": false, "default": false, "field": "flag"},
+        ]);
+        let old = apps_event(&old_fields, &serde_json::json!({"id": 1, "name": "old"}));
+        let new = apps_event(
+            &new_fields,
+            &serde_json::json!({"id": 2, "name": "new", "flag": true}),
+        );
+        let (table_schema, defaults) = adopted(&new);
+        assert!(
+            !table_schema
+                .field_with_name("flag")
+                .expect("flag")
+                .is_nullable(),
+            "a NOT NULL column is a required Arrow field"
+        );
+
+        let batch = vector_to_change_batch_with_defaults(
+            &table_schema,
+            &["id".to_string()],
+            &[&old, &new],
+            None,
+            &defaults,
+        )
+        .expect("the older event decodes with the column's default");
+
+        let flags: Vec<bool> = (0..2)
+            .map(|row| {
+                batch
+                    .data(row)
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .expect("flag is Boolean")
+                    .value(0)
+            })
+            .collect();
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    /// Without a declared default, a required column an event lacks is still
+    /// an error: there is no value to give it.
+    #[test]
+    fn a_required_column_without_a_default_is_still_an_error() {
+        let old_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+        ]);
+        let new_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "boolean", "optional": false, "field": "flag"},
+        ]);
+        let old = apps_event(&old_fields, &serde_json::json!({"id": 1}));
+        let new = apps_event(&new_fields, &serde_json::json!({"id": 2, "flag": true}));
+        let (table_schema, defaults) = adopted(&new);
+        assert!(defaults.is_empty());
+
+        let err = vector_to_change_batch_with_defaults(
+            &table_schema,
+            &["id".to_string()],
+            &[&old, &new],
+            None,
+            &defaults,
+        )
+        .expect_err("no default to fill a required column");
+        assert!(
+            matches!(err, Error::MissingFieldInValue { ref field_name, .. } if field_name == "flag"),
+            "got {err:?}"
+        );
+    }
+
+    /// A nullable column an older event lacks stays null even when Debezium
+    /// declares a default, as before.
+    #[test]
+    fn a_nullable_column_missing_from_an_older_event_stays_null() {
+        let old_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+        ]);
+        let new_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "int32", "optional": true, "default": 5, "field": "n"},
+        ]);
+        let old = apps_event(&old_fields, &serde_json::json!({"id": 1}));
+        let new = apps_event(&new_fields, &serde_json::json!({"id": 2, "n": 7}));
+        let (table_schema, defaults) = adopted(&new);
+
+        let batch = vector_to_change_batch_with_defaults(
+            &table_schema,
+            &["id".to_string()],
+            &[&old, &new],
+            None,
+            &defaults,
+        )
+        .expect("change batch");
+        assert!(batch.data(0).column(1).is_null(0));
+        assert!(!batch.data(1).column(1).is_null(0));
     }
 }

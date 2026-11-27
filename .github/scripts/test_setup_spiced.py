@@ -171,12 +171,13 @@ class StoreTest(unittest.TestCase):
             script = f"cd {self.checkout}\n{script}"
         return self.run_script(script, env)
 
-    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit=""):
-        return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit})
+    def locate(self, github_ref, ref="refs/heads/trunk", spiced_commit="", event="push", base_ref=""):
+        return self.run_step("locate", {"GITHUB_REF": github_ref, "REF": ref, "INPUT_SPICED_COMMIT": spiced_commit,
+                                        "RUN_EVENT": event, "PULL_REQUEST_BASE": base_ref if event == "pull_request" else ""})
 
     def store_prefix(self, github_ref, repository_id=REPOSITORY_ID):
         return self.run_script(self.prefix_steps["prefix"]["run"],
-                               {"GITHUB_REF": github_ref, "GITHUB_REPOSITORY_ID": repository_id})
+                               {"GITHUB_REF": github_ref, "GITHUB_REPOSITORY_ID": repository_id, "SPICEPOD": ""})
 
     def uploads(self):
         return [s for s in self.build["steps"] if s.get("uses") == "./.github/actions/upload-to-minio"]
@@ -241,9 +242,9 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
                 self.assertLess(names.index(attest["name"]), names.index(upload["name"]))
 
     def test_the_key_a_release_build_writes_is_the_key_its_readers_read(self):
-        # The release branch builds commit C and stores it. The daily dispatch, on trunk, finds C
-        # as the branch's latest build by the same rule as this action's, and the bench run it
-        # dispatches on the branch downloads C with this action.
+        # The release branch builds commit C and stores it. Its leg of the daily dispatch, a run
+        # on the branch that trunk's dispatch starts, finds C as the branch's latest build, and
+        # the bench run that leg dispatches on the branch downloads C.
         proc, values = self.store_prefix(RELEASE)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         written = []
@@ -257,8 +258,8 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
         self.assertEqual(written, [self.key(prefix, self.release), self.key(prefix, self.release, odbc=True)])
         self.stored.write_text(written[0] + "\n")
 
-        # The dispatch's read: no commit, the branch as `ref`.
-        proc, located = self.locate("refs/heads/trunk", ref="release/2.4")
+        # The leg's read: no commit, its own branch as `ref`.
+        proc, located = self.locate(RELEASE, ref=RELEASE)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": RELEASE, "prefix": prefix})
         proc, found = self.run_step(FIND, {"REF": located["ref"], "SOURCE_PREFIX": located["prefix"]})
@@ -274,6 +275,83 @@ class BuildStoresUnderItsPrefixTest(StoreTest):
         log = self.mc_log.read_text()
         self.assertIn(f"mc cp {written[0]} ", log)
         self.assertIn("sudo cp ./spiced /usr/local/bin/spiced", log)
+
+
+class ToolBuildsStoreUnderThePrefixTest(unittest.TestCase):
+    """The testoperator and spicepod-validator binaries the release leg's jobs build and reuse."""
+
+    def test_each_tool_build_reads_and_writes_under_the_runs_prefix(self):
+        for name in ("build-testoperator", "build-spicepod-validator", "build-spidapter"):
+            with self.subTest(action=name):
+                steps = yaml.safe_load((GITHUB_DIR / "actions" / name / "action.yml").read_text())["runs"]["steps"]
+                self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+                keys = [line for step in steps for line in str(step.get("run", "")).splitlines()
+                        if "spice-minio/artifacts/" in line]
+                self.assertEqual(len(keys), 3, keys)
+                for line in keys:
+                    self.assertIn("spice-minio/artifacts/${CI_STORE_PREFIX}", line)
+
+
+class MssqlBenchImageTest(unittest.TestCase):
+    """The spice-mssql-bench image this branch's benchmark legs run as a service."""
+
+    def test_every_job_that_runs_it_pins_its_digest_and_only_trunk_publishes_it(self):
+        pinned = re.compile(r"'ghcr\.io/spiceai/spice-mssql-bench@sha256:[0-9a-f]{64}'")
+        users = 0
+        for workflow in sorted((GITHUB_DIR / "workflows").glob("*.yml")):
+            text = workflow.read_text()
+            if workflow.name == "spice_mssql_tpch_bench_docker.yml" or "spice-mssql-bench" not in text:
+                continue
+            users += 1
+            for line in text.splitlines():
+                if "spice-mssql-bench" in line and "image:" in line:
+                    self.assertRegex(line, pinned)
+        self.assertEqual(users, 2)
+        build = yaml.safe_load((GITHUB_DIR / "workflows" / "spice_mssql_tpch_bench_docker.yml").read_text())
+        first = build["jobs"]["build"]["steps"][0]
+        self.assertEqual(first["name"], "Refuse a run off trunk")
+        self.assertIn('[ "$GITHUB_REF" != refs/heads/trunk ]', first["run"])
+
+
+class StoreWritersUseThePrefixTest(unittest.TestCase):
+    """This branch's other writers to the store's shared prefixes, which refuse its writes."""
+
+    def test_the_integration_test_archive_is_under_the_runs_prefix(self):
+        workflow = yaml.safe_load((GITHUB_DIR / "workflows" / "integration.yml").read_text())
+        jobs_using = 0
+        for name, job in workflow["jobs"].items():
+            steps = job.get("steps") or []
+            runs = [str(step.get("run", "")) for step in steps]
+            using = [i for i, run in enumerate(runs) if "INTEGRATION_TESTS_ARCHIVE_S3_URI" in run]
+            if not using:
+                continue
+            jobs_using += 1
+            with self.subTest(job=name):
+                uses = [step.get("uses") for step in steps]
+                self.assertIn("./.github/actions/ci-store-prefix", uses)
+                self.assertLess(uses.index("./.github/actions/ci-store-prefix"), using[0])
+                for i in using:
+                    self.assertIn("spice-minio/build/test_binaries/${CI_STORE_PREFIX?}", runs[i])
+                    self.assertNotIn("spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}", runs[i])
+        self.assertGreater(jobs_using, 1)
+
+    def test_the_compiler_cache_keys_are_under_the_runs_prefix(self):
+        steps = yaml.safe_load((GITHUB_DIR / "actions" / "setup-sccache" / "action.yml").read_text())["runs"]["steps"]
+        self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+        configs = [line for step in steps for line in str(step.get("run", "")).splitlines() if "[cache.s3]" in line]
+        self.assertEqual(len(configs), 3)
+        for line in configs:
+            self.assertIn("key_prefix", line)
+            self.assertIn("CI_STORE_PREFIX", line)
+
+    def test_the_cold_start_fixture_is_seeded_under_the_runs_prefix_and_trunks_copy_is_read(self):
+        steps = yaml.safe_load((GITHUB_DIR / "actions" / "seed-cold-start-fixture" / "action.yml").read_text())["runs"]["steps"]
+        self.assertEqual(steps[0].get("uses"), "./.github/actions/ci-store-prefix")
+        # The E2E job only reads the fixture, and a merge-queue ref is new for every entry, so it
+        # reads trunk's copy, which no run off trunk can write.
+        job = yaml.safe_load((GITHUB_DIR / "workflows" / "e2e_test_ci.yml").read_text())["jobs"]["test_cold_start_unkeyed_append"]
+        self.assertNotIn("./.github/actions/ci-store-prefix", [step.get("uses") for step in job["steps"]])
+        self.assertIn("spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED", yaml.safe_dump(job, width=10**6))
 
 
 class SetupSpicedTest(StoreTest):
@@ -298,11 +376,71 @@ class SetupSpicedTest(StoreTest):
 
     def test_a_release_commit_is_read_under_the_release_branchs_prefix(self):
         prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
-        for github_ref, ref in ((RELEASE, "refs/heads/trunk"), (PULL_REQUEST, RELEASE), ("refs/heads/trunk", RELEASE)):
-            with self.subTest(github_ref=github_ref, ref=ref):
-                proc, located = self.locate(github_ref, ref=ref, spiced_commit=self.release)
+        for ref in ("refs/heads/trunk", RELEASE):
+            with self.subTest(ref=ref):
+                proc, located = self.locate(RELEASE, ref=ref, spiced_commit=self.release)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(located["prefix"], prefix)
+
+    def test_a_run_never_takes_another_refs_build(self):
+        # A build of a ref other than trunk runs only in a run of that ref, with that ref's
+        # credentials: a trunk run's store credentials write trunk's keys.
+        for github_ref, ref, commit in (
+            ("refs/heads/trunk", RELEASE, ""),
+            ("refs/heads/trunk", "release/2.4", ""),
+            ("refs/heads/trunk", RELEASE, "release"),
+            ("refs/heads/trunk", "refs/heads/trunk", "release"),
+            (PULL_REQUEST, RELEASE, ""),
+            (PULL_REQUEST, RELEASE, "release"),
+            ("refs/heads/feature", RELEASE, ""),
+        ):
+            with self.subTest(github_ref=github_ref, ref=ref, commit=commit):
+                proc, located = self.locate(github_ref, ref=ref, spiced_commit=self.release if commit else "")
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("runs only a spiced that trunk or this run's own ref built", proc.stdout)
+                self.assertEqual(located, {})
+
+    def test_a_pull_request_reads_its_base_branchs_build(self):
+        prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
+        proc, located = self.locate(PULL_REQUEST, ref=RELEASE, event="pull_request", base_ref="release/2.4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(located["prefix"], prefix)
+        # Only its own base, and only for a pull_request event: the base name comes from the runner.
+        for event, base_ref in (("pull_request", "release/2.5"), ("pull_request", ""), ("push", "release/2.4"),
+                                ("pull_request_target", "release/2.4"), ("workflow_dispatch", "release/2.4")):
+            with self.subTest(event=event, base_ref=base_ref):
+                proc, located = self.locate(PULL_REQUEST, ref=RELEASE, event=event, base_ref=base_ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(located, {})
+
+    def test_the_pull_request_check_reads_the_event_not_the_environment(self):
+        env = yaml.safe_load((Path(__file__).resolve().parents[1] / "actions" / "setup-spiced" / "action.yml").read_text())
+        locate = next(s for s in env["runs"]["steps"] if s.get("id") == "locate")
+        self.assertEqual(locate["env"]["RUN_EVENT"], "${{ github.event_name }}")
+        self.assertEqual(locate["env"]["PULL_REQUEST_BASE"], "${{ github.event_name == 'pull_request' && github.base_ref || '' }}")
+        self.assertNotIn("GITHUB_BASE_REF", locate["run"])
+        self.assertNotIn("GITHUB_EVENT_NAME", locate["run"])
+        # GITHUB_* values a step could add to the environment change nothing.
+        proc, located = self.run_step("locate", {"GITHUB_REF": PULL_REQUEST, "REF": RELEASE, "INPUT_SPICED_COMMIT": "",
+                                                 "RUN_EVENT": "push", "PULL_REQUEST_BASE": "",
+                                                 "GITHUB_EVENT_NAME": "pull_request", "GITHUB_BASE_REF": "release/2.4"})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(located, {})
+
+    def test_release_24s_cold_start_reads_the_branchs_own_build(self):
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "testoperator_run_cold_start.yml").read_text())
+        step = next(s for s in workflow["jobs"]["cold-start"]["steps"] if s.get("id") == "setup-spiced")
+        self.assertEqual(
+            step["with"]["ref"],
+            "${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}",
+        )
+        # What that ref is on each run: the branch's own prefix, never trunk's keys.
+        for github_ref, event, base_ref, ref in ((RELEASE, "workflow_dispatch", "", RELEASE),
+                                                 (PULL_REQUEST, "pull_request", "release/2.4", RELEASE)):
+            with self.subTest(event=event):
+                proc, located = self.locate(github_ref, ref=ref, event=event, base_ref=base_ref)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(located["prefix"], f"untrusted/{REPOSITORY_ID}/{RELEASE}/")
 
     def test_the_latest_build_is_the_newest_stored_commit_under_the_prefix(self):
         prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
@@ -313,11 +451,24 @@ class SetupSpicedTest(StoreTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(found["SPICED_COMMIT"], self.release_parent)
 
+    def test_no_build_of_the_ref_says_which_ref_and_where(self):
+        # A ref with no build of its own, such as a feature branch's dispatch of cold-start, fails
+        # with the ref and the prefix it searched, not by testing trunk's runtime instead.
+        prefix = f"untrusted/{REPOSITORY_ID}/{RELEASE}/"
+        self.stored.write_text(self.key("", self.release) + "\n")
+        proc, found = self.run_step(FIND, {"REF": RELEASE, "SOURCE_PREFIX": prefix})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("SPICED_COMMIT", found)
+        self.assertIn(f"::error::No spiced build of {RELEASE}'s last 10 commits is stored", proc.stdout)
+        self.assertIn(f"under artifacts/{prefix}spiced/", proc.stdout)
+        self.assertIn(f"run build_and_release.yml on {RELEASE} first", proc.stdout)
+
     def test_a_bare_branch_name_is_that_branch(self):
         proc, located = self.locate(PULL_REQUEST, ref="trunk")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": "refs/heads/trunk", "prefix": ""})
-        proc, located = self.locate(PULL_REQUEST, ref="release/2.4")
+        proc, located = self.locate(RELEASE, ref="release/2.4")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(located, {"ref": RELEASE, "prefix": f"untrusted/{REPOSITORY_ID}/{RELEASE}/"})
 
     def test_a_ref_that_is_not_a_plain_ref_is_refused(self):

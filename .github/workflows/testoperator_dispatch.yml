@@ -36,7 +36,7 @@ on:
         type: boolean
         default: false
       schedule:
-        description: 'Run a scheduled dispatch (daily or weekly) instead of the workflow_type dispatch'
+        description: 'Run a scheduled dispatch instead of the workflow_type dispatch: daily or weekly on trunk, or release, the daily dispatch''s leg on a release branch, run on that branch'
         required: false
         type: choice
         default: 'none'
@@ -44,27 +44,28 @@ on:
           - 'none'
           - 'daily'
           - 'weekly'
+          - 'release'
 
 # A scheduled dispatch plans, dispatches and records its release commit as one unit: a second run
 # of the same schedule (a manual run during the cron's, say) waits until the first one finishes, so
 # it plans against the commit the first run recorded instead of dispatching that commit again. A
 # manual run that dispatches no schedule gets a group of its own.
 concurrency:
-  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' && (github.event.schedule == '0 0 * * 0' && 'weekly' || 'daily')) || ((github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly') && github.event.inputs.schedule) || github.run_id }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'schedule' && (github.event.schedule == '0 0 * * 0' && 'weekly' || 'daily')) || ((github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly') && github.event.inputs.schedule) || (github.event.inputs.schedule == 'release' && format('release-{0}', github.ref)) || github.run_id }}
   cancel-in-progress: false
 
 jobs:
-  # Resolves which schedule this run dispatches (the cron that fired, or the manual `schedule`
-  # input) and for which branches. trunk dispatches the configs on that schedule. A release
-  # branch changes only when a fix is cherry-picked onto it, so the daily schedule also plans it,
-  # and its job dispatches the whole suite, weekly configs included, once per spiced build. The
-  # release branch is the newest `release/<major>.<minor>`; `release/<version>-rc.<n>` branches are
-  # not planned.
+  # Resolves which schedule this run dispatches (the manual `schedule` input) and for which
+  # branch. On this release branch that is `schedule: release`: the daily dispatch on trunk starts
+  # this workflow here for the branch's leg, which dispatches the whole suite, weekly configs
+  # included, once per spiced build. The leg runs on this branch, never in a trunk run: a run's
+  # store credentials write its own ref's keys, so this branch's code and builds run only with this
+  # branch's credentials. The daily and weekly schedules run on trunk.
   plan-scheduled:
     environment: secret-free
     name: Plan scheduled dispatch
     runs-on: ubuntu-24.04
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly' }}
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.schedule == 'daily' || github.event.inputs.schedule == 'weekly' || github.event.inputs.schedule == 'release' }}
     outputs:
       schedule: ${{ steps.plan.outputs.schedule }}
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -80,26 +81,30 @@ jobs:
             '0 9 * * *') schedule=daily ;;
             '0 0 * * 0') schedule=weekly ;;
             '')          # manual dispatch
-                         case "$INPUT_SCHEDULE" in daily|weekly) schedule="$INPUT_SCHEDULE" ;; *) schedule= ;; esac ;;
+                         case "$INPUT_SCHEDULE" in daily|weekly|release) schedule="$INPUT_SCHEDULE" ;; *) schedule= ;; esac ;;
             *)           schedule= ;;                      # unrecognized cron — dispatch nothing
           esac
           echo "Resolved schedule: ${schedule:-<none>}"
           echo "schedule=$schedule" >> "$GITHUB_OUTPUT"
 
+          # Each leg runs in a run of its own branch.
           matrix='[]'
-          if [ -n "$schedule" ]; then
-            matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
-          fi
-          if [ "$schedule" = daily ]; then
-            release_branch=$(git ls-remote --heads "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" 'refs/heads/release/*' \
-              | cut -f 2 | sed -n 's#^refs/heads/\(release/[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' | sort -V | tail -n 1)
-            if [ -z "$release_branch" ]; then
-              echo "::error::Found no release/<major>.<minor> branch to dispatch."
-              exit 1
-            fi
-            echo "Release branch: $release_branch"
-            matrix=$(jq -c --arg branch "$release_branch" '. + [{branch: $branch, schedule: ""}]' <<< "$matrix")
-          fi
+          case "$schedule" in
+            daily|weekly)
+              if [ "$GITHUB_REF" != refs/heads/trunk ]; then
+                echo "::error::The $schedule dispatch runs on trunk, not $GITHUB_REF. A release branch runs its leg with schedule: release."
+                exit 1
+              fi
+              matrix=$(jq -cn --arg schedule "$schedule" '[{branch: "trunk", schedule: $schedule}]')
+              ;;
+            release)
+              if ! [[ "$GITHUB_REF" =~ ^refs/heads/release/[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::schedule: release runs on a release/<major>.<minor> branch, not $GITHUB_REF."
+                exit 1
+              fi
+              matrix=$(jq -cn --arg branch "${GITHUB_REF#refs/heads/}" '[{branch: $branch, schedule: ""}]')
+              ;;
+          esac
           echo "Dispatching for: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -124,10 +129,10 @@ jobs:
       # a release branch, which dispatches its whole suite.
       SCHEDULE: ${{ matrix.schedule }}
     steps:
+      # The run's own commit: the plan gives this job only the branch the run is on.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ matrix.branch }}
 
       - name: Get RustFS credentials
         id: rustfs
@@ -149,7 +154,7 @@ jobs:
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
-          ref: refs/heads/${{ matrix.branch }}
+          ref: ${{ github.ref }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -532,7 +537,7 @@ jobs:
       contents: read
       actions: write  # dispatches the benchmark workflows
       id-token: write  # RustFS credentials
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' && github.event.inputs.schedule != 'release' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
