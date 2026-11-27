@@ -165,7 +165,7 @@ steps:
     when: *full
   # The first restart and this start each load the saved index. The plan alone
   # cannot tell: an index rebuilt at startup also covers every file.
-  - assert-log: { count: { 'loaded its secondary index from disk .*, covering all': '>=2' } }
+  - assert-log: { count: { 'loaded its saved secondary index .*, covering all': '>=2' } }
     only: *indexed-object-native
     when: *full
   - explain: SELECT * FROM orders WHERE o_custkey = 42

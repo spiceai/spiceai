@@ -3108,7 +3108,7 @@ fn persisted_runs_loaded_message(
         )
     };
     format!(
-        "Dataset '{table_name}' (cayenne): loaded its secondary index from disk ({mib:.1} MiB), {coverage}"
+        "Dataset '{table_name}' (cayenne): loaded its saved secondary index ({mib:.1} MiB), {coverage}"
     )
 }
 
@@ -4246,15 +4246,15 @@ mod tests {
     fn the_loaded_runs_message_names_the_table_its_size_and_its_coverage() {
         assert_eq!(
             persisted_runs_loaded_message("orders", 5 << 20, 20, 20),
-            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 20 of its files"
+            "Dataset 'orders' (cayenne): loaded its saved secondary index (5.0 MiB), covering all 20 of its files"
         );
         assert_eq!(
             persisted_runs_loaded_message("orders", 3 << 19, 18, 20),
-            "Dataset 'orders' (cayenne): loaded its secondary index from disk (1.5 MiB), covering 18 of its 20 files; the other 2 are indexed in the background"
+            "Dataset 'orders' (cayenne): loaded its saved secondary index (1.5 MiB), covering 18 of its 20 files; the other 2 are indexed in the background"
         );
         assert_eq!(
             persisted_runs_loaded_message("orders", 5 << 20, 4, 4),
-            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 4 of its files"
+            "Dataset 'orders' (cayenne): loaded its saved secondary index (5.0 MiB), covering all 4 of its files"
         );
     }
 
