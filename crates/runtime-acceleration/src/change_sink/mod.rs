@@ -323,11 +323,11 @@ impl Default for WriteOptions {
     }
 }
 
-/// Indexes that a CDC delete must also update.
+/// Accelerator indexes that a native CDC delete must also update.
 pub type ChangeIndexes = Vec<Arc<dyn spice_table::Index + Send + Sync>>;
 
-/// The write target and its external index effects. The callback resolves the
-/// current source-side index chain without capturing source orchestration types.
+/// The write target of a change sink. Source-side indexes are not part of it: the
+/// change stream that carries each batch maintains them.
 ///
 /// The runtime builds one when it binds a sink, and gives it to the engine's
 /// `change_sink` hook or to `provider::ProviderChangeSinkBackend::new`.
@@ -341,9 +341,6 @@ pub struct ChangeSinkContext {
     /// Serializes sink writes with other writers of the same accelerated
     /// table. The runtime passes the table's shared write mutex.
     pub write_lock: Arc<Mutex<()>>,
-    /// Returns the source-side indexes that CDC deletes must update. Empty by
-    /// default and in caching mode.
-    pub external_indexes: Arc<dyn Fn() -> ChangeIndexes + Send + Sync>,
 }
 
 impl ChangeSinkContext {
@@ -353,7 +350,6 @@ impl ChangeSinkContext {
             dataset_name,
             table,
             write_lock: Arc::new(Mutex::new(())),
-            external_indexes: Arc::new(Vec::new),
         }
     }
 }

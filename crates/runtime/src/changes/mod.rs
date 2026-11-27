@@ -14,13 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::take;
 use arrow::datatypes::{FieldRef, Schema};
 use arrow::error::ArrowError;
-use data_components::cdc::{ChangeEnvelope, StreamError, replace_change_batch_data};
+use arrow::row::{RowConverter, SortField};
+use data_components::cdc::{
+    ChangeEnvelope, ChangeOperation, StreamError, replace_change_batch_data,
+};
 use spice_table::{Index, LayerWalk, SpiceTable};
 
 /// A newtype wrapper around a vector of indexes to prevent cloning the vector for each item in a stream.
@@ -68,7 +72,7 @@ pub async fn index_change_envelope(
     // Project the change batch into the operations an index maintains (the upsert
     // rows, the delete rows, and a truncate flag), then maintain every index by
     // composing the primitives it already has, one per operation. `compute_index`
-    // runs on the upserts only, so a delete or snapshot row is never embedded, and
+    // runs on the upserts only, so a delete row is never embedded, and
     // the delete happens here — in the same task and turn as the upsert — so no
     // deleted row is left resurrected in the index.
     let change_set = batch
@@ -77,7 +81,8 @@ pub async fn index_change_envelope(
     let data_batch = batch.data_batch();
 
     // Truncate first: clear each index before anything is (re)indexed, so a batch
-    // that truncates and then inserts keeps the inserted rows.
+    // that truncates and then inserts keeps the inserted rows. The rows before the
+    // batch's last truncate are indexed with the others and removed with the deletes.
     if change_set.truncated() {
         for index in &indexes.0 {
             index
@@ -102,18 +107,32 @@ pub async fn index_change_envelope(
             .map_err(|e| StreamError::External(e.to_string()))?;
     }
 
-    // Deletes: remove the deleted keys (the delete rows projected to the primary
-    // key) from each index's own store.
-    let delete_keys = if change_set.delete_rows().is_empty() {
+    // Deletes: remove from each index's own store every key the batch leaves out of
+    // the table, as the accelerator, which applies the rows in order, does: a deleted
+    // key, and a key upserted before the batch's last truncate, unless a later upsert
+    // writes it again.
+    let primary_keys = change_set.primary_key_columns();
+    let last_truncate = if change_set.truncated() {
+        (0..batch.record.num_rows())
+            .rev()
+            .find(|&row| matches!(batch.op(row), ChangeOperation::Truncate))
+    } else {
+        None
+    };
+    let delete_rows = rows_whose_key_ends_absent(
+        &data_batch,
+        change_set.delete_rows(),
+        upsert_rows,
+        last_truncate,
+        primary_keys,
+    )
+    .map_err(|e| StreamError::Arrow(e.to_string()))?;
+    let delete_keys = if delete_rows.is_empty() {
         None
     } else {
         Some(
-            delete_key_batch(
-                &data_batch,
-                change_set.delete_rows(),
-                change_set.primary_key_columns(),
-            )
-            .map_err(|e| StreamError::Arrow(e.to_string()))?,
+            delete_key_batch(&data_batch, &delete_rows, primary_keys)
+                .map_err(|e| StreamError::Arrow(e.to_string()))?,
         )
     };
     if let Some(keys) = &delete_keys {
@@ -147,6 +166,54 @@ pub async fn index_change_envelope(
     ))
 }
 
+/// The rows of `batch` whose primary key the batch leaves out of the table, in their
+/// original order: each delete row, and each upsert row before `last_truncate`, unless
+/// a later upsert row (one after `last_truncate` too, for a row before it) writes the
+/// key again.
+fn rows_whose_key_ends_absent(
+    batch: &RecordBatch,
+    delete_rows: &[usize],
+    upsert_rows: &[usize],
+    last_truncate: Option<usize>,
+    pk: &[String],
+) -> Result<Vec<usize>, ArrowError> {
+    let truncated_upserts = upsert_rows
+        .iter()
+        .copied()
+        .take_while(|&row| last_truncate.is_some_and(|truncate| row < truncate));
+    let mut candidates: Vec<usize> = delete_rows
+        .iter()
+        .copied()
+        .chain(truncated_upserts)
+        .collect();
+    if candidates.is_empty() || upsert_rows.is_empty() {
+        return Ok(candidates);
+    }
+    candidates.sort_unstable();
+    let keys = project_primary_key(batch, pk)?;
+    let converter = RowConverter::new(
+        keys.schema()
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )?;
+    let rows = converter.convert_columns(keys.columns())?;
+    let mut last_upsert = HashMap::with_capacity(upsert_rows.len());
+    for &row in upsert_rows {
+        last_upsert.insert(rows.row(row), row);
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|&row| {
+            let written_after = last_truncate.map_or(row, |truncate| row.max(truncate));
+            last_upsert
+                .get(&rows.row(row))
+                .is_none_or(|&upsert| upsert < written_after)
+        })
+        .collect())
+}
+
 /// The delete keys for `Index::delete_by_keys`: the `rows` of `batch`, projected
 /// to the primary-key columns `pk`.
 fn delete_key_batch(
@@ -154,6 +221,11 @@ fn delete_key_batch(
     rows: &[usize],
     pk: &[String],
 ) -> Result<RecordBatch, ArrowError> {
+    take_rows(&project_primary_key(batch, pk)?, rows)
+}
+
+/// `batch` projected to the primary-key columns `pk`.
+fn project_primary_key(batch: &RecordBatch, pk: &[String]) -> Result<RecordBatch, ArrowError> {
     let schema = batch.schema();
     let mut fields = Vec::with_capacity(pk.len());
     let mut columns = Vec::with_capacity(pk.len());
@@ -166,8 +238,7 @@ fn delete_key_batch(
         fields.push(field.clone());
         columns.push(Arc::clone(batch.column(idx)));
     }
-    let projected = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-    take_rows(&projected, rows)
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
 /// The rows of `batch` at `rows`, in order, as a new `RecordBatch`.
@@ -576,6 +647,159 @@ mod tests {
                 .record
                 .num_rows(),
             original_row_count
+        );
+    }
+
+    /// Records the `id` of each row it is asked to index and of each key it is asked to
+    /// delete, in call order.
+    #[derive(Debug, Default)]
+    struct RecordingIndex {
+        ops: std::sync::Mutex<Vec<(&'static str, i32)>>,
+    }
+
+    impl RecordingIndex {
+        fn record(&self, op: &'static str, batch: &RecordBatch) {
+            let ids = batch
+                .column_by_name("id")
+                .and_then(|ids| ids.as_any().downcast_ref::<Int32Array>())
+                .expect("id column");
+            let mut ops = self.ops.lock().expect("ops lock");
+            ops.extend(ids.iter().map(|id| (op, id.expect("non-null id"))));
+        }
+    }
+
+    #[async_trait]
+    impl Index for RecordingIndex {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["id".to_string()]
+        }
+
+        async fn compute_index(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> DataFusionResult<Vec<RecordBatch>> {
+            for batch in &batches {
+                self.record("index", batch);
+            }
+            Ok(batches)
+        }
+
+        async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+            self.record("delete", &keys);
+            Ok(())
+        }
+
+        async fn truncate(&self) -> DataFusionResult<()> {
+            self.ops.lock().expect("ops lock").push(("truncate", 0));
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A change batch keyed on `id`, one row per `(op, id, name)`.
+    fn keyed_change_envelope(rows: &[(&str, i32, &str)]) -> ChangeEnvelope {
+        use arrow::array::{ArrayRef, ListBuilder, StringBuilder, StructArray};
+
+        let table = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let data = StructArray::from(vec![
+            (
+                Arc::new(Field::new("id", DataType::Int32, false)),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("name", DataType::Utf8, true)),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, _, name)| *name).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+        ]);
+        let mut primary_keys = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in rows {
+            primary_keys.values().append_value("id");
+            primary_keys.append(true);
+        }
+        let record = RecordBatch::try_new(
+            Arc::new(data_components::cdc::changes_schema(&table)),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(op, _, _)| *op).collect::<Vec<_>>(),
+                )),
+                Arc::new(primary_keys.finish()),
+                Arc::new(data),
+            ],
+        )
+        .expect("keyed change batch matches the change schema");
+        let batch = data_components::cdc::ChangeBatch::try_new(record)
+            .expect("keyed change batch validates");
+        ChangeEnvelope::new(Box::new(MockCommitChange), batch, true)
+    }
+
+    #[tokio::test]
+    async fn a_key_deleted_then_written_again_in_one_batch_stays_indexed() {
+        // One source transaction deletes id 1 and inserts it again, and deletes id 2 after
+        // writing it. The accelerator applies the rows in order: it keeps id 1 and drops id 2.
+        let envelope = keyed_change_envelope(&[
+            ("d", 1, "falcon"),
+            ("c", 1, "kestrel"),
+            ("c", 2, "heron"),
+            ("d", 2, "heron"),
+        ]);
+        let index = Arc::new(RecordingIndex::default());
+        let table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![
+                Arc::clone(&index) as Arc<dyn Index + Send + Sync>
+            ])),
+            Arc::new(MockTableProvider),
+        );
+
+        index_change_envelope(Ok(envelope), Arc::new(table.into()))
+            .await
+            .expect("the change batch indexes");
+
+        let ops = index.ops.lock().expect("ops lock").clone();
+        assert_eq!(
+            ops,
+            vec![("index", 1), ("index", 2), ("delete", 2)],
+            "id 1 must stay in the index and id 2 must leave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_before_a_truncate_in_one_batch_leave_the_index() {
+        // `INSERT 1; TRUNCATE; INSERT 2` reaches the index as one batch. The accelerator
+        // applies the truncate in row order and keeps only id 2.
+        let envelope =
+            keyed_change_envelope(&[("c", 1, "osprey"), ("t", 0, ""), ("c", 2, "condor")]);
+        let index = Arc::new(RecordingIndex::default());
+        let table = SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(vec![
+                Arc::clone(&index) as Arc<dyn Index + Send + Sync>
+            ])),
+            Arc::new(MockTableProvider),
+        );
+
+        index_change_envelope(Ok(envelope), Arc::new(table.into()))
+            .await
+            .expect("the change batch indexes");
+
+        let ops = index.ops.lock().expect("ops lock").clone();
+        assert_eq!(
+            ops,
+            vec![("truncate", 0), ("index", 1), ("index", 2), ("delete", 1)],
+            "id 1 was written before the truncate, so it must leave the index"
         );
     }
 }

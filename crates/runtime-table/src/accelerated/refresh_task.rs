@@ -776,8 +776,6 @@ impl RefreshTask {
                     Arc::clone(&self.accelerator),
                 );
                 context.write_lock = Arc::clone(&self.accelerator_write_mutex);
-                let federated = Arc::clone(&self.federated);
-                context.external_indexes = Arc::new(move || indexes_from_federated(&federated));
                 ChangeSink::new(
                     Arc::new(ProviderChangeSinkBackend::new(context)),
                     util::session_state::session_context(),

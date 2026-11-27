@@ -400,7 +400,7 @@ impl CayenneChangeSinkBackend {
                 .map_err(DataFusionError::from)?
             {
                 for chunk in rows.chunks(cap) {
-                    delete_index_keys(&self.context, batch, chunk, true).await?;
+                    delete_index_keys(&self.context, batch, chunk).await?;
                 }
                 self.metrics.path("inmem_delete");
                 return Ok(Some(epoch));
@@ -438,10 +438,11 @@ impl CayenneChangeSinkBackend {
                     .delete_from_cdc_fast(std::slice::from_ref(&filter))
                     .await?
                     .is_some();
-                if !native {
+                if native {
+                    delete_index_keys(&self.context, batch, chunk).await?;
+                } else {
                     self.provider.delete_filter(filter, ctx).await?;
                 }
-                delete_index_keys(&self.context, batch, chunk, native).await?;
             }
         }
         self.metrics.fixed_cost("durable_delete_apply", apply_start);

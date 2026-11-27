@@ -1229,11 +1229,6 @@ impl Builder {
             let mut context =
                 ChangeSinkContext::new(self.dataset_name.clone(), Arc::clone(&self.accelerator));
             context.write_lock = Arc::clone(&self.accelerator_write_mutex);
-            if refresh_mode != RefreshMode::Caching {
-                let federated = Arc::clone(&self.federated);
-                context.external_indexes =
-                    Arc::new(move || refresh_task::indexes_from_federated(&federated));
-            }
             let runtime = self
                 .cdc_apply_runtime
                 .as_ref()
