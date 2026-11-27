@@ -2071,12 +2071,24 @@ pub struct SnapshotFile {
     /// when `integrity_checksums` is enabled. See
     /// [`crate::provider::file_digest`].
     pub digest: Option<String>,
-    /// The file's footer statistics as its writer recorded them, serialized as
-    /// [`SnapshotFileStatistics::statistics_blob`] is, with no deletion applied.
-    /// Only a metastore whose writers record them keeps them
+    /// The file's footer statistics as its writer recorded them. Only a
+    /// metastore whose writers record them keeps them
     /// ([`crate::MetadataCatalog::records_file_statistics_with_files`]); `None`
     /// for a file written without them. With them, `row_count` is the footer's.
-    pub statistics_blob: Option<bytes::Bytes>,
+    pub recorded_statistics: Option<RecordedFileStatistics>,
+}
+
+/// A data file's footer statistics as the writer that wrote it computed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedFileStatistics {
+    /// Serialized as [`SnapshotFileStatistics::statistics_blob`] is, with no
+    /// deletion applied.
+    pub blob: bytes::Bytes,
+    /// [`crate::stats::schema_identity`] of the table schema `blob` is laid out
+    /// as. A scan of any other schema reads the file's footer instead: bounds
+    /// decode by the scan's column types, and a decimal's unscaled bounds would
+    /// decode at another scale.
+    pub schema: u64,
 }
 
 /// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).

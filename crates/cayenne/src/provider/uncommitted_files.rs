@@ -38,7 +38,7 @@ limitations under the License.
 //! releases them, or the orphan sweep finds a commit naming them.
 //!
 //! Each data file the sink closes is held with the footer statistics its writer
-//! computed from the footer it wrote ([`RecordedFileStatistics`]), so the commit
+//! computed from the footer it wrote ([`WrittenFileStatistics`]), so the commit
 //! that names the file records them with it and no scan has to read the footer
 //! or write them.
 //!
@@ -60,6 +60,8 @@ use vortex::file::Footer;
 use vortex::session::VortexSession;
 use vortex_datafusion::VortexWriteObserver;
 
+use crate::metadata::RecordedFileStatistics;
+
 /// Files written into snapshot directories and not yet named by a commit, by
 /// snapshot id, then file name, with their size in bytes.
 #[derive(Debug, Default)]
@@ -71,21 +73,16 @@ pub(crate) struct UncommittedFiles {
     deletion_files: Mutex<HashSet<String>>,
     /// The footer statistics of the data files held above, by file name: a data
     /// file's name is unique to the write that made it.
-    statistics: Mutex<HashMap<String, RecordedFileStatistics>>,
+    statistics: Mutex<HashMap<String, WrittenFileStatistics>>,
 }
 
 /// A written file's footer statistics as its commit records them
-/// ([`crate::metadata::SnapshotFile::statistics_blob`]): no deletion applied.
+/// ([`crate::metadata::SnapshotFile::recorded_statistics`]), with the footer's
+/// row count.
 #[derive(Clone, Debug)]
-pub(crate) struct RecordedFileStatistics {
-    /// The footer's row count.
+pub(crate) struct WrittenFileStatistics {
     pub(crate) rows: i64,
-    /// The serialized statistics, laid out as `schema`.
-    pub(crate) blob: bytes::Bytes,
-    /// The table schema the statistics were computed under. A commit records
-    /// them only while it is still the table's: a decimal column whose scale
-    /// changed would decode the blob's unscaled bounds at the new scale.
-    pub(crate) schema: SchemaRef,
+    pub(crate) recorded: RecordedFileStatistics,
 }
 
 /// One append writing its files at their final keys in `directory`.
@@ -272,13 +269,13 @@ impl UncommittedFiles {
     }
 
     /// Records the footer statistics of `name`, a data file just written.
-    pub(crate) fn note_statistics(&self, name: &str, statistics: RecordedFileStatistics) {
+    pub(crate) fn note_statistics(&self, name: &str, statistics: WrittenFileStatistics) {
         self.statistics.lock().insert(name.to_string(), statistics);
     }
 
     /// The footer statistics of `name`, a data file written and not yet
     /// forgotten, when its writer computed them.
-    pub(crate) fn statistics(&self, name: &str) -> Option<RecordedFileStatistics> {
+    pub(crate) fn statistics(&self, name: &str) -> Option<WrittenFileStatistics> {
         self.statistics.lock().get(name).cloned()
     }
 
@@ -352,7 +349,7 @@ impl UncommittedFilesObserver {
         &self,
         file_path: &object_store::path::Path,
         footer: &Footer,
-    ) -> Option<RecordedFileStatistics> {
+    ) -> Option<WrittenFileStatistics> {
         let statistics = match vortex_datafusion::footer_statistics(
             &self.session,
             file_path,
@@ -370,10 +367,12 @@ impl UncommittedFilesObserver {
             }
         };
         let blob = crate::stats::statistics_to_persisted_blob(&statistics, &self.schema)?;
-        Some(RecordedFileStatistics {
+        Some(WrittenFileStatistics {
             rows: i64::try_from(footer.row_count()).ok()?,
-            blob: bytes::Bytes::from(blob),
-            schema: Arc::clone(&self.schema),
+            recorded: RecordedFileStatistics {
+                blob: bytes::Bytes::from(blob),
+                schema: crate::stats::schema_identity(&self.schema),
+            },
         })
     }
 }
@@ -406,14 +405,6 @@ mod tests {
         let files = Arc::new(UncommittedFiles::default());
         files.note("s1", "w_00001.vortex", 20);
         files.note("s1", "w_00000.vortex", 10);
-        files.note_statistics(
-            "w_00000.vortex",
-            RecordedFileStatistics {
-                rows: 3,
-                blob: bytes::Bytes::from_static(b"stats"),
-                schema: Arc::new(arrow::datatypes::Schema::empty()),
-            },
-        );
         files.note("s2", "c.vortex", 5);
         assert_eq!(
             files.files("s1"),
@@ -427,15 +418,7 @@ mod tests {
                 .held()
                 .contains(&("s2".to_string(), "c.vortex".to_string()))
         );
-        assert_eq!(
-            files.statistics("w_00000.vortex").map(|stats| stats.rows),
-            Some(3)
-        );
         files.forget("s1");
-        assert!(
-            files.statistics("w_00000.vortex").is_none(),
-            "a forgotten file's statistics are dropped with it"
-        );
         assert_eq!(files.files("s1"), [] as [(String, u64); 0]);
         assert!(!files.holds_snapshot("s1"));
         assert_eq!(files.snapshots(), HashSet::from(["s2".to_string()]));

@@ -22,8 +22,8 @@ limitations under the License.
 
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
-    TableStatistics, TableStorageStats,
+    InlinedDelete, PartitionMetadata, RecordedFileStatistics, SnapshotFile, SnapshotFileStatistics,
+    TableMetadata, TableStatistics, TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -1391,15 +1391,15 @@ pub trait MetadataCatalog: Send + Sync {
     fn records_file_statistics_with_files(&self) -> bool;
 
     /// The footer statistics the writer of `file_name` (a manifest file name)
-    /// recorded with it in `snapshot_id`, with no deletion applied; `None` when
-    /// it recorded none, or the catalog does not record them
+    /// recorded with it in `snapshot_id`, with the footer's row count; `None`
+    /// when it recorded none, or the catalog does not record them
     /// ([`Self::records_file_statistics_with_files`]). Wrappers must forward this.
     async fn get_recorded_file_statistics(
         &self,
         table_id: &str,
         snapshot_id: &str,
         file_name: &str,
-    ) -> CatalogResult<Option<SnapshotFileStatistics>>;
+    ) -> CatalogResult<Option<(i64, RecordedFileStatistics)>>;
 
     /// Upsert one row of the authoritative per-snapshot data-file manifest
     /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.

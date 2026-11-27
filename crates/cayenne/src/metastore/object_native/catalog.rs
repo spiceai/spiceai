@@ -573,7 +573,7 @@ impl MetadataCatalog for ObjectNativeCatalog {
         table_id: &str,
         snapshot_id: &str,
         file_name: &str,
-    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
+    ) -> CatalogResult<Option<(i64, crate::metadata::RecordedFileStatistics)>> {
         self.for_table(table_id)
             .get_recorded_file_statistics(table_id, snapshot_id, file_name)
             .await

@@ -27,8 +27,8 @@ use crate::{
     catalog::{CatalogError, CatalogResult},
     metadata::{
         ColdTierFile, DeleteFile, DeletionType, IndexRunRecord, InlinedData, InlinedDataStats,
-        InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
-        TableStatistics, TableStorageStats,
+        InlinedDelete, PartitionMetadata, RecordedFileStatistics, SnapshotFile,
+        SnapshotFileStatistics, TableMetadata, TableStatistics, TableStorageStats,
     },
 };
 use cayenne_metastore_actions::{DatasetState, ObjRef, TableState};
@@ -348,31 +348,33 @@ impl DatasetStateReader {
                 min_sequence: f.min_seq,
                 max_sequence: f.max_seq,
                 digest: f.digest.clone(),
-                statistics_blob: f.stats.clone(),
+                recorded_statistics: f.stats.as_ref().map(|recorded| RecordedFileStatistics {
+                    blob: recorded.blob.clone(),
+                    schema: recorded.schema,
+                }),
             })
             .collect()
     }
     /// The footer statistics recorded with `file_name` in `snapshot_id`, from the
-    /// commit that added it.
+    /// commit that added it, with the footer's row count.
     pub(crate) fn get_recorded_file_statistics(
         &self,
         table_id: &str,
         snapshot_id: &str,
         file_name: &str,
-    ) -> Option<SnapshotFileStatistics> {
+    ) -> Option<(i64, RecordedFileStatistics)> {
         let file = self
             .rows(table_id)
             .files
             .get(&(Arc::from(snapshot_id), Arc::from(file_name)))?;
-        let blob = file.stats.as_ref()?;
-        Some(SnapshotFileStatistics {
-            table_id: table_id.to_string(),
-            snapshot_id: snapshot_id.to_string(),
-            file_path: file_name.to_string(),
-            file_size_bytes: file.size,
-            num_rows: file.rows,
-            statistics_blob: blob.to_vec(),
-        })
+        let recorded = file.stats.as_ref()?;
+        Some((
+            file.rows,
+            RecordedFileStatistics {
+                blob: recorded.blob.clone(),
+                schema: recorded.schema,
+            },
+        ))
     }
     pub(crate) fn get_snapshot_files(
         &self,

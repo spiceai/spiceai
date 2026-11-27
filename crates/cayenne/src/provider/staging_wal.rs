@@ -765,7 +765,7 @@ impl PreparedStagedAppend {
                         min_sequence: 0,
                         max_sequence: new_sequence,
                         digest: None,
-                        statistics_blob: recorded.map(|(_, blob)| blob),
+                        recorded_statistics: recorded.map(|(_, recorded)| recorded),
                     }
                 }),
         );
@@ -784,7 +784,7 @@ impl PreparedStagedAppend {
                         min_sequence: new_sequence,
                         max_sequence: new_sequence,
                         digest: None,
-                        statistics_blob: recorded.map(|(_, blob)| blob),
+                        recorded_statistics: recorded.map(|(_, recorded)| recorded),
                     }
                 }),
         );

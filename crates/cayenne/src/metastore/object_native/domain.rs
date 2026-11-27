@@ -955,18 +955,9 @@ impl Domain {
         drop_statistics: bool,
     ) -> CatalogResult<()> {
         let mut inner = self.inner.take().await;
-        let Some(name) = inner
-            .reader
-            .state
-            .tables
-            .get(table_id)
-            .map(|table| table.name.clone())
-        else {
+        if !inner.reader.state.tables.contains_key(table_id) {
             return Ok(());
-        };
-        let stored = inner.reader.get_table(&name).await?.schema;
-        let rebased =
-            actions::rebase_recorded_file_stats(table_id, inner.table(table_id)?, &stored, schema);
+        }
         let schema = crate::cayenne_catalog::serialize_schema_ipc_base64(schema.as_ref())?;
         let reference = inner.blob(schema.as_bytes()).await?;
         let mut batch = vec![Action::new(Kind::SetSchema(proto::SetSchema {
@@ -980,7 +971,6 @@ impl Domain {
                 Action::new(Kind::ClearColdStats(actions::table(table_id))),
             ]);
         }
-        batch.extend(rebased);
         inner.commit(batch).await
     }
 }
@@ -1131,12 +1121,6 @@ impl Inner {
                         Action::new(Kind::ClearColdStats(actions::table(&stored.table_id))),
                     ]);
                 }
-                batch.extend(actions::rebase_recorded_file_stats(
-                    &stored.table_id,
-                    self.table(&stored.table_id)?,
-                    &stored.schema,
-                    &plan.evolved_schema,
-                ));
             }
         }
         if !batch.is_empty() {

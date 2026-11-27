@@ -2869,12 +2869,11 @@ async fn scans_read_persisted_statistics_while_a_statistics_write_is_held() {
     assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(250));
 }
 
-/// A cold scan serves a file from the statistics its writer recorded, reading
-/// no footer and adding no statistics blob, and a widening between a provider's
-/// open and its scan keeps them in use: no decimal scale changed, so they decode
-/// against the wider schema.
+/// Statistics recorded under one schema are not used by a scan of another: a
+/// cold scan serves the file from the statistics its writer recorded and adds
+/// no blob, and after the table widens the scan reads the file's footer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recorded_statistics_add_no_blob_and_survive_a_widening() {
+async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
     const ROWS: i64 = 200;
     let name = "widened_during_read";
     let (faults, fixture) = fault_fixture().await;
@@ -2951,8 +2950,8 @@ async fn recorded_statistics_add_no_blob_and_survive_a_widening() {
     let counters = table.scan_file_statistics_counters();
     assert_eq!(
         (counters.persisted_hits, counters.footer_reads),
-        (1, 0),
-        "the widened table's file is served from its recorded statistics: {counters:?}"
+        (0, 1),
+        "the statistics recorded before the widening are not used; the footer is: {counters:?}"
     );
 }
 

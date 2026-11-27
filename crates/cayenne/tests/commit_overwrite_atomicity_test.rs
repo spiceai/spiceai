@@ -787,7 +787,7 @@ fn manifest_rows(table_id: &str, snapshot_id: &str, files: &[&str]) -> Vec<Snaps
             min_sequence: n,
             max_sequence: n,
             digest: Some(format!("xxh3-128:{n:032x}")),
-            statistics_blob: None,
+            recorded_statistics: None,
         })
         .collect()
 }

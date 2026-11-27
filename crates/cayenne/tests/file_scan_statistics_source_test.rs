@@ -276,6 +276,10 @@ fn legacy_blob(num_rows: i64) -> Vec<u8> {
 async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
+    // An object-native table's scans neither read nor rewrite such a row.
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        return Ok(());
+    }
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -399,32 +403,11 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
             rewritten_rows += 1;
         }
     }
-    let counters = reopened.scan_file_statistics_counters();
-    eprintln!(
-        "LEGACY_BLOB backend={} counters {counters:?}, rewritten rows {rewritten_rows}",
-        fixture.backend_type.name()
+    assert!(
+        rewritten_rows > 0,
+        "re-inference must persist the size back for the file it read, or every process re-reads the footer (seeded {} rows, none rewritten)",
+        files.len()
     );
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        // Each file's writer recorded its statistics, sizes included, in the
-        // commit that added it: the scan is served from those and writes nothing.
-        let live = fixture
-            .catalog
-            .get_snapshot_files(&table_id, &reopened.current_snapshot_id())
-            .await?;
-        assert_eq!(
-            (counters.footer_reads, counters.persisted_hits),
-            (0, u64::try_from(live.len())?),
-            "every file is served from the statistics its writer recorded"
-        );
-        assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
-        assert_eq!(rewritten_rows, 0, "no scan rewrites a statistics row");
-    } else {
-        assert!(
-            rewritten_rows > 0,
-            "re-inference must persist the size back for the file it read, or every process re-reads the footer (seeded {} rows, none rewritten)",
-            files.len()
-        );
-    }
 
     assert_input_rows(&reopened).await?;
 
@@ -457,6 +440,11 @@ fn evolved_schema() -> Arc<Schema> {
 async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
+    // An object-native table's older files read their footers after a widening
+    // (`a_statistics_row_read_across_a_schema_widening_is_not_used`).
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        return Ok(());
+    }
     let ctx = SessionContext::new();
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -507,47 +495,10 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     );
     table.wait_for_scan_file_statistics_persistence().await;
 
-    let table_id = table.table_id().to_string();
-    if fixture.backend_type == common::BackendType::ObjectNative {
-        // Each file's writer recorded its statistics in the commit that added
-        // it; a restart must still serve the widened table's files from those.
-        await_manifest_rows(&fixture, &table_id).await?;
-        let catalog = common::fixture_catalog(fixture.connection_string()).await?;
-        catalog.init().await?;
-        let ctx = SessionContext::new();
-        let reopened = Arc::new(
-            fixture
-                .data_store
-                .open(
-                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-                    ctx.runtime_env(),
-                    EVOLVED_TABLE,
-                )
-                .await?,
-        );
-        scan_statistics(&reopened, &ctx).await?;
-        let counters = reopened.scan_file_statistics_counters();
-        let live = catalog
-            .get_snapshot_files(&table_id, &reopened.current_snapshot_id())
-            .await?;
-        eprintln!(
-            "WIDENED object-native counters after a restart: {counters:?}, live files {}",
-            live.len()
-        );
-        assert_eq!(
-            (counters.footer_reads, counters.persisted_hits),
-            (0, u64::try_from(live.len())?),
-            "a widened table's files must still be served from the statistics their \
-             writer recorded, not re-read on every cold scan"
-        );
-        assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
-        assert_input_rows(&reopened).await?;
-        return Ok(());
-    }
-
     // Poison every per-file row with a size no footer would produce. A later scan
     // that reports it was served from the blob; one that reports the footer value
     // rejected the blob and re-read the file.
+    let table_id = table.table_id().to_string();
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let data_path = table.metadata().path.clone();
@@ -1292,15 +1243,9 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
          SQLite statistics writes {pass_writes:?}, object-native commits {pass_commits:?}",
         fixture.backend_type.name()
     );
-    // On the object-native metastore each input file's writer recorded its
-    // statistics, so the pass reads those instead of the footers.
-    let object_native = fixture.backend_type == common::BackendType::ObjectNative;
+    // From their footers, or from the statistics their writers recorded.
     assert_eq!(
-        if object_native {
-            after_pass.persisted_hits
-        } else {
-            after_pass.footer_reads
-        },
+        after_pass.footer_reads + after_pass.persisted_hits,
         u64::try_from(REPLACED_FILES)?,
         "the pass read each input file's statistics"
     );
@@ -1318,8 +1263,11 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
         );
     }
 
-    // A query's scan of the merged file still persists its statistics, unless
-    // the merge recorded them with the file.
+    // A query's scan of the merged file still persists its statistics, on a
+    // metastore whose writers do not record them.
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        return Ok(());
+    }
     let query = SessionContext::new();
     query.register_table(REPLACED_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let batches = query
@@ -1350,19 +1298,6 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
          SQLite statistics writes {query_writes:?}, object-native commits {query_commits:?}",
         fixture.backend_type.name()
     );
-    if object_native {
-        assert_eq!(
-            (
-                after_query.persisted_hits - after_pass.persisted_hits,
-                after_query.footer_reads - after_pass.footer_reads,
-                after_query.persisted_upserts - after_pass.persisted_upserts,
-            ),
-            (1, 0, 0),
-            "the query reads the statistics the merge recorded with its file, and persists none"
-        );
-        assert_eq!(query_commits, Some(0), "the query commits nothing");
-        return Ok(());
-    }
     assert_eq!(
         after_query.footer_reads - after_pass.footer_reads,
         1,

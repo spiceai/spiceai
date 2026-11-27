@@ -188,7 +188,7 @@ impl MetadataCatalog for Domain {
         table_id: &str,
         snapshot_id: &str,
         file_name: &str,
-    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
+    ) -> CatalogResult<Option<(i64, crate::metadata::RecordedFileStatistics)>> {
         Ok(self
             .read()
             .await?

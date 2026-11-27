@@ -2127,7 +2127,7 @@ async fn an_auto_table_is_sized_by_its_live_snapshots_not_the_storage_figures() 
             min_sequence: 1,
             max_sequence: 1,
             digest: None,
-            statistics_blob: None,
+            recorded_statistics: None,
         })
         .await
         .expect("register its file");

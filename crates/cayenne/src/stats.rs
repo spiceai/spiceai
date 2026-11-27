@@ -734,42 +734,27 @@ pub(crate) fn restore_persisted_statistics(
     })
 }
 
-/// `blob`, statistics of a file with `num_rows` rows laid out as `stored`,
-/// laid out again as `evolved`, a widening of it: each column keeps its
-/// statistics by name, rebased onto its widened type (a decimal bound rescaled,
-/// one that cannot be represented dropped), and a column `stored` lacks has
-/// none. `None` when the blob does not decode against `stored` or predates NaN
-/// accounting, so the file's scans read its footer instead.
-pub(crate) fn rebase_persisted_statistics(
-    blob: &[u8],
-    num_rows: i64,
-    stored: &Schema,
-    evolved: &Schema,
-) -> Option<Vec<u8>> {
-    let restored = restore_persisted_statistics(blob, stored, num_rows)?;
-    if !restored.accounts_for_nan {
-        return None;
+/// A stable identity of `schema` for the statistics laid out as it: the first
+/// eight bytes of a BLAKE3 digest over each column's name, type and
+/// nullability, in order, which are what the layout and decoding of statistics
+/// depend on. Field metadata is left out. A build whose types print differently
+/// gives a schema another identity, which only sends a file's scans to its
+/// footer.
+#[must_use]
+pub(crate) fn schema_identity(schema: &Schema) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for field in schema.fields() {
+        let data_type = format!("{:?}", field.data_type());
+        for part in [field.name().as_bytes(), data_type.as_bytes()] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        hasher.update(&[u8::from(field.is_nullable())]);
     }
-    let column_statistics = evolved
-        .fields()
-        .iter()
-        .map(|field| {
-            stored
-                .index_of(field.name())
-                .ok()
-                .and_then(|index| restored.statistics.column_statistics.get(index))
-                .cloned()
-                .unwrap_or_else(ColumnStatistics::new_unknown)
-        })
-        .collect();
-    statistics_to_persisted_blob(
-        &Statistics {
-            num_rows: restored.statistics.num_rows,
-            total_byte_size: Precision::Absent,
-            column_statistics,
-        },
-        evolved,
-    )
+    let digest = hasher.finalize();
+    let mut identity = [0_u8; 8];
+    identity.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(identity)
 }
 
 /// Whether a restored blob was written by a build that persists per-column byte

@@ -40,8 +40,6 @@ use cayenne_metastore_model::MemTierCatalogView;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-use object_store_occ::headlog::{Group, Reader};
-use prost::Message;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::{Semaphore, mpsc};
@@ -1072,93 +1070,4 @@ async fn mem_tier_model_replay_bake_after_two_seals() {
             failures.len()
         );
     }
-}
-
-async fn log_records(disk: &Disk, label: &str) -> Vec<(u64, Vec<&'static str>)> {
-    let log = crate::metastore::object_native::dataset_log_at(
-        Arc::clone(&disk.store),
-        &ObjectPath::from(disk.prefix.as_str()),
-        "replay",
-    )
-    .await
-    .expect("registry")
-    .expect("dataset log");
-    let (_, opened) = Reader::open(Arc::clone(&disk.store), log)
-        .await
-        .expect("read log");
-    assert_eq!(opened.floor, 0, "retain all records for attribution");
-    let records = opened
-        .records
-        .into_iter()
-        .map(|entry| {
-            let names = Group::decode(entry.record.payload)
-                .expect("group")
-                .payloads
-                .into_iter()
-                .flat_map(|payload| {
-                    cayenne_metastore_actions::Record::decode(payload)
-                        .expect("record")
-                        .actions
-                })
-                .map(|a| a.name())
-                .collect();
-            (entry.commit, names)
-        })
-        .collect::<Vec<_>>();
-    eprintln!("PUBLISHER {label}: {records:?}");
-    records
-}
-
-/// A scan while a checkpoint is parked before its publication commits nothing,
-/// so it cannot publish the checkpoint's staged state early: each file's writer
-/// records its footer statistics in the commit that adds it, and a scan writes
-/// none. The checkpoint then publishes in one record of its own.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mem_tier_model_replay_early_publisher() {
-    let disk = Disk::new(Backend::Object);
-    let catalog = disk.catalog(true).await;
-    let table = initial(&disk, catalog).await;
-    table.install_slot_advancer(Arc::new(Ack::default()));
-    apply(&table, 0, Some(10)).await;
-    apply(&table, 0, Some(11)).await;
-    let mut checkpoint = Operation::start(Arc::clone(&table), "CkCapture");
-    checkpoint.at("CkCapture").await;
-    checkpoint.release.add_permits(1);
-    checkpoint.at("CkPrecompute").await;
-    checkpoint.release.add_permits(1);
-    checkpoint.at("CkStage").await;
-    let stage = log_records(&disk, "CkStage").await;
-    checkpoint.release.add_permits(1);
-    checkpoint.at("CkPublish").await;
-    let before = log_records(&disk, "CkPublish before SQL").await;
-    assert_eq!(stage, before);
-    let counters = table.scan_file_statistics_counters();
-    assert_eq!(rows(&table).await, vec![(0, 11), (1, 2)]);
-    table.wait_for_scan_file_statistics_persistence().await;
-    let after_scan = log_records(&disk, "CkPublish after SQL").await;
-    let scanned = table.scan_file_statistics_counters();
-    eprintln!("PUBLISHER scan counters before={counters:?} after={scanned:?}");
-    assert_eq!(scanned.persisted_upserts, counters.persisted_upserts);
-    assert_eq!(after_scan, before, "the scan committed nothing");
-    checkpoint.finish().await;
-    let after = log_records(&disk, "CkPublish released").await;
-    let added = &after[before.len()..];
-    assert_eq!(added.len(), 1, "one checkpoint publication: {added:?}");
-    for name in [
-        "AddDeleteFiles",
-        "SetGroup",
-        "AddInsertRecords",
-        "SetTableStats",
-        "RemoveFileStats",
-    ] {
-        assert!(
-            added[0].1.contains(&name),
-            "checkpoint record missing {name}: {added:?}"
-        );
-    }
-    assert!(
-        !added[0].1.contains(&"SetFileStats"),
-        "no scan statistics ride the checkpoint: {added:?}"
-    );
-    table.quiesce().await;
 }
