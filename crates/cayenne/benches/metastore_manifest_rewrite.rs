@@ -261,6 +261,7 @@ fn manifest(table_id: &str, snapshot_id: &str, n: usize) -> Vec<SnapshotFile> {
             min_sequence: 0,
             max_sequence: i as i64,
             digest: Some(format!("xxh3-128:{i:032x}")),
+            statistics_blob: None,
         })
         .collect()
 }

@@ -183,6 +183,17 @@ impl MetadataCatalog for Domain {
             .get_snapshot_file_statistics(table_id, snapshot_id, file_path)
             .await
     }
+    async fn get_recorded_file_statistics(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_name: &str,
+    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
+        Ok(self
+            .read()
+            .await?
+            .get_recorded_file_statistics(table_id, snapshot_id, file_name))
+    }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         Ok(self.read().await?.get_all_snapshot_files(table_id))
     }
@@ -1384,6 +1395,9 @@ impl MetadataCatalog for Domain {
         Err(CatalogError::NotImplemented {
             function: "object-native: import_dataset_slice".to_string(),
         })
+    }
+    fn records_file_statistics_with_files(&self) -> bool {
+        true
     }
     fn keeps_retirement_record(&self) -> bool {
         true

@@ -2109,6 +2109,19 @@ struct ColdTierBranch {
     max_sequence_column: Option<usize>,
 }
 
+/// `statistics` of the file `object` adjusted for the rows `format` hides, as
+/// its `infer_stats` adjusts a footer's. A format other than Vortex hides none.
+fn adjust_file_statistics_for_deletions(
+    format: &dyn FileFormat,
+    object: &ObjectMeta,
+    statistics: Statistics,
+) -> Statistics {
+    match format.downcast_ref::<VortexFormat>() {
+        Some(vortex) => vortex.adjust_statistics(object, statistics),
+        None => statistics,
+    }
+}
+
 /// Whether any tombstone in `deletion_snapshot` is newer than some of
 /// `cold_files` — the only case in which the cold branch needs a deletion
 /// filter (see [`ColdTierBranch`]).
@@ -9978,15 +9991,19 @@ impl CayenneTableProvider {
             .unwrap_or(0);
         let rows: Vec<SnapshotFile> = files
             .iter()
-            .map(|(file_path, size)| SnapshotFile {
-                table_id: table_id.clone(),
-                snapshot_id: snapshot_id.to_string(),
-                file_path: file_path.clone(),
-                row_count: 0,
-                file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
-                min_sequence: 0,
-                max_sequence,
-                digest: None,
+            .map(|(file_path, size)| {
+                let recorded = self.recorded_file_statistics(file_path);
+                SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.to_string(),
+                    file_path: file_path.clone(),
+                    row_count: recorded.as_ref().map_or(0, |(rows, _)| *rows),
+                    file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
+                    min_sequence: 0,
+                    max_sequence,
+                    digest: None,
+                    statistics_blob: recorded.map(|(_, blob)| blob),
+                }
             })
             .collect();
         self.catalog
@@ -13630,9 +13647,14 @@ impl CayenneTableProvider {
                 }
             }
 
-            fn file_written(&self, file_path: &object_store::path::Path, size: u64) {
+            fn file_written(
+                &self,
+                file_path: &object_store::path::Path,
+                size: u64,
+                footer: &vortex::file::Footer,
+            ) {
                 for observer in &self.0 {
-                    observer.file_written(file_path, size);
+                    observer.file_written(file_path, size, footer);
                 }
             }
         }
@@ -13824,6 +13846,8 @@ impl CayenneTableProvider {
                 super::uncommitted_files::UncommittedFilesObserver {
                     files: Arc::clone(&self.uncommitted_files),
                     snapshot_id: snapshot_id.to_string(),
+                    session: write_format.session().clone(),
+                    schema: self.table_schema(),
                 },
             ));
         }
@@ -28094,15 +28118,21 @@ impl CayenneTableProvider {
         // existing ranges could clobber a compaction-authored merged `[min, max]`
         // with the per-file fallback and overstate `min_sequence` (an unsafe
         // reference-in-place input for the seq-prefix bake).
-        let existing: std::collections::HashMap<String, (i64, i64, Option<String>)> = match tag {
-            ManifestSequenceTag::PreserveOrUniform { .. } => self
-                .catalog
+        //
+        // A catalog that records footer statistics with the files reads it for
+        // `Uniform` too: a file the snapshot already names keeps the statistics
+        // its writer recorded.
+        let read_existing = matches!(tag, ManifestSequenceTag::PreserveOrUniform { .. })
+            || self.catalog.records_file_statistics_with_files();
+        let existing: std::collections::HashMap<String, SnapshotFile> = if read_existing {
+            self.catalog
                 .get_snapshot_files(&table_id, snapshot_id)
                 .await?
                 .into_iter()
-                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence, f.digest)))
-                .collect(),
-            ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
+                .map(|f| (f.file_path.clone(), f))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
         };
 
         // A per-file integrity digest is computed only when the feature is
@@ -28122,8 +28152,8 @@ impl CayenneTableProvider {
                 // bake-eligible, never wrongly referenced, never resurrecting a
                 // deleted row).
                 ManifestSequenceTag::PreserveOrUniform { min, max } => existing_entry
-                    .map_or((min, max), |(existing_min, existing_max, _)| {
-                        (*existing_min, *existing_max)
+                    .map_or((min, max), |existing| {
+                        (existing.min_sequence, existing.max_sequence)
                     }),
             };
             replacement.push(
@@ -28132,7 +28162,7 @@ impl CayenneTableProvider {
                     file_name,
                     *size,
                     (min_sequence, max_sequence),
-                    existing_entry.and_then(|(_, _, digest)| digest.clone()),
+                    existing_entry,
                 )
                 .await,
             );
@@ -28166,27 +28196,41 @@ impl CayenneTableProvider {
     }
 
     /// The manifest row of `file_name` (`size` bytes) in `snapshot_id`, tagged
-    /// with the commit-sequence range `sequences`.
+    /// with the commit-sequence range `sequences`. `existing` is the snapshot's
+    /// committed row for the file, if it names it already.
     async fn manifest_row(
         &self,
         snapshot_id: &str,
         file_name: &str,
         size: u64,
         (min_sequence, max_sequence): (i64, i64),
-        existing_digest: Option<String>,
+        existing: Option<&SnapshotFile>,
     ) -> SnapshotFile {
         let table_id = self.table_metadata.table_id.clone();
-        // Reuse the per-file footer row count when the scan path already
-        // persisted it for this exact (snapshot, file); the manifest entry is
-        // a hint until the manifest becomes the scan's file source, so a 0
-        // here is correct-but-imprecise, never wrong.
-        let row_count = self
-            .catalog
-            .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
-            .await
-            .ok()
-            .flatten()
-            .map_or(0, |stats| stats.num_rows);
+        let existing_digest = existing.and_then(|row| row.digest.clone());
+        // The footer statistics the file's writer computed, or that the
+        // snapshot already records with it, with the footer's row count.
+        let recorded = self.recorded_file_statistics(file_name).or_else(|| {
+            existing.and_then(|row| {
+                row.statistics_blob
+                    .clone()
+                    .map(|blob| (row.row_count, blob))
+            })
+        });
+        // Otherwise reuse the per-file footer row count when the scan path
+        // already persisted it for this exact (snapshot, file); the manifest
+        // entry is a hint until the manifest becomes the scan's file source, so
+        // a 0 here is correct-but-imprecise, never wrong.
+        let row_count = match &recorded {
+            Some((rows, _)) => *rows,
+            None => self
+                .catalog
+                .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
+                .await
+                .ok()
+                .flatten()
+                .map_or(0, |stats| stats.num_rows),
+        };
 
         // Reuse a digest a prior flush already recorded for this immutable
         // file (preserved even when the feature is now off, so toggling off
@@ -28224,7 +28268,22 @@ impl CayenneTableProvider {
             min_sequence,
             max_sequence,
             digest,
+            statistics_blob: recorded.map(|(_, blob)| blob),
         }
+    }
+
+    /// The footer statistics the writer of `file_name`, a file this process
+    /// wrote and no commit names yet, computed for its commit to record, with
+    /// the footer's row count: only for a catalog that records them, and only
+    /// while the schema they were computed under is still the table's.
+    pub(crate) fn recorded_file_statistics(&self, file_name: &str) -> Option<(i64, bytes::Bytes)> {
+        if !self.catalog.records_file_statistics_with_files() {
+            return None;
+        }
+        self.uncommitted_files
+            .statistics(file_name)
+            .filter(|statistics| statistics.schema.as_ref() == self.table_schema().as_ref())
+            .map(|statistics| (statistics.rows, statistics.blob))
     }
 
     /// The manifest rows of `files`, written at their final keys into
@@ -46137,6 +46196,7 @@ impl CayenneTableProvider {
                             min_sequence: 0,
                             max_sequence: 0,
                             digest: None,
+                            statistics_blob: None,
                         });
                     }
                 }
@@ -46668,9 +46728,29 @@ impl CayenneTableProvider {
         // never a newer one; it is decoded against `table_schema`. A schema that
         // changed during the read never returns to `table_schema`, so the row is
         // not used. Footer I/O below stays outside the lock.
+        //
+        // A catalog that records each file's footer statistics in the commit that
+        // adds it serves those, by the file's manifest name, and this scan writes
+        // nothing: a file recorded without them is read from its footer.
+        let recorded_with_files = self.catalog.records_file_statistics_with_files();
         let persisted =
             if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
                 None
+            } else if recorded_with_files {
+                match part_file.object_meta.location.filename() {
+                    Some(file_name) => self
+                        .catalog
+                        .get_recorded_file_statistics(
+                            &self.table_metadata.table_id,
+                            request.snapshot_id,
+                            file_name,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|_| table_schema.as_ref() == self.table_schema().as_ref()),
+                    None => None,
+                }
             } else {
                 self.catalog
                     .get_snapshot_file_statistics(
@@ -46703,7 +46783,18 @@ impl CayenneTableProvider {
             && crate::stats::blob_carries_per_column_byte_sizes(&restored.statistics)
         {
             self.scan_file_statistics_flights.record_persisted_hit();
-            let statistics = restored.statistics;
+            // A writer records its file's statistics with no deletion applied, so
+            // they are adjusted here as a footer read's are; a row a scan
+            // persisted was adjusted when that scan read the footer.
+            let statistics = if recorded_with_files {
+                Arc::new(adjust_file_statistics_for_deletions(
+                    request.format,
+                    &part_file.object_meta,
+                    Statistics::clone(&restored.statistics),
+                ))
+            } else {
+                restored.statistics
+            };
             self.publish_scan_file_statistics(request, &statistics);
             return Ok(statistics);
         }
@@ -46721,11 +46812,12 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        let persist = request
-            .state
-            .config()
-            .get_extension::<ReplacedFilesScan>()
-            .is_none();
+        let persist = !recorded_with_files
+            && request
+                .state
+                .config()
+                .get_extension::<ReplacedFilesScan>()
+                .is_none();
         if persist
             && let Some(blob) =
                 crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
@@ -68465,6 +68557,7 @@ mod tests {
                 min_sequence: 0,
                 max_sequence: 0,
                 digest: None,
+                statistics_blob: None,
             })
             .await
             .expect("seed a sentinel manifest row");
@@ -68643,6 +68736,7 @@ mod tests {
                     min_sequence: seq,
                     max_sequence: seq,
                     digest: None,
+                    statistics_blob: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -68709,6 +68803,7 @@ mod tests {
                     min_sequence: min_seq,
                     max_sequence: max_seq,
                     digest: None,
+                    statistics_blob: None,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -68887,6 +68982,7 @@ mod tests {
                         min_sequence: seq,
                         max_sequence: seq,
                         digest: None,
+                        statistics_blob: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -69796,6 +69892,7 @@ mod tests {
                         min_sequence: seq,
                         max_sequence: seq,
                         digest: None,
+                        statistics_blob: None,
                     })
                     .await
                     .expect("pin manifest sequence");
@@ -70904,6 +71001,7 @@ mod tests {
                         min_sequence: seq,
                         max_sequence: seq,
                         digest: None,
+                        statistics_blob: None,
                     })
                     .await
                     .expect("re-pin manifest sequence");
@@ -71010,6 +71108,7 @@ mod tests {
                     min_sequence: 5, // <= T=20: the write-range trap
                     max_sequence: 5,
                     digest: None,
+                    statistics_blob: None,
                 })
                 .await
                 .expect("pin low write-range");
@@ -71586,6 +71685,7 @@ mod tests {
             min_sequence: 1,
             max_sequence: 1,
             digest: None,
+            statistics_blob: None,
         };
         let all_rows = vec![
             // current snapshot owns one file...
@@ -71635,6 +71735,7 @@ mod tests {
             min_sequence: 1,
             max_sequence: 1,
             digest: None,
+            statistics_blob: None,
         };
         for row in [
             mk("snapA", "a0.vortex"),

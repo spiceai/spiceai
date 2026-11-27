@@ -59,6 +59,12 @@ pub struct FileEntry {
     pub max_seq: i64,
     #[prost(string, optional, tag = "6")]
     pub digest: Option<String>,
+    /// The file's footer statistics, recorded by the writer that wrote it, in
+    /// the encoding a `FileStat` blob holds, with no deletion applied. With
+    /// them, `rows` is the footer's row count. Absent for a file recorded
+    /// without them, whose scans read its footer.
+    #[prost(bytes = "bytes", optional, tag = "7")]
+    pub stats: Option<prost::bytes::Bytes>,
 }
 
 /// One deletion vector (`cayenne_delete_file`).

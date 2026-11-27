@@ -1435,8 +1435,9 @@ mod data_path {
         for nth in 1..=4 {
             fired += usize::from(keyed_upsert_after_a_background_reopen(nth, true).await);
         }
-        assert!(
-            fired >= 2,
+        // The upsert commits once: its scans of the table commit nothing.
+        assert_eq!(
+            fired, 1,
             "the upsert's commits lost their responses ({fired} fired)"
         );
     }
@@ -1448,8 +1449,9 @@ mod data_path {
         for nth in 1..=4 {
             fired += usize::from(keyed_upsert_after_a_background_reopen(nth, false).await);
         }
-        assert!(
-            fired >= 2,
+        // The upsert commits once: its scans of the table commit nothing.
+        assert_eq!(
+            fired, 1,
             "the upsert's commits failed unconfirmed ({fired} fired)"
         );
     }

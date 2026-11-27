@@ -909,6 +909,11 @@ async fn suite(backend: Backend) {
         );
     }
     eprintln!("{backend:?} {counts:?}");
+    // A scan commits nothing, so no publication lands ahead of the model's.
+    assert_eq!(
+        counts.matched_durable_plus_pending, 0,
+        "no state is published early"
+    );
     assert_eq!(counts.bakes_declined, 0, "enabled model bakes must commit");
     assert!(
         counts.bakes_committed > 0 && counts.bake_pruned_entries > 0,
@@ -1104,8 +1109,10 @@ async fn log_records(disk: &Disk, label: &str) -> Vec<(u64, Vec<&'static str>)> 
     records
 }
 
-/// Isolate the footer-statistics task instead of inferring its publication from
-/// a row scan that has already returned. The checkpoint remains parked throughout.
+/// A scan while a checkpoint is parked before its publication commits nothing,
+/// so it cannot publish the checkpoint's staged state early: each file's writer
+/// records its footer statistics in the commit that adds it, and a scan writes
+/// none. The checkpoint then publishes in one record of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mem_tier_model_replay_early_publisher() {
     let disk = Disk::new(Backend::Object);
@@ -1125,47 +1132,18 @@ async fn mem_tier_model_replay_early_publisher() {
     checkpoint.at("CkPublish").await;
     let before = log_records(&disk, "CkPublish before SQL").await;
     assert_eq!(stage, before);
-    let (entered, arrived) = tokio::sync::oneshot::channel();
-    let release = Arc::new(Semaphore::new(0));
-    let gate = Arc::clone(&release);
-    *table.test_file_statistics_publish_hook.lock() = Some(Box::new(move || {
-        Box::pin(async move {
-            entered.send(()).expect("driver");
-            gate.acquire()
-                .await
-                .expect("release footer statistics")
-                .forget();
-        })
-    }));
     let counters = table.scan_file_statistics_counters();
-    let scan = {
-        let table = Arc::clone(&table);
-        tokio::spawn(async move { rows(&table).await })
-    };
-    tokio::time::timeout(Duration::from_secs(30), arrived)
-        .await
-        .expect("footer hook reached")
-        .expect("footer hook");
-    let parked = log_records(
-        &disk,
-        "CkPublish SQL parked before persist_scan_file_statistics",
-    )
-    .await;
-    assert_eq!(before, parked);
-    release.add_permits(1);
-    assert_eq!(scan.await.expect("SQL scan"), vec![(0, 11), (1, 2)]);
-    let after = log_records(&disk, "CkPublish after footer task drained").await;
-    let persisted =
-        table.scan_file_statistics_counters().persisted_upserts - counters.persisted_upserts;
-    eprintln!("PUBLISHER detached footer persisted_upserts={persisted}");
-    assert!(persisted > 0);
+    assert_eq!(rows(&table).await, vec![(0, 11), (1, 2)]);
+    table.wait_for_scan_file_statistics_persistence().await;
+    let after_scan = log_records(&disk, "CkPublish after SQL").await;
+    let scanned = table.scan_file_statistics_counters();
+    eprintln!("PUBLISHER scan counters before={counters:?} after={scanned:?}");
+    assert_eq!(scanned.persisted_upserts, counters.persisted_upserts);
+    assert_eq!(after_scan, before, "the scan committed nothing");
+    checkpoint.finish().await;
+    let after = log_records(&disk, "CkPublish released").await;
     let added = &after[before.len()..];
-    assert_ne!(added.len(), 0, "{added:?}");
-    let checkpoints = added
-        .iter()
-        .filter(|(_, actions)| actions.contains(&"SetGroup"))
-        .collect::<Vec<_>>();
-    assert_eq!(checkpoints.len(), 1, "one checkpoint publication");
+    assert_eq!(added.len(), 1, "one checkpoint publication: {added:?}");
     for name in [
         "AddDeleteFiles",
         "SetGroup",
@@ -1174,15 +1152,13 @@ async fn mem_tier_model_replay_early_publisher() {
         "RemoveFileStats",
     ] {
         assert!(
-            checkpoints[0].1.contains(&name),
+            added[0].1.contains(&name),
             "checkpoint record missing {name}: {added:?}"
         );
     }
     assert!(
-        added
-            .iter()
-            .any(|(_, actions)| actions.contains(&"SetFileStats"))
+        !added[0].1.contains(&"SetFileStats"),
+        "no scan statistics ride the checkpoint: {added:?}"
     );
-    checkpoint.cancel().await;
     table.quiesce().await;
 }

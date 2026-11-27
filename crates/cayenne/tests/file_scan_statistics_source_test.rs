@@ -399,11 +399,32 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
             rewritten_rows += 1;
         }
     }
-    assert!(
-        rewritten_rows > 0,
-        "re-inference must persist the size back for the file it read, or every process re-reads the footer (seeded {} rows, none rewritten)",
-        files.len()
+    let counters = reopened.scan_file_statistics_counters();
+    eprintln!(
+        "LEGACY_BLOB backend={} counters {counters:?}, rewritten rows {rewritten_rows}",
+        fixture.backend_type.name()
     );
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        // Each file's writer recorded its statistics, sizes included, in the
+        // commit that added it: the scan is served from those and writes nothing.
+        let live = fixture
+            .catalog
+            .get_snapshot_files(&table_id, &reopened.current_snapshot_id())
+            .await?;
+        assert_eq!(
+            (counters.footer_reads, counters.persisted_hits),
+            (0, u64::try_from(live.len())?),
+            "every file is served from the statistics its writer recorded"
+        );
+        assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
+        assert_eq!(rewritten_rows, 0, "no scan rewrites a statistics row");
+    } else {
+        assert!(
+            rewritten_rows > 0,
+            "re-inference must persist the size back for the file it read, or every process re-reads the footer (seeded {} rows, none rewritten)",
+            files.len()
+        );
+    }
 
     assert_input_rows(&reopened).await?;
 
@@ -486,10 +507,47 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     );
     table.wait_for_scan_file_statistics_persistence().await;
 
+    let table_id = table.table_id().to_string();
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        // Each file's writer recorded its statistics in the commit that added
+        // it; a restart must still serve the widened table's files from those.
+        await_manifest_rows(&fixture, &table_id).await?;
+        let catalog = common::fixture_catalog(fixture.connection_string()).await?;
+        catalog.init().await?;
+        let ctx = SessionContext::new();
+        let reopened = Arc::new(
+            fixture
+                .data_store
+                .open(
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    ctx.runtime_env(),
+                    EVOLVED_TABLE,
+                )
+                .await?,
+        );
+        scan_statistics(&reopened, &ctx).await?;
+        let counters = reopened.scan_file_statistics_counters();
+        let live = catalog
+            .get_snapshot_files(&table_id, &reopened.current_snapshot_id())
+            .await?;
+        eprintln!(
+            "WIDENED object-native counters after a restart: {counters:?}, live files {}",
+            live.len()
+        );
+        assert_eq!(
+            (counters.footer_reads, counters.persisted_hits),
+            (0, u64::try_from(live.len())?),
+            "a widened table's files must still be served from the statistics their \
+             writer recorded, not re-read on every cold scan"
+        );
+        assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
+        assert_input_rows(&reopened).await?;
+        return Ok(());
+    }
+
     // Poison every per-file row with a size no footer would produce. A later scan
     // that reports it was served from the blob; one that reports the footer value
     // rejected the blob and re-read the file.
-    let table_id = table.table_id().to_string();
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let data_path = table.metadata().path.clone();
@@ -584,32 +642,37 @@ const ROWS_PER_FILE: i64 = 256;
 const CONCURRENT_SCANS: usize = 6;
 
 /// A primary-key-less table whose current snapshot holds `SINGLE_FLIGHT_FILES`
-/// Vortex files, with no persisted statistics rows. Returns the table id.
-async fn write_multi_file_table(fixture: &common::TestFixture) -> TestResult<String> {
+/// Vortex files, with no persisted statistics rows. Returns the table id, and
+/// the provider that wrote it with its session.
+async fn write_multi_file_table(
+    fixture: &common::TestFixture,
+) -> TestResult<(String, Arc<CayenneTableProvider>, SessionContext)> {
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: SINGLE_FLIGHT_TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    // One Vortex file per insert, and nothing to merge them.
-                    inline_max_rows: 0,
-                    inline_max_bytes: 0,
-                    inline_max_buffer_bytes: 0,
-                    compaction_trigger_files: 64,
-                    compaction_background_interval_ms: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: SINGLE_FLIGHT_TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(SINGLE_FLIGHT_TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        // One Vortex file per insert, and nothing to merge them.
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        compaction_trigger_files: 64,
+                        compaction_background_interval_ms: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     for file in 0..SINGLE_FLIGHT_FILES {
         let start = i64::try_from(file)? * ROWS_PER_FILE;
@@ -631,7 +694,7 @@ async fn write_multi_file_table(fixture: &common::TestFixture) -> TestResult<Str
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Ok(table_id)
+    Ok((table_id, table, ctx))
 }
 
 /// Counts the reads of each Vortex file, so a test can see how many times a
@@ -724,13 +787,15 @@ impl object_store::ObjectStore for FooterReadCounter {
 
 /// A provider over the fixture's metastore with every cache cold — a fresh
 /// catalog connection, a fresh provider, and a runtime that keeps no footers —
-/// whose reads go through a fresh [`FooterReadCounter`].
+/// whose reads go through a fresh [`FooterReadCounter`]. On the object-native
+/// metastore the table reads through the fixture's own store instead, and no
+/// counter is returned.
 async fn open_cold(
     fixture: &common::TestFixture,
 ) -> TestResult<(
     Arc<CayenneTableProvider>,
     SessionContext,
-    Arc<FooterReadCounter>,
+    Option<Arc<FooterReadCounter>>,
 )> {
     let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
@@ -738,6 +803,17 @@ async fn open_cold(
         .with_metadata_cache_limit(0)
         .build_arc()?;
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    if fixture.backend_type == common::BackendType::ObjectNative {
+        let table = fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                SINGLE_FLIGHT_TABLE,
+            )
+            .await?;
+        return Ok((Arc::new(table), ctx, None));
+    }
     let table = Arc::new(
         CayenneTableProviderBuilder::new(
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
@@ -751,7 +827,7 @@ async fn open_cold(
         &url::Url::parse("file:///")?,
         Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
     );
-    Ok((table, ctx, store))
+    Ok((table, ctx, Some(store)))
 }
 
 /// The full statistics of a plain scan's plan.
@@ -841,7 +917,7 @@ impl StatisticsWriteLog {
 async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let table_id = write_multi_file_table(&fixture).await?;
+    let (table_id, _, _) = write_multi_file_table(&fixture).await?;
     let write_log = StatisticsWriteLog::install(&fixture).await?;
     let expected_rows = usize::try_from(i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE)?;
 
@@ -854,6 +930,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         log.clear().await?;
     }
     let (table, ctx, store) = open_cold(&fixture).await?;
+    let store = store.expect("a SQLite fixture counts its footer reads");
     let reference = plan_statistics(&table, &ctx).await?;
     table.wait_for_scan_file_statistics_persistence().await;
     let lone_reads = store.reads();
@@ -889,6 +966,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         log.clear().await?;
     }
     let (table, ctx, store) = open_cold(&fixture).await?;
+    let store = store.expect("a SQLite fixture counts its footer reads");
     let started = std::time::Instant::now();
     let concurrent =
         futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
@@ -971,7 +1049,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let table_id = write_multi_file_table(&fixture).await?;
+    let (table_id, _, _) = write_multi_file_table(&fixture).await?;
     fixture
         .catalog
         .clear_snapshot_file_statistics(&table_id)
@@ -979,6 +1057,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
 
     // Cold, no persisted rows: every file goes to its footer, once.
     let (table, ctx, store) = open_cold(&fixture).await?;
+    let store = store.expect("a SQLite fixture counts its footer reads");
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
     table.wait_for_scan_file_statistics_persistence().await;
@@ -999,6 +1078,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     // A restart over those rows: every file is served from its persisted row,
     // read once however many scans asked.
     let (table, ctx, store) = open_cold(&fixture).await?;
+    let store = store.expect("a SQLite fixture counts its footer reads");
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
     table.wait_for_scan_file_statistics_persistence().await;
@@ -1012,6 +1092,104 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
         "no footer is read when every row is persisted: {:?}",
         store.reads()
     );
+    Ok(())
+}
+
+/// [`scan_file_statistics_counters_match_the_store_and_the_metastore`] on the
+/// object-native metastore, where each file's writer records its footer
+/// statistics in the commit that adds it. The first cold scan after a restart
+/// is served from those for every file: the store's log shows it read no footer
+/// and wrote nothing, the dataset's log gained no commit, and the scan plans
+/// with exactly the statistics the files' footers give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_native()
+-> TestResult<()> {
+    let mut faults = None;
+    let (fixture, _) = common::TestFixture::object_native_through(|store| {
+        let store = Arc::new(object_store_sim::fault::FaultStore::new(store));
+        faults = Some(Arc::clone(&store));
+        store as Arc<dyn object_store::ObjectStore>
+    })
+    .await?;
+    let faults = faults.expect("the fixture wraps its store");
+    let (table_id, writer, writer_ctx) = write_multi_file_table(&fixture).await?;
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+
+    let (table, ctx, _) = open_cold(&fixture).await?;
+    let commits_before = fixture
+        .object_native_head_commit(SINGLE_FLIGHT_TABLE)
+        .await?;
+    let logged_before = faults.log().len();
+    let cold =
+        futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
+            .await?;
+    table.wait_for_scan_file_statistics_persistence().await;
+    let counters = table.scan_file_statistics_counters();
+    let commits_after = fixture
+        .object_native_head_commit(SINGLE_FLIGHT_TABLE)
+        .await?;
+    let logged = faults.log().split_off(logged_before);
+    let footer_reads: Vec<String> = logged
+        .iter()
+        .filter(|op| op.op == object_store_sim::Op::Get && op.path.as_ref().ends_with(".vortex"))
+        .map(|op| op.path.to_string())
+        .collect();
+    let store_writes: Vec<String> = logged
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.op,
+                object_store_sim::Op::Create
+                    | object_store_sim::Op::Cas
+                    | object_store_sim::Op::Put
+                    | object_store_sim::Op::MultipartBegin
+            )
+        })
+        .map(|op| format!("{:?} {}", op.op, op.path))
+        .collect();
+    eprintln!(
+        "SINGLE_FLIGHT object-native counters, cold after a restart: {counters:?}, \
+         footer reads {footer_reads:?}, writes {store_writes:?}, \
+         dataset log head {commits_before:?} -> {commits_after:?}"
+    );
+    assert_eq!(
+        counters.footer_reads, 0,
+        "every file is served from the statistics its writer recorded"
+    );
+    assert_eq!(counters.persisted_hits, u64::try_from(SINGLE_FLIGHT_FILES)?);
+    assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
+    assert!(
+        footer_reads.is_empty(),
+        "the store saw no footer read: {footer_reads:?}"
+    );
+    assert!(
+        store_writes.is_empty(),
+        "a scan writes no object to the store: {store_writes:?}"
+    );
+    assert_eq!(
+        commits_after, commits_before,
+        "a scan commits nothing to the dataset's log"
+    );
+
+    // The writer's own process reads the footers it just wrote, which is what
+    // the recorded statistics must reproduce.
+    let reference = plan_statistics(&writer, &writer_ctx).await?;
+    let expected_rows = usize::try_from(i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE)?;
+    assert_eq!(reference.num_rows, Precision::Exact(expected_rows));
+    assert!(
+        matches!(reference.total_byte_size, Precision::Exact(_)),
+        "the footer path reports an exact size: {:?}",
+        reference.total_byte_size
+    );
+    for (scan, statistics) in cold.iter().enumerate() {
+        assert_eq!(
+            statistics, &reference,
+            "cold scan {scan} must plan with exactly the statistics the footers give"
+        );
+    }
     Ok(())
 }
 
@@ -1114,8 +1292,15 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
          SQLite statistics writes {pass_writes:?}, object-native commits {pass_commits:?}",
         fixture.backend_type.name()
     );
+    // On the object-native metastore each input file's writer recorded its
+    // statistics, so the pass reads those instead of the footers.
+    let object_native = fixture.backend_type == common::BackendType::ObjectNative;
     assert_eq!(
-        after_pass.footer_reads,
+        if object_native {
+            after_pass.persisted_hits
+        } else {
+            after_pass.footer_reads
+        },
         u64::try_from(REPLACED_FILES)?,
         "the pass read each input file's statistics"
     );
@@ -1133,7 +1318,8 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
         );
     }
 
-    // A query's scan of the merged file still persists its statistics.
+    // A query's scan of the merged file still persists its statistics, unless
+    // the merge recorded them with the file.
     let query = SessionContext::new();
     query.register_table(REPLACED_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let batches = query
@@ -1164,6 +1350,19 @@ async fn compaction_persists_no_statistics_for_the_files_it_replaces(
          SQLite statistics writes {query_writes:?}, object-native commits {query_commits:?}",
         fixture.backend_type.name()
     );
+    if object_native {
+        assert_eq!(
+            (
+                after_query.persisted_hits - after_pass.persisted_hits,
+                after_query.footer_reads - after_pass.footer_reads,
+                after_query.persisted_upserts - after_pass.persisted_upserts,
+            ),
+            (1, 0, 0),
+            "the query reads the statistics the merge recorded with its file, and persists none"
+        );
+        assert_eq!(query_commits, Some(0), "the query commits nothing");
+        return Ok(());
+    }
     assert_eq!(
         after_query.footer_reads - after_pass.footer_reads,
         1,

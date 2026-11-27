@@ -2780,29 +2780,33 @@ fn append_sql(name: &str, ids: &Range<i64>) -> String {
     )
 }
 
-/// A reopened table's scan takes its files' statistics from their persisted
-/// rows without waiting for the table's statistics lock. After an append
-/// returns, its maintenance writes the table's statistics under that lock, and
-/// while that write's head write is held, a cold scan still plans from the
-/// persisted rows and answers every acknowledged row.
+/// A reopened table's scan takes its files' statistics from the ones their
+/// writers recorded without waiting for the table's statistics lock. After an
+/// append returns, its maintenance writes the table's statistics under that
+/// lock, and while that write's head write is held, a cold scan still plans
+/// from the recorded statistics and answers every acknowledged row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scans_read_persisted_statistics_while_a_statistics_write_is_held() {
     let name = "held_statistics";
     let (faults, fixture) = fault_fixture().await;
     create_append_table(&fixture, name, &[1..101, 101..201]).await;
 
-    // A cold provider reads each file's footer and persists its row.
+    // A cold provider serves each file from the statistics its writer recorded.
     let files = {
         let (table, ctx) = open_cold(&fixture, name).await;
         assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(200));
         table.wait_for_scan_file_statistics_persistence().await;
         let counters = table.scan_file_statistics_counters();
         assert_eq!(
-            (counters.footer_reads, counters.persisted_upserts),
-            (2, 2),
-            "each file is read from its footer and persisted: {counters:?}"
+            (
+                counters.footer_reads,
+                counters.persisted_hits,
+                counters.persisted_upserts
+            ),
+            (0, 2, 0),
+            "each file is served from its recorded statistics: {counters:?}"
         );
-        counters.footer_reads
+        counters.persisted_hits
     };
 
     // Every head write of the append goes through; the first one after the
@@ -2847,8 +2851,9 @@ async fn scans_read_persisted_statistics_while_a_statistics_write_is_held() {
     );
     let counters = table.scan_file_statistics_counters();
     assert_eq!(
-        counters.persisted_hits, files,
-        "every file written before the reopen is served from its persisted row: {counters:?}"
+        counters.persisted_hits,
+        files + 1,
+        "every file, the append's too, is served from its recorded statistics: {counters:?}"
     );
 
     faults.clear_rules();
@@ -2864,18 +2869,19 @@ async fn scans_read_persisted_statistics_while_a_statistics_write_is_held() {
     assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(250));
 }
 
-/// A persisted statistics row whose read spans a schema widening is not used:
-/// with the read of the row's blob held, the table widens, and the scan takes
-/// the file's statistics from its footer instead.
+/// A cold scan serves a file from the statistics its writer recorded, reading
+/// no footer and adding no statistics blob, and a widening between a provider's
+/// open and its scan keeps them in use: no decimal scale changed, so they decode
+/// against the wider schema.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
+async fn recorded_statistics_add_no_blob_and_survive_a_widening() {
     const ROWS: i64 = 200;
     let name = "widened_during_read";
     let (faults, fixture) = fault_fixture().await;
     create_append_table(&fixture, name, std::slice::from_ref(&(1..ROWS + 1))).await;
 
-    // A cold scan persists the file's row; its blob is the one object it adds
-    // under the dataset's blobs. A shared bucket holds other tests' datasets, and
+    // A cold scan would add a persisted row's blob under the dataset's blobs.
+    // A shared bucket holds other tests' datasets, and
     // a local location's store is keyed by absolute paths, so the listing stays
     // under the catalog's dataset folders.
     let datasets = Path::from(
@@ -2909,27 +2915,19 @@ async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
         table.wait_for_scan_file_statistics_persistence().await;
         let counters = table.scan_file_statistics_counters();
         assert_eq!(
-            (counters.footer_reads, counters.persisted_upserts),
-            (1, 1),
-            "one file, read from its footer and persisted: {counters:?}"
+            (
+                counters.footer_reads,
+                counters.persisted_hits,
+                counters.persisted_upserts
+            ),
+            (0, 1, 0),
+            "one file, served from its recorded statistics: {counters:?}"
         );
     }
     let added: Vec<Path> = blobs().await.difference(&before).cloned().collect();
-    let [row_blob] = added.as_slice() else {
-        panic!("persisting one file's row adds one blob, not {added:?}");
-    };
+    assert!(added.is_empty(), "a scan adds no blob: {added:?}");
 
     let (table, ctx) = open_cold(&fixture, name).await;
-    let gated = row_blob.clone();
-    faults.gate_reads(move |path| *path == gated);
-    let scan = tokio::spawn({
-        let ctx = ctx.clone();
-        async move { sorted_rows(&ctx, name).await }
-    });
-    tokio::time::timeout(Duration::from_secs(30), faults.wait_gated(1))
-        .await
-        .expect("the scan reads the file's persisted row");
-
     let widened = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
@@ -2945,22 +2943,16 @@ async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
         arrow_tools::schema_evolution::SchemaEvolution::Widening(plan) => plan,
         other => panic!("expected a widening, got {other:?}"),
     };
-    tokio::time::timeout(Duration::from_secs(30), table.evolve_schema_live(&plan))
+    table
+        .evolve_schema_live(&plan)
         .await
-        .expect("the widening does not wait for the scan")
         .expect("widen the schema");
-    faults.open_reads();
-
-    let rows = tokio::time::timeout(Duration::from_secs(30), scan)
-        .await
-        .expect("the scan finishes")
-        .expect("the scan task");
-    assert_eq!(rows, prefix_rows(ROWS));
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(ROWS));
     let counters = table.scan_file_statistics_counters();
     assert_eq!(
         (counters.persisted_hits, counters.footer_reads),
-        (0, 1),
-        "the row read across the widening is not used; the footer is: {counters:?}"
+        (1, 0),
+        "the widened table's file is served from its recorded statistics: {counters:?}"
     );
 }
 

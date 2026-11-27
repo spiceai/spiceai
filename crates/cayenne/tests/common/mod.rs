@@ -1248,6 +1248,7 @@ pub fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotF
         min_sequence: 0,
         max_sequence: 0,
         digest: None,
+        statistics_blob: None,
     }]
 }
 

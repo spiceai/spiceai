@@ -20,6 +20,8 @@ use cayenne_metastore_actions::proto::{
     self, Action, ColdEntry, DvEntry, FileEntry, FileStat, Select, TableRef, action::Kind,
 };
 
+use cayenne_metastore_actions::TableState;
+
 use crate::metadata::{
     ColdTierFile, DeleteFile, InlinedData, SnapshotFile, SnapshotFileStatistics,
 };
@@ -48,6 +50,7 @@ pub(crate) fn add_files(
                 min_seq: f.min_sequence,
                 max_seq: f.max_sequence,
                 digest: f.digest.clone(),
+                stats: f.statistics_blob.clone(),
             })
             .collect(),
         upsert,
@@ -67,6 +70,57 @@ pub(crate) fn forget_retired(table_id: &str, keys: &[String]) -> Action {
         table_id: table_id.to_string(),
         keys: keys.to_vec(),
     }))
+}
+
+/// The actions that lay the footer statistics recorded with the files of
+/// `table`'s live snapshots out as `evolved`, the table's new schema, from
+/// `stored`, its schema until now: each such snapshot's manifest is recorded
+/// again with its files' statistics rebased
+/// ([`crate::stats::rebase_persisted_statistics`]), or without them where they
+/// cannot be. A file's entry in a snapshot that is not live keeps its
+/// statistics as they are, for the scans that captured it with `stored`.
+pub(crate) fn rebase_recorded_file_stats(
+    table_id: &str,
+    table: &TableState,
+    stored: &arrow_schema::Schema,
+    evolved: &arrow_schema::Schema,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    if stored == evolved {
+        return actions;
+    }
+    for snapshot in table.live_snapshots() {
+        let files: Vec<&FileEntry> = table
+            .files
+            .iter()
+            .filter(|((file_snapshot, _), _)| file_snapshot.as_ref() == snapshot)
+            .map(|(_, file)| &**file)
+            .collect();
+        if files.iter().all(|file| file.stats.is_none()) {
+            continue;
+        }
+        actions.push(remove_files(
+            table_id,
+            Select::Listed,
+            &[snapshot.to_string()],
+        ));
+        actions.push(Action::new(Kind::AddFiles(proto::AddFiles {
+            table_id: table_id.to_string(),
+            snapshot_id: snapshot.to_string(),
+            files: files
+                .into_iter()
+                .map(|file| FileEntry {
+                    stats: file.stats.as_ref().and_then(|blob| {
+                        crate::stats::rebase_persisted_statistics(blob, file.rows, stored, evolved)
+                            .map(bytes::Bytes::from)
+                    }),
+                    ..file.clone()
+                })
+                .collect(),
+            upsert: false,
+        })));
+    }
+    actions
 }
 
 pub(crate) fn remove_file_stats(table_id: &str, select: Select, snapshot_ids: &[String]) -> Action {

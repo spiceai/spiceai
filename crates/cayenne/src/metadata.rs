@@ -2071,6 +2071,12 @@ pub struct SnapshotFile {
     /// when `integrity_checksums` is enabled. See
     /// [`crate::provider::file_digest`].
     pub digest: Option<String>,
+    /// The file's footer statistics as its writer recorded them, serialized as
+    /// [`SnapshotFileStatistics::statistics_blob`] is, with no deletion applied.
+    /// Only a metastore whose writers record them keeps them
+    /// ([`crate::MetadataCatalog::records_file_statistics_with_files`]); `None`
+    /// for a file written without them. With them, `row_count` is the footer's.
+    pub statistics_blob: Option<bytes::Bytes>,
 }
 
 /// One row of the cold-tier object-store manifest (`cayenne_cold_tier_file`).
