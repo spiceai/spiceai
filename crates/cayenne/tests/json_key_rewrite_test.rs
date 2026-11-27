@@ -274,6 +274,13 @@ fn logs_document(rng: &mut Rng, profile: Profile) -> Option<String> {
         let j = rng.below(i + 1);
         members.swap(i, j);
     }
+    // A repeated key, which the writer stores like the functions read it: the
+    // first occurrence is the value, wherever the repeat falls.
+    match rng.below(9) {
+        0 => members.push(format!("\"url.path\":{ws}\"/dup-second\"")),
+        1 => members.insert(0, format!("\"url.path\":{ws}\"/dup-first\"")),
+        _ => {}
+    }
     Some(format!("{{{ws}{}{ws}}}", members.join(&format!(",{ws}"))))
 }
 
