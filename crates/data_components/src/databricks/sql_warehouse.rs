@@ -2886,11 +2886,17 @@ mod tests {
         )
         .expect("should create api");
         for value in VALUES {
+            let [catalog, schema, table] = ["c", "s", "t"].map(|slot| format!("{slot}{value}"));
+            let reference = TableReference::full(catalog.as_str(), schema.as_str(), table.as_str());
             let payload = api
-                .create_schema_payload(&TableReference::full(value, value, value), "data_type")
+                .create_schema_payload(&reference, "data_type")
                 .expect("should create payload");
             let sql = payload["statement"].as_str().expect("statement");
-            assert_eq!(spark_string_literals(sql), [value; 3], "{sql}");
+            assert_eq!(
+                spark_string_literals(sql),
+                [table, schema, catalog],
+                "{sql}"
+            );
         }
     }
 
@@ -2937,38 +2943,6 @@ mod tests {
         assert!(
             matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing catalog")),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_create_schema_payload_sql_injection_prevention() {
-        let api = SqlWarehouseApi::new(
-            "host.example.com",
-            "wh-1",
-            Arc::new(StaticTokenProvider("t".to_string())),
-            &SqlWarehouseConfig::default(),
-            Arc::new(DatabricksMetrics::default()),
-            Arc::new(Semaphore::new(8)),
-            None,
-        )
-        .expect("should create api");
-        let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
-
-        let payload = api
-            .create_schema_payload(&table, "full_data_type")
-            .expect("should create payload");
-        let stmt = payload["statement"]
-            .as_str()
-            .expect("statement should be string");
-
-        // Single quotes should be escaped as double single-quotes
-        assert!(stmt.contains("tab''le"), "table name not escaped: {stmt}");
-        assert!(stmt.contains("sch''ema"), "schema not escaped: {stmt}");
-        assert!(stmt.contains("cat''alog"), "catalog not escaped: {stmt}");
-        // Should NOT contain unescaped single quotes between the SQL string quotes
-        assert!(
-            !stmt.contains("tab'le"),
-            "unescaped table name found: {stmt}"
         );
     }
 
