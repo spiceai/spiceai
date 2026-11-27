@@ -583,7 +583,16 @@ impl DatasetState {
             }
             Kind::SetFileStats(a) => {
                 let table = self.table(name, &a.table_id)?;
-                if let Some(stat) = &a.stat {
+                // Statistics exist only for a snapshot the table still holds,
+                // live or with retired files: a late write for a forgotten one,
+                // from an older build, adds nothing.
+                if let Some(stat) = &a.stat
+                    && (table.live_snapshots().contains(stat.snapshot_id.as_str())
+                        || table
+                            .files
+                            .keys()
+                            .any(|(snapshot, _)| snapshot.as_ref() == stat.snapshot_id))
+                {
                     table.file_stats.insert(
                         (
                             Arc::from(stat.snapshot_id.as_str()),
@@ -1510,6 +1519,29 @@ mod tests {
         assert!(rebuilt.tables["t"].retired.is_empty());
         assert_eq!(rebuilt.tables["t"].files.len(), 1);
         assert_eq!(rebuilt.tables["t"].file_stats.len(), 1);
+    }
+
+    /// A statistics row for a snapshot the table no longer holds, such as a late
+    /// write from an older build, adds nothing, and an old log still replays.
+    #[test]
+    fn a_statistic_for_a_forgotten_snapshot_adds_no_row() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create_at("t"))).expect("create");
+        state.apply(&one(files("t", "s", &["a"]))).expect("append");
+        state
+            .apply(&Record {
+                actions: vec![files("t", "s2", &["b"]), set_current("t", "s2")],
+            })
+            .expect("replace s");
+        state.apply(&one(forget("t", &["a"]))).expect("forget");
+        state
+            .apply(&one(stat("t", "s", "a")))
+            .expect("a statistic for a forgotten snapshot still applies");
+        assert!(
+            state.tables["t"].file_stats.is_empty(),
+            "a forgotten snapshot gets no statistics row: {:?}",
+            state.tables["t"].file_stats
+        );
     }
 
     #[test]

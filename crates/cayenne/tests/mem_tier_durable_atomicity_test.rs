@@ -228,6 +228,12 @@ async fn extras(
     (records, stats, stale)
 }
 
+/// Whether [`plant`] left the stale snapshot's statistics: the object-native
+/// metastore keeps statistics only for a snapshot the table holds.
+fn stale_planted(catalog: &dyn MetadataCatalog) -> bool {
+    !catalog.keeps_retirement_record()
+}
+
 async fn state(catalog: &dyn MetadataCatalog, table_id: &str) -> String {
     let mut files = catalog
         .get_table_delete_files(table_id)
@@ -294,7 +300,7 @@ async fn assert_untouched(catalog: &dyn MetadataCatalog, table_id: &str) {
     );
     assert_eq!(
         extras(catalog, table_id).await,
-        (vec![], None, true),
+        (vec![], None, stale_planted(catalog)),
         "no insert records or statistics, and the stale file statistics remain"
     );
 }
@@ -327,7 +333,10 @@ async fn assert_sealed(catalog: &dyn MetadataCatalog, table_id: &str) {
             .len(),
         0
     );
-    assert_eq!(extras(catalog, table_id).await, (vec![], None, true));
+    assert_eq!(
+        extras(catalog, table_id).await,
+        (vec![], None, stale_planted(catalog))
+    );
 }
 
 /// All of the checkpoint: its vectors, the inline corpus and its tombstones

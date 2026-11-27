@@ -720,20 +720,14 @@ impl MetadataCatalog for Domain {
             .commit(vec![actions::set_file_stats(ObjRef::of, stats)])
             .await
     }
+    // A file's statistics leave only with the file (`ForgetRetired`), so a
+    // protected snapshot and a scan that captured a retired one keep theirs.
     async fn clear_snapshot_file_statistics_except(
         &self,
-        table_id: &str,
-        snapshot_id: &str,
+        _table_id: &str,
+        _snapshot_id: &str,
     ) -> CatalogResult<()> {
-        self.inner
-            .take()
-            .await
-            .commit(vec![actions::remove_file_stats(
-                table_id,
-                proto::Select::AllExcept,
-                &[snapshot_id.to_string()],
-            )])
-            .await
+        Ok(())
     }
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()> {
         self.inner
@@ -1116,7 +1110,10 @@ impl MetadataCatalog for Domain {
             clear_inlined,
             insert_records,
             table_statistics,
-            keep_file_statistics_of,
+            // A file's statistics leave only with the file (`ForgetRetired`), so
+            // a protected snapshot and a scan that captured a retired one keep
+            // theirs.
+            keep_file_statistics_of: _,
             manifest_files,
         } = commit;
         if !insert_pk_bytes.is_empty()
@@ -1208,13 +1205,6 @@ impl MetadataCatalog for Domain {
         }
         if let Some(stats) = &table_statistics {
             batch.push(inner.table_stats_action(stats).await?);
-        }
-        if let Some(snapshot_id) = keep_file_statistics_of {
-            batch.push(actions::remove_file_stats(
-                &table_id,
-                proto::Select::AllExcept,
-                &[snapshot_id],
-            ));
         }
         if batch.is_empty() {
             return Ok(());
