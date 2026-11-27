@@ -10500,6 +10500,10 @@ impl CayenneTableProvider {
         let previously_seen = std::mem::take(&mut *disk_cache.seen.lock());
         let mut seen = HashSet::with_capacity(files.data.len() + files.deletions.len());
         let mut candidates = Vec::new();
+        // New files to prefetch, by path: each leaves `seen` again unless its
+        // whole-file prefetch is queued in full, so the next round retries a
+        // file the cache declined or the round never reached.
+        let mut unsettled: HashMap<ObjectStorePath, String> = HashMap::new();
         let tagged = files
             .data
             .iter()
@@ -10510,6 +10514,9 @@ impl CayenneTableProvider {
             cache.note_size(namespace, &path, file.size);
             let new = seen.insert(file.key.clone()) && !previously_seen.contains(&file.key);
             if (full || new) && !cache.written_here(namespace, &path) {
+                if new {
+                    unsettled.insert(path.clone(), file.key.clone());
+                }
                 candidates.push(crate::disk_cache::PrefetchCandidate {
                     path,
                     size: file.size,
@@ -10518,7 +10525,6 @@ impl CayenneTableProvider {
                 });
             }
         }
-        *disk_cache.seen.lock() = seen;
         let plan = crate::disk_cache::plan_prefetch(
             candidates,
             cache.block_bytes(),
@@ -10545,7 +10551,14 @@ impl CayenneTableProvider {
             if whole && prefetched.declined_bytes > 0 {
                 break;
             }
+            if whole {
+                unsettled.remove(&path);
+            }
         }
+        for key in unsettled.values() {
+            seen.remove(key);
+        }
+        *disk_cache.seen.lock() = seen;
         tracing::debug!(
             table = table_name,
             evicted_bytes = evicted,

@@ -1024,3 +1024,176 @@ async fn close_with_no_time_left_still_seals_the_cache() {
     cayenne::disk_cache::close_process_disk_cache(std::time::Duration::ZERO).await;
     assert_eq!(idx(&dir), 1, "the close sealed the slab");
 }
+
+/// Polls `cond` every 20 ms until it holds; fails after `secs` seconds.
+async fn poll_until(secs: u64, what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !cond().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: not reached within {secs}s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A new file whose prefetch the cache declined (the prefetch queue was full)
+/// is retried by the next round after a reload, without waiting for a full
+/// round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declined_prefetch_is_retried_by_the_next_reload_round() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Node::open(&objects, Access::Writer, None).await;
+    let data_url = writer.data_url("orders");
+    let written = writer.create("orders", &data_url).await;
+    write(&written, rows(1, 2_000), InsertOp::Append).await;
+
+    let dir = TempDir::new().expect("cache dir");
+    let cache = object_store_cache::testing::open_with(
+        NodeCacheConfig {
+            dir: dir.path().to_path_buf(),
+            budget_bytes: 64 << 20,
+            volume: Arc::new(RoomyVolume),
+        },
+        Tuning {
+            block_bytes: 4096,
+            prefetch_queue_jobs: 2,
+            ..Tuning::default()
+        },
+    )
+    .await
+    .expect("open the cache");
+    let replica = Node::open(&objects, Access::Replica, Some(&cache)).await;
+    // Fill both prefetch slots: jobs for unrelated objects, held back by a
+    // read whose response is not consumed yet.
+    let fillers = [
+        Path::from("other/filler-1.bin"),
+        Path::from("other/filler-2.bin"),
+    ];
+    let held_path = Path::from("other/held.bin");
+    for p in fillers.iter().chain([&held_path]) {
+        objects
+            .put(p, Bytes::from(vec![1_u8; 10_000]).into())
+            .await
+            .expect("put");
+    }
+    let held = replica
+        .data_store
+        .get_opts(&held_path, GetOptions::default())
+        .await
+        .expect("held read");
+    for filler in &fillers {
+        let queued = cache
+            .prefetch(NAMESPACE, filler, 10_000, None)
+            .expect("prefetch");
+        assert!(queued.queued_bytes > 0, "{queued:?}");
+    }
+
+    let table = replica.open_table("orders", &data_url).await;
+    // The reconciler's first (full) round declines the first file.
+    poll_until(10, "full round declined F1", async || {
+        cache.stats().prefetch_declined_bytes > 0
+    })
+    .await;
+    let declined_full = cache.stats().prefetch_declined_bytes;
+
+    // F2 committed; the reload wakes a round that is not full, which
+    // declines F2 too (the queue is still full).
+    write(&written, rows(2_001, 4_000), InsertOp::Append).await;
+    replica
+        .catalog
+        .follow_commits(table.table_id())
+        .await
+        .expect("follow");
+    table.refresh(&table).await.expect("reload");
+    poll_until(10, "reload round declined F2", async || {
+        cache.stats().prefetch_declined_bytes > declined_full
+    })
+    .await;
+
+    // The queue drains.
+    drop(held);
+    cache.wait_idle().await;
+    poll_until(10, "filler fetched", async || {
+        cache.stats().fetched_bytes_prefetch >= 20_000
+    })
+    .await;
+    cache.wait_idle().await;
+
+    // F3 committed; rounds after reloads, and no full round, prefetch F3 and
+    // retry F1 and F2, two jobs at a time.
+    write(&written, rows(4_001, 6_000), InsertOp::Append).await;
+    replica
+        .catalog
+        .follow_commits(table.table_id())
+        .await
+        .expect("follow");
+    let files = writer.data_files(&written, &data_url).await;
+    assert_eq!(files.len(), 3, "{files:?}");
+    poll_until(30, "reload rounds prefetched F1, F2 and F3", async || {
+        table.refresh(&table).await.expect("reload");
+        cache.wait_idle().await;
+        let mut all = true;
+        for (path, size) in &files {
+            all &= resident(&replica, path, 0..*size).await;
+        }
+        all
+    })
+    .await;
+}
+
+/// A deletion vector of an object-native table is keyed under the table's
+/// folder, a replica's round prefetches it at the object that key names, and
+/// later rounds neither evict it nor fetch it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deletion_vector_stays_cached_across_rounds() {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::{col, lit};
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let writer = Node::open(&objects, Access::Writer, None).await;
+    let data_url = writer.data_url("orders");
+    let written = writer.create("orders", &data_url).await;
+    write(&written, rows(1, 100), InsertOp::Append).await;
+    let plan = written
+        .delete_from(&writer.ctx.state(), vec![col("id").lt(lit(10_i64))])
+        .await
+        .expect("plan the delete");
+    datafusion::physical_plan::collect(plan, writer.ctx.task_ctx())
+        .await
+        .expect("delete");
+    let files = writer
+        .catalog
+        .cacheable_files(written.table_id())
+        .await
+        .expect("files")
+        .expect("settled");
+    let data_prefix =
+        cayenne::dataset_storage::object_key_of_url(&url::Url::parse(&data_url).expect("url"))
+            .expect("prefix");
+    assert_eq!(files.deletions.len(), 1, "one deletion vector");
+    let dv_key = files.deletions[0].key.clone();
+    let dv_path = Path::parse(format!("{data_prefix}/{dv_key}")).expect("deletion vector path");
+    assert!(
+        objects.head(&dv_path).await.is_ok(),
+        "the deletion vector is at {dv_path}"
+    );
+    let dv_size = files.deletions[0].size;
+
+    let dir = TempDir::new().expect("cache dir");
+    let cache = open_cache(&dir, 64 << 20).await;
+    let replica = Node::open(&objects, Access::Replica, Some(&cache)).await;
+    let table = replica.open_table("orders", &data_url).await;
+    table.reconcile_disk_cache_now().await;
+    cache.wait_idle().await;
+    let first = cache.stats();
+    let resident_first = resident(&replica, &dv_path, 0..dv_size).await;
+    for _ in 0..3 {
+        table.reconcile_disk_cache_now().await;
+        cache.wait_idle().await;
+    }
+    let later = cache.stats();
+    let resident_later = resident(&replica, &dv_path, 0..dv_size).await;
+    assert!(resident_first && resident_later);
+    assert_eq!(later.evicted_bytes_unreferenced, 0);
+    assert_eq!(later.fetched_bytes_prefetch, first.fetched_bytes_prefetch);
+}
