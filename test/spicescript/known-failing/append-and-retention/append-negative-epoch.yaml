@@ -1,4 +1,5 @@
 name: append-negative-epoch
+duration: 6s
 description: >
   Known failing (#15542). Append refresh with epoch milliseconds as the time column
   over rows before 1970: the initial load is right, but the next refresh

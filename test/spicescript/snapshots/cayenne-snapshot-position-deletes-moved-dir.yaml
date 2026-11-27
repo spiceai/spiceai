@@ -1,4 +1,5 @@
 name: cayenne-snapshot-position-deletes-moved-dir
+duration: 9s
 description: >
   A DELETE on a Cayenne file acceleration with no primary key writes position
   deletion vectors against the data files it already wrote. A snapshot taken

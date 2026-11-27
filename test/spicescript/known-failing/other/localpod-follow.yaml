@@ -1,4 +1,5 @@
 name: localpod-follow
+duration: 376s
 description: >
   Known failing (#15547). `localpod:` children of a Cayenne parent do not follow it
   in four cases (Cayenne, results cache off):

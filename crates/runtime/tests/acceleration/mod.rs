@@ -44,7 +44,6 @@ mod partition_by_arrow;
 mod partition_by_cayenne;
 mod refresh;
 mod reload_file_accelerated;
-mod retention_arrow;
 mod retention_cayenne;
 mod settings_change_cayenne;
 #[cfg(feature = "snapshots")]

@@ -3,6 +3,7 @@
 # enabled after startup registers empty, and rows written right afterwards can
 # be missed for good — in 3 of 4 runs at least one such table stays empty.
 name: dynamodb-declared-streams-race
+duration: 111s
 description: >
   A DynamoDB Streams dataset with declared columns, over a table created with
   streams, or given streams, after Spice has started, loads every row written

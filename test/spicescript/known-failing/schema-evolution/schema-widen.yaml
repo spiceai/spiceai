@@ -8,6 +8,7 @@
 # here does not rule it out.
 # Move this script to test/spicescript/ once it passes.
 name: schema-widen
+duration: 79s
 description: >
   sync_all_columns adopts a column widened at the source, under full refresh
   and CDC; block and append_new_columns, which cannot store the wider values,

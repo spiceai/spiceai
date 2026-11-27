@@ -1,4 +1,5 @@
 name: object-native-read-cache
+duration: 268s
 tags: [long]
 description: >
   Read latency and store traffic of a Cayenne dataset whose data files are in

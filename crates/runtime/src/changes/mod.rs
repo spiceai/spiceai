@@ -62,7 +62,7 @@ pub async fn index_change_envelope(
     // Materialize a deferred batch here (this index wrapper transforms the
     // stream before the accelerator consumes it). Offload the synchronous build
     // so a large deferred burst can't stall this async worker.
-    let (change_committer, batch, is_dataset_ready, history_unavailable, snapshot_rows) =
+    let (change_committer, batch, is_dataset_ready, history_unavailable) =
         envelope.into_parts_offloaded().await?;
 
     // Project the change batch into the operations an index maintains (the upsert
@@ -144,7 +144,6 @@ pub async fn index_change_envelope(
         new_change_batch,
         is_dataset_ready,
         history_unavailable,
-        snapshot_rows,
     ))
 }
 

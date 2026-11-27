@@ -1,4 +1,5 @@
 name: dynamodb-iterator-expiry
+duration: 461s
 tags: [long]
 description: >
   A DynamoDB Streams changes-mode acceleration keeps every change across a

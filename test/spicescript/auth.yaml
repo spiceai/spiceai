@@ -1,4 +1,5 @@
 name: auth
+duration: 4s
 description: >
   With API keys required, HTTP and Flight accept a valid key (as `x-api-key`
   or a Bearer token, read-write or read-only) and refuse a missing or wrong

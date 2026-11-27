@@ -1,4 +1,5 @@
 name: ordering-window-join-semantics
+duration: 5s
 description: >
   A filter on a lossy cast or on integer division of an ORDER BY column keeps
   the sort, LEAD and LAG with IGNORE NULLS skip NULLs past the cached row, and

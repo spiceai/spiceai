@@ -1,4 +1,5 @@
 name: http-request-bound
+duration: 2s
 description: >
   A query against an HTTP dataset sends at most `max_request_partitions`
   distinct requests, one for each combination of its request filter values,
