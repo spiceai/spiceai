@@ -1,4 +1,5 @@
 name: acceleration-source-change
+duration: 194s
 description: >
   A file acceleration answers from the source its dataset names once the
   Spicepod points the dataset at another source: across a restart, while Spice

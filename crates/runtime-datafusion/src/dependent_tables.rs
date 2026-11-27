@@ -23,26 +23,31 @@ use std::collections::HashSet;
 /// tables inside CTEs, derived tables, joins, and set operations are included.
 #[must_use]
 pub fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
+    match statement {
+        parser::Statement::Statement(statement) => match statement.as_ref() {
+            ast::Statement::Query(query) => get_dependent_table_names_of_query(query),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Walks the query by reference: cloning it would recurse once per level of
+/// every expression tree inside it, as deep as the parser allows.
+fn get_dependent_table_names_of_query(query: &ast::Query) -> Vec<TableReference> {
     let mut table_names = Vec::new();
     let mut cte_names = HashSet::new();
 
-    if let parser::Statement::Statement(statement) = statement.clone()
-        && let ast::Statement::Query(statement) = *statement
-    {
-        // Collect names of CTEs
-        if let Some(with) = statement.with {
-            for table in with.cte_tables {
-                cte_names.insert(TableReference::bare(table.alias.name.to_string()));
-                let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
-                    Box::new(ast::Statement::Query(table.query)),
-                ));
-                // Extend table_names with names found in CTEs if they reference actual tables
-                table_names.extend(cte_table_names);
-            }
+    // Collect names of CTEs
+    if let Some(with) = &query.with {
+        for table in &with.cte_tables {
+            cte_names.insert(TableReference::bare(table.alias.name.to_string()));
+            // Extend table_names with names found in CTEs if they reference actual tables
+            table_names.extend(get_dependent_table_names_of_query(&table.query));
         }
-        // Extract table names from the main query
-        table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
     }
+    // Extract table names from the main query
+    table_names.extend(extract_tables_from_set_expr(&query.body, &cte_names));
 
     // Filter out CTEs and temporary views (aliases of subqueries)
     table_names
@@ -59,10 +64,8 @@ fn extract_tables_from_set_expr(
         ast::SetExpr::Select(select_statement) => {
             let mut table_names = vec![];
             for from in &select_statement.from {
-                let mut relations = vec![from.relation.clone()];
-                for join in &from.joins {
-                    relations.push(join.relation.clone());
-                }
+                let relations = std::iter::once(&from.relation)
+                    .chain(from.joins.iter().map(|join| &join.relation));
 
                 for relation in relations {
                     match relation {
@@ -73,11 +76,7 @@ fn extract_tables_from_set_expr(
                             }
                         }
                         ast::TableFactor::Derived { subquery, .. } => {
-                            table_names.extend(get_dependent_table_names(
-                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                    subquery,
-                                ))),
-                            ));
+                            table_names.extend(get_dependent_table_names_of_query(subquery));
                         }
                         _ => {}
                     }

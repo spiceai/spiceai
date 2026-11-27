@@ -1,4 +1,5 @@
 name: unparse-pruned-aggregate
+duration: 29s
 tags: [long]
 description: >
   Aggregates keep their rows when an outer query reads none of their output

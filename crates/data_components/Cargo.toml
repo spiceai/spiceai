@@ -32,7 +32,6 @@ bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
-cpu-budget.workspace = true
 connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
@@ -192,7 +191,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock = "0.6"
-zstd = "0.13.5"
+zstd = "0.13.6"
 
 [[bench]]
 harness = false

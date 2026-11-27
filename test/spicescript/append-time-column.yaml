@@ -1,4 +1,5 @@
 name: append-time-column
+duration: 10s
 description: >
   Append refresh on a time column adds exactly the source rows newer than the
   stored maximum minus the overlap window: new rows and late rows inside the

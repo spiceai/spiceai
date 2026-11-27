@@ -1,4 +1,5 @@
 name: append-upsert-same-time
+duration: 7s
 description: >
   An append refresh into an acceleration that upserts on a primary key keeps the
   newest version of a key when a second version arrives with the same time

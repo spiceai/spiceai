@@ -1,4 +1,5 @@
 name: search
+duration: 11s
 description: >
   Full-text and vector search answer correctly on Cayenne in file and memory mode:
   text_search returns exactly the rows containing the term, ranked by how often

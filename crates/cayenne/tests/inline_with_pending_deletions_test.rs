@@ -624,6 +624,9 @@ async fn test_double_inline_upsert_same_pk_impl(fixture: TestFixture) -> TestRes
 
     // ---- Restart ----
     let connection_string = fixture.connection_string();
+    // A real restart stops this instance; in-process, its background
+    // maintenance would otherwise race the reopened catalog for the head.
+    table.drain_in_flight_maintenance().await?;
     drop(table);
     drop(ctx);
 
