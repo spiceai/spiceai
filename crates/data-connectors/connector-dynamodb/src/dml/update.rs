@@ -19,6 +19,7 @@ use crate::utils::scalar_to_attribute_value;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use aws_sdk_dynamodb::Client as DbClient;
+use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -171,9 +172,12 @@ async fn execute_update(
     // Build the SET expression and attribute maps from assignments.
     let UpdateExpression {
         expression: update_expression,
-        attr_names,
+        mut attr_names,
         attr_values,
     } = build_update_expression(&config.assignments, &config.time_format)?;
+
+    // `UpdateItem` creates an item that does not exist; an UPDATE changes only existing items.
+    attr_names.insert("#key".to_string(), config.partition_key.clone());
 
     // Issue UpdateItem calls in parallel chunks.
     let mut total: u64 = 0;
@@ -197,6 +201,7 @@ async fn execute_update(
                         .table_name(table_name)
                         .key(partition_key, pk_attr)
                         .update_expression(update_expression)
+                        .condition_expression("attribute_exists(#key)")
                         .set_expression_attribute_names(Some(attr_names))
                         .set_expression_attribute_values(Some(attr_values));
 
@@ -204,17 +209,26 @@ async fn execute_update(
                         req = req.key(sk_name, sk_val);
                     }
 
-                    req.send().await.map_err(|e| {
-                        DataFusionError::Execution(format!("DynamoDB UpdateItem failed: {e}"))
-                    })
+                    match req.send().await {
+                        Ok(_) => Ok(1),
+                        Err(e)
+                            if e.as_service_error().is_some_and(
+                                UpdateItemError::is_conditional_check_failed_exception,
+                            ) =>
+                        {
+                            Ok(0)
+                        }
+                        Err(e) => Err(DataFusionError::Execution(format!(
+                            "DynamoDB UpdateItem failed: {e}"
+                        ))),
+                    }
                 }
             })
             .collect();
 
         let results = join_all(futures).await;
         for result in results {
-            result?;
-            total += 1;
+            total += result?;
         }
     }
 

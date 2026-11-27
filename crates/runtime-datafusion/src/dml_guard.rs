@@ -51,14 +51,15 @@ limitations under the License.
 //! column (`__common_expr_1`), which the table does not have.
 //! [`rewrite_dml_for_the_table`] puts a non-volatile expression back in its
 //! place. A column computed by a volatile expression, such as a model call
-//! placed to run once per row, keeps its name, and the table refuses it.
+//! placed to run once per row, keeps its name. A condition that reads it is
+//! refused, and the table refuses a new value that does.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{ScalarValue, TableReference};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
     DmlStatement, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, WriteOp, lit,
@@ -131,6 +132,35 @@ fn refusal(verb: &Verb, table: &str, found: &Unrepresentable) -> String {
     )
 }
 
+/// A column a condition reads that is not one of the table's own.
+enum OffTheTable {
+    /// A value a projection computes for each row, such as a model call's.
+    Computed(String),
+    /// A column of another relation, such as a view's base table.
+    OfAnotherRelation(String),
+}
+
+/// The refusal for a condition that reads a column the table does not have,
+/// naming the column.
+fn off_the_table_refusal(verb: &Verb, table: &str, column: &OffTheTable) -> String {
+    let reason = match column {
+        OffTheTable::Computed(column) => format!(
+            "the condition reads `{column}`, a value computed for each row, such as the result of a model call (ai_if). \
+            The table cannot evaluate a condition on it"
+        ),
+        OffTheTable::OfAnotherRelation(column) => format!(
+            "the condition reads `{column}`, a column of another relation, such as a view's base table. \
+            The table cannot evaluate a condition on it"
+        ),
+    };
+    format!(
+        "Failed to {} table '{table}': {reason}. \
+        Select the rows to affect first, then name them by a condition on the table's own columns. \
+        See: https://spiceai.org/docs/reference/sql",
+        verb.action
+    )
+}
+
 /// Refuse a `DELETE`/`UPDATE` whose row condition the planner cannot carry to
 /// the table.
 ///
@@ -144,7 +174,8 @@ fn refusal(verb: &Verb, table: &str, found: &Unrepresentable) -> String {
 /// # Errors
 ///
 /// [`DataFusionError::Plan`] when the statement's input plan restricts rows in
-/// a way the extracted filter list cannot express.
+/// a way the extracted filter list cannot express, or when a condition reads a
+/// column that is not one of the table's own.
 pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()> {
     plan.apply(|node| match node {
         LogicalPlan::Dml(dml) => {
@@ -354,14 +385,64 @@ fn ensure_statement_restriction_reaches_the_table(dml: &DmlStatement) -> Result<
         Ok(TreeNodeRecursion::Continue)
     })?;
 
-    match found {
-        None => Ok(()),
-        Some(found) => Err(DataFusionError::Plan(refusal(
+    if let Some(found) = found {
+        return Err(DataFusionError::Plan(refusal(
             &verb,
             &dml.table_name.to_string(),
             &found,
+        )));
+    }
+
+    match column_off_the_table(dml)? {
+        None => Ok(()),
+        Some(column) => Err(DataFusionError::Plan(off_the_table_refusal(
+            &verb,
+            &dml.table_name.to_string(),
+            &column,
         ))),
     }
+}
+
+/// The first column a condition in the statement reads that is not one of the
+/// table's own, such as the column a model call is computed into. The planner
+/// passes such a condition to the table, which cannot evaluate it, and leaves
+/// it out when the column belongs to another relation.
+fn column_off_the_table(dml: &DmlStatement) -> Result<Option<OffTheTable>> {
+    // The table's columns go by its name, or by an alias given directly to its
+    // scan: the names the planner accepts for them.
+    let mut table_names: Vec<TableReference> = vec![dml.table_name.clone()];
+    dml.input.apply(|node| {
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && let LogicalPlan::TableScan(scan) = alias.input.as_ref()
+            && scan.table_name.resolved_eq(&dml.table_name)
+        {
+            table_names.push(alias.alias.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    let mut off_the_table = None;
+    dml.input.apply(|node| {
+        let LogicalPlan::Filter(filter) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        for column in filter.predicate.column_refs() {
+            let (qualifier, _) = filter.input.schema().qualified_field_from_column(column)?;
+            off_the_table = match qualifier {
+                None => Some(OffTheTable::Computed(column.flat_name())),
+                Some(qualifier) if !table_names.iter().any(|name| qualifier.resolved_eq(name)) => {
+                    Some(OffTheTable::OfAnotherRelation(column.flat_name()))
+                }
+                Some(_) => None,
+            };
+            if off_the_table.is_some() {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    Ok(off_the_table)
 }
 
 #[cfg(test)]
@@ -593,6 +674,12 @@ mod tests {
             run("UPDATE t SET label = 'x' WHERE id = 1").await.planned(),
             vec![vec!["id = Int32(1)".to_string()]]
         );
+        assert_eq!(
+            run("UPDATE t AS x SET label = 'x' WHERE x.id = 1")
+                .await
+                .planned(),
+            vec![vec!["id = Int32(1)".to_string()]]
+        );
     }
 
     /// `DELETE FROM t` really does mean every row, and must keep working.
@@ -746,10 +833,10 @@ mod tests {
         assert!(err.contains("Failed to delete from table 't'"), "{err}");
     }
 
-    /// A column computed by a volatile expression, such as a model call placed
-    /// to run once per row, is not put back into the condition.
-    #[test]
-    fn a_volatile_computed_column_stays_a_column() {
+    /// `DELETE FROM t WHERE r > 0.5`, where `r` is a column a projection
+    /// computes by a volatile expression, as a model call placed to run once per
+    /// row is.
+    fn delete_on_a_volatile_computed_column() -> LogicalPlan {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let table = datafusion::datasource::provider_as_source(Arc::new(Recorder {
             schema,
@@ -767,6 +854,54 @@ mod tests {
             .and_then(|plan| plan.project(vec![datafusion::prelude::col("id")]))
             .and_then(LogicalPlanBuilder::build)
             .expect("build the statement's input");
+        LogicalPlan::Dml(DmlStatement::new(
+            "t".into(),
+            table,
+            WriteOp::Delete,
+            Arc::new(input),
+        ))
+    }
+
+    /// A column computed by a volatile expression, such as a model call placed
+    /// to run once per row, is not put back into the condition.
+    #[test]
+    fn a_volatile_computed_column_stays_a_column() {
+        let delete = delete_on_a_volatile_computed_column();
+        let rewritten = rewrite_dml_for_the_table(&delete).expect("rewrite");
+        assert_eq!(rewritten.as_ref(), &delete);
+    }
+
+    /// A condition on a computed column would reach the table as a condition on
+    /// a column it does not have.
+    #[test]
+    fn a_condition_on_a_computed_column_is_refused() {
+        let delete = delete_on_a_volatile_computed_column();
+        let err = ensure_dml_restriction_reaches_the_table(&delete)
+            .expect_err("a condition on a computed column is refused")
+            .to_string();
+        assert!(
+            err.contains("Failed to delete from table 't': the condition reads `r`, a value computed for each row, such as the result of a model call (ai_if). The table cannot evaluate a condition on it.")
+                && err.contains("name them by a condition on the table's own columns")
+                && !err.contains('\n'),
+            "{err}"
+        );
+    }
+
+    /// A condition on the table's columns under an alias given to its scan is a
+    /// condition on the table's own columns: the planner carries it.
+    #[test]
+    fn a_condition_through_an_alias_of_the_table_is_planned() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = datafusion::datasource::provider_as_source(Arc::new(Recorder {
+            schema,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            assigned: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let input = LogicalPlanBuilder::scan("t", Arc::clone(&table), None)
+            .and_then(|plan| plan.alias("x"))
+            .and_then(|plan| plan.filter(datafusion::prelude::col("x.id").eq(lit(1))))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("build the statement's input");
         let delete = LogicalPlan::Dml(DmlStatement::new(
             "t".into(),
             table,
@@ -774,8 +909,40 @@ mod tests {
             Arc::new(input),
         ));
 
-        let rewritten = rewrite_dml_for_the_table(&delete).expect("rewrite");
-        assert_eq!(rewritten.as_ref(), &delete);
+        ensure_dml_restriction_reaches_the_table(&delete).expect("planned");
+    }
+
+    /// A condition on an alias that is not directly over the table's scan names
+    /// another relation, which the planner leaves out of the filter list.
+    #[test]
+    fn a_condition_on_another_relation_is_refused() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = datafusion::datasource::provider_as_source(Arc::new(Recorder {
+            schema,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            assigned: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let input = LogicalPlanBuilder::scan("t", Arc::clone(&table), None)
+            .and_then(|plan| plan.project(vec![datafusion::prelude::col("id")]))
+            .and_then(|plan| plan.alias("x"))
+            .and_then(|plan| plan.filter(datafusion::prelude::col("x.id").eq(lit(1))))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("build the statement's input");
+        let delete = LogicalPlan::Dml(DmlStatement::new(
+            "t".into(),
+            table,
+            WriteOp::Delete,
+            Arc::new(input),
+        ));
+
+        let err = ensure_dml_restriction_reaches_the_table(&delete)
+            .expect_err("a condition on another relation is refused")
+            .to_string();
+        assert!(
+            err.contains("Failed to delete from table 't': the condition reads `x.id`, a column of another relation")
+                && err.contains("a view's base table. The table cannot evaluate a condition on it."),
+            "{err}"
+        );
     }
 
     /// A plan that is not DML has no row condition to lose, and is never

@@ -74,7 +74,7 @@ async fn table(
         schema: Arc::clone(&schema),
         primary_key: Vec::new(),
         on_conflict: None,
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: match storage {
@@ -86,8 +86,12 @@ async fn table(
         },
     };
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), options)
+            .await?,
+    );
     common::insert_batch(
         table.as_ref(),
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])?,
@@ -210,4 +214,4 @@ async fn shared_filters_follow_join_key_lineage_impl(fixture: TestFixture) -> Te
     Ok(())
 }
 
-test_with_backends!(shared_filters_follow_join_key_lineage_impl);
+test_on_data_store!(shared_filters_follow_join_key_lineage_impl);

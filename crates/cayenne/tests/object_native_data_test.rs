@@ -2106,14 +2106,31 @@ enum ChangeStream {
 /// and re-upserts rows on a store whose every request takes 20 ms: each answer is
 /// a whole prefix of the keys acknowledged writes left, with every row once.
 async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
-    const READERS: usize = 8;
-    const RUN: Duration = Duration::from_secs(20);
     const DELAY: Duration = Duration::from_millis(20);
     let name = "latency_cdc";
     let (setup, catalog) = KeyedSetup::new(name).await;
     let store = setup.store(Some(DELAY));
     let catalog: Arc<dyn MetadataCatalog> = Arc::new(catalog);
-    let config = match stream {
+    let ctx = SessionContext::new();
+    let mut builder = setup.builder(&store, catalog, &ctx);
+    if stream == ChangeStream::RuntimeDefaults {
+        builder =
+            builder.with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::from_secs(1)));
+    }
+    let table = Arc::new(
+        builder
+            .create(change_stream_table(name, setup.data_url.clone(), stream))
+            .await
+            .expect("create the keyed table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    read_during_change_stream(&table, &ctx, name, stream).await;
+}
+
+/// The keyed table [`read_during_change_stream`] writes, configured for `stream`.
+fn change_stream_table(name: &str, base_path: String, stream: ChangeStream) -> CreateTableOptions {
+    let vortex_config = match stream {
         ChangeStream::Durable => cdc_config(CdcDurability::File),
         ChangeStream::MemoryTier => cdc_config(CdcDurability::Memory),
         ChangeStream::RuntimeDefaults => VortexConfig {
@@ -2123,30 +2140,131 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
             ..VortexConfig::default()
         },
     };
-    let ctx = SessionContext::new();
-    let mut builder = setup.builder(&store, catalog, &ctx);
-    if stream == ChangeStream::RuntimeDefaults {
-        builder =
-            builder.with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::from_secs(1)));
+    CreateTableOptions {
+        table_name: name.to_string(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path,
+        partition_column: None,
+        vortex_config,
     }
-    let table = Arc::new(
-        builder
-            .create(CreateTableOptions {
-                table_name: name.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                    "id".to_string(),
-                ]))),
-                base_path: setup.data_url.clone(),
-                partition_column: None,
-                vortex_config: config,
-            })
-            .await
-            .expect("create the keyed table"),
-    );
-    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
-        .expect("register");
+}
+
+/// What a reader of [`read_during_change_stream`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadPath {
+    /// Every `(id, v)` row, compared as a whole against the expected prefix.
+    Rows,
+    /// `count(*)` and `sum(v)`, which scan the table.
+    Aggregate,
+    /// `count(*)` alone, answered from statistics where the plan can.
+    Statistics,
+}
+
+impl ReadPath {
+    const ALL: [Self; 3] = [Self::Rows, Self::Aggregate, Self::Statistics];
+
+    fn of_reader(reader: usize) -> Self {
+        match reader % 4 {
+            0 => Self::Rows,
+            2 => Self::Aggregate,
+            _ => Self::Statistics,
+        }
+    }
+
+    fn sql(self, name: &str) -> String {
+        match self {
+            Self::Rows => format!("SELECT id, v FROM {name}"),
+            Self::Aggregate => format!("SELECT count(*), coalesce(sum(v), 0) FROM {name}"),
+            Self::Statistics => format!("SELECT count(*) FROM {name}"),
+        }
+    }
+
+    /// The row count an answer holds, if it holds exactly the rows `1..=count`
+    /// with `v = id * 10`, each once: `Err` describes the first mismatch.
+    fn prefix_count(self, batches: &[arrow::record_batch::RecordBatch]) -> Result<i64, String> {
+        let int64 = |batch: &arrow::record_batch::RecordBatch, column: usize| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 column")
+                .clone()
+        };
+        match self {
+            Self::Rows => {
+                let mut rows = Vec::new();
+                for batch in batches {
+                    let (ids, values) = (int64(batch, 0), int64(batch, 1));
+                    rows.extend(
+                        ids.values()
+                            .iter()
+                            .copied()
+                            .zip(values.values().iter().copied()),
+                    );
+                }
+                rows.sort_unstable();
+                let count = i64::try_from(rows.len()).expect("row count");
+                match (1..=count)
+                    .zip(&rows)
+                    .find(|(id, row)| **row != (*id, id * 10))
+                {
+                    Some((id, row)) => Err(format!(
+                        "{count} rows are not the prefix 1..={count}: sorted row {id} is {row:?}"
+                    )),
+                    None => Ok(count),
+                }
+            }
+            Self::Aggregate | Self::Statistics => {
+                let batch = &batches[0];
+                let count = int64(batch, 0).value(0);
+                if self == Self::Aggregate {
+                    let sum = int64(batch, 1).value(0);
+                    let expected = (1..=count).map(|id| id * 10).sum::<i64>();
+                    if sum != expected {
+                        return Err(format!("count {count} with sum {sum}, not {expected}"));
+                    }
+                }
+                Ok(count)
+            }
+        }
+    }
+}
+
+/// How long each read, by path, and each apply of [`read_during_change_stream`]
+/// took.
+struct ChangeStreamTimings {
+    reads: Vec<(ReadPath, Duration)>,
+    applies: Vec<Duration>,
+}
+
+impl ChangeStreamTimings {
+    fn reads_of(&self, path: ReadPath) -> Vec<Duration> {
+        self.reads
+            .iter()
+            .filter(|(read, _)| *read == path)
+            .map(|(_, took)| *took)
+            .collect()
+    }
+}
+
+/// Runs `stream` into `table` for 20 s with 8 concurrent readers, and asserts
+/// that no read failed and that each answer is a whole prefix of the keys
+/// acknowledged writes left, with every row once: two readers compare every
+/// row, two check the count and sum of a scan, and four count from statistics.
+/// Then, quiesced, that the count answered from statistics equals a forced
+/// scan's.
+async fn read_during_change_stream(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+    name: &'static str,
+    stream: ChangeStream,
+) -> ChangeStreamTimings {
+    const READERS: usize = 8;
+    const RUN: Duration = Duration::from_secs(20);
     let memory = stream != ChangeStream::Durable;
     if memory {
         table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -2169,13 +2287,14 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let writer = {
-        let table = Arc::clone(&table);
+        let table = Arc::clone(table);
         let acknowledged = Arc::clone(&acknowledged);
         let history = Arc::clone(&history);
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
             let mut next = 1_i64;
             let mut applies = 0_i64;
+            let mut timings = Vec::new();
             // 75 rows every 40 ms: about 1,900 rows a second, the rate the
             // object-store measurements of change streams use.
             let mut tick = tokio::time::interval(Duration::from_millis(40));
@@ -2183,7 +2302,9 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
             while !stop.load(Ordering::Acquire) {
                 tick.tick().await;
                 let rows: Vec<(i64, i64)> = (next..next + 50).map(|id| (id, id * 10)).collect();
+                let started = Instant::now();
                 cdc_upsert(&table, &rows).await;
+                timings.push(started.elapsed());
                 next += 50;
                 history.lock().push((Instant::now(), next - 1));
                 acknowledged.store(next - 1, Ordering::Release);
@@ -2197,7 +2318,9 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                     .collect::<std::collections::BTreeMap<_, _>>()
                     .into_iter()
                     .collect();
+                let started = Instant::now();
                 cdc_upsert(&table, &again).await;
+                timings.push(started.elapsed());
                 applies += 1;
                 if stream != ChangeStream::MemoryTier {
                     continue;
@@ -2208,7 +2331,7 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                     table.seal_mem_tier_durable().await.expect("seal");
                 }
             }
-            applies
+            (applies, timings)
         })
     };
 
@@ -2220,6 +2343,7 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
         let stop = Arc::clone(&stop);
         readers.push(tokio::spawn(async move {
             let (mut ok, mut failed, mut wrong) = (0_u64, Vec::new(), Vec::new());
+            let mut timings = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let floor = {
                     let asked = Instant::now();
@@ -2230,52 +2354,63 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
                         .find(|(at, _)| asked.duration_since(*at) >= lag)
                         .map_or(0, |(_, count)| *count)
                 };
-                // Odd readers count from statistics where the plan can; even ones scan.
-                let sql = if reader % 2 == 0 {
-                    format!("SELECT count(*), coalesce(sum(v), 0) FROM {name}")
-                } else {
-                    format!("SELECT count(*) FROM {name}")
-                };
+                let path = ReadPath::of_reader(reader);
+                let sql = path.sql(name);
+                let started = Instant::now();
                 let result = async { ctx.sql(&sql).await?.collect().await }.await;
+                timings.push((path, started.elapsed()));
                 let ceiling = acknowledged.load(Ordering::Acquire) + 50;
-                match result {
-                    Err(error) => failed.push(error.to_string()),
-                    Ok(batches) => {
-                        let batch = &batches[0];
-                        let count = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
-                        let sum_ok = batch.num_columns() < 2 || {
-                            let sum = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("sum").value(0);
-                            sum == (1..=count).map(|id| id * 10).sum::<i64>()
-                        };
-                        if count < floor || count > ceiling || count % 50 != 0 || !sum_ok {
-                            wrong.push(format!("{sql}: count {count} outside [{floor}, {ceiling}] or not a whole prefix (sum ok: {sum_ok})"));
-                        } else {
-                            ok += 1;
+                match result.map_err(|error| error.to_string()) {
+                    Err(error) => failed.push(error),
+                    Ok(batches) => match path.prefix_count(&batches) {
+                        Err(mismatch) => wrong.push(format!("{sql}: {mismatch}")),
+                        Ok(count) if count < floor || count > ceiling || count % 50 != 0 => {
+                            wrong.push(format!(
+                                "{sql}: count {count} outside [{floor}, {ceiling}] or not a whole apply"
+                            ));
                         }
-                    }
+                        Ok(_) => ok += 1,
+                    },
                 }
             }
-            (ok, failed, wrong)
+            (ok, failed, wrong, timings)
         }));
     }
 
     tokio::time::sleep(RUN).await;
     stop.store(true, Ordering::Release);
-    let applies = writer.await.expect("writer");
+    let (applies, apply_timings) = writer.await.expect("writer");
     let (mut ok, mut failed, mut wrong) = (0_u64, Vec::new(), Vec::new());
+    let mut read_timings = Vec::new();
     for reader in readers {
-        let (o, f, w) = reader.await.expect("reader");
+        let (o, f, w, t) = reader.await.expect("reader");
         ok += o;
         failed.extend(f);
         wrong.extend(w);
+        read_timings.extend(t);
     }
+    let timings = ChangeStreamTimings {
+        reads: read_timings,
+        applies: apply_timings,
+    };
     eprintln!(
         "{applies} applies; {ok} reads exact, {} failed, {} wrong; first failure: {:?}; first wrong: {:?}",
         failed.len(),
         wrong.len(),
         failed.first(),
-        wrong.first()
+        wrong.first(),
     );
+    for path in ReadPath::ALL {
+        let reads = timings.reads_of(path);
+        if !reads.is_empty() {
+            eprintln!(
+                "{path:?} read P99 {:?}, P99.9 {:?} (n = {})",
+                crate::common::percentile(&reads, 99.0),
+                crate::common::percentile(&reads, 99.9),
+                reads.len()
+            );
+        }
+    }
     assert!(ok > 0, "no read completed");
     assert!(
         failed.is_empty(),
@@ -2297,9 +2432,10 @@ async fn scans_under_store_latency_are_stable(stream: ChangeStream) {
     if stream == ChangeStream::RuntimeDefaults {
         tokio::time::sleep(Duration::from_millis(1_100)).await;
     }
-    let stats_count = count_and_sum(&ctx, name).await.0;
-    let exact = sorted_rows(&ctx, name).await.len();
+    let stats_count = count_and_sum(ctx, name).await.0;
+    let exact = sorted_rows(ctx, name).await.len();
     assert_eq!(usize::try_from(stats_count).expect("count"), exact);
+    timings
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2315,6 +2451,517 @@ async fn scans_under_store_latency_are_stable_during_a_file_durability_change_st
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn scans_under_store_latency_are_stable_with_runtime_change_stream_defaults() {
     scans_under_store_latency_are_stable(ChangeStream::RuntimeDefaults).await;
+}
+
+/// A scan reads the catalog's committed state without waiting for the commit in
+/// flight: with every conditional head write taking about 200 ms and nothing
+/// else delayed, a durable change stream keeps a head write in flight almost all
+/// the time and leaves its upserts' snapshots uncompacted, while readers read
+/// every row, aggregate a scan, and count from statistics. No read fails or sees
+/// a torn state. Then, with one head write held, every kind of read answers the
+/// rows from before it while it stays held: how long a read takes depends on the
+/// runner, whether it waits for the head write does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn scans_do_not_wait_for_a_slow_head_write() {
+    const HEAD_WRITE: Duration = Duration::from_millis(200);
+    let name = "slow_head_cdc";
+    let mut faults = None;
+    let (fixture, _) = crate::common::TestFixture::object_native_through(|store| {
+        let delayed: Arc<dyn ObjectStore> = Arc::new(LatencyStore::new(
+            store,
+            LatencyProfile::default()
+                .with(Op::Cas, Delay::new(HEAD_WRITE, Duration::from_millis(250))),
+            0x16132,
+        ));
+        let store = Arc::new(FaultStore::new(delayed));
+        faults = Some(Arc::clone(&store));
+        store as Arc<dyn ObjectStore>
+    })
+    .await
+    .expect("object-native fixture");
+    let faults = faults.expect("the fixture wraps its store");
+    let ctx = SessionContext::new();
+    let store = fixture
+        .data_store
+        .config
+        .clone()
+        .expect("an object-native data store");
+    // Every scan captures its view anew, so every read reads the catalog.
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog),
+            ctx.runtime_env(),
+            store,
+        )
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+        .create(change_stream_table(
+            name,
+            fixture.data_store.base_path(name),
+            ChangeStream::Durable,
+        ))
+        .await
+        .expect("create the keyed table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    let timings = read_during_change_stream(&table, &ctx, name, ChangeStream::Durable).await;
+    // Each durable apply commits once, so it takes at least one delayed head write.
+    let fastest_apply = timings.applies.iter().min().copied().expect("applies");
+    assert!(
+        fastest_apply >= HEAD_WRITE / 2,
+        "the fastest apply took {fastest_apply:?}, so head writes were not delayed"
+    );
+    for path in ReadPath::ALL {
+        assert!(
+            !timings.reads_of(path).is_empty(),
+            "no {path:?} read completed"
+        );
+    }
+
+    // Maintenance the stream left behind commits first, so the held head write
+    // is the apply's.
+    table.drain_in_flight_maintenance().await.expect("drain");
+    let before = i64::try_from(sorted_rows(&ctx, name).await.len()).expect("row count");
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let rows: Vec<(i64, i64)> = (before + 1..=before + 50).map(|id| (id, id * 10)).collect();
+    let apply = tokio::spawn({
+        let table = Arc::clone(&table);
+        async move { cdc_upsert(&table, &rows).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(None))
+        .await
+        .expect("the apply reaches its head write");
+    for path in ReadPath::ALL {
+        let sql = path.sql(name);
+        let answer = tokio::time::timeout(Duration::from_secs(30), async {
+            ctx.sql(&sql).await?.collect().await
+        })
+        .await;
+        let Ok(batches) = answer else {
+            panic!("a {path:?} read waited for the held head write");
+        };
+        assert_eq!(
+            path.prefix_count(&batches.expect("the read")),
+            Ok(before),
+            "a {path:?} read during the held head write answers the rows from before it"
+        );
+    }
+    assert!(!apply.is_finished(), "the apply waits for its head write");
+
+    faults.clear_rules();
+    faults.deliver(held).await.expect("deliver the head write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), apply)
+        .await
+        .expect("the apply returns")
+        .expect("the apply task");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(before + 50));
+}
+
+/// An object-native fixture in the store `CAYENNE_TEST_DATA_STORE` names, with
+/// its catalog's and its data's requests going through a [`FaultStore`].
+async fn fault_fixture() -> (Arc<FaultStore>, crate::common::TestFixture) {
+    let mut faults = None;
+    let (fixture, _) = crate::common::TestFixture::object_native_through(|store| {
+        let store = Arc::new(FaultStore::new(store));
+        faults = Some(Arc::clone(&store));
+        store as Arc<dyn ObjectStore>
+    })
+    .await
+    .expect("object-native fixture");
+    (faults.expect("the fixture wraps its store"), fixture)
+}
+
+/// The table `name` of `fixture`, opened by a fresh provider in a runtime that
+/// keeps no footers, so its first scan collects every file's statistics.
+async fn open_cold(
+    fixture: &crate::common::TestFixture,
+    name: &str,
+) -> (Arc<CayenneTableProvider>, SessionContext) {
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_metadata_cache_limit(0)
+        .build_arc()
+        .expect("runtime");
+    let ctx =
+        SessionContext::new_with_config_rt(datafusion::prelude::SessionConfig::new(), runtime);
+    let store = fixture
+        .data_store
+        .config
+        .clone()
+        .expect("an object-native data store");
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            store,
+        )
+        .open(name)
+        .await
+        .expect("open the table"),
+    );
+    table.wait_for_orphan_sweep().await;
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    (table, ctx)
+}
+
+/// The rows `1..=count` with `v = id * 10`.
+fn prefix_rows(count: i64) -> Vec<(i64, i64)> {
+    (1..=count).map(|id| (id, id * 10)).collect()
+}
+
+/// The head object of a transaction domain: the catalog's or a dataset's.
+fn is_head(path: &Path) -> bool {
+    path.filename() == Some("head")
+}
+
+/// A scan during a durable change-stream apply whose dataset head write is
+/// held answers exactly the rows of the applies that returned, and the rows of
+/// the held apply once its head write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_during_a_held_change_stream_commit_answers_the_prior_rows() {
+    let name = "held_cdc_commit";
+    let (faults, fixture) = fault_fixture().await;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            fixture
+                .data_store
+                .config
+                .clone()
+                .expect("an object-native data store"),
+        )
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+        .create(change_stream_table(
+            name,
+            fixture.data_store.base_path(name),
+            ChangeStream::Durable,
+        ))
+        .await
+        .expect("create the keyed table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    cdc_upsert(&table, &prefix_rows(50)).await;
+    table.drain_in_flight_maintenance().await.expect("drain");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(50));
+
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let apply = tokio::spawn({
+        let table = Arc::clone(&table);
+        async move { cdc_upsert(&table, &prefix_rows(100).split_off(50)).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(None))
+        .await
+        .expect("the apply reaches its head write");
+    for _ in 0..3 {
+        let during = tokio::time::timeout(Duration::from_secs(10), sorted_rows(&ctx, name))
+            .await
+            .expect("a scan does not wait for the held head write");
+        assert_eq!(
+            during,
+            prefix_rows(50),
+            "a scan answers only the rows of the applies that returned"
+        );
+    }
+    assert!(!apply.is_finished(), "the apply waits for its head write");
+
+    faults.deliver(held).await.expect("deliver the head write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), apply)
+        .await
+        .expect("the apply returns")
+        .expect("the apply task");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(100));
+}
+
+/// A scan during an append whose dataset head write is held answers exactly
+/// the rows of the appends that returned: the append's files are named only in
+/// its buffered record until that head write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_during_a_held_append_commit_answers_the_prior_rows() {
+    let name = "held_append_commit";
+    let (faults, fixture) = fault_fixture().await;
+    create_append_table(&fixture, name, std::slice::from_ref(&(1..51))).await;
+    let ctx = SessionContext::new();
+    // Every scan captures its view anew, so every scan reads the catalog.
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            fixture
+                .data_store
+                .config
+                .clone()
+                .expect("an object-native data store"),
+        )
+        .with_scan_view_reuse(cayenne::ScanViewReuse::WithinLag(Duration::ZERO))
+        .open(name)
+        .await
+        .expect("open the table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(50));
+
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let append = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { run(&ctx, &append_sql(name, &(51..101))).await }
+    });
+    let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(None))
+        .await
+        .expect("the append reaches its head write");
+    for _ in 0..3 {
+        let during = tokio::time::timeout(Duration::from_secs(10), sorted_rows(&ctx, name))
+            .await
+            .expect("a scan does not wait for the held head write");
+        assert_eq!(
+            during,
+            prefix_rows(50),
+            "a scan answers only the rows of the appends that returned"
+        );
+    }
+    assert!(!append.is_finished(), "the append waits for its head write");
+
+    faults.clear_rules();
+    faults.deliver(held).await.expect("deliver the head write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), append)
+        .await
+        .expect("the append returns")
+        .expect("the append task");
+    table.drain_in_flight_maintenance().await.expect("drain");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(100));
+}
+
+/// Creates the key-less table `name` in `fixture` and appends `ids` to it, one
+/// data file per range.
+async fn create_append_table(fixture: &crate::common::TestFixture, name: &str, ids: &[Range<i64>]) {
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        crate::common::table_builder_on_store(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+            fixture
+                .data_store
+                .config
+                .clone()
+                .expect("an object-native data store"),
+        )
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: fixture.data_store.base_path(name),
+            partition_column: None,
+            vortex_config: vortex_config(),
+        })
+        .await
+        .expect("create the table"),
+    );
+    ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register");
+    for range in ids {
+        run(&ctx, &append_sql(name, range)).await;
+    }
+    table.drain_in_flight_maintenance().await.expect("drain");
+}
+
+/// Appends the rows `(id, id * 10)` for `ids`.
+fn append_sql(name: &str, ids: &Range<i64>) -> String {
+    format!(
+        "INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series({}, {})",
+        ids.start,
+        ids.end - 1
+    )
+}
+
+/// A reopened table's scan takes its files' statistics from their persisted
+/// rows without waiting for the table's statistics lock. After an append
+/// returns, its maintenance writes the table's statistics under that lock, and
+/// while that write's head write is held, a cold scan still plans from the
+/// persisted rows and answers every acknowledged row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scans_read_persisted_statistics_while_a_statistics_write_is_held() {
+    let name = "held_statistics";
+    let (faults, fixture) = fault_fixture().await;
+    create_append_table(&fixture, name, &[1..101, 101..201]).await;
+
+    // A cold provider reads each file's footer and persists its row.
+    let files = {
+        let (table, ctx) = open_cold(&fixture, name).await;
+        assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(200));
+        table.wait_for_scan_file_statistics_persistence().await;
+        let counters = table.scan_file_statistics_counters();
+        assert_eq!(
+            (counters.footer_reads, counters.persisted_upserts),
+            (2, 2),
+            "each file is read from its footer and persisted: {counters:?}"
+        );
+        counters.footer_reads
+    };
+
+    // Every head write of the append goes through; the first one after the
+    // append returns is its maintenance's statistics write, and is held.
+    let (table, ctx) = open_cold(&fixture, name).await;
+    faults.arm(Op::Cas, is_head, Fault::Hold);
+    let mut append = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { run(&ctx, &append_sql(name, &(201..251))).await }
+    });
+    let mut last = None;
+    let held = loop {
+        let held = tokio::time::timeout(Duration::from_secs(30), faults.wait_held(last))
+            .await
+            .expect("the append and its maintenance reach a head write");
+        if append.is_finished() {
+            break held;
+        }
+        faults.arm(Op::Cas, is_head, Fault::Hold);
+        faults
+            .deliver(held)
+            .await
+            .expect("deliver an append head write");
+        faults.respond(held).expect("return its response");
+        last = Some(held);
+        tokio::select! {
+            appended = &mut append => appended.expect("the append task"),
+            () = async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            } => panic!("the append did not return"),
+            _ = faults.wait_held(last) => {}
+        }
+    };
+    let during = tokio::time::timeout(Duration::from_secs(10), sorted_rows(&ctx, name))
+        .await
+        .expect("a scan does not wait for the held statistics write");
+    assert_eq!(during, prefix_rows(250));
+    assert_eq!(
+        faults.held_ids().last(),
+        Some(&held),
+        "the statistics write is still held"
+    );
+    let counters = table.scan_file_statistics_counters();
+    assert_eq!(
+        counters.persisted_hits, files,
+        "every file written before the reopen is served from its persisted row: {counters:?}"
+    );
+
+    faults.clear_rules();
+    faults
+        .deliver(held)
+        .await
+        .expect("deliver the statistics write");
+    faults.respond(held).expect("return its response");
+    tokio::time::timeout(Duration::from_secs(30), table.drain_in_flight_maintenance())
+        .await
+        .expect("the maintenance returns")
+        .expect("the maintenance");
+    assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(250));
+}
+
+/// A persisted statistics row whose read spans a schema widening is not used:
+/// with the read of the row's blob held, the table widens, and the scan takes
+/// the file's statistics from its footer instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_statistics_row_read_across_a_schema_widening_is_not_used() {
+    const ROWS: i64 = 200;
+    let name = "widened_during_read";
+    let (faults, fixture) = fault_fixture().await;
+    create_append_table(&fixture, name, std::slice::from_ref(&(1..ROWS + 1))).await;
+
+    // A cold scan persists the file's row; its blob is the one object it adds
+    // under the dataset's blobs. A shared bucket holds other tests' datasets, and
+    // a local location's store is keyed by absolute paths, so the listing stays
+    // under the catalog's dataset folders.
+    let datasets = Path::from(
+        fixture
+            .data_store
+            .config
+            .as_ref()
+            .expect("an object-native data store")
+            .url
+            .path(),
+    );
+    let dataset_blobs = format!("/datasets/{name}-");
+    let blobs = || async {
+        faults
+            .list(Some(&datasets))
+            .map_ok(|meta| meta.location)
+            .try_filter(|path| {
+                let path = path.as_ref();
+                futures::future::ready(
+                    path.contains(&dataset_blobs) && path.contains("/objects/blobs/"),
+                )
+            })
+            .try_collect::<std::collections::BTreeSet<_>>()
+            .await
+            .expect("list blobs")
+    };
+    let before = blobs().await;
+    {
+        let (table, ctx) = open_cold(&fixture, name).await;
+        assert_eq!(sorted_rows(&ctx, name).await, prefix_rows(ROWS));
+        table.wait_for_scan_file_statistics_persistence().await;
+        let counters = table.scan_file_statistics_counters();
+        assert_eq!(
+            (counters.footer_reads, counters.persisted_upserts),
+            (1, 1),
+            "one file, read from its footer and persisted: {counters:?}"
+        );
+    }
+    let added: Vec<Path> = blobs().await.difference(&before).cloned().collect();
+    let [row_blob] = added.as_slice() else {
+        panic!("persisting one file's row adds one blob, not {added:?}");
+    };
+
+    let (table, ctx) = open_cold(&fixture, name).await;
+    let gated = row_blob.clone();
+    faults.gate_reads(move |path| *path == gated);
+    let scan = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { sorted_rows(&ctx, name).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), faults.wait_gated(1))
+        .await
+        .expect("the scan reads the file's persisted row");
+
+    let widened = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+        Field::new("extra", DataType::Int64, true),
+    ]));
+    let plan = match arrow_tools::schema_evolution::classify(
+        &schema(),
+        &widened,
+        &arrow_tools::schema_evolution::EvolutionContext {
+            constraint_columns: &[],
+        },
+    ) {
+        arrow_tools::schema_evolution::SchemaEvolution::Widening(plan) => plan,
+        other => panic!("expected a widening, got {other:?}"),
+    };
+    tokio::time::timeout(Duration::from_secs(30), table.evolve_schema_live(&plan))
+        .await
+        .expect("the widening does not wait for the scan")
+        .expect("widen the schema");
+    faults.open_reads();
+
+    let rows = tokio::time::timeout(Duration::from_secs(30), scan)
+        .await
+        .expect("the scan finishes")
+        .expect("the scan task");
+    assert_eq!(rows, prefix_rows(ROWS));
+    let counters = table.scan_file_statistics_counters();
+    assert_eq!(
+        (counters.persisted_hits, counters.footer_reads),
+        (0, 1),
+        "the row read across the widening is not used; the footer is: {counters:?}"
+    );
 }
 
 /// What one arm of [`sealed_rows_inline_against_data_files`] cost.
@@ -2594,6 +3241,93 @@ async fn the_catalog_recognizes_its_datasets_data_in_both_recorded_forms() {
             expected,
             "holds_data_at({path})"
         );
+    }
+}
+
+/// A location whose path needs percent-encoding is opened by its configured
+/// string, with its keys decoded once (`state dir`, `state-dir`, `state%20dir`):
+/// the catalog recognizes its datasets' data by any URL spelling of those keys,
+/// only under that location, and never under the keys another decoding gives.
+#[tokio::test]
+async fn the_catalog_recognizes_its_datasets_data_under_a_percent_encoded_location() {
+    let cases = [
+        (
+            "state dir",
+            "s3://bucket/state dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                ("datasets/orders-1/data", true),
+                (
+                    "s3://other/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state-dir",
+            "s3://bucket/state%2Ddir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%2ddir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/%73tate-dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%252Ddir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "state%20dir",
+            "s3://bucket/state%2520dir/cayenne/v1",
+            vec![
+                (
+                    "s3://bucket/state%2520dir/cayenne/v1/datasets/orders-1/data",
+                    true,
+                ),
+                (
+                    "s3://bucket/state%20dir/cayenne/v1/datasets/orders-1/data",
+                    false,
+                ),
+            ],
+        ),
+    ];
+    for (folder, location, paths) in cases {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let catalog = ObjectNativeCatalog::open_or_create_at(
+            Arc::clone(&store),
+            Path::parse(format!("{folder}/cayenne/v1/catalog")).expect("catalog prefix"),
+            location,
+        )
+        .await
+        .expect("open the catalog");
+        catalog.init().await.expect("init");
+        for (path, expected) in paths {
+            assert_eq!(
+                catalog.holds_data_at(path),
+                expected,
+                "opened at {location}: holds_data_at({path})"
+            );
+        }
     }
 }
 

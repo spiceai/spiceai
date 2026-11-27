@@ -1,4 +1,5 @@
 name: tool-access-config
+duration: 1s
 description: >
   `access` and `read_only_tools` on a `tools:` entry are accepted only where
   they mean something: on an MCP server's tools, with `access` `read` or

@@ -1,4 +1,5 @@
 name: anonymous-access
+duration: 9s
 description: >
   Without `runtime.auth`, a request without credentials is served by what its
   listener is bound to. On a listener bound only to loopback it is the local

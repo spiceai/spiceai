@@ -1,4 +1,5 @@
 name: readiness-mixed
+duration: 65s
 tags: [long]
 description: >
   Datasets with different ready_state settings in one runtime each follow

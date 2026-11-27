@@ -1,4 +1,5 @@
 name: random-queries
+duration: 604s
 tags: [long]
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,

@@ -1,4 +1,5 @@
 name: feed-chaos
+duration: 423s
 tags: [long]
 description: >
   One mutation history follows Kafka append, MongoDB change streams, DynamoDB

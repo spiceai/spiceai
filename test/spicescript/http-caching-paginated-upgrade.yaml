@@ -1,4 +1,5 @@
 name: http-caching-paginated-upgrade
+duration: 71s
 description: >
   A Cayenne file caching acceleration written by a release, whose table has no
   column grouping the pages of a response, is served by the binary under test

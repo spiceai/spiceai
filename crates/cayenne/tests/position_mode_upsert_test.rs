@@ -30,17 +30,17 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
+use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-test_with_backends!(test_position_mode_composite_pk_upsert_impl);
-test_with_backends!(test_position_mode_resurrection_impl);
-test_with_backends!(test_position_mode_without_capture_falls_back_to_key_impl);
+test_on_data_store!(test_position_mode_composite_pk_upsert_impl);
+test_on_data_store!(test_position_mode_resurrection_impl);
+test_on_data_store!(test_position_mode_without_capture_falls_back_to_key_impl);
 
 /// Force-file-write Vortex config in `deletion_mode: position`.
 fn position_mode_config() -> VortexConfig {
@@ -75,7 +75,7 @@ async fn test_position_mode_composite_pk_upsert_impl(
             "w_id".to_string(),
             "o_id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("pos_upsert"),
         partition_column: None,
         vortex_config: position_mode_config(),
     };
@@ -83,7 +83,10 @@ async fn test_position_mode_composite_pk_upsert_impl(
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "pos_upsert",
@@ -155,14 +158,17 @@ async fn test_position_mode_resurrection_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("pos_resurrect"),
         partition_column: None,
         vortex_config: position_mode_config(),
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "pos_resurrect",
@@ -210,14 +216,17 @@ async fn test_position_mode_without_capture_falls_back_to_key_impl(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("pos_fallback"),
         partition_column: None,
         vortex_config: position_mode_config(),
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "pos_fallback",

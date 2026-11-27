@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use datafusion::common::TableReference;
 use scheduler::{
@@ -25,6 +28,7 @@ use scheduler::{
 };
 use snafu::ResultExt;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, Runtime,
@@ -48,6 +52,10 @@ const REFRESH_SCHEDULER_NAME: &str = "refresh_scheduler";
 const WORKER_SCHEDULER_NAME: &str = "worker_scheduler";
 
 pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Running>>>>;
+
+/// Per dataset, the token of the task that creates its refresh schedule once its initial
+/// load ends. Removing the dataset's schedule cancels it.
+pub(crate) type DatasetScheduleWaiters = Mutex<HashMap<TableReference, Arc<CancellationToken>>>;
 
 impl Runtime {
     pub async fn create_worker_schedule(self: Arc<Self>, worker: Arc<dyn Worker>) -> Result<()> {
@@ -166,10 +174,39 @@ impl Runtime {
         Ok(())
     }
 
+    /// Registers the task that creates `name`'s refresh schedule once its initial load ends.
+    /// A task registered earlier for `name` waits for a definition that has since been
+    /// replaced, so it is cancelled.
+    pub(crate) fn register_dataset_schedule_waiter(
+        &self,
+        name: &TableReference,
+    ) -> Arc<CancellationToken> {
+        let token = Arc::new(CancellationToken::new());
+        let previous = self
+            .dataset_schedule_waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.clone(), Arc::clone(&token));
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        token
+    }
+
     pub async fn remove_dataset_or_view_schedule(
         self: Arc<Self>,
         ds_name: &TableReference,
     ) -> Result<()> {
+        // Before the registry lock: a waiter checks its token under that lock, so once this
+        // returns no waiter of the removed definition can create a schedule.
+        if let Some(waiter) = self
+            .dataset_schedule_waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(ds_name)
+        {
+            waiter.cancel();
+        }
         let scheduler_lock = Arc::clone(&self.schedulers);
         let schedulers = scheduler_lock.read().await;
         let dataset_name = ds_name.to_string().into();
@@ -205,8 +242,25 @@ impl Runtime {
         self: Arc<Self>,
         component: impl Into<ScheduleDataComponent>,
     ) -> Result<()> {
-        let component: ScheduleDataComponent = component.into();
+        self.create_schedule(component.into(), None).await
+    }
 
+    /// Creates `dataset`'s refresh schedule for the task registered with
+    /// [`Self::register_dataset_schedule_waiter`], unless its token was cancelled.
+    pub(crate) async fn create_dataset_schedule_after_initial_load(
+        self: Arc<Self>,
+        dataset: Arc<Dataset>,
+        waiter: &CancellationToken,
+    ) -> Result<()> {
+        self.create_schedule(ScheduleDataComponent::Dataset(dataset), Some(waiter))
+            .await
+    }
+
+    async fn create_schedule(
+        self: Arc<Self>,
+        component: ScheduleDataComponent,
+        waiter: Option<&CancellationToken>,
+    ) -> Result<()> {
         let Some(acceleration) = component.acceleration() else {
             tracing::debug!(
                 "{} '{}' has no acceleration source, skipping schedule creation",
@@ -241,6 +295,13 @@ impl Runtime {
         );
         let scheduler_lock = Arc::clone(&self.schedulers);
         let mut schedulers = scheduler_lock.write().await;
+        if waiter.is_some_and(CancellationToken::is_cancelled) {
+            tracing::debug!(
+                "Dataset '{}' was reloaded or removed during its initial load; not creating a refresh schedule for its earlier definition.",
+                component.name()
+            );
+            return Ok(());
+        }
         let component_name = component.name().to_string().into();
 
         let refresh_task: Arc<dyn ScheduledTask> = match component.clone() {

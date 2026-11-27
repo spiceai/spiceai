@@ -2,6 +2,7 @@
 # dataset serves correct and current rows, but the scheduler reports it
 # Refreshing forever and the runtime never becomes ready.
 name: cluster-cdc-ready
+duration: 37s
 description: >
   On a cluster scheduler with one executor, a Cayenne acceleration kept
   current by PostgreSQL change capture becomes Ready and the runtime ready,

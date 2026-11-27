@@ -261,8 +261,23 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             // Test 2: Query with id = 1 filter - should only scan partition containing id=1
             let result = execute_rt_sql(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
-            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
-            assert_eq!(count, 1, "Should have 1 row for id=1");
+            datafusion::assert_batches_eq!(
+                [
+                    "+----+----------+-----+----------+-------+",
+                    "| id | name     | age | city     | score |",
+                    "+----+----------+-----+----------+-------+",
+                    "| 1  | John Doe | 28  | New York | 85    |",
+                    "+----+----------+-----+----------+-------+",
+                ],
+                &result
+            );
+
+            // An aggregate across every partition.
+            let result = execute_rt_sql(&rt, "SELECT COUNT(*) AS cnt FROM bucket_test").await?;
+            datafusion::assert_batches_eq!(
+                ["+-----+", "| cnt |", "+-----+", "| 10  |", "+-----+"],
+                &result
+            );
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();

@@ -51,8 +51,8 @@ use datafusion_table_providers::util::{
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-test_with_backends!(predicate_delete_spanning_durable_and_ram_rows_impl);
-test_with_backends!(predicate_delete_ram_only_row_impl);
+test_on_data_store!(predicate_delete_spanning_durable_and_ram_rows_impl);
+test_on_data_store!(predicate_delete_ram_only_row_impl);
 
 struct NoopSlotAdvancer;
 #[async_trait::async_trait]
@@ -90,7 +90,7 @@ async fn make_memory_cdc_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -103,7 +103,10 @@ async fn make_memory_cdc_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
     ctx.register_table(name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
@@ -176,27 +179,22 @@ async fn delete_where(
         .unwrap_or(0))
 }
 
-/// Number of files under the table's data directory — a durable write adds
+/// Number of data files and deletion vectors stored under the table's data
+/// path — a durable write adds
 /// files, a RAM-tier write does not. An increased count is the precondition that
 /// a checkpoint really made its rows durable; an unchanged count is the
 /// precondition that the second CDC write really stayed in RAM.
-fn count_files(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                n += 1;
-            }
-        }
-    }
-    n
+async fn count_files(
+    fixture: &common::TestFixture,
+    table: &CayenneTableProvider,
+) -> TestResult<usize> {
+    Ok(fixture
+        .data_store
+        .list_files(&table.metadata().path)
+        .await?
+        .iter()
+        .filter(|file| file.is_data_file() || file.is_deletion_vector())
+        .count())
 }
 
 async fn predicate_delete_spanning_durable_and_ram_rows_impl(
@@ -207,9 +205,9 @@ async fn predicate_delete_spanning_durable_and_ram_rows_impl(
     let sql = "SELECT id, value FROM durable_and_ram ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(7, 10), (8, 5)]).await?;
-    let files_before_checkpoint = count_files(&fixture.data_path);
+    let files_before_checkpoint = count_files(&fixture, &table).await?;
     let durable_epoch = table.checkpoint_mem_tier().await?;
-    let files_after_checkpoint = count_files(&fixture.data_path);
+    let files_after_checkpoint = count_files(&fixture, &table).await?;
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
         "[durable+ram] durable CDC (7,10),(8,5) + checkpoint (epoch {durable_epoch}, data files {files_before_checkpoint} -> {files_after_checkpoint}): {rows:?}"
@@ -221,7 +219,7 @@ async fn predicate_delete_spanning_durable_and_ram_rows_impl(
     assert_eq!(rows, vec![(7, 10), (8, 5)], "durable baseline");
 
     cdc_upsert(&table, &schema, &[(7, 60), (9, 20)]).await?;
-    let files_after_ram_write = count_files(&fixture.data_path);
+    let files_after_ram_write = count_files(&fixture, &table).await?;
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
         "[durable+ram] RAM-only CDC (7,60),(9,20), no checkpoint ({files_after_ram_write} data files): {rows:?}"
@@ -269,16 +267,16 @@ async fn predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> Tes
     let sql = "SELECT id, value FROM ram_only ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(8, 5)]).await?;
-    let files_before_checkpoint = count_files(&fixture.data_path);
+    let files_before_checkpoint = count_files(&fixture, &table).await?;
     let _ = table.checkpoint_mem_tier().await?;
-    let files_after_checkpoint = count_files(&fixture.data_path);
+    let files_after_checkpoint = count_files(&fixture, &table).await?;
     assert!(
         files_after_checkpoint > files_before_checkpoint,
         "the checkpoint must write a data file ({files_before_checkpoint} -> {files_after_checkpoint}), otherwise (8,5) is not a durable row and this scenario does not span the durable and RAM tiers"
     );
 
     cdc_upsert(&table, &schema, &[(9, 20)]).await?;
-    let files_after_ram_write = count_files(&fixture.data_path);
+    let files_after_ram_write = count_files(&fixture, &table).await?;
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
         "[ram-only] durable (8,5) + checkpoint (data files {files_before_checkpoint} -> {files_after_checkpoint}), then RAM-only (9,20) ({files_after_ram_write} data files): {rows:?}"
