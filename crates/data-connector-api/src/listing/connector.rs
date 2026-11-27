@@ -9174,6 +9174,110 @@ mod tests {
         );
     }
 
+    /// A Parquet dictionary page whose header declares more values than its body can
+    /// hold is a scan error, raised before the reader sizes the dictionary to that
+    /// count, and an honest dictionary page still reads.
+    ///
+    /// A Spice patch to `decode_page` in the `spiceai/arrow-rs` fork bounds a
+    /// dictionary page's declared value count by what its PLAIN-encoded body can
+    /// hold. Without it, the reader allocates the declared count before decoding a
+    /// value, so a small file whose dictionary pages declare far more values than
+    /// they carry makes every scan of it allocate that much. Driven through a
+    /// `DataFusion` Parquet scan, the reader path a file or object-store dataset takes.
+    #[tokio::test]
+    async fn a_dictionary_page_declaring_more_values_than_its_body_holds_is_an_error() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::basic::Compression;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::prelude::ParquetReadOptions;
+
+        const VALUES: [i64; 5] = [10, 20, 10, 30, 20];
+
+        async fn scan(path: &std::path::Path) -> datafusion::error::Result<Vec<RecordBatch>> {
+            SessionContext::new()
+                .read_parquet(
+                    path.to_str().expect("a UTF-8 path"),
+                    ParquetReadOptions::default(),
+                )
+                .await?
+                .collect()
+                .await
+        }
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(VALUES.to_vec()))],
+        )
+        .expect("builds a batch");
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(true)
+            .build();
+        let mut file = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut file, Arc::clone(&schema), Some(properties))
+            .expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        // The dictionary holds the three distinct values: 24 bytes, room for exactly 3.
+        let reader = SerializedFileReader::new(bytes::Bytes::from(file.clone()))
+            .expect("reads the footer");
+        let dictionary_offset = reader
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .dictionary_page_offset()
+            .expect("the column is dictionary-encoded");
+        let dictionary_offset = usize::try_from(dictionary_offset).expect("a file offset");
+
+        // In the compact Thrift page header, the `dictionary_page_header` struct field
+        // opens with `num_values` (field 1, an i32: 0x15) and its zigzag varint, which
+        // is 0x06 for 3. 0x08 declares 4.
+        let num_values_at = file[dictionary_offset..]
+            .windows(3)
+            .position(|bytes| bytes[0] & 0x0F == 0x0C && bytes[1..] == [0x15, 0x06])
+            .map(|at| dictionary_offset + at + 2)
+            .expect("the dictionary page header declares 3 values");
+        let mut over_capacity = file.clone();
+        over_capacity[num_values_at] = 0x08;
+
+        let dir = tempfile::tempdir().expect("creates a temporary directory");
+        let honest_path = dir.path().join("honest.parquet");
+        let over_capacity_path = dir.path().join("over_capacity.parquet");
+        std::fs::write(&honest_path, &file).expect("writes the honest file");
+        std::fs::write(&over_capacity_path, &over_capacity).expect("writes the patched file");
+
+        let batches = scan(&honest_path).await.expect("scans the honest file");
+        let read: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("an Int64 column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(read, VALUES, "the honest dictionary page has to read back unchanged");
+
+        let Err(error) = scan(&over_capacity_path).await else {
+            panic!("a dictionary page declaring 4 values in 24 bytes was decoded");
+        };
+        assert!(
+            error.to_string().contains(
+                "Dictionary page declares 4 values but its 24 bytes can hold at most 3 INT64 values"
+            ),
+            "the scan failed, but not on the dictionary bound: {error}"
+        );
+    }
+
     /// A second reader built for the *same* file has to stay on the generation the
     /// first one pinned.
     ///
