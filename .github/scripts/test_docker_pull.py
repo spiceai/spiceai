@@ -167,7 +167,7 @@ class IntegrationPrePullTest(unittest.TestCase):
                     return candidate
             except FileNotFoundError:
                 continue
-        self.skipTest("no bash 4 or later here")
+        raise unittest.SkipTest("no bash 4 or later here")
 
     def pinned(self):
         return json.loads((self.ROOT / "test" / "container_images.json").read_text())

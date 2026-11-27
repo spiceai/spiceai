@@ -1676,7 +1676,8 @@ def _expression_image_problems(value: str) -> list[str]:
                 try:
                     candidates = _json_strings(json.loads(literal))
                 except ValueError:
-                    pass
+                    # Not JSON after all: check the literal itself as one image name.
+                    candidates = [literal]
             for candidate in candidates:
                 if _looks_like_image(candidate):
                     images += 1
