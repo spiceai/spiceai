@@ -61,6 +61,7 @@ serde = { workspace = true }
 telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
+jiter = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
@@ -120,6 +121,8 @@ result-correctness-duckdb = []
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# The JSON functions a shredded column must answer exactly like (json_shred's differential test).
+datafusion-functions-json = { workspace = true }
 # Steps the model's transactions traces for the object-native catalog's replay.
 cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 object_store_sim = { path = "../object_store_sim" }

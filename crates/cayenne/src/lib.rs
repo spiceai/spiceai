@@ -62,6 +62,7 @@ pub mod cayenne_catalog;
 #[cfg(feature = "partition-table-provider")]
 pub mod ddl;
 pub mod hll;
+pub(crate) mod json_shred;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
