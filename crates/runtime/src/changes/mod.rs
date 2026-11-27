@@ -82,7 +82,8 @@ pub async fn index_change_envelope(
 
     // Truncate first: clear each index before anything is (re)indexed, so a batch
     // that truncates and then inserts keeps the inserted rows. The rows before the
-    // batch's last truncate are indexed with the others and removed with the deletes.
+    // batch's last truncate are indexed with the others and removed with the deletes,
+    // except in a batch without key columns, which has no key to remove them by.
     if change_set.truncated() {
         for index in &indexes.0 {
             index
@@ -110,7 +111,7 @@ pub async fn index_change_envelope(
     // Deletes: remove from each index's own store every key the batch leaves out of
     // the table, as the accelerator, which applies the rows in order, does: a deleted
     // key, and a key upserted before the batch's last truncate, unless a later upsert
-    // writes it again.
+    // writes it again. A batch without key columns keeps its rows before a truncate.
     let primary_keys = change_set.primary_key_columns();
     let last_truncate = if change_set.truncated() {
         (0..batch.record.num_rows())
@@ -169,7 +170,8 @@ pub async fn index_change_envelope(
 /// The rows of `batch` whose primary key the batch leaves out of the table, in their
 /// original order: each delete row, and each upsert row before `last_truncate`, unless
 /// a later upsert row (one after `last_truncate` too, for a row before it) writes the
-/// key again.
+/// key again. A batch without key columns returns only its delete rows: its upserts
+/// before `last_truncate` have no key to remove them by, so they stay in the index.
 fn rows_whose_key_ends_absent(
     batch: &RecordBatch,
     delete_rows: &[usize],
@@ -177,7 +179,6 @@ fn rows_whose_key_ends_absent(
     last_truncate: Option<usize>,
     pk: &[String],
 ) -> Result<Vec<usize>, ArrowError> {
-    // A batch without key columns gives no key to remove a row before a truncate by.
     if pk.is_empty() {
         return Ok(delete_rows.to_vec());
     }
@@ -833,6 +834,10 @@ mod tests {
             .expect("a keyless change batch still indexes");
 
         let ops = index.ops.lock().expect("ops lock").clone();
-        assert_eq!(ops, vec![("truncate", 0), ("index", 1), ("index", 2)]);
+        assert_eq!(
+            ops,
+            vec![("truncate", 0), ("index", 1), ("index", 2)],
+            "a keyless batch has no key to remove id 1 by, so id 1 stays indexed"
+        );
     }
 }
