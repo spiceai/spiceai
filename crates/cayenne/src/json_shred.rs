@@ -306,9 +306,9 @@ pub(crate) fn file_projection_with_json_keys(
 /// computed from `source`, the same rows with every table column.
 pub(crate) fn with_json_key_columns(
     source: &RecordBatch,
-    projected: RecordBatch,
+    projected: &RecordBatch,
     keys: &[JsonKeyColumn],
-    schema: SchemaRef,
+    schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let rows = projected.num_rows();
     let mut columns = projected.columns().to_vec();
@@ -329,7 +329,7 @@ pub(crate) fn with_json_key_columns(
         columns.push(top_level_values(json.as_ref(), &key.key)?);
     }
     Ok(RecordBatch::try_new_with_options(
-        schema,
+        Arc::clone(schema),
         columns,
         &RecordBatchOptions::new().with_row_count(Some(rows)),
     )?)
@@ -639,7 +639,9 @@ mod tests {
                     for rest in REST_PATHS {
                         let sql = format!(
                             "SELECT doc, {f}(doc, '{key}'{rest}) AS whole, {f}(val{rest}) AS extracted, \
-                             {f}({JSON_TOP_LEVEL_VALUE_NAME}(doc, '{key}'){rest}) AS via_udf FROM t"
+                             {f}({JSON_TOP_LEVEL_VALUE_NAME}(doc, '{key}'){rest}) AS via_udf, \
+                             {f}({JSON_TOP_LEVEL_VALUE_NAME}(arrow_cast(doc, 'Utf8View'), '{key}'){rest}) AS via_views \
+                             FROM t"
                         );
                         let batches = ctx
                             .sql(&sql)
@@ -663,6 +665,14 @@ mod tests {
                                     whole, via_udf,
                                     "seed {seed}: {f}(doc, '{key}'{rest}) differs through {JSON_TOP_LEVEL_VALUE_NAME}"
                                 );
+                                // Over string views the values are views into the
+                                // documents' own buffers rather than copies.
+                                let via_views = ScalarValue::try_from_array(b.column(4), row)
+                                    .expect("via_views");
+                                assert_eq!(
+                                    whole, via_views,
+                                    "seed {seed}: {f}(doc, '{key}'{rest}) differs through {JSON_TOP_LEVEL_VALUE_NAME} over string views"
+                                );
                                 assert_eq!(
                                     whole,
                                     extracted,
@@ -684,6 +694,32 @@ mod tests {
                 n >= 200,
                 "{f} answered only {n} times: the documents exercise too little"
             );
+        }
+    }
+
+    #[test]
+    fn values_of_string_views_point_into_the_documents() {
+        let documents = StringViewArray::from(vec![
+            Some(r#"{"k": "short"}"#),
+            Some(r#"{"other": 1, "k": "a value longer than twelve bytes", "z": 2}"#),
+            None,
+            Some(r#"{"k": 1}"#),
+            Some("[1, 2, 3, 4, 5, 6, 7, 8, 9]"),
+        ]);
+        let values = top_level_values_in_place(&documents, "k").expect("views into the documents");
+        let expected: Vec<Option<&str>> = vec![
+            Some(r#""short""#),
+            Some(r#""a value longer than twelve bytes""#),
+            None,
+            Some("1"),
+            None,
+        ];
+        assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        // No value was copied: the result holds the documents' buffers, and the
+        // long value's view points into one of them.
+        assert_eq!(values.data_buffers().len(), documents.data_buffers().len());
+        for (value, document) in values.data_buffers().iter().zip(documents.data_buffers()) {
+            assert_eq!(value.as_ptr(), document.as_ptr());
         }
     }
 

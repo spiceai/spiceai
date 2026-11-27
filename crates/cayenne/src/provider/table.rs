@@ -42764,9 +42764,9 @@ impl CayenneTableProvider {
                 }
                 json_shred::with_json_key_columns(
                     &batch,
-                    projected,
+                    &projected,
                     json_keys,
-                    Arc::clone(&output_schema),
+                    &output_schema,
                 )
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
@@ -44819,7 +44819,7 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    json_shred::JsonKeyExprAdapterFactory::shared(),
+                    Some(json_shred::JsonKeyExprAdapterFactory::shared()),
                 ),
                 None => (file_source, projection.cloned(), None),
             };
@@ -45120,7 +45120,7 @@ impl CayenneTableProvider {
                 Some(source) => (
                     source,
                     None,
-                    json_shred::JsonKeyExprAdapterFactory::shared(),
+                    Some(json_shred::JsonKeyExprAdapterFactory::shared()),
                 ),
                 None => (file_source, scan_projection, None),
             };
@@ -47467,6 +47467,10 @@ impl CayenneTableProvider {
     /// one capture, and its `scan_guard` pins the captured snapshot dirs, so the plan
     /// can be built after any lock the capture was taken under is released: it reads
     /// exactly the captured state whatever lands meanwhile.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each branch of the plan reads every one of these from the scan"
+    )]
     async fn plan_scan_from_view(
         &self,
         state: &dyn Session,
@@ -47895,9 +47899,9 @@ impl CayenneTableProvider {
                     }
                     json_shred::with_json_key_columns(
                         &batch,
-                        projected,
+                        &projected,
                         json_keys,
-                        Arc::clone(&output_schema),
+                        &output_schema,
                     )
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?;

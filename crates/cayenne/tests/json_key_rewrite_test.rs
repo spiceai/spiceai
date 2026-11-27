@@ -45,7 +45,7 @@ use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
 use common::TestFixture;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::{DefaultTableSource, MemTable, TableProvider};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, LogicalPlan};

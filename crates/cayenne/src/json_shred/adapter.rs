@@ -52,8 +52,8 @@ impl JsonKeyExprAdapterFactory {
     }
 
     /// The factory, as a file scan configuration takes it.
-    pub(crate) fn shared() -> Option<Arc<dyn PhysicalExprAdapterFactory>> {
-        Some(Arc::new(Self::new()))
+    pub(crate) fn shared() -> Arc<dyn PhysicalExprAdapterFactory> {
+        Arc::new(Self::new())
     }
 }
 
@@ -141,6 +141,7 @@ mod tests {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
+    use vortex::VortexSessionDefault;
     use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
 
     use crate::json_shred::{JsonKeyColumn, file_projection_with_json_keys};
@@ -205,7 +206,7 @@ mod tests {
             .expect("push the projection")
             .expect("the source takes expressions");
         let mut builder = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
-            .with_expr_adapter(JsonKeyExprAdapterFactory::shared());
+            .with_expr_adapter(Some(JsonKeyExprAdapterFactory::shared()));
         for (name, size) in files {
             let path = object_store::path::Path::from_filesystem_path(dir.join(name))
                 .expect("a filesystem path");

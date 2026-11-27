@@ -299,6 +299,15 @@ impl OptimizerRule for CayenneJsonKeyRewrite {
     }
 }
 
+/// Where `item` is in `items`, appending it first when it is not there.
+fn position_or_push<T: PartialEq>(items: &mut Vec<T>, item: T) -> usize {
+    if let Some(position) = items.iter().position(|existing| *existing == item) {
+        return position;
+    }
+    items.push(item);
+    items.len() - 1
+}
+
 /// The scan under `plan`, through any filters.
 fn scan_below(plan: &LogicalPlan) -> Option<&TableScan> {
     match plan {
@@ -360,24 +369,18 @@ fn key_column_call(
     {
         return None;
     }
-    let key = match key {
-        ScalarValue::Utf8(Some(key))
-        | ScalarValue::Utf8View(Some(key))
-        | ScalarValue::LargeUtf8(Some(key)) => key,
-        _ => return None,
+    let (ScalarValue::Utf8(Some(key))
+    | ScalarValue::Utf8View(Some(key))
+    | ScalarValue::LargeUtf8(Some(key))) = key
+    else {
+        return None;
     };
     let source = table_schema.index_of(&column.name).ok()?;
     if !is_json_text_type(table_schema.field(source).data_type()) {
         return None;
     }
     let key_column = JsonKeyColumn::new(source, &column.name, key)?;
-    let position = match keys.iter().position(|existing| *existing == key_column) {
-        Some(position) => position,
-        None => {
-            keys.push(key_column);
-            keys.len() - 1
-        }
-    };
+    let position = position_or_push(keys, key_column);
     let mut args = Vec::with_capacity(rest.len() + 1);
     args.push(Expr::Column(datafusion::common::Column::new(
         Some(scan_name.clone()),
@@ -523,13 +526,7 @@ impl JsonKeyScanTable {
                     key.name()
                 );
             }
-            let position = match scanned.iter().position(|&index| index == key.source()) {
-                Some(position) => position,
-                None => {
-                    scanned.push(key.source());
-                    scanned.len() - 1
-                }
-            };
+            let position = position_or_push(&mut scanned, key.source());
             sources.push(position);
         }
         let scan_args = ScanArgs::default()
@@ -611,12 +608,11 @@ impl TableProvider for JsonKeyScanTable {
         args: ScanArgs<'a>,
     ) -> Result<ScanResult> {
         let all: Vec<usize>;
-        let projection = match args.projection() {
-            Some(projection) => projection,
-            None => {
-                all = (0..self.schema.fields().len()).collect();
-                &all
-            }
+        let projection = if let Some(projection) = args.projection() {
+            projection
+        } else {
+            all = (0..self.schema.fields().len()).collect();
+            &all
         };
         let table_columns = self.table_schema.fields().len();
         let mut table_projection = Vec::with_capacity(projection.len());
@@ -634,14 +630,7 @@ impl TableProvider for JsonKeyScanTable {
                     self.schema.fields().len()
                 )
             })?;
-            let position = match keys.iter().position(|existing| existing == key) {
-                Some(position) => position,
-                None => {
-                    keys.push(key.clone());
-                    keys.len() - 1
-                }
-            };
-            columns.push(ScanColumn::Key(position));
+            columns.push(ScanColumn::Key(position_or_push(&mut keys, key.clone())));
         }
 
         let plan = if keys.is_empty() {
