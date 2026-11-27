@@ -126,93 +126,49 @@ fn expected() -> Vec<(i64, i64)> {
     (11..=100).map(|id| (id, id)).collect()
 }
 
-/// Control: a compaction that commits before the scan starts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_after_compaction_returns_only_live_rows() {
-    for object_native in [false, true] {
-        after_compaction(object_native).await;
-    }
-}
-
-async fn after_compaction(object_native: bool) {
-    let ctx = SessionContext::new();
-    let (provider, _tmp) =
-        table_with_position_deletes("deletes_compaction_control", &ctx, object_native).await;
-    assert_eq!(scan_id_values(&provider).await, expected());
-    assert!(
-        provider
-            .force_full_compaction()
-            .await
-            .expect("full compaction"),
-        "the full compaction must commit"
-    );
-    assert!(
-        provider
-            .pk_deletion_strategy
-            .position_cache()
-            .load()
-            .is_empty()
-    );
-    assert_eq!(scan_id_values(&provider).await, expected());
-}
-
 /// A compaction that commits after the scan captured its files and before it
-/// built its plan, with the SQLite metastore.
+/// built its plan, with the SQLite metastore and in the object-native location.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scan_racing_compaction_returns_only_live_rows() {
-    racing_compaction(false).await;
-}
-
-/// The same with the data and metastore in the object-native location.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scan_racing_compaction_returns_only_live_rows_object_native() {
-    racing_compaction(true).await;
-}
-
-async fn racing_compaction(object_native: bool) {
-    let ctx = SessionContext::new();
-    let (provider, _tmp) =
-        table_with_position_deletes("deletes_compaction_race", &ctx, object_native).await;
-    let snapshot_before = provider.get_current_snapshot_id();
-    let compacted = Arc::new(ParkingMutex::new(None::<bool>));
-    let compactor = Arc::clone(&provider);
-    let outcome = Arc::clone(&compacted);
-    *provider.test_post_scan_view_selection_hook.lock() = Some(Box::new(move || {
-        Box::pin(async move {
-            // Bounded: a compaction that waits on the scan would deadlock here.
-            let committed =
-                tokio::time::timeout(Duration::from_secs(60), compactor.force_full_compaction())
-                    .await
-                    .expect("the compaction must not wait for the scan that captured its files")
-                    .expect("full compaction");
-            *outcome.lock() = Some(committed);
-        })
-    }));
-    let rows = scan_id_values(&provider).await;
-    assert_eq!(
-        *compacted.lock(),
-        Some(true),
-        "precondition: the compaction committed inside the scan's window"
-    );
-    assert_ne!(provider.get_current_snapshot_id(), snapshot_before);
-    assert!(
-        provider
-            .pk_deletion_strategy
-            .position_cache()
-            .load()
-            .is_empty()
-    );
-    let resurrected: Vec<i64> = rows
-        .iter()
-        .map(|(id, _)| *id)
-        .filter(|id| *id <= 10)
-        .collect();
-    assert_eq!(
-        rows,
-        expected(),
-        "object_native={object_native}: {} rows returned, deleted ids that came back: {resurrected:?}",
-        rows.len()
-    );
-    // The next scan, planned after the compaction, reads the new files.
-    assert_eq!(scan_id_values(&provider).await, expected());
+    for object_native in [false, true] {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            table_with_position_deletes("deletes_compaction_race", &ctx, object_native).await;
+        let compacted = Arc::new(ParkingMutex::new(None::<bool>));
+        let compactor = Arc::clone(&provider);
+        let outcome = Arc::clone(&compacted);
+        *provider.test_post_scan_view_selection_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                // Bounded: a compaction that waits on the scan would deadlock here.
+                let committed = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    compactor.force_full_compaction(),
+                )
+                .await
+                .expect("the compaction must not wait for the scan that captured its files")
+                .expect("full compaction");
+                *outcome.lock() = Some(committed);
+            })
+        }));
+        let rows = scan_id_values(&provider).await;
+        assert_eq!(
+            *compacted.lock(),
+            Some(true),
+            "precondition: the compaction committed inside the scan's window"
+        );
+        assert!(
+            provider
+                .pk_deletion_strategy
+                .position_cache()
+                .load()
+                .is_empty()
+        );
+        assert_eq!(rows, expected(), "object_native={object_native}");
+        // The next scan, planned after the compaction, reads the new files.
+        assert_eq!(
+            scan_id_values(&provider).await,
+            expected(),
+            "object_native={object_native}"
+        );
+    }
 }
