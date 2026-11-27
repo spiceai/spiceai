@@ -47,13 +47,19 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
-use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::engine_data::{GetData, RowIndexIterator, TypedGetData};
+use delta_kernel::expressions::{
+    BinaryExpressionOp, ColumnName, DecimalData, Expression, Scalar, column_name,
+};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::scan::state::ScanFile;
+use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
+use delta_kernel::{
+    DeltaResult, Engine, ExpressionRef, FilteredRowVisitor, Predicate, SnapshotRef,
+};
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
@@ -63,8 +69,9 @@ use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use roaring::RoaringTreemap;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
@@ -1451,6 +1458,11 @@ impl TableProvider for DeltaTable {
 
                 for scan_result in scan_iter {
                     let scan = scan_result.map_err(map_delta_error_to_datafusion_err)?;
+                    let mut deletion_vectors = DeletionVectorVisitor::default();
+                    deletion_vectors
+                        .visit_rows_of(&scan.scan_files)
+                        .map_err(map_delta_error_to_datafusion_err)?;
+                    scan_context.deletion_vectors = deletion_vectors.descriptors;
                     scan_context = scan
                         .visit_scan_files(scan_context, handle_scan_file)
                         .map_err(map_delta_error_to_datafusion_err)?;
@@ -1658,6 +1670,9 @@ struct ScanContext {
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     pub files: Vec<PartitionFileContext>,
     table_root: Url,
+    /// The deletion vectors of the scan metadata batch being visited, in the order in which
+    /// `handle_scan_file` receives their files.
+    deletion_vectors: VecDeque<DeletionVectorDescriptor>,
 }
 
 impl ScanContext {
@@ -1667,7 +1682,86 @@ impl ScanContext {
             errs: Vec::new(),
             files: Vec::new(),
             table_root,
+            deletion_vectors: VecDeque::new(),
         }
+    }
+}
+
+/// Reads the deletion vector descriptors of a batch of scan metadata, in the order in which
+/// `ScanMetadata::visit_scan_files` visits their files: the selected rows that have a path.
+#[derive(Default)]
+struct DeletionVectorVisitor {
+    descriptors: VecDeque<DeletionVectorDescriptor>,
+}
+
+impl FilteredRowVisitor for DeletionVectorVisitor {
+    fn selected_column_names_and_types(
+        &self,
+    ) -> (
+        &'static [ColumnName],
+        &'static [delta_kernel::schema::DataType],
+    ) {
+        static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<delta_kernel::schema::DataType>)> =
+            LazyLock::new(|| {
+                use delta_kernel::schema::DataType;
+                [
+                    (column_name!("path"), DataType::STRING),
+                    (column_name!("deletionVector.storageType"), DataType::STRING),
+                    (
+                        column_name!("deletionVector.pathOrInlineDv"),
+                        DataType::STRING,
+                    ),
+                    (column_name!("deletionVector.offset"), DataType::INTEGER),
+                    (
+                        column_name!("deletionVector.sizeInBytes"),
+                        DataType::INTEGER,
+                    ),
+                    (column_name!("deletionVector.cardinality"), DataType::LONG),
+                ]
+                .into_iter()
+                .unzip()
+            });
+        (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+    }
+
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        for row in rows {
+            let Some(path): Option<&str> = getters[0].get_opt(row, "scanFile.path")? else {
+                continue;
+            };
+            let Some(storage_type): Option<&str> =
+                getters[1].get_opt(row, "deletionVector.storageType")?
+            else {
+                continue;
+            };
+            let path_or_inline_dv: String = getters[2].get(row, "deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> = getters[3].get_opt(row, "deletionVector.offset")?;
+            let size_in_bytes: i32 = getters[4].get(row, "deletionVector.sizeInBytes")?;
+            let cardinality: i64 = getters[5].get(row, "deletionVector.cardinality")?;
+            let descriptor = storage_type
+                .parse()
+                .and_then(|storage_type| {
+                    DeletionVectorDescriptor::try_new(
+                        storage_type,
+                        path_or_inline_dv,
+                        offset,
+                        size_in_bytes,
+                        cardinality,
+                    )
+                })
+                .map_err(|e| {
+                    delta_kernel::Error::generic(format!(
+                        "Delta Lake table is corrupt: the deletion vector of data file '{path}' is \
+                         not valid: {e}"
+                    ))
+                })?;
+            self.descriptors.push_back(descriptor);
+        }
+        Ok(())
     }
 }
 
@@ -1719,6 +1813,10 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
         ..
     } = scan_file;
 
+    let deletion_vector = dv_info
+        .has_vector()
+        .then(|| scan_context.deletion_vectors.pop_front());
+
     let root_url = &scan_context.table_root;
 
     let partitioned_file_path = match data_file_location(root_url, &path) {
@@ -1741,7 +1839,19 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
 
     let partitioned_file = PartitionedFile::from(partitioned_file_object_meta);
 
-    let deleted_rows = match dv_info.get_treemap(scan_context.engine.as_ref(), root_url) {
+    let deleted_rows = deletion_vector
+        .map(|descriptor| {
+            descriptor
+                .filter(|descriptor| DvInfo::from(descriptor.clone()) == dv_info)
+                .ok_or_else(|| {
+                    delta_kernel::Error::internal_error(
+                        "the deletion vector read from the scan metadata is not the file's",
+                    )
+                })?
+                .read(scan_context.engine.storage_handler(), root_url)
+        })
+        .transpose();
+    let deleted_rows = match deleted_rows {
         Ok(deleted_rows) => deleted_rows,
         Err(e) => {
             scan_context
@@ -4477,78 +4587,87 @@ mod table_read_tests {
     /// Writes a table with one data file holding the `id`s 0 to 9 in two row groups of five rows,
     /// and a deletion vector that deletes `deleted_rows` of that file.
     fn write_table_with_deletion_vector(table: &Path, deleted_rows: &[u64]) {
+        write_table_with_deletion_vectors(table, &[Some(deleted_rows)]);
+    }
+
+    /// Writes a table with one data file `part-<i>.parquet` per entry of `files`, holding the
+    /// `id`s `10 * i` to `10 * i + 9` in two row groups of five rows. A file whose entry is `Some`
+    /// has a deletion vector that deletes those rows of the file.
+    fn write_table_with_deletion_vectors(table: &Path, files: &[Option<&[u64]>]) {
         use datafusion::arrow::array::Int64Array;
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
         };
         use parquet::arrow::ArrowWriter;
 
-        let file = table.join("part-0.parquet");
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from_iter_values(0..10))],
-        )
-        .expect("batch");
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(5))
-            .build();
-        let out = std::fs::File::create(&file).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(out, schema, Some(properties)).expect("parquet writer");
-        writer.write(&batch).expect("write batch");
-        let metadata = writer.close().expect("close parquet file");
-        assert_eq!(metadata.num_row_groups(), 2, "the file has two row groups");
-        let size = std::fs::metadata(&file).expect("parquet file").len();
-
-        let dv_file = table.join("deletion_vector.bin");
-        let mut out = std::fs::File::create(&dv_file).expect("create deletion vector file");
-        let mut dv_writer = StreamingDeletionVectorWriter::new(&mut out);
-        let mut dv = KernelDeletionVector::new();
-        dv.add_deleted_row_indexes(deleted_rows.iter().copied());
-        let written = dv_writer
-            .write_deletion_vector(dv)
-            .expect("write deletion vector");
-        dv_writer.finalize().expect("finish deletion vector file");
-
         let schema = serde_json::json!({"type": "struct", "fields": [
             {"name": "id", "type": "long", "nullable": true, "metadata": {}}
         ]})
         .to_string();
-        write_commit(
-            table,
-            0,
-            &[
-                serde_json::json!({"protocol": {
-                    "minReaderVersion": 3,
-                    "minWriterVersion": 7,
-                    "readerFeatures": ["deletionVectors"],
-                    "writerFeatures": ["deletionVectors"]
-                }}),
-                serde_json::json!({"metaData": {
-                    "id": "00000000-0000-0000-0000-000000000000",
-                    "format": {"provider": "parquet", "options": {}},
-                    "schemaString": schema,
-                    "partitionColumns": [],
-                    "configuration": {"delta.enableDeletionVectors": "true"},
-                    "createdTime": 0
-                }}),
-                serde_json::json!({"add": {
-                    "path": "part-0.parquet",
-                    "partitionValues": {},
-                    "size": size,
-                    "modificationTime": 0,
-                    "dataChange": true,
-                    "deletionVector": {
-                        "storageType": "p",
-                        "pathOrInlineDv": Url::from_file_path(&dv_file).expect("file URL").to_string(),
-                        "offset": written.offset,
-                        "sizeInBytes": written.size_in_bytes,
-                        "cardinality": written.cardinality
-                    }
-                }}),
-            ],
-        );
+        let mut actions = vec![
+            serde_json::json!({"protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors"],
+                "writerFeatures": ["deletionVectors"]
+            }}),
+            serde_json::json!({"metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema,
+                "partitionColumns": [],
+                "configuration": {"delta.enableDeletionVectors": "true"},
+                "createdTime": 0
+            }}),
+        ];
+        for (i, deleted_rows) in (0_i64..).zip(files) {
+            let path = format!("part-{i}.parquet");
+            let file = table.join(&path);
+            let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&arrow_schema),
+                vec![Arc::new(Int64Array::from_iter_values(10 * i..10 * i + 10))],
+            )
+            .expect("batch");
+            let properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(5))
+                .build();
+            let out = std::fs::File::create(&file).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(out, arrow_schema, Some(properties)).expect("parquet writer");
+            writer.write(&batch).expect("write batch");
+            let metadata = writer.close().expect("close parquet file");
+            assert_eq!(metadata.num_row_groups(), 2, "the file has two row groups");
+            let size = std::fs::metadata(&file).expect("parquet file").len();
+
+            let mut add = serde_json::json!({
+                "path": path,
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": true
+            });
+            if let Some(deleted_rows) = deleted_rows {
+                let dv_file = table.join(format!("deletion_vector-{i}.bin"));
+                let mut out = std::fs::File::create(&dv_file).expect("create deletion vector file");
+                let mut dv_writer = StreamingDeletionVectorWriter::new(&mut out);
+                let mut dv = KernelDeletionVector::new();
+                dv.add_deleted_row_indexes(deleted_rows.iter().copied());
+                let written = dv_writer
+                    .write_deletion_vector(dv)
+                    .expect("write deletion vector");
+                dv_writer.finalize().expect("finish deletion vector file");
+                add["deletionVector"] = serde_json::json!({
+                    "storageType": "p",
+                    "pathOrInlineDv": Url::from_file_path(&dv_file).expect("file URL").to_string(),
+                    "offset": written.offset,
+                    "sizeInBytes": written.size_in_bytes,
+                    "cardinality": written.cardinality
+                });
+            }
+            actions.push(serde_json::json!({ "add": add }));
+        }
+        write_commit(table, 0, &actions);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4575,6 +4694,23 @@ mod table_read_tests {
                 "+----+", "| id |", "+----+", "| 5  |", "| 6  |", "| 7  |", "| 9  |", "+----+",
             ],
             &query(dir.path(), "SELECT id FROM t ORDER BY id").await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_deletion_vector_deletes_rows_of_its_own_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vectors(dir.path(), &[None, Some(&[1, 3, 7]), None, Some(&[0])]);
+        // The ids are 0 to 39 (sum 780), less 11, 13, 17 and 30.
+        assert_batches_eq!(
+            [
+                "+----+-----+",
+                "| n  | s   |",
+                "+----+-----+",
+                "| 36 | 709 |",
+                "+----+-----+",
+            ],
+            &query(dir.path(), "SELECT count(*) AS n, sum(id) AS s FROM t").await
         );
     }
 
