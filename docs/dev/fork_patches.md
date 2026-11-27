@@ -108,7 +108,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `7caad4ccc7050b0721778a426eef38f0f151fef9` | `spiceai-25` |
-| [arrow-rs](#arrow-rs) | `aac2a79b802c5788be5a77b90421efa4346a5a3c` | `phillip/parquet-dictionary-page-bound` (TEMPORARY: spiceai/arrow-rs#39) |
+| [arrow-rs](#arrow-rs) | `ca5de5e072ffd9e85a7281244bb92aa48506db32` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `e92cdef14c1e1c027f4e18cdbd5a957148462889` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
