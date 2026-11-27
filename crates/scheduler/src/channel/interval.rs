@@ -17,14 +17,14 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
-use snafu::{OptionExt, ResultExt};
+use snafu::OptionExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 use crate::task::TaskRequest;
 
-use super::TaskRequestChannel;
+use super::{Cycle, TaskRequestChannel, timed_request_cycle};
 
 pub struct IntervalRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
@@ -89,43 +89,23 @@ impl TaskRequestChannel for IntervalRequestChannel {
         let interval = self.interval;
 
         Ok(tokio::spawn(async move {
-            let mut first_run = true;
             loop {
-                if first_run {
-                    first_run = false;
-                } else {
-                    tokio::select! {
-                        () = cancellation.cancelled() => {
-                            tracing::debug!("Interval evaluator cancelled");
-                            return Ok(());
-                        }
-                        () = reset.notified() => {
-                            tracing::debug!("Interval evaluator reset");
-                            continue;
-                        }
-                        () = task_completion.notified() => {
-                            tracing::debug!("Interval evaluator notified");
-                        }
-                    }
-                }
-
-                tokio::select! {
-                    () = cancellation.cancelled() => {
+                let cycle = timed_request_cycle(
+                    tokio::time::sleep(interval),
+                    &cancellation,
+                    &reset,
+                    &task_completion,
+                    &tx,
+                )
+                .await?;
+                match cycle {
+                    Cycle::Requested => tracing::debug!("Interval evaluator notified"),
+                    Cycle::Reset => tracing::debug!("Interval evaluator reset"),
+                    Cycle::Cancelled => {
                         tracing::debug!("Interval evaluator cancelled");
                         return Ok(());
                     }
-                    () = reset.notified() => {
-                        tracing::debug!("Interval evaluator reset");
-                        continue;
-                    }
-                    () = tokio::time::sleep(interval) => {
-                        tracing::debug!("Interval evaluator interval elapsed");
-                    }
                 }
-
-                tx.send(Arc::new(TaskRequest::default()))
-                    .await
-                    .context(crate::ChannelSendSnafu)?;
             }
         }))
     }

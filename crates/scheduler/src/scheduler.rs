@@ -917,4 +917,34 @@ mod test {
         scheduler.stop().await;
         assert_eq!(executions.load(Ordering::SeqCst), 3);
     }
+
+    /// A trigger waits for each run to end before it schedules the next one. A run that ends
+    /// right after it starts must still end that wait: on a multi-thread runtime the run is
+    /// spawned next to the reset that tells the trigger a run started, and can end before the
+    /// trigger is polled again. Runs back to back (interval 0) for a second of wall time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interval_schedule_keeps_running_when_each_run_ends_at_once() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let schedule = Schedule::new(
+            Arc::from("an_interval_schedule_keeps_running_when_each_run_ends_at_once"),
+            Arc::new(TestComponent {
+                executions: Arc::clone(&executions),
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(0))));
+        let scheduler = Scheduler::<NotStarted>::new(
+            "an_interval_schedule_keeps_running_when_each_run_ends_at_once".into(),
+            vec![Arc::new(schedule)],
+        );
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let halfway = executions.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let end = executions.load(Ordering::SeqCst);
+        scheduler.stop().await;
+        assert!(
+            end > halfway && halfway >= 20,
+            "the schedule stopped: {halfway} runs after 0.5 s, {end} after 1 s"
+        );
+    }
 }
