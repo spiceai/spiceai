@@ -514,8 +514,8 @@ pub fn build_db_options(
     opts
 }
 
-/// Returns the SQL dialect for a given ADBC driver name, if a non-default one is
-/// needed.
+/// Returns the SQL dialect for a given ADBC driver name, in any letter case, if
+/// a non-default one is needed.
 ///
 /// These are the stock `DataFusion` dialects, which rewrite no Spice function,
 /// with string literals written as the engine reads them: `BigQuery` and
@@ -527,7 +527,7 @@ pub fn build_db_options(
 /// only be used with its matching policy; the catalog keeps the stock dialect.
 #[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
+    match driver_name.to_ascii_lowercase().as_str() {
         "bigquery" => Some(Arc::new(BackslashEscapedStrings::new(
             BigQueryDialect::new(),
             QuoteEscape::Unicode,
@@ -799,15 +799,17 @@ mod tests {
                     .to_string()
             }
         };
-        assert_string_literals(
-            unparse("bigquery"),
-            "`c`",
-            UNICODE_QUOTE_LITERALS,
-            read_bigquery,
-        );
-        assert_string_literals(unparse("snowflake"), "c", DOUBLED_QUOTE_LITERALS, |sql| {
-            read_with_tokenizer(&SnowflakeDialect, sql)
-        });
+        for (bigquery, snowflake) in [("bigquery", "snowflake"), ("BigQuery", "Snowflake")] {
+            assert_string_literals(
+                unparse(bigquery),
+                "`c`",
+                UNICODE_QUOTE_LITERALS,
+                read_bigquery,
+            );
+            assert_string_literals(unparse(snowflake), "c", DOUBLED_QUOTE_LITERALS, |sql| {
+                read_with_tokenizer(&SnowflakeDialect, sql)
+            });
+        }
     }
 
     #[test]

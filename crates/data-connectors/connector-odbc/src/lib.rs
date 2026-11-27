@@ -24,7 +24,7 @@ pub mod odbcconn;
 pub mod odbcpool;
 
 use crate::odbc::ODBCTableFactory;
-use crate::odbcconn::ODBCDbConnectionPool;
+use crate::odbcconn::{ODBCDbConnectionPool, SqlCheck};
 use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
@@ -48,7 +48,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape, refuse_variable_reference};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -157,6 +157,15 @@ impl ODBCProfile {
             ODBCProfile::Sqlite => Some("sqlite"),
             ODBCProfile::Athena => Some("athena"),
             ODBCProfile::Databricks | ODBCProfile::Unknown => None,
+        }
+    }
+
+    /// The check a connection runs on SQL text before it sends the text to
+    /// the engine behind the profile.
+    fn sql_check(&self) -> Option<SqlCheck> {
+        match self {
+            ODBCProfile::Databricks => Some(refuse_variable_reference),
+            _ => None,
         }
     }
 }
@@ -360,11 +369,13 @@ impl DataConnectorFactory for ODBCFactory {
                 return Err(Error::DirectDriverNotPermitted {}.into());
             }
 
+            let sql_check;
             let (dialect, engine): (
                 Result<Option<Arc<dyn Dialect + Send + Sync>>>,
                 Option<String>,
             ) = if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
                 let engine = sql_dialect.to_string();
+                sql_check = ODBCProfile::from(sql_dialect).sql_check();
                 let sql_dialect = SQLDialectParam::new(sql_dialect);
                 (sql_dialect.try_into(), Some(engine))
             } else {
@@ -382,13 +393,15 @@ impl DataConnectorFactory for ODBCFactory {
 
                 let profile = ODBCProfile::from(driver);
                 let engine = profile.engine().map(str::to_string);
+                sql_check = profile.sql_check();
                 (Ok(profile.into()), engine)
             };
             let dialect = dialect?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
                 ODBCPool::new(params.parameters.to_secret_map())
-                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
+                    .context(UnableToCreateODBCConnectionPoolSnafu)?
+                    .with_sql_check(sql_check),
             );
 
             let odbc_factory = ODBCTableFactory::new(pool, dialect)
@@ -467,6 +480,34 @@ mod test {
             UNICODE_QUOTE_LITERALS,
             read_spark,
         );
+    }
+
+    /// A Databricks connection unparses a plan with this dialect and checks
+    /// the statement before it sends it, whether `sql_dialect` or the driver
+    /// name selects the profile.
+    #[test]
+    fn databricks_statements_holding_a_variable_reference_are_refused() {
+        use datafusion::logical_expr::LogicalPlan;
+        use util::sql_string_literal::test_support::{
+            assert_no_variable_reference_sent, variable_reference_plans,
+        };
+
+        let dialect = databricks_dialect();
+        for selected_by in ["databricks", "driver={databricks odbc driver}"] {
+            let check = ODBCProfile::from(selected_by)
+                .sql_check()
+                .expect("a Databricks connection checks SQL text");
+            let send = |plan: &LogicalPlan| -> Result<String> {
+                let sql = Unparser::new(&dialect).plan_to_sql(plan)?.to_string();
+                check(&sql)?;
+                Ok(sql)
+            };
+            let (refused, literal) = variable_reference_plans();
+            for plan in &refused {
+                assert_no_variable_reference_sent(send(plan));
+            }
+            send(&literal).expect("a string literal that holds ${ is sent");
+        }
     }
 
     #[test]

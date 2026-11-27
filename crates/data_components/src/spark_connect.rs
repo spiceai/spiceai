@@ -48,7 +48,7 @@ use runtime_udfs_api::deny_spice_specific_functions;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col};
 use tokio::sync::{Mutex, RwLock};
-use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape, refuse_variable_reference};
 use uuid::Uuid;
 
 use std::error::Error;
@@ -584,9 +584,9 @@ fn expr_to_sql(expr: &Expr) -> DataFusionResult<String> {
             .build(),
         QuoteEscape::Unicode,
     );
-    Unparser::new(&dialect)
-        .expr_to_sql(expr)
-        .map(|expr| expr.to_string())
+    let sql = Unparser::new(&dialect).expr_to_sql(expr)?.to_string();
+    refuse_variable_reference(&sql)?;
+    Ok(sql)
 }
 
 impl DisplayAs for SparkConnectExecutionPlan {
@@ -739,6 +739,19 @@ mod tests {
             UNICODE_QUOTE_LITERALS,
             read_spark,
         );
+    }
+
+    #[test]
+    fn pushed_filters_holding_a_variable_reference_are_refused() {
+        use util::sql_string_literal::test_support::{
+            assert_no_variable_reference_sent, variable_reference_filters,
+        };
+
+        let (refused, literal) = variable_reference_filters();
+        for filter in &refused {
+            assert_no_variable_reference_sent(expr_to_sql(filter));
+        }
+        expr_to_sql(&literal).expect("a string literal that holds ${ is sent");
     }
 
     const TEST_CONNECTION: &str = "sc://dbc-abcd.cloud.databricks.com:443/;use_ssl=true;user_id=spice.ai;session_id=00000000-0000-0000-0000-000000000001;token=secret-token;x-databricks-cluster-id=cluster-123;user_agent=SpiceAI_OSS/1.0;";

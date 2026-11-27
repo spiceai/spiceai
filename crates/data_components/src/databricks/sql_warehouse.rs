@@ -56,7 +56,9 @@ use tokio::sync::Semaphore;
 use util::{
     fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
     format_datafusion_error,
-    sql_string_literal::{QuoteEscape, backslash_escaped_string_literal},
+    sql_string_literal::{
+        QuoteEscape, backslash_escaped_string_literal, refuse_variable_reference,
+    },
 };
 
 #[cfg(test)]
@@ -282,6 +284,9 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire Databricks SQL Warehouse rate-control permit: {source}"))]
     RateControl { source: runtime_rate_control::Error },
+
+    #[snafu(display("{source}"))]
+    SqlNotSendable { source: DataFusionError },
 
     #[snafu(display(
         "Failed to parse response from Databricks SQL Warehouse: {}",
@@ -1160,6 +1165,7 @@ impl SqlWarehouseApi {
             .get("statement")
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
+        refuse_variable_reference(sql_text).context(SqlNotSendableSnafu)?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         async {
@@ -3500,6 +3506,50 @@ mod tests {
             2,
             "expected the SQL statement request to be retried once"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn statements_holding_a_variable_reference_are_not_sent() {
+        use datafusion::sql::unparser::Unparser;
+        use std::sync::atomic::Ordering;
+        use util::sql_string_literal::test_support::variable_reference_plans;
+
+        let (port, requests) = start_mock_http_server(
+            vec![],
+            MockHttpResponse::json(
+                "200 OK",
+                json!({ "status": { "state": "SUCCEEDED" }, "statement_id": "stmt-1" }).to_string(),
+            ),
+        )
+        .await;
+        let api = create_test_api(port);
+        let dialect = databricks_dialect();
+        let payload = |plan| {
+            let sql = Unparser::new(&dialect)
+                .plan_to_sql(plan)
+                .expect("unparse")
+                .to_string();
+            json!({ "statement": sql })
+        };
+
+        let (refused, literal) = variable_reference_plans();
+        for plan in &refused {
+            let statement = payload(plan);
+            let err = api
+                .execute_sql_statement("token", &statement)
+                .await
+                .expect_err("a statement that holds ${ is not sent");
+            assert!(
+                matches!(&err, Error::SqlNotSendable { .. }),
+                "{statement}: {err}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        api.execute_sql_statement("token", &payload(&literal))
+            .await
+            .expect("a string literal that holds ${ is sent");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

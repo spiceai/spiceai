@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, WindowFrameBound};
 use datafusion::sql::unparser::Unparser;
@@ -62,6 +62,25 @@ pub fn backslash_escaped_string_literal(s: &str, quote: QuoteEscape) -> ast::Exp
         }
     }
     ast::Expr::value(ast::Value::SingleQuotedString(escaped))
+}
+
+/// Refuses SQL text for Spark SQL or Databricks that holds `${`.
+///
+/// These engines replace each `${...}` anywhere in the SQL text before they
+/// parse it, quoted identifiers and time zone names included, and an
+/// identifier has no escape for `$`. A string literal written with
+/// [`QuoteEscape::Unicode`] never holds `${`.
+///
+/// # Errors
+///
+/// [`DataFusionError::NotImplemented`] when `sql` holds `${`.
+pub fn refuse_variable_reference(sql: &str) -> Result<()> {
+    if sql.contains("${") {
+        return Err(DataFusionError::NotImplemented(
+            "SQL that holds ${ cannot be sent to Spark or Databricks, because they substitute variables written as ${...} in SQL text".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `inner`, with every string literal written by
@@ -328,7 +347,13 @@ impl<D: Dialect> Dialect for BackslashEscapedStrings<D> {
 /// that assert a rendered literal holds exactly its value and nothing after it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::common::{Column, DataFusionError, Result};
+    use datafusion::logical_expr::builder::LogicalTableSource;
     use datafusion::logical_expr::expr::Like;
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, cast};
     use datafusion::prelude::{Expr, col, lit};
     use datafusion::sql::sqlparser::dialect::{
         BigQueryDialect, DatabricksDialect, Dialect as ParserDialect,
@@ -627,6 +652,79 @@ pub mod test_support {
             }
         }
         out
+    }
+
+    fn cast_to_zone_holding_a_variable_reference() -> Expr {
+        cast(
+            col("ts"),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("${x}".into())),
+        )
+    }
+
+    /// Filters over `t(c STRING, ts TIMESTAMP)` that Spark SQL and Databricks
+    /// would substitute a variable in: on a column whose name holds `${`, and
+    /// on a cast to a time zone whose name holds `${`; then a filter whose only
+    /// `${` is in a string literal value.
+    #[must_use]
+    pub fn variable_reference_filters() -> ([Expr; 2], Expr) {
+        (
+            [
+                Expr::Column(Column::from_name("${x}")).is_not_null(),
+                cast_to_zone_holding_a_variable_reference().is_not_null(),
+            ],
+            col("c").eq(lit("${x}")),
+        )
+    }
+
+    /// Plans over `t(c STRING, ts TIMESTAMP)` that Spark SQL and Databricks
+    /// would substitute a variable in: a column alias that holds `${`, and a
+    /// cast to a time zone whose name holds `${`; then a plan whose only `${`
+    /// is in a string literal value.
+    ///
+    /// # Panics
+    ///
+    /// When a plan does not build.
+    #[must_use]
+    pub fn variable_reference_plans() -> ([LogicalPlan; 2], LogicalPlan) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Utf8, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ]));
+        let scan = || {
+            LogicalPlanBuilder::scan(
+                "t",
+                Arc::new(LogicalTableSource::new(Arc::clone(&schema))),
+                None,
+            )
+        };
+        let build = |builder: Result<LogicalPlanBuilder>| {
+            builder
+                .and_then(LogicalPlanBuilder::build)
+                .unwrap_or_else(|e| panic!("plan does not build: {e}"))
+        };
+        (
+            [
+                build(scan().and_then(|scan| scan.project(vec![col("c").alias("${x}")]))),
+                build(scan().and_then(|scan| {
+                    scan.filter(cast_to_zone_holding_a_variable_reference().is_not_null())
+                })),
+            ],
+            build(scan().and_then(|scan| scan.filter(col("c").eq(lit("${x}"))))),
+        )
+    }
+
+    /// Asserts that `sent` is refused with `NotImplemented`, or is SQL that
+    /// holds no `${`.
+    ///
+    /// # Panics
+    ///
+    /// When `sent` is SQL that holds `${`, or another error.
+    pub fn assert_no_variable_reference_sent(sent: Result<String>) {
+        match sent {
+            Err(DataFusionError::NotImplemented(_)) => {}
+            Ok(sql) => assert!(!sql.contains("${"), "{sql} holds a variable reference"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
     }
 }
 

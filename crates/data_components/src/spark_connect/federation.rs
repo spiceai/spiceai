@@ -28,7 +28,7 @@ use datafusion::{
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::Stream;
-use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape, refuse_variable_reference};
 
 use crate::function_support::contains_unsupported_functions;
 use crate::spark_connect::map_error_to_datafusion_err;
@@ -90,6 +90,7 @@ impl SQLExecutor for SparkConnectTableProvider {
         schema: SchemaRef,
         _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        refuse_variable_reference(query)?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             spark_query_to_stream(self.spark_connect.clone(), query.to_string()),
@@ -153,9 +154,13 @@ fn spark_sql_dialect() -> BackslashEscapedStrings<CustomDialect> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::LogicalPlan;
     use datafusion::sql::unparser::Unparser;
+    use util::sql_string_literal::refuse_variable_reference;
     use util::sql_string_literal::test_support::{
-        UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
+        UNICODE_QUOTE_LITERALS, assert_no_variable_reference_sent, assert_string_literals,
+        read_spark, variable_reference_plans,
     };
 
     use super::spark_sql_dialect;
@@ -170,5 +175,22 @@ mod tests {
             UNICODE_QUOTE_LITERALS,
             read_spark,
         );
+    }
+
+    /// Federation unparses a plan with this dialect and `execute` checks the
+    /// statement before it sends it.
+    #[test]
+    fn statements_holding_a_variable_reference_are_refused() {
+        let dialect = spark_sql_dialect();
+        let send = |plan: &LogicalPlan| -> DataFusionResult<String> {
+            let sql = Unparser::new(&dialect).plan_to_sql(plan)?.to_string();
+            refuse_variable_reference(&sql)?;
+            Ok(sql)
+        };
+        let (refused, literal) = variable_reference_plans();
+        for plan in &refused {
+            assert_no_variable_reference_sent(send(plan));
+        }
+        send(&literal).expect("a string literal that holds ${ is sent");
     }
 }
