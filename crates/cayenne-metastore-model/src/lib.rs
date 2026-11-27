@@ -113,7 +113,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 35] = [
+const REPLAYED_AGAINST_CODE: [&str; 44] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -134,6 +134,15 @@ const REPLAYED_AGAINST_CODE: [&str; 35] = [
     "mem-tier-no-one-call",
     "mem-tier-seal-delete-only",
     "mem-tier-seal-delete-only-sqlite",
+    "schema",
+    "schema-no-adopt",
+    "schema-no-conform",
+    "schema-positional",
+    "schema-recreate-drops",
+    "schema-replica-commits",
+    "schema-stale-plan",
+    "schema-takeover-narrows",
+    "schema-takeover-trusts-checkpoint",
     "source-ack-before-acceptance",
     "source-no-redelivery-skip",
     "source-position-before-data",
@@ -411,6 +420,30 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "an instance fails only for a change it cannot apply",
+        },
+        Run {
+            name: "schema-stale-plan",
+            family: "schema",
+            mode: "schema-stale-plan",
+            bound: 0,
+            seed: None,
+            failure: "a query answers in the schema its instance serves",
+        },
+        Run {
+            name: "schema-no-conform",
+            family: "schema",
+            mode: "schema-no-conform",
+            bound: 0,
+            seed: None,
+            failure: "a replica never serves rows misaligned with its schema",
+        },
+        Run {
+            name: "schema-takeover-trusts-checkpoint",
+            family: "schema",
+            mode: "schema-takeover-trusts-checkpoint",
+            bound: 0,
+            seed: None,
+            failure: "a copy's schema never narrows below its data",
         },
         Run {
             name: "schema-no-adopt",
@@ -3646,6 +3679,14 @@ pub fn mem_tier_steps(run: &str, actions: &[String]) -> Option<Vec<MemTierStep>>
         .find(|r| r.name == run && r.family == "mem-tier")?;
     mem_tier::steps(run.mode, run.bound, actions)
 }
+
+/// The `schema` family, for a replay of its traces through the real code
+/// (`crates/cayenne/tests/object_native_schema_replay_test.rs`).
+pub use schema::{
+    Action as SchemaAction, Copy as SchemaCopy, INCOMPATIBLE as SCHEMA_INCOMPATIBLE,
+    INSTANCES as SCHEMA_INSTANCES, Instance as SchemaInstance, Protocol as SchemaProtocol,
+    State as SchemaState, Status as SchemaStatus,
+};
 
 pub use transactions::Step as TransactionStep;
 

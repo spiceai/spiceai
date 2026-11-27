@@ -120,6 +120,7 @@ mod object_native_local_location_test;
 mod object_native_log_collection_test;
 mod object_native_mem_tier_publication_test;
 mod object_native_replica_test;
+mod object_native_schema_replay_test;
 mod object_native_source_replay_test;
 mod object_native_transaction_test;
 mod object_native_writer_lease_test;
