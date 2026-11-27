@@ -560,23 +560,19 @@ impl CayenneAccelerator {
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
                     )
                     .await
-                    .map(|native| {
-                        let native = native.with_data_store(data_store);
-                        // The node disk cache reads data files through the meter, so
-                        // the data requests measured are the cache's misses and
-                        // prefetches.
-                        match cayenne::disk_cache::process_disk_cache().zip(identity) {
-                            Some((cache, identity)) => {
-                                native.with_disk_cache(cache, &identity.namespace())
-                            }
-                            None => native,
-                        }
-                    });
-                let catalog = Arc::new(
-                    native
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?,
-                );
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                let native = native.with_data_store(data_store);
+                // The node disk cache reads data files through the meter, so the
+                // data requests measured are the cache's misses and prefetches.
+                let native = match cayenne::disk_cache::process_disk_cache_or_open()
+                    .await
+                    .zip(identity)
+                {
+                    Some((cache, identity)) => native.with_disk_cache(cache, &identity.namespace()),
+                    None => native,
+                };
+                let catalog = Arc::new(native);
                 cayenne::MetadataCatalog::init(catalog.as_ref())
                     .await
                     .boxed()

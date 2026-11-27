@@ -22,6 +22,7 @@ limitations under the License.
     reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
 )]
 
+mod disk_cache_lifecycle;
 mod lookup_index_catch_up;
 mod partitioned_keyed_writes;
 mod partitioned_lookup_index;

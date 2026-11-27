@@ -441,22 +441,21 @@ impl RuntimeBuilder {
         let cayenne_segment_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
-        // The cache decision must exist before a Cayenne table added through DDL can
-        // initialize, but an initially non-Cayenne Spicepod has no user-visible
-        // Cayenne cache to report at startup.
+        // The segment cache is installed process-wide before a Cayenne table added
+        // through DDL can initialize, but an initially non-Cayenne Spicepod has no
+        // user-visible segment cache to report at startup.
         let cayenne_configured = cayenne_configured_for_startup_log(self.app.as_ref());
         install_segment_cache(cayenne_segment_cache_mb, cayenne_configured);
-        // Opened before any dataset loads: the object-native catalog wraps its
-        // data store with the cache when it is first created.
+        // The first object-native catalog opens the disk cache and wraps its data
+        // store with it. The decision is registered before a catalog can be added
+        // through DDL or a Spicepod reload.
         install_disk_cache(disk_cache_decision(
-            cayenne_configured,
             &spicepod_rt.params,
             spicepod_rt.state.as_ref(),
             role.cluster_role().as_ref(),
             std::path::Path::new(&crate::spice_data_base_path()),
             crate::resource_monitor::get_total_memory(),
-        ))
-        .await;
+        ));
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -1196,7 +1195,7 @@ enum DiskCacheBudget {
 impl DiskCacheBudget {
     fn describe(self) -> String {
         match self {
-            Self::SizedFromMemory => "sized from memory".to_string(),
+            Self::SizedFromMemory => "an eighth of memory".to_string(),
             Self::Configured => format!("set by `runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}`"),
         }
     }
@@ -1205,11 +1204,14 @@ impl DiskCacheBudget {
 /// What this process does about the node disk cache.
 #[derive(Debug, PartialEq, Eq)]
 enum DiskCacheDecision {
-    /// No cache, and nothing to report: `0`, no Cayenne dataset, or the param
-    /// unset where the cache has nothing to serve.
+    /// No cache, and nothing to report: `0`, or the param unset where the
+    /// cache has nothing to serve.
     Off,
     /// The param is set, but the cache cannot be on: the WARN line.
     Refused(String),
+    /// The cache is off, reported at INFO when the first object-native catalog
+    /// is created.
+    DeferredInfo(String),
     /// Open a cache of `budget_bytes` in `dir` for the Cayenne data in
     /// `location`.
     Open {
@@ -1222,13 +1224,12 @@ enum DiskCacheDecision {
 
 /// The node disk cache holds Cayenne data files read from an `s3://`
 /// `runtime.state.location`, which is where `cayenne_vnext: enabled` keeps
-/// them outside a cluster. It is on wherever it has something to serve (a
-/// Spicepod with a Cayenne dataset, `cayenne_configured`), with
-/// [`disk_cache_default_budget_bytes`] of `total_memory` unless
+/// them outside a cluster. It is opened when the first object-native catalog
+/// gives it something to serve, with [`disk_cache_default_budget_bytes`] of
+/// `total_memory` unless
 /// `runtime.params.cayenne_disk_cache_mb` sets the budget (`0` turns it off);
 /// `dir` is under `data_dir`, the Spice data directory.
 fn disk_cache_decision(
-    cayenne_configured: bool,
     params: &HashMap<String, String>,
     state: Option<&spicepod::component::runtime::RuntimeState>,
     cluster_role: Option<&ClusterRole>,
@@ -1243,19 +1244,18 @@ fn disk_cache_decision(
             Ok(mb) => Some(mb),
             Err(_) => {
                 return DiskCacheDecision::Refused(format!(
-                    "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is '{raw}', not a number of MiB, so the Cayenne disk cache is off and every read of Cayenne data goes to the object store. Set it to the most MiB the cache may use, or to 0 to turn the cache off. See: {CAYENNE_DOCS}"
+                    "The Cayenne disk cache is off: `runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is '{raw}', not a number of MiB, so every read of Cayenne data goes to the object store. Set it to the most MiB the cache may use, or to 0 to turn the cache off. See: {CAYENNE_DOCS}"
                 ));
             }
         },
     };
-    if !cayenne_configured {
-        return DiskCacheDecision::Off;
-    }
     // Unset, the cache is simply not used where it has nothing to serve; a set
     // budget that cannot apply is reported.
     let off = |message: String| {
         if configured_mb.is_some() {
-            DiskCacheDecision::Refused(format!("{message} See: {CAYENNE_DOCS}"))
+            DiskCacheDecision::Refused(format!(
+                "The Cayenne disk cache is off: {message} See: {CAYENNE_DOCS}"
+            ))
         } else {
             DiskCacheDecision::Off
         }
@@ -1263,26 +1263,33 @@ fn disk_cache_decision(
     // An invalid value is reported by the accelerator, which refuses it.
     if !matches!(cayenne::vnext_enabled(params), Ok(true)) {
         return off(format!(
-            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but the Cayenne disk cache serves only data Cayenne keeps in `runtime.state.location`, which needs `runtime.params.{CAYENNE_VNEXT_PARAM}: enabled`, so the cache is off. Enable `{CAYENNE_VNEXT_PARAM}`, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
+            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but the cache serves only data Cayenne keeps in `runtime.state.location`, which needs `runtime.params.{CAYENNE_VNEXT_PARAM}: enabled`, so every read of Cayenne data goes to its local files. Enable `{CAYENNE_VNEXT_PARAM}`, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
         ));
     }
     if cluster_role.is_some() {
         return off(format!(
-            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but a cluster scheduler or executor keeps its Cayenne data on local disk, so the Cayenne disk cache is off: there is nothing for it to cache. Remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
+            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but a cluster scheduler or executor keeps its Cayenne data on local disk, so there is nothing for the cache to serve. Remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
         ));
     }
     let Some(location) = state.map(|state| state.location.clone()) else {
         return off(format!(
-            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but `runtime.state.location` is not, so Cayenne keeps its data on local disk and the Cayenne disk cache is off: there is nothing for it to cache. Set `runtime.state.location` to an `s3://` location, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
+            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but `runtime.state.location` is not, so Cayenne keeps its data on local disk and there is nothing for the cache to serve. Set `runtime.state.location` to an `s3://` location, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
         ));
     };
     let scheme = url::Url::parse(&location)
         .map(|url| url.scheme().to_string())
         .unwrap_or_default();
     if scheme != "s3" {
-        return off(format!(
-            "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but `runtime.state.location` '{location}' is not an `s3://` location, so the Cayenne disk cache is off: it caches only data in S3. Move `runtime.state.location` to S3, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
-        ));
+        return if configured_mb.is_some() {
+            off(format!(
+                "`runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` is set, but `runtime.state.location` '{location}' is not an `s3://` location, and the cache serves only data in S3. Move `runtime.state.location` to S3, or remove `{CAYENNE_DISK_CACHE_MB_PARAM}`."
+            ))
+        } else if scheme == "file" {
+            // Data in a local location is read from local disk already.
+            DiskCacheDecision::Off
+        } else {
+            DiskCacheDecision::DeferredInfo(disk_cache_non_s3_message(&location))
+        };
     }
     let (budget_bytes, budget) = match configured_mb {
         Some(mb) => (mb.saturating_mul(MIB), DiskCacheBudget::Configured),
@@ -1297,6 +1304,14 @@ fn disk_cache_decision(
         budget_bytes,
         budget,
     }
+}
+
+/// The INFO line reported when the first object-native catalog uses a state
+/// location the disk cache does not serve.
+fn disk_cache_non_s3_message(location: &str) -> String {
+    format!(
+        "The Cayenne disk cache is off: it caches only `s3://` locations, so every read of Cayenne data in '{location}' goes to the object store. See: {CAYENNE_DOCS}"
+    )
 }
 
 /// `bytes` for a log line: MiB below 1 GiB, GiB with one decimal above.
@@ -1325,21 +1340,27 @@ fn disk_cache_opened_message(
     let basis = budget.describe();
     match (space, reserve) {
         (Some(space), Some(reserve)) if capacity == 0 => format!(
-            "Disk cache for data in '{location}' has no room: '{dir}' has {} free, below the {} the cache leaves free on its volume, so every read of Cayenne data goes to the object store until space frees up. Free space on that volume, or set `runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` to 0 to turn the cache off. See: {CAYENNE_DOCS}",
+            "The Cayenne disk cache for data in '{location}' has no room: '{dir}' has {} free, below the {} the cache leaves free on its volume, so every read of Cayenne data goes to the object store until space frees up. Free space on that volume, or set `runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` to 0 to turn the cache off. See: {CAYENNE_DOCS}",
             format_bytes(space.available),
             format_bytes(reserve),
         ),
         (Some(space), Some(reserve)) if capacity < budget_bytes => format!(
-            "Disk cache for data in '{location}' is on at '{dir}': {} of its {} budget ({basis}), as the cache leaves {} free on its volume ({} free now). See: {CAYENNE_DOCS}",
+            "The Cayenne disk cache for data in '{location}' is on at '{dir}': {} of its {} budget ({basis}), as the cache leaves {} free on its volume ({} free now). See: {CAYENNE_DOCS}",
             format_bytes(capacity),
             format_bytes(budget_bytes),
             format_bytes(reserve),
             format_bytes(space.available),
         ),
-        _ => format!(
-            "Disk cache for data in '{location}' is on at '{dir}': up to {}, {basis}. See: {CAYENNE_DOCS}",
-            format_bytes(capacity),
-        ),
+        _ => match budget {
+            DiskCacheBudget::SizedFromMemory => format!(
+                "The Cayenne disk cache for data in '{location}' is on at '{dir}': up to {}, {basis}. Set `runtime.params.{CAYENNE_DISK_CACHE_MB_PARAM}` to change it. See: {CAYENNE_DOCS}",
+                format_bytes(capacity),
+            ),
+            DiskCacheBudget::Configured => format!(
+                "The Cayenne disk cache for data in '{location}' is on at '{dir}': up to {}, {basis}. See: {CAYENNE_DOCS}",
+                format_bytes(capacity),
+            ),
+        },
     }
 }
 
@@ -1366,26 +1387,48 @@ fn disk_cache_volume_refused_message(
     )
 }
 
-/// Open and install the node disk cache `decision` asks for, reporting why
-/// when it cannot be opened. Never fails the runtime: without the cache, reads
-/// go to the object store.
-async fn install_disk_cache(decision: DiskCacheDecision) {
-    let (location, dir, budget_bytes, budget) = match decision {
-        DiskCacheDecision::Off => return,
-        DiskCacheDecision::Refused(warning) => {
-            tracing::warn!("{warning}");
-            return;
+/// Register what the first object-native catalog does about the node disk
+/// cache, reporting startup refusals immediately.
+fn install_disk_cache(decision: DiskCacheDecision) {
+    match decision {
+        DiskCacheDecision::Off => {}
+        DiskCacheDecision::Refused(warning) => tracing::warn!("{warning}"),
+        DiskCacheDecision::DeferredInfo(message) => {
+            if !cayenne::disk_cache::register_deferred_info(message) {
+                tracing::debug!(
+                    "The Cayenne disk cache already has a process-wide decision; keeping it"
+                );
+            }
         }
         DiskCacheDecision::Open {
             location,
             dir,
             budget_bytes,
             budget,
-        } => (location, dir, budget_bytes, budget),
-    };
+        } => {
+            if !cayenne::disk_cache::register_opener(move || {
+                open_disk_cache(location, dir, budget_bytes, budget)
+            }) {
+                tracing::debug!(
+                    "The Cayenne disk cache already has a process-wide decision; keeping it"
+                );
+            }
+        }
+    }
+}
+
+/// Open and install the node disk cache, reporting why it cannot be opened.
+/// Never fails catalog creation: without the cache, reads go to the object
+/// store.
+async fn open_disk_cache(
+    location: String,
+    dir: std::path::PathBuf,
+    budget_bytes: u64,
+    budget: DiskCacheBudget,
+) {
     if cayenne::disk_cache::process_disk_cache().is_some() {
         // A second runtime in one process keeps the first one's open cache.
-        tracing::debug!("Cayenne disk cache already installed; keeping it");
+        tracing::debug!("The Cayenne disk cache is already installed; keeping it");
         return;
     }
     let probe = dir.clone();
@@ -1422,7 +1465,7 @@ async fn install_disk_cache(decision: DiskCacheDecision) {
         Err(object_store_cache::Error::UnsupportedPlatform)
             if budget == DiskCacheBudget::SizedFromMemory =>
         {
-            tracing::debug!("Cayenne disk cache is not supported on this platform");
+            tracing::debug!("The Cayenne disk cache is not supported on this platform");
             return;
         }
         Err(error) => {
@@ -1441,18 +1484,22 @@ async fn install_disk_cache(decision: DiskCacheDecision) {
     let reserve = space.map(|space| cache.volume_reserve_bytes(space.total));
     let capacity = cache.stats().capacity_bytes;
     if cayenne::disk_cache::install(Arc::clone(&cache), dir.clone()) {
-        tracing::info!(
-            "{}",
-            disk_cache_opened_message(
-                &location,
-                &dir,
-                budget_bytes,
-                budget,
-                capacity,
-                space,
-                reserve
-            )
+        let message = disk_cache_opened_message(
+            &location,
+            &dir,
+            budget_bytes,
+            budget,
+            capacity,
+            space,
+            reserve,
         );
+        // A budget the user set that leaves no room is a problem to fix; a
+        // budget sized from memory with no room is reported for information.
+        if capacity == 0 && budget == DiskCacheBudget::Configured {
+            tracing::warn!("{message}");
+        } else {
+            tracing::info!("{message}");
+        }
     }
 }
 
@@ -2213,7 +2260,8 @@ mod test {
         use super::super::{
             CAYENNE_DISK_CACHE_MB_PARAM, CAYENNE_VNEXT_PARAM, ClusterRole, DiskCacheBudget,
             DiskCacheDecision, disk_cache_decision, disk_cache_default_budget_bytes,
-            disk_cache_opened_message, disk_cache_volume_refused_message,
+            disk_cache_non_s3_message, disk_cache_opened_message,
+            disk_cache_volume_refused_message,
         };
         use data_accelerator_api::storage::DiskCacheVolumeRefusal;
         use spicepod::component::runtime::RuntimeState;
@@ -2245,13 +2293,20 @@ mod test {
             state: Option<&RuntimeState>,
             role: Option<&ClusterRole>,
         ) -> DiskCacheDecision {
-            disk_cache_decision(true, &params(entries), state, role, Path::new("/d"), MEMORY)
+            disk_cache_decision(&params(entries), state, role, Path::new("/d"), MEMORY)
         }
 
         fn refused(decision: DiskCacheDecision) -> String {
             match decision {
                 DiskCacheDecision::Refused(warning) => warning,
                 other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        fn deferred_info(decision: DiskCacheDecision) -> String {
+            match decision {
+                DiskCacheDecision::DeferredInfo(message) => message,
+                other => panic!("expected deferred info, got {other:?}"),
             }
         }
 
@@ -2278,7 +2333,6 @@ mod test {
             let vnext = (CAYENNE_VNEXT_PARAM, "enabled");
             assert_eq!(
                 disk_cache_decision(
-                    true,
                     &params(&[vnext]),
                     Some(&s3),
                     None,
@@ -2325,36 +2379,57 @@ mod test {
                 decide(&[vnext], Some(&s3), Some(&ClusterRole::Executor)),
                 decide(&[vnext], None, None),
                 decide(&[vnext], Some(&state("file:///srv/state/")), None),
-                decide(&[vnext], Some(&state("gs://bucket/state/")), None),
             ];
             for (case, decision) in off.into_iter().enumerate() {
                 assert_eq!(decision, DiskCacheDecision::Off, "case {case}");
             }
         }
 
-        /// A Spicepod with no Cayenne dataset opens no cache, so it locks no
-        /// directory and reports nothing, even with a budget set.
+        /// The decision is independent of which datasets were present when
+        /// the runtime started, so a later object-native catalog can use it.
         #[test]
-        fn off_without_a_cayenne_dataset() {
+        fn decision_does_not_depend_on_a_cayenne_dataset_at_startup() {
             let s3 = state("s3://bucket/state/");
             let vnext = (CAYENNE_VNEXT_PARAM, "enabled");
-            for entries in [
-                &[vnext][..],
-                &[vnext, (CAYENNE_DISK_CACHE_MB_PARAM, "512")][..],
+            for (entries, budget_bytes, budget) in [
+                (&[vnext][..], 8 * GIB, DiskCacheBudget::SizedFromMemory),
+                (
+                    &[vnext, (CAYENNE_DISK_CACHE_MB_PARAM, "512")][..],
+                    512 * MIB,
+                    DiskCacheBudget::Configured,
+                ),
             ] {
                 assert_eq!(
-                    disk_cache_decision(
-                        false,
-                        &params(entries),
-                        Some(&s3),
-                        None,
-                        Path::new("/d"),
-                        MEMORY
-                    ),
-                    DiskCacheDecision::Off,
+                    disk_cache_decision(&params(entries), Some(&s3), None, Path::new("/d"), MEMORY),
+                    DiskCacheDecision::Open {
+                        location: "s3://bucket/state/".to_string(),
+                        dir: PathBuf::from("/d/cache/objects"),
+                        budget_bytes,
+                        budget,
+                    },
                     "{entries:?}"
                 );
             }
+        }
+
+        #[test]
+        fn non_s3_location_is_reported_when_the_first_catalog_is_created() {
+            let vnext = (CAYENNE_VNEXT_PARAM, "enabled");
+            for location in [
+                "abfs://container@account/state/",
+                "abfss://container@account/state/",
+                "gs://bucket/state/",
+            ] {
+                assert_eq!(
+                    deferred_info(decide(&[vnext], Some(&state(location)), None)),
+                    disk_cache_non_s3_message(location),
+                    "{location}"
+                );
+            }
+            assert_eq!(
+                disk_cache_non_s3_message("gs://bucket/state/"),
+                "The Cayenne disk cache is off: it caches only `s3://` locations, so every read of Cayenne data in 'gs://bucket/state/' goes to the object store. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            );
         }
 
         #[test]

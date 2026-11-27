@@ -17,16 +17,18 @@ limitations under the License.
 //! The node's disk cache of the data files Cayenne keeps in an object-store
 //! location: one cache per process, shared by every table whose data is there.
 //!
-//! The runtime opens the cache and [installs](install) it before any dataset
-//! loads; the accelerator wraps the location's data store with it, and each
-//! table keeps what the cache holds of it in step with its committed state
-//! (see `CayenneTableProvider::reconcile_disk_cache`).
+//! The runtime registers how to open the cache; the first object-native
+//! catalog opens it, and concurrent catalogs wait for that same attempt. The
+//! accelerator wraps the location's data store with it, and each table keeps
+//! what the cache holds of it in step with its committed state (see
+//! `CayenneTableProvider::reconcile_disk_cache`).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,7 +36,7 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use object_store_cache::{Cacheable, NodeCache};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 use crate::CAYENNE_DOCS_URL as CAYENNE_DOCS;
@@ -68,6 +70,113 @@ struct Installed {
 /// The process's disk cache. A cache closed by a runtime's shutdown is
 /// replaced by the next runtime that installs one.
 static PROCESS_DISK_CACHE: RwLock<Option<Arc<Installed>>> = RwLock::new(None);
+
+type OpenFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type Opener = Box<dyn FnOnce() -> OpenFuture + Send + 'static>;
+
+enum DeferredAction {
+    Open(Opener),
+    Report(String),
+}
+
+struct DeferredState {
+    action: Option<DeferredAction>,
+    closed: bool,
+}
+
+struct Deferred {
+    initialized: OnceCell<Option<Arc<NodeCache>>>,
+    state: Mutex<DeferredState>,
+}
+
+impl Deferred {
+    fn new(action: DeferredAction) -> Self {
+        Self {
+            initialized: OnceCell::new(),
+            state: Mutex::new(DeferredState {
+                action: Some(action),
+                closed: false,
+            }),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
+
+    async fn initialize(&self) -> Option<Arc<NodeCache>> {
+        self.initialized
+            .get_or_init(|| async {
+                let action = {
+                    let mut state = self.state.lock();
+                    if state.closed {
+                        None
+                    } else {
+                        state.action.take()
+                    }
+                };
+                match action {
+                    Some(DeferredAction::Open(opener)) => opener().await,
+                    Some(DeferredAction::Report(message)) => tracing::info!("{message}"),
+                    None => {}
+                }
+                process_disk_cache()
+            })
+            .await
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    async fn close(&self) {
+        let wait_for_initialization = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            state.action.take().is_none() && self.initialized.get().is_none()
+        };
+        if wait_for_initialization {
+            let _ = self.initialized.get_or_init(|| async { None }).await;
+        }
+    }
+}
+
+/// The lazy action for the process's disk cache. A closed action is replaced
+/// by the next runtime; an active action is kept for a second runtime in the
+/// same process.
+static DEFERRED_PROCESS_DISK_CACHE: RwLock<Option<Arc<Deferred>>> = RwLock::new(None);
+
+fn register_deferred(action: DeferredAction) -> bool {
+    if process_disk_cache().is_some() {
+        return false;
+    }
+    let mut current = DEFERRED_PROCESS_DISK_CACHE.write();
+    if current
+        .as_ref()
+        .is_some_and(|deferred| !deferred.is_closed())
+    {
+        return false;
+    }
+    *current = Some(Arc::new(Deferred::new(action)));
+    true
+}
+
+/// Register how the first object-native catalog opens the process's disk
+/// cache. Returns false when this process already has an open cache or an
+/// active registration.
+pub fn register_opener<F, Fut>(opener: F) -> bool
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    register_deferred(DeferredAction::Open(Box::new(move || Box::pin(opener()))))
+}
+
+/// Register an INFO line for the first object-native catalog instead of an
+/// opener. Returns false when this process already has an open cache or an
+/// active registration.
+#[must_use]
+pub fn register_deferred_info(message: String) -> bool {
+    register_deferred(DeferredAction::Report(message))
+}
 
 /// Make `cache`, opened in `dir`, the process's disk cache, and start
 /// reporting its errors. Returns false, and changes nothing, when an open
@@ -105,11 +214,29 @@ pub fn process_disk_cache() -> Option<Arc<NodeCache>> {
         .map(|installed| Arc::clone(&installed.cache))
 }
 
+/// Open the process's disk cache on the first call, or wait for the opening
+/// already started by another caller. When the registered action only reports
+/// why the cache is off, report it once and return `None`.
+pub async fn process_disk_cache_or_open() -> Option<Arc<NodeCache>> {
+    if let Some(cache) = process_disk_cache() {
+        return Some(cache);
+    }
+    let deferred = DEFERRED_PROCESS_DISK_CACHE
+        .read()
+        .as_ref()
+        .map(Arc::clone)?;
+    deferred.initialize().await
+}
+
 /// Close the process's disk cache, once, giving it `within` (at least
 /// [`CLOSE_FLOOR`]): prefetch stops, running entry writes finish, and the slab
 /// being written is sealed so the next start does not rescan it. Reads keep
 /// working afterwards, without filling the cache.
 pub async fn close_process_disk_cache(within: Duration) {
+    let deferred = DEFERRED_PROCESS_DISK_CACHE.read().as_ref().map(Arc::clone);
+    if let Some(deferred) = deferred {
+        deferred.close().await;
+    }
     let installed = {
         let current = PROCESS_DISK_CACHE.write();
         let Some(installed) = current.as_ref() else {
@@ -133,14 +260,14 @@ pub async fn close_process_disk_cache(within: Duration) {
 /// The WARN for a close that failed with `cause`.
 fn close_failure_warning(dir: &str, cause: &str) -> String {
     format!(
-        "Failed to close the Cayenne disk cache at '{dir}' cleanly, so the next start rescans its last file and takes longer; no data is lost. Cause: {cause}. See: {CAYENNE_DOCS}"
+        "The Cayenne disk cache at '{dir}' failed to close cleanly, so the next start rescans its last file and takes longer; no data is lost. Cause: {cause}. See: {CAYENNE_DOCS}"
     )
 }
 
 /// The WARN for a close that did not finish within `waited`.
 fn close_timeout_warning(dir: &str, waited: Duration) -> String {
     format!(
-        "Failed to close the Cayenne disk cache at '{dir}' within {:.1} s of shutdown, so the next start rescans its last file and takes longer; no data is lost. See: {CAYENNE_DOCS}",
+        "The Cayenne disk cache at '{dir}' failed to close within {:.1} s of shutdown, so the next start rescans its last file and takes longer; no data is lost. See: {CAYENNE_DOCS}",
         waited.as_secs_f64()
     )
 }
@@ -423,10 +550,10 @@ fn reconcile_warning_due(last: &mut Option<Instant>, now: Instant) -> bool {
 fn reconcile_warning(dataset: &str, failure: ReconcileFailure, cause: &str) -> String {
     match failure {
         ReconcileFailure::ReadFiles => format!(
-            "Failed to read the committed files of dataset '{dataset}' for the Cayenne disk cache, so the cache neither prefetches the dataset's new files nor evicts the ones it no longer uses until a later attempt succeeds; query results are unchanged. Cause: {cause}. See: {CAYENNE_DOCS}"
+            "The Cayenne disk cache failed to read the committed files of dataset '{dataset}', so it neither prefetches the dataset's new files nor evicts the ones it no longer uses until a later attempt succeeds; query results are unchanged. Cause: {cause}. See: {CAYENNE_DOCS}"
         ),
         ReconcileFailure::Prefetch => format!(
-            "Failed to prefetch the files of dataset '{dataset}' into the Cayenne disk cache, so queries read them from the object store until a later attempt succeeds; query results are unchanged. Cause: {cause}. See: {CAYENNE_DOCS}"
+            "The Cayenne disk cache failed to prefetch the files of dataset '{dataset}', so queries read them from the object store until a later attempt succeeds; query results are unchanged. Cause: {cause}. See: {CAYENNE_DOCS}"
         ),
     }
 }
@@ -599,11 +726,11 @@ mod tests {
                 ReconcileFailure::ReadFiles,
                 "the head is unreadable"
             ),
-            "Failed to read the committed files of dataset 'orders' for the Cayenne disk cache, so the cache neither prefetches the dataset's new files nor evicts the ones it no longer uses until a later attempt succeeds; query results are unchanged. Cause: the head is unreadable. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "The Cayenne disk cache failed to read the committed files of dataset 'orders', so it neither prefetches the dataset's new files nor evicts the ones it no longer uses until a later attempt succeeds; query results are unchanged. Cause: the head is unreadable. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
         assert_eq!(
             reconcile_warning("orders", ReconcileFailure::Prefetch, "no store"),
-            "Failed to prefetch the files of dataset 'orders' into the Cayenne disk cache, so queries read them from the object store until a later attempt succeeds; query results are unchanged. Cause: no store. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "The Cayenne disk cache failed to prefetch the files of dataset 'orders', so queries read them from the object store until a later attempt succeeds; query results are unchanged. Cause: no store. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
         let now = Instant::now();
         let mut last = None;
@@ -618,7 +745,7 @@ mod tests {
     fn close_timeout_warning_names_the_dir_and_the_wait() {
         assert_eq!(
             close_timeout_warning("/data/cache/objects", Duration::from_millis(1500)),
-            "Failed to close the Cayenne disk cache at '/data/cache/objects' within 1.5 s of shutdown, so the next start rescans its last file and takes longer; no data is lost. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "The Cayenne disk cache at '/data/cache/objects' failed to close within 1.5 s of shutdown, so the next start rescans its last file and takes longer; no data is lost. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 
@@ -626,7 +753,7 @@ mod tests {
     fn close_failure_warning_names_the_dir_the_cause_and_the_docs() {
         assert_eq!(
             close_failure_warning("/data/cache/objects", "disk full"),
-            "Failed to close the Cayenne disk cache at '/data/cache/objects' cleanly, so the next start rescans its last file and takes longer; no data is lost. Cause: disk full. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "The Cayenne disk cache at '/data/cache/objects' failed to close cleanly, so the next start rescans its last file and takes longer; no data is lost. Cause: disk full. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
     }
 

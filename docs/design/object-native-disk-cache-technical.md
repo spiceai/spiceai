@@ -65,9 +65,10 @@ instance a reader today, because the writer lease cannot be configured.
 
 A Cayenne dataset in an object-store location reads its data files over the
 network. Its memory caches (the footer cache and the segment cache) are small
-and empty after every restart. Each Spice instance that starts with a Cayenne
-dataset, `cayenne_vnext: enabled` and an `s3://` location keeps a disk cache
-of the location's immutable data objects, unless
+and empty after every restart. Each Spice instance with
+`cayenne_vnext: enabled` and an `s3://` location registers a disk cache of the
+location's immutable data objects and opens it when its first object-native
+catalog is created, unless
 `runtime.params.cayenne_disk_cache_mb` is `0`. Reads fill it in 1 MiB blocks. Each table's committed
 state decides what it keeps: files a table no longer references, or retired
 longer than the retention, are evicted. After a restart, or on a node that did
@@ -665,8 +666,10 @@ container's writable layer. A cache sized from free space could therefore get
 the pod evicted. This is read from the Kubernetes documentation; no eviction
 was observed on a cluster.
 
-v1 is on by default wherever it has data to serve: a Cayenne dataset in the
-Spicepod at startup, `cayenne_vnext: enabled` and an `s3://` state location.
+v1 is on by default wherever it has data to serve: when the first
+object-native catalog is created under `cayenne_vnext: enabled` and an
+`s3://` state location. This includes a dataset added after startup by DDL or
+a Spicepod reload.
 Its budget is not read from free space: unset, it is eight times the segment
 cache's default, an eighth of the process's memory clamped to
 [2 GiB, 16 GiB], from the same memory source
@@ -743,31 +746,33 @@ runtime:
     location: s3://my-bucket/spice
   params:
     cayenne_vnext: enabled
-    cayenne_disk_cache_mb: "200000"   # unset: sized from memory; 0: off; N: at most N MiB
+    cayenne_disk_cache_mb: "200000"   # unset: an eighth of memory; 0: off; N: at most N MiB
 ```
 
-The unit follows `cayenne_segment_cache_mb`. Decision order at startup
+The unit follows `cayenne_segment_cache_mb`. The runtime makes and registers
+the decision at startup; the first object-native catalog runs it
 (`disk_cache_decision` and `install_disk_cache` in
 `crates/runtime/src/builder.rs`):
 
 1. A value that is not a number: no cache, one warning. `0`: no cache, no log
    line.
-2. No Cayenne dataset in the Spicepod at startup: no cache, no log line.
-3. `cayenne_vnext` not enabled, a cluster role, no `runtime.state.location`,
-   or a location that is not `s3://`: no cache; one warning when
-   `cayenne_disk_cache_mb` is set, no log line when it is unset.
-4. An open cache already installed in this process (a second runtime): it is
+2. `cayenne_vnext` not enabled, a cluster role, or no
+   `runtime.state.location`: no cache; one warning when
+   `cayenne_disk_cache_mb` is set, no log line when it is unset. A location
+   that is not `s3://` behaves the same when the budget is set; when it is
+   unset, the first object-native catalog logs one info line.
+3. An open cache or active opener already installed in this process (a second runtime): it is
    kept.
-5. The cache directory on an in-memory or a network or remote filesystem: no
+4. The cache directory on an in-memory or a network or remote filesystem: no
    cache; one warning when the size is set, one info line when it is unset.
-6. Open fails: no cache, one warning (locked: another process uses the
+5. Open fails: no cache, one warning (locked: another process uses the
    directory; otherwise the cause). A platform without the cache's file APIs
    logs at DEBUG when the size is unset.
-7. Otherwise the cache is installed and one info line states the location,
-   directory, capacity and the budget's basis (sized from memory, or set by
+6. Otherwise the cache is installed and one info line states the location,
+   directory, capacity and the budget's basis (an eighth of memory, or set by
    `cayenne_disk_cache_mb`), and, when the volume's reserve lowers the
    capacity, the reserve and the free space; a capacity of 0 is reported as
-   "has no room".
+   "has no room", at WARN when `cayenne_disk_cache_mb` is set.
 
 Every tuning value in this document (block size, wait bound, queue depths,
 watermark shares, prefetch quiet period) is a constant inside the crate, not
@@ -801,7 +806,8 @@ slabs and the watermarks; these are not published as metrics.
 Log lines (**for review**), each built in a function whose text a unit test
 or snapshot asserts:
 
-- INFO at startup: `Disk cache for data in 's3://bucket/state/' is on at '/srv/.spice/data/cache/objects': up to 8.0 GiB, sized from memory. See: <docs>`. When the volume's reserve lowers the capacity: `` … is on at '<dir>': 512 MiB of its 64.0 GiB budget (set by `runtime.params.cayenne_disk_cache_mb`), as the cache leaves 15.0 GiB free on its volume (15.5 GiB free now). See: <docs> ``. At a capacity of 0, the line says the cache `has no room` and names the fix.
+- INFO when the first object-native catalog opens the cache: ``The Cayenne disk cache for data in 's3://bucket/state/' is on at '/srv/.spice/data/cache/objects': up to 8.0 GiB, an eighth of memory. Set `runtime.params.cayenne_disk_cache_mb` to change it. See: <docs>``. With a configured budget, the line ends ``set by `runtime.params.cayenne_disk_cache_mb`. See: <docs>`` without the instruction to change it. When the volume's reserve lowers the capacity: ``The Cayenne disk cache for data in '<location>' is on at '<dir>': 512 MiB of its 64.0 GiB budget (set by `runtime.params.cayenne_disk_cache_mb`), as the cache leaves 15.0 GiB free on its volume (15.5 GiB free now). See: <docs>``. At a capacity of 0, the line begins `The Cayenne disk cache for data in '<location>' has no room` and names the fix.
+- INFO when the first object-native catalog uses a non-`s3://` location with no configured budget: ``The Cayenne disk cache is off: it caches only `s3://` locations, so every read of Cayenne data in '<location>' goes to the object store. See: <docs>``.
 - WARN (INFO when the size is unset): `The Cayenne disk cache is off: '<dir>' is in memory (tmpfs), and a cache there takes memory queries need, so every read of Cayenne data in '<location>' goes to the object store. Run Spice with its data directory on a local disk. See: <docs>`, and the same for a network or remote filesystem.
 - WARN when the size is set but the cache cannot apply (no `cayenne_vnext`, a cluster role, no or a non-`s3://` location, a value that is not a number), naming the reason and the fix.
 - WARN, at most once a minute: `The Cayenne disk cache at '<dir>' had 3 error(s) in the last minute reading, writing or evicting cached blocks, so the reads it could not serve went to the object store: results are unchanged, but those queries were slower. Check the disk that holds '<dir>'. Last cause: <error>. See: <docs>`
@@ -971,17 +977,14 @@ rather than a `cayenne_` one. That scope is part of the same review.
   are admitted and counted like a query's, and its inputs, once retired, hold
   budget until their retention passes. The trade-off keeps one data store and
   one read path per dataset.
-- **Datasets added after startup run without the cache.** The cache opens
-  only when the Spicepod has a Cayenne dataset at startup, and the catalog
-  wraps its data store once. A Cayenne dataset added later by a Spicepod
-  reload reads from the store until a restart.
 - **The reader role is not reachable from a Spicepod.** The writer lease
   cannot be configured, so a node that serves files it did not write is
   tested by starting on an empty data directory, not by a second replica.
 - **No timeout on a disk read.** A failing or very slow volume delays the
   reads that hit it; only the rate-limited warning reports it.
-- **The cache opens before the runtime is ready**, so its open time adds to
-  startup; at 10.5 M entries it is not measured.
+- **The first object-native catalog waits for the cache to open**, so that
+  catalog's creation includes the open time; at 10.5 M entries it is not
+  measured.
 - **Backups.** Tools that copy `.spice/data` should exclude `cache/`.
 - **Platforms.** Unix only; elsewhere the cache reports it is unsupported and
   the runtime runs without it. `spiced` ships only on Unix. tmpfs and network

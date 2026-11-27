@@ -81,9 +81,9 @@ steps:
         INSERT INTO kv SELECT i, (i * 7919) % 1000, (i * 2654435761) % 1000000007, md5(i::text) FROM generate_series(1::bigint, 2000000::bigint) i;
         ANALYZE kv;
   - start: {}
-  - assert-log: { contains: ["Disk cache for data in 's3://[^']+' is on at '[^']+': .*sized from memory"] }
+  - assert-log: { contains: ["The Cayenne disk cache for data in 's3://[^']+' is on at '[^']+': .*an eighth of memory"] }
     only: disk-cache
-  - assert-log: { lacks: ['Disk cache for data in'] }
+  - assert-log: { lacks: ['The Cayenne disk cache for data in'] }
     except: disk-cache
   - query: SELECT count(*) AS n, sum(v) AS sv, count(DISTINCT grp) AS g, min(s) AS lo, max(s) AS hi FROM kv
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/kv-, contains: .vortex, min: 4 }
