@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `2436c78a8b439307359b747f8f1282939217f565` | `phillip/unparse-like-escape-literal` (TEMPORARY: spiceai/datafusion#320) |
+| [datafusion](#datafusion) | `74eeca062c9cb9a48ea7687e042f50299842efff` | `phillip/unparse-like-escape-literal` (TEMPORARY: spiceai/datafusion#320) |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
@@ -262,8 +262,9 @@ the column of an `ANY`/`ALL` subquery a name of its own, #309 quotes the qualifi
 expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`. On top of #308, #312 has
 `ANY`/`ALL` over an aggregate without `GROUP BY` compare with that aggregate's one row, and #306
 ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern. On top of #306, #320 writes the
-`ESCAPE` character of a `LIKE` the way the dialect writes a string literal, and refuses to write a cast to a
-time zone that holds a quote or a backslash; the pin is #320's head commit (`2436c78a8b439307359b747f8f1282939217f565`).
+`ESCAPE` character of a `LIKE` the way the dialect writes a string literal, refuses to write a cast to a
+time zone that holds a quote or a backslash, and writes a backslash, a backtick or a line break in a BigQuery
+quoted identifier as an escape; the pin is #320's head commit (`74eeca062c9cb9a48ea7687e042f50299842efff`).
 Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's

@@ -1615,6 +1615,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.identifier_quote_style(identifier)
     }
 
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        self.inner.quoted_identifier_escapes()
+    }
+
     fn use_array_keyword_for_array_literals(&self) -> bool {
         self.inner.use_array_keyword_for_array_literals()
     }
@@ -1887,6 +1891,17 @@ mod tests {
             UNICODE_QUOTE_LITERALS,
             read_bigquery,
         );
+    }
+
+    #[test]
+    fn relation_names_read_back_as_their_name() {
+        use util::sql_string_literal::test_support::assert_bigquery_relation_names_read_back;
+
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        assert_bigquery_relation_names_read_back(|plan| {
+            unparser.plan_to_sql(plan).expect("unparse").to_string()
+        });
     }
 
     #[test]

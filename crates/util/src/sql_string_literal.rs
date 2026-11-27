@@ -114,6 +114,10 @@ impl<D: Dialect> Dialect for BackslashEscapedStrings<D> {
         self.inner.identifier_quote_style(identifier)
     }
 
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        self.inner.quoted_identifier_escapes()
+    }
+
     fn use_array_keyword_for_array_literals(&self) -> bool {
         self.inner.use_array_keyword_for_array_literals()
     }
@@ -350,7 +354,7 @@ pub mod test_support {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use datafusion::common::{Column, DataFusionError, Result};
+    use datafusion::common::{Column, DataFusionError, Result, TableReference};
     use datafusion::logical_expr::builder::LogicalTableSource;
     use datafusion::logical_expr::expr::Like;
     use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, cast};
@@ -552,11 +556,17 @@ pub mod test_support {
             !body.contains(['\n', '\r']),
             "BigQuery rejects a line break in {sql}"
         );
+        decode_bigquery(&body)
+    }
+
+    /// A `BigQuery` string literal or backtick identifier body decoded with the
+    /// escape sequences of the `GoogleSQL` lexical reference.
+    fn decode_bigquery(body: &str) -> String {
         let code_points = CodePoints {
             hex: &[('u', 4), ('U', 8), ('x', 2), ('X', 2)],
             octal_lead: '0'..='3',
         };
-        decode(&body, &code_points, |escape, out| {
+        decode(body, &code_points, |escape, out| {
             out.push(match escape {
                 'a' => '\u{7}',
                 'b' => '\u{8}',
@@ -569,6 +579,91 @@ pub mod test_support {
                 other => panic!("BigQuery rejects the escape \\{other} in {body}"),
             });
         })
+    }
+
+    /// Names that hold a character `BigQuery` escapes in a backtick identifier:
+    /// a backslash, a backtick, a carriage return and a line feed.
+    pub const BIGQUERY_ESCAPED_NAMES: [&str; 4] = ["a\\b", "a`b", "a\rb", "a\nb"];
+
+    /// Every backtick identifier in `sql`, read as `GoogleSQL` reads one: a
+    /// backslash starts an escape, with the escapes of a string literal, and
+    /// the next backtick that is not escaped ends the identifier. String
+    /// literals are skipped.
+    ///
+    /// # Panics
+    ///
+    /// When an identifier holds a line break, or an identifier or a string
+    /// literal does not end.
+    #[must_use]
+    pub fn bigquery_identifiers(sql: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut chars = sql.chars();
+        while let Some(quote) = chars.next() {
+            if !matches!(quote, '`' | '\'' | '"') {
+                continue;
+            }
+            let mut body = String::new();
+            loop {
+                let c = chars
+                    .next()
+                    .unwrap_or_else(|| panic!("{sql} does not close a {quote}"));
+                if c == quote {
+                    break;
+                }
+                assert!(
+                    quote != '`' || !matches!(c, '\n' | '\r'),
+                    "BigQuery rejects a line break in an identifier of {sql}"
+                );
+                body.push(c);
+                if c == '\\' {
+                    body.push(
+                        chars
+                            .next()
+                            .unwrap_or_else(|| panic!("{sql} ends in an escape")),
+                    );
+                }
+            }
+            if quote == '`' {
+                names.push(decode_bigquery(&body));
+            }
+        }
+        names
+    }
+
+    /// A plan that names a relation `name`, as a table alias and as a column
+    /// qualifier: `SELECT name.c FROM t AS name`.
+    ///
+    /// # Panics
+    ///
+    /// When the plan does not build.
+    #[must_use]
+    pub fn plan_naming_a_relation(name: &str) -> LogicalPlan {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, true)]));
+        let qualified_c = Expr::Column(Column::new(Some(TableReference::bare(name)), "c"));
+        LogicalPlanBuilder::scan("t", Arc::new(LogicalTableSource::new(schema)), None)
+            .and_then(|scan| scan.alias(TableReference::bare(name)))
+            .and_then(|aliased| aliased.project(vec![qualified_c]))
+            .and_then(LogicalPlanBuilder::build)
+            .unwrap_or_else(|e| panic!("plan does not build: {e}"))
+    }
+
+    /// Asserts that the SQL `unparse` writes for a relation named each of
+    /// [`BIGQUERY_ESCAPED_NAMES`] reads back to that name when `BigQuery` reads
+    /// it, as the table alias and as the column qualifier.
+    ///
+    /// # Panics
+    ///
+    /// When a name does not read back twice.
+    pub fn assert_bigquery_relation_names_read_back(unparse: impl Fn(&LogicalPlan) -> String) {
+        for name in BIGQUERY_ESCAPED_NAMES {
+            let sql = unparse(&plan_naming_a_relation(name));
+            let read = bigquery_identifiers(&sql);
+            assert_eq!(
+                read.iter().filter(|read| *read == name).count(),
+                2,
+                "{name:?} as the alias and the qualifier of {sql}, read as {read:?}"
+            );
+        }
     }
 
     /// The raw body of the one single-quoted literal `sql` holds, read with
@@ -733,8 +828,8 @@ mod tests {
     use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
 
     use super::test_support::{
-        DOUBLED_QUOTE_LITERALS, UNICODE_QUOTE_LITERALS, VALUES, read_bigquery, read_spark,
-        read_with_tokenizer,
+        DOUBLED_QUOTE_LITERALS, UNICODE_QUOTE_LITERALS, VALUES, bigquery_identifiers,
+        read_bigquery, read_spark, read_with_tokenizer,
     };
     use super::*;
 
@@ -746,6 +841,18 @@ mod tests {
             assert_eq!(read_spark(&sql), value, "{value:?} written as {sql}");
             assert_eq!(read_bigquery(&sql), value, "{value:?} written as {sql}");
         }
+    }
+
+    #[test]
+    fn bigquery_identifiers_read_escapes_and_end_at_a_backtick() {
+        let backslash = '\\';
+        let sql = format!(
+            "SELECT `a{backslash}{backslash}b`.`a{backslash}u0060b`, `a``b`, 'x`y' FROM `a{backslash}nb`"
+        );
+        assert_eq!(
+            bigquery_identifiers(&sql),
+            ["a\\b", "a`b", "a", "b", "a\nb"]
+        );
     }
 
     #[test]

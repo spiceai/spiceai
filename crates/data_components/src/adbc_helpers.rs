@@ -781,6 +781,18 @@ fn bigquery_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn driver_dialect_relation_names_read_back_as_their_name() {
+        use datafusion::sql::unparser::Unparser;
+        use util::sql_string_literal::test_support::assert_bigquery_relation_names_read_back;
+
+        let dialect = super::dialect_for_driver("bigquery").expect("dialect");
+        let unparser = Unparser::new(dialect.as_ref());
+        assert_bigquery_relation_names_read_back(|plan| {
+            unparser.plan_to_sql(plan).expect("unparse").to_string()
+        });
+    }
+
+    #[test]
     fn driver_dialect_string_literals_read_back_as_their_value() {
         use datafusion::logical_expr::Expr;
         use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
