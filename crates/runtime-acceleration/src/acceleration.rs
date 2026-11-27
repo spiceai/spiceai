@@ -777,16 +777,6 @@ impl Acceleration {
         }
     }
 
-    /// Returns whether Arrow `hash_index` is enabled for primary key upserts or indexes.
-    #[must_use]
-    pub fn is_hash_index_enabled(&self) -> bool {
-        matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
-            && self.enabled
-            && (!self.indexes.is_empty()
-                || (self.primary_key.is_some()
-                    && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))
-    }
-
     // ── Constraints methods ───────────────────────────────────────────────────
 
     #[must_use]
@@ -1068,7 +1058,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .engine
             .as_deref()
             .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
-        let engine = match Engine::try_from(engine_str).map_err(|err| match err {
+        let engine = Engine::try_from(engine_str).map_err(|err| match err {
             crate::Error::AcceleratorEngineRemoved { name } => {
                 ParseError::AcceleratorEngineRemoved { name }
             }
@@ -1077,29 +1067,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                     name: engine_str.to_string(),
                 }
             }
-        })? {
-            Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
-            engine => engine,
-        };
-
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && let Some(params) = &mut params
-            && params.data.remove("hash_index").is_some()
-        {
-            tracing::warn!(
-                "The hash_index acceleration parameter is ignored for Arrow acceleration; hash_index alone no longer enables indexing. Hash indexes are automatically enabled only when primary_key or indexes are configured."
-            );
-        }
-        // Note: The warning for hash_index being experimental is logged once
-        // at dataset registration time in init/dataset.rs, not during parsing.
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && !on_conflict.is_empty()
-            && primary_key.is_none()
-        {
-            tracing::warn!(
-                "Conflict resolution for Arrow engine acceleration requires primary_key. Ignoring on_conflict."
-            );
-        }
+        })?;
 
         if matches!(
             acceleration.snapshots_reset_expiry_on_load,
@@ -1502,12 +1470,6 @@ mod tests {
             "s3://lake/prefix".to_string(),
         );
         assert!(acceleration.uses_cayenne_datalake());
-
-        acceleration.engine = Engine::Arrow;
-        assert!(
-            !acceleration.uses_cayenne_datalake(),
-            "only Cayenne has a datalake tier"
-        );
     }
 
     /// The three connectors that override `DataConnector::resolve_refresh_mode`, plus
@@ -1948,22 +1910,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_index_param_is_ignored() {
-        let acceleration = spicepod_acceleration::Acceleration {
-            engine: Some("arrow".to_string()),
-            params: Some(Params::from_string_map(HashMap::from([(
-                "hash_index".to_string(),
-                "enabled".to_string(),
-            )]))),
-            ..Default::default()
-        };
-
-        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
-        assert!(!parsed.params.contains_key("hash_index"));
-        assert!(!parsed.is_hash_index_enabled());
-    }
-
-    #[test]
     fn test_storage_profile_is_parsed_from_spicepod_acceleration() {
         let acceleration = spicepod_acceleration::Acceleration {
             storage_profile: spicepod_acceleration::StorageProfile::Ebs,
@@ -2223,15 +2169,6 @@ mod tests {
     /// never mark keys (or, worse, stay silent on ones that do).
     #[test]
     fn every_condition_is_required_for_durable_write_back() {
-        let not_cayenne = Acceleration {
-            engine: Engine::Arrow,
-            ..durable_write_back_acceleration()
-        };
-        assert!(
-            !not_cayenne.resolves_to_durable_write_back(),
-            "only the Cayenne provider marks dirty keys for delivery"
-        );
-
         let not_write_back = Acceleration {
             write_mode: spicepod_acceleration::WriteMode::WriteThrough,
             ..durable_write_back_acceleration()

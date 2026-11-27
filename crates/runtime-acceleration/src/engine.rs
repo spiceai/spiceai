@@ -17,7 +17,7 @@ use std::fmt::Display;
 /// that sets one fails with [`removed_engine_message`], which names the fix, rather than
 /// with the unknown-engine error. Spice never switches such an acceleration to Cayenne on
 /// its own: rebuilding it would discard data its source may not have.
-const REMOVED_ENGINES: &[&str] = &["duckdb", "postgres", "sqlite", "turso"];
+const REMOVED_ENGINES: &[&str] = &["arrow", "duckdb", "postgres", "sqlite", "turso"];
 
 /// Other spellings of a removed engine, each mapped to the name its removal message uses.
 const REMOVED_ENGINE_ALIASES: &[(&str, &str)] = &[("postgresql", "postgres")];
@@ -35,34 +35,20 @@ pub fn removed_engine_message(engine: &str) -> String {
     )
 }
 
-/// The acceleration engines. Every engine but [`Engine::Cayenne`] is deprecated in v2.4
-/// and will be removed in v2.5.
+/// The acceleration engine. Cayenne is the only one: every other engine was removed in
+/// v2.5, and its name fails with [`removed_engine_message`].
 ///
 /// The default is the engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the
 /// one an acceleration uses when it does not set `engine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {
-    Arrow,
-    PartitionedArrow,
     #[default]
     Cayenne,
-}
-
-impl Engine {
-    /// Returns the unpartitioned version of the engine. If an engine is not partitioned, it returns itself.
-    #[must_use]
-    pub fn to_unpartitioned(&self) -> Engine {
-        match self {
-            Engine::PartitionedArrow => Engine::Arrow,
-            other => *other,
-        }
-    }
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
             Engine::Cayenne => write!(f, "cayenne"),
         }
     }
@@ -83,7 +69,6 @@ impl TryFrom<&str> for Engine {
             return AcceleratorEngineRemovedSnafu { name: *removed }.fail();
         }
         match name.as_str() {
-            "arrow" => Ok(Engine::Arrow),
             "cayenne" | "vortex" => Ok(Engine::Cayenne),
             _ => AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
@@ -108,6 +93,9 @@ mod tests {
     #[test]
     fn a_removed_engine_fails_with_the_removal_message() {
         for (spelling, engine) in [
+            ("arrow", "arrow"),
+            ("Arrow", "arrow"),
+            ("ARROW", "arrow"),
             ("turso", "turso"),
             ("Turso", "turso"),
             ("TURSO", "turso"),
@@ -138,7 +126,7 @@ mod tests {
         let err = Engine::try_from("nosuchengine").expect_err("unknown engine");
         assert_eq!(
             err.to_string(),
-            "Unknown acceleration engine 'nosuchengine'. Valid engines are: arrow, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+            "Unknown acceleration engine 'nosuchengine'. Valid engines are: cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
         );
     }
 }

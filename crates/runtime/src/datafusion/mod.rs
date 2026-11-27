@@ -582,9 +582,6 @@ pub enum Error {
     #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
     UnsupportedSnapshotTriggerForCaching,
 
-    #[snafu(display("Invalid snapshot configuration: Only DuckDB and SQlite support snapshots"))]
-    UnsupportedAccelerationEngineForSnapshots,
-
     #[snafu(display(
         "refresh_mode: snapshot requires snapshot bootstrap to be enabled \
          (set `acceleration.snapshots: enabled` or `bootstrap_only`); \
@@ -662,7 +659,6 @@ impl Error {
                 | Self::UnsupportedStreamBatchesForBatchRefresh
                 | Self::UnsupportedRefreshCompleteForStream
                 | Self::UnsupportedSnapshotTriggerForCaching
-                | Self::UnsupportedAccelerationEngineForSnapshots
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
@@ -838,12 +834,9 @@ fn acceleration_rebuilt_message(cause: &str) -> String {
 }
 
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
-///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
-pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> AccelerationEngine {
     match engine {
-        Engine::Cayenne => Some(AccelerationEngine::Cayenne),
-        _ => None,
+        Engine::Cayenne => AccelerationEngine::Cayenne,
     }
 }
 
@@ -4817,17 +4810,6 @@ impl DataFusion {
             None => None,
         };
 
-        // Arrow accelerators do not have engine-level write completion retention hooks,
-        // so apply retention_sql from the refresh write path.
-        if let Some(retention_delete_expr) = retention_delete_expr.clone()
-            && matches!(
-                acceleration_settings.engine,
-                Engine::Arrow | Engine::PartitionedArrow
-            )
-        {
-            refresh.write_retention_sql_delete_expr = Some(retention_delete_expr);
-        }
-
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
@@ -5663,9 +5645,8 @@ impl DataFusion {
             // Snapshot before recreating (best-effort)
             if let Ok(layout) =
                 get_acceleration_layout(dataset, &self.accelerator_engine_registry).await
-                && let Some(accel_engine) =
-                    engine_to_acceleration_engine(acceleration_settings.engine)
             {
+                let accel_engine = engine_to_acceleration_engine(acceleration_settings.engine);
                 // The same engine-specific override the normal creation path resolves,
                 // so the archive is in the format that engine's bootstrap consumes —
                 // a Cayenne snapshot without its per-dataset metastore slice becomes
@@ -8355,12 +8336,10 @@ async fn build_snapshot_creation_config(
     // that states it — rationale on `archive_would_be_unrestorable`. A copy per
     // publish path is how the periodic path came to publish an archive the
     // pre-recreation path already refused.
-    if engine_to_acceleration_engine(acceleration_settings.engine).is_some_and(|engine| {
-        data_accelerator_api::snapshots::archive_would_be_unrestorable(
-            &engine,
-            snapshot_engine_override.as_ref(),
-        )
-    }) {
+    if data_accelerator_api::snapshots::archive_would_be_unrestorable(
+        &engine_to_acceleration_engine(acceleration_settings.engine),
+        snapshot_engine_override.as_ref(),
+    ) {
         tracing::warn!(
             dataset = %dataset.name,
             "Dataset '{}' will not publish snapshots: its Cayenne metastore catalog is unavailable, so an archive of it would carry no metastore slice and could not be restored. Check that this dataset's `cayenne_metadata_dir` and data directory are readable.",
@@ -8463,11 +8442,6 @@ async fn build_snapshot_creation_config(
 
     let acceleration_engine = match acceleration_settings.engine {
         Engine::Cayenne => AccelerationEngine::Cayenne,
-        _ => {
-            // This code is unreachable since build_snapshot_creation_config is
-            // only called iff acceleration_file_path returned Some(<file_path>)
-            return Err(Error::UnsupportedAccelerationEngineForSnapshots);
-        }
     };
 
     Ok(SnapshotManager::try_new(
@@ -8523,10 +8497,7 @@ async fn build_snapshot_refresh_state(
     }
 
     // 2. engine must be snapshot-capable (file-based with a known layout).
-    let acceleration_engine = engine_to_acceleration_engine(acceleration_settings.engine)
-        .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
-            engine: acceleration_settings.engine.to_string(),
-        })?;
+    let acceleration_engine = engine_to_acceleration_engine(acceleration_settings.engine);
 
     // 3. accelerator must support reload_from_snapshot.
     let accelerator = df

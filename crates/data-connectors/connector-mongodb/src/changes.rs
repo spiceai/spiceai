@@ -40,7 +40,7 @@ use mongodb::{
 };
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
 use runtime_component::dataset::DatasetSpec;
-use runtime_component::dataset::acceleration::{Acceleration, Engine};
+use runtime_component::dataset::acceleration::Acceleration;
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
@@ -592,13 +592,6 @@ fn resolve_primary_keys(
         ))
     })?;
 
-    let engine = acceleration.engine.to_unpartitioned();
-    if matches!(engine, Engine::Arrow) {
-        return Err(data_components::cdc::StreamError::External(format!(
-            "mongodb change streams for dataset `{dataset_name}` require an accelerator engine with upsert support. Use `cayenne` instead of `{engine}`."
-        )));
-    }
-
     let primary_key = acceleration.primary_key.as_ref().ok_or_else(|| {
         data_components::cdc::StreamError::External(format!(
             "mongodb change streams for dataset `{dataset_name}` require `acceleration.primary_key` so UPDATE and DELETE events can be applied correctly. For most collections, set `primary_key: _id`."
@@ -779,7 +772,9 @@ mod tests {
     use datafusion_table_providers::util::{
         column_reference::ColumnReference, constraints::UpsertOptions,
     };
-    use runtime_component::dataset::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
+    use runtime_component::dataset::acceleration::{
+        Acceleration, Engine, OnConflictBehavior, RefreshMode,
+    };
     use secrecy::SecretString;
     use std::collections::HashMap;
 
@@ -835,33 +830,6 @@ mod tests {
             .expect_err("missing acceleration should fail");
 
         assert!(error.to_string().contains("require acceleration"));
-    }
-
-    #[test]
-    fn rejects_arrow_acceleration() {
-        let primary_key = ColumnReference::new(vec!["_id".to_string()]);
-        let mut on_conflict = HashMap::new();
-        on_conflict.insert(
-            primary_key.clone(),
-            OnConflictBehavior::Upsert(UpsertOptions::default()),
-        );
-        let acceleration = Acceleration {
-            enabled: true,
-            engine: Engine::Arrow,
-            refresh_mode: Some(RefreshMode::Changes),
-            primary_key: Some(primary_key),
-            on_conflict,
-            ..Default::default()
-        };
-
-        let dataset_name = datafusion::common::TableReference::bare("users");
-        let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
-            .expect_err("arrow acceleration should fail");
-
-        assert_eq!(
-            error.to_string(),
-            "External error: mongodb change streams for dataset `users` require an accelerator engine with upsert support. Use `cayenne` instead of `arrow`."
-        );
     }
 
     #[test]

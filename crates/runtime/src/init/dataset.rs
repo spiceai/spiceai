@@ -53,8 +53,7 @@ use crate::{
         builder::DatasetBuilder,
     },
     component::{
-        AcceleratedComponent, component_accelerations, deprecated_acceleration_engines_warning,
-        deprecated_ready_state_warning, disabled_acceleration_warning,
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
@@ -299,14 +298,6 @@ impl Runtime {
                     &app.runtime,
                 )
             {
-                tracing::warn!("{warning}");
-            }
-            // Once for the whole Spicepod, not per component. A hot reload warns about
-            // the components it adds or changes (`Runtime::apply_app_diff`).
-            if let Some(warning) = deprecated_acceleration_engines_warning(component_accelerations(
-                &app.datasets,
-                &app.views,
-            )) {
                 tracing::warn!("{warning}");
             }
             if let Some(section) = app.snapshots.as_deref() {
@@ -1517,14 +1508,9 @@ impl Runtime {
         // schema metadata and are surfaced as table statistics / tuning inputs
         // elsewhere. Skip the refresh_sql parse and dataset rebuild when nothing
         // acceleration-relevant was inferred (e.g. sizing only).
-        // `shard_key` is consumed only by Cayenne (see `apply_inferred_shard_key`);
-        // for other engines it is not acceleration-relevant and must not, on its
-        // own, force a refresh_sql parse + dataset rebuild below.
-        let shard_key_relevant = !inferred.shard_key.is_empty()
-            && ds.acceleration.as_ref().is_some_and(|a| {
-                a.engine.to_unpartitioned()
-                    == crate::component::dataset::acceleration::Engine::Cayenne
-            });
+        // `shard_key` is consumed by Cayenne (see `apply_inferred_shard_key`), so it
+        // matters only for an accelerated dataset.
+        let shard_key_relevant = !inferred.shard_key.is_empty() && ds.acceleration.is_some();
         if inferred.primary_key.is_empty()
             && inferred.indexes.is_empty()
             && inferred.sort_columns.is_empty()
@@ -1729,22 +1715,8 @@ impl Runtime {
         let records_commits = federated_table
             .try_table_provider_sync_ref()
             .is_some_and(|provider| incremental_append_source(provider.as_ref()).is_some());
-        if records_commits {
-            // A source that records its commits (Iceberg) needs no overlap, unless read by time.
-            if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
-                && acceleration.refresh_append_overlap.is_none()
-                && reads_by_time_despite_commits(
-                    acceleration,
-                    ds.time_column.as_deref(),
-                    resolved_refresh_mode,
-                )
-            {
-                tracing::warn!(
-                    "{}",
-                    last_arrival_without_overlap_warning(&ds.name.to_string(), acceleration.engine)
-                );
-            }
-        } else if let Some(warning) = overlap_warning {
+        // A source that records its commits (Iceberg) needs no overlap.
+        if !records_commits && let Some(warning) = overlap_warning {
             tracing::warn!("{warning}");
         }
 
@@ -1777,16 +1749,6 @@ impl Runtime {
             .await
         {
             Ok(()) => {
-                // Log experimental hash_index warning once per dataset at registration
-                if matches!(
-                    ds.acceleration.as_ref(),
-                    Some(acceleration) if acceleration.is_hash_index_enabled()
-                ) {
-                    tracing::warn!(
-                        dataset = %ds.name,
-                        "hash_index is automatically enabled for Arrow acceleration because primary_key or indexes are configured. Note: hash_index is experimental and may have breaking changes in future releases."
-                    );
-                }
                 tracing::info!(
                     duration_ms = register_start.elapsed().as_millis(),
                     "{}",
@@ -2205,11 +2167,10 @@ impl Runtime {
             assigned.len(),
         );
 
-        // Clear partition_by and convert engine to unpartitioned.
+        // Clear partition_by: this executor serves its assigned partitions as one table.
         let mut ds_mod = (*ds).clone();
         if let Some(acc) = ds_mod.acceleration.as_mut() {
             acc.partition_by = vec![];
-            acc.engine = acc.engine.to_unpartitioned();
         }
         (Arc::new(ds_mod), Some(assigned))
     }
@@ -3521,30 +3482,6 @@ fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str)
     )
 }
 
-/// Whether a keyed append refresh reads by time instead of following its source's
-/// commits, because the engine keeps the last arrival of a key (#15273). Must match
-/// `RefreshTask::commit_cursor_store`.
-fn reads_by_time_despite_commits(
-    acceleration: &Acceleration,
-    time_column: Option<&str>,
-    refresh_mode: RefreshMode,
-) -> bool {
-    let (Some(time_column), Some(key)) = (time_column, acceleration.primary_key.as_ref()) else {
-        return false;
-    };
-    refresh_mode == RefreshMode::Append
-        && !acceleration.orders_versions_by_time(Some(time_column), refresh_mode)
-        && !key.iter().any(|column| column == time_column)
-}
-
-/// Warning for a keyed append that reads by time ([`reads_by_time_despite_commits`])
-/// without `refresh_append_overlap`, so it never loads a late row.
-fn last_arrival_without_overlap_warning(dataset_name: &str, engine: Engine) -> String {
-    format!(
-        "Dataset '{dataset_name}' (`engine: {engine}`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
-    )
-}
-
 /// Returns `true` when a dataset load failure cannot be cleared by retrying it.
 ///
 /// `load_dataset` retries with unbounded backoff and only short-circuits on
@@ -4269,44 +4206,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
-        assert_eq!(
-            last_arrival_without_overlap_warning("acc", Engine::Arrow),
-            "Dataset 'acc' (`engine: arrow`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
-        );
-    }
-
-    /// Only a keyed append that keeps the last arrival reads by time (#15273).
-    #[test]
-    fn only_a_keyed_last_arrival_append_reads_by_time() {
-        use datafusion_table_providers::util::column_reference::ColumnReference;
-        let key = ColumnReference::new(vec!["list_id".to_string(), "row_id".to_string()]);
-        let acceleration = |engine, primary_key: Option<&ColumnReference>| Acceleration {
-            engine,
-            primary_key: primary_key.cloned(),
-            ..Acceleration::default()
-        };
-        let with_time =
-            ColumnReference::new(vec!["row_id".to_string(), "update_timestamp".to_string()]);
-        let ts = Some("update_timestamp");
-        let (keyed, time_keyed) = (Some(&key), Some(&with_time));
-        let (append, full) = (RefreshMode::Append, RefreshMode::Full);
-        for (engine, key, mode, expected, what) in [
-            (Engine::Arrow, keyed, append, true, "keyed"),
-            (Engine::Arrow, None, append, false, "unkeyed"),
-            (Engine::Arrow, keyed, full, false, "full"),
-            (Engine::Cayenne, keyed, append, false, "keeps newest"),
-            (Engine::Arrow, time_keyed, append, false, "key holds time"),
-        ] {
-            assert_eq!(
-                reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
-                expected,
-                "{engine} {what}"
-            );
-        }
-    }
-
     /// Every retention setting has to be recognised, whichever one the dataset
     /// carries: a prune can remove a row that was acknowledged to the writer and
     /// not yet delivered, and nothing else holds that value.
@@ -4606,35 +4505,23 @@ mod tests {
     async fn validate_dataset_refuses_write_back_without_the_durable_prerequisites() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
 
-        for (acceleration, named) in [
-            (
-                spicepod::acceleration::Acceleration {
-                    engine: Some("arrow".to_string()),
-                    ..durable_write_back_acceleration()
-                },
-                "acceleration.engine: cayenne",
-            ),
-            (
-                spicepod::acceleration::Acceleration {
-                    refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
-                    ..durable_write_back_acceleration()
-                },
-                "acceleration.refresh_mode: changes",
-            ),
-        ] {
-            let err = validate_dataset(&dataset_with_acceleration(&runtime, acceleration))
-                .expect_err("write-back without its prerequisites must be refused");
-            assert!(
-                matches!(err, Error::DurableWriteBackPrerequisitesUnmet { .. }),
-                "expected a prerequisites refusal, got: {err}"
-            );
-            // The message is the user's only account of what to add, so it names
-            // the setting rather than saying something is missing.
-            assert!(
-                err.to_string().contains(named),
-                "the refusal must name {named:?}: {err}"
-            );
-        }
+        let acceleration = spicepod::acceleration::Acceleration {
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+            ..durable_write_back_acceleration()
+        };
+        let named = "acceleration.refresh_mode: changes";
+        let err = validate_dataset(&dataset_with_acceleration(&runtime, acceleration))
+            .expect_err("write-back without its prerequisites must be refused");
+        assert!(
+            matches!(err, Error::DurableWriteBackPrerequisitesUnmet { .. }),
+            "expected a prerequisites refusal, got: {err}"
+        );
+        // The message is the user's only account of what to add, so it names
+        // the setting rather than saying something is missing.
+        assert!(
+            err.to_string().contains(named),
+            "the refusal must name {named:?}: {err}"
+        );
 
         assert!(
             validate_dataset(&dataset_with_acceleration(
@@ -4913,20 +4800,6 @@ mod tests {
                 advised.params
             );
         }
-
-        let not_cayenne = Acceleration {
-            engine: Engine::Arrow,
-            ..acceleration_with_params(WriteMode::WriteThrough, &none)
-        };
-        assert_eq!(
-            pk_conflict_detection_refusal(
-                &not_cayenne,
-                RefreshMode::Changes,
-                crate::datafusion::AcceleratedWriteMode::WriteThrough
-            ),
-            None,
-            "only Cayenne reads the parameter"
-        );
     }
 
     #[test]

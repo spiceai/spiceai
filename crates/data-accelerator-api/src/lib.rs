@@ -118,8 +118,6 @@ pub struct CayenneRuntimeConfig {
 /// it — including each engine's own constructor — is total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceleratorRuntimeConfig {
-    Arrow,
-    PartitionedArrow,
     Cayenne(CayenneRuntimeConfig),
 }
 
@@ -128,8 +126,6 @@ impl AcceleratorRuntimeConfig {
     #[must_use]
     pub fn engine(&self) -> Engine {
         match self {
-            Self::Arrow => Engine::Arrow,
-            Self::PartitionedArrow => Engine::PartitionedArrow,
             Self::Cayenne(_) => Engine::Cayenne,
         }
     }
@@ -142,8 +138,6 @@ impl AcceleratorRuntimeConfig {
     #[must_use]
     pub fn default_for(engine: Engine) -> Self {
         match engine {
-            Engine::Arrow => Self::Arrow,
-            Engine::PartitionedArrow => Self::PartitionedArrow,
             Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
         }
     }
@@ -205,8 +199,7 @@ pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
 /// `acceleration.engine`, sorted and de-duplicated.
 ///
 /// Reads the registration slice rather than a hand-maintained list, so a build that
-/// omits an engine crate cannot advertise it. `Engine::Arrow` and
-/// `Engine::PartitionedArrow` both spell "arrow", which is why this de-duplicates.
+/// omits an engine crate cannot advertise it.
 #[must_use]
 pub fn registered_engine_names() -> Vec<String> {
     let mut names: Vec<String> = DATA_ACCELERATOR_REGISTRATIONS
@@ -218,7 +211,7 @@ pub fn registered_engine_names() -> Vec<String> {
     names
 }
 
-/// [`registered_engine_names`] as a user-facing list — `"arrow and cayenne"`.
+/// [`registered_engine_names`] as a user-facing list — `"cayenne"`.
 ///
 /// Separate from the message that embeds it so the wording can be asserted directly;
 /// the link order of the registration slice is not stable, hence the sort above.
@@ -345,7 +338,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -461,14 +454,11 @@ impl AcceleratorEngineRegistry {
         // For example, Table {schema: "schema", table: "table_name"} is converted to Table {table: "schema.table_name"}.
         let accelerated_table_name = TableReference::bare(table_name.to_string());
 
-        let mut external_table_builder = AcceleratorExternalTableBuilder::new(
-            accelerated_table_name,
-            Arc::clone(&schema),
-            engine,
-        )
-        .mode(acceleration_settings.mode)
-        .options(params)
-        .indexes(acceleration_settings.indexes.clone());
+        let mut external_table_builder =
+            AcceleratorExternalTableBuilder::new(accelerated_table_name, Arc::clone(&schema))
+                .mode(acceleration_settings.mode)
+                .options(params)
+                .indexes(acceleration_settings.indexes.clone());
         let suppress_auto_on_conflict = cayenne_pk_conflict_detection_none(acceleration_settings);
         // Cayenne keeps the last version of each key whatever `on_conflict` says: a
         // primary key alone makes its table upsert on that key. The setting still
@@ -945,7 +935,6 @@ pub struct SchemaEvolutionUnsupported {
 pub struct AcceleratorExternalTableBuilder {
     table_name: TableReference,
     schema: SchemaRef,
-    engine: Engine,
     mode: Mode,
     options: Option<Parameters>,
     indexes: HashMap<ColumnReference, IndexType>,
@@ -956,11 +945,10 @@ pub struct AcceleratorExternalTableBuilder {
 
 impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new(table_name: TableReference, schema: SchemaRef, engine: Engine) -> Self {
+    pub fn new(table_name: TableReference, schema: SchemaRef) -> Self {
         Self {
             table_name,
             schema,
-            engine,
             mode: Mode::Memory,
             options: None,
             indexes: HashMap::new(),
@@ -1006,23 +994,6 @@ impl AcceleratorExternalTableBuilder {
         self
     }
 
-    fn validate_arrow(&self) -> Result<(), Error> {
-        if matches!(self.mode, Mode::File | Mode::FileUpdate) {
-            InvalidConfigurationSnafu {
-                msg: "File mode not supported for Arrow engine".to_string(),
-            }
-            .fail()?;
-        }
-        Ok(())
-    }
-
-    fn validate(&self) -> Result<(), Error> {
-        match self.engine {
-            Engine::Arrow => self.validate_arrow(),
-            _ => Ok(()),
-        }
-    }
-
     /// Builds the `CREATE EXTERNAL TABLE` command from the accumulated builder state.
     ///
     /// # Errors
@@ -1030,8 +1001,6 @@ impl AcceleratorExternalTableBuilder {
     /// Returns an error if the accumulated acceleration settings are invalid for the
     /// selected engine.
     pub fn build(self) -> Result<CreateExternalTable> {
-        self.validate()?;
-
         let mut options: HashMap<String, String> = self
             .options
             .map(|x| x.to_secret_map())
@@ -1349,8 +1318,8 @@ mod tests {
         ]))
     }
 
-    fn builder(engine: Engine) -> AcceleratorExternalTableBuilder {
-        AcceleratorExternalTableBuilder::new(TableReference::bare("orders"), schema(), engine)
+    fn builder() -> AcceleratorExternalTableBuilder {
+        AcceleratorExternalTableBuilder::new(TableReference::bare("orders"), schema())
     }
 
     fn pk(columns: Vec<usize>) -> Constraints {
@@ -1370,7 +1339,7 @@ mod tests {
                 .with_remove_duplicates(true)
                 .with_last_write_wins(true),
         ] {
-            let table = builder(Engine::Cayenne)
+            let table = builder()
                 .upsert_options(options.clone())
                 .build()
                 .expect("build succeeds");
@@ -1391,7 +1360,7 @@ mod tests {
     /// on the same "no deduplication" answer.
     #[test]
     fn no_upsert_options_means_no_keys_written_and_none_read_back() {
-        let table = builder(Engine::Cayenne).build().expect("build succeeds");
+        let table = builder().build().expect("build succeeds");
 
         assert!(!table.options.contains_key("upsert_remove_duplicates"));
         assert!(!table.options.contains_key("upsert_last_write_wins"));
@@ -1405,7 +1374,7 @@ mod tests {
     /// upserts on. Dropping them turns every upsert into a blind append.
     #[test]
     fn constraints_reach_the_created_table() {
-        let table = builder(Engine::Cayenne)
+        let table = builder()
             .constraints(pk(vec![0, 1]))
             .build()
             .expect("build succeeds");
@@ -1415,13 +1384,13 @@ mod tests {
 
     #[test]
     fn a_table_built_without_constraints_has_none_rather_than_a_stale_key() {
-        let table = builder(Engine::Cayenne).build().expect("build succeeds");
+        let table = builder().build().expect("build succeeds");
         assert!(table.constraints.is_empty());
     }
 
     #[test]
     fn the_on_conflict_behavior_reaches_the_created_table() {
-        let table = builder(Engine::Cayenne)
+        let table = builder()
             .on_conflict(OnConflict::Upsert(
                 datafusion_table_providers::util::column_reference::ColumnReference::try_from("id")
                     .expect("column reference"),
@@ -1437,30 +1406,9 @@ mod tests {
 
     #[test]
     fn the_write_mode_reaches_the_created_table() {
-        let table = builder(Engine::Cayenne)
-            .mode(Mode::File)
-            .build()
-            .expect("build succeeds");
+        let table = builder().mode(Mode::File).build().expect("build succeeds");
 
         assert_eq!(table.options.get("mode"), Some(&Mode::File.to_string()));
-    }
-
-    /// The Arrow engine is in-memory only. Accepting file mode would produce a
-    /// table that silently loses every row on restart.
-    #[test]
-    fn the_arrow_engine_rejects_file_mode() {
-        builder(Engine::Arrow)
-            .mode(Mode::File)
-            .build()
-            .expect_err("file mode must be rejected for the Arrow engine");
-        builder(Engine::Arrow)
-            .mode(Mode::FileUpdate)
-            .build()
-            .expect_err("file-update mode must be rejected for the Arrow engine");
-        builder(Engine::Arrow)
-            .mode(Mode::Memory)
-            .build()
-            .expect("memory mode is valid for the Arrow engine");
     }
 
     #[test]
@@ -1490,11 +1438,8 @@ mod tests {
         );
     }
 
-    /// Turning primary-key conflict detection off is a Cayenne-only escape
-    /// hatch. Reading it on another engine would disable a check that engine
-    /// still depends on.
     #[test]
-    fn pk_conflict_detection_none_is_recognised_only_for_cayenne() {
+    fn pk_conflict_detection_none_is_recognised() {
         for key in ["cayenne_pk_conflict_detection", "pk_conflict_detection"] {
             for value in ["none", "NONE", "None"] {
                 let mut acceleration = Acceleration {
@@ -1507,16 +1452,6 @@ mod tests {
                 assert!(
                     cayenne_pk_conflict_detection_none(&acceleration),
                     "{key}={value} must disable pk conflict detection"
-                );
-
-                let other_engine = Acceleration {
-                    engine: Engine::Arrow,
-                    params: acceleration.params.clone(),
-                    ..Acceleration::default()
-                };
-                assert!(
-                    !cayenne_pk_conflict_detection_none(&other_engine),
-                    "{key}={value} must not apply to a non-Cayenne engine"
                 );
             }
         }
@@ -1619,13 +1554,12 @@ mod tests {
     /// fails to compile in `engine`.
     #[test]
     fn the_default_config_for_an_engine_is_that_engines_own_variant() {
-        for engine in [Engine::Arrow, Engine::PartitionedArrow, Engine::Cayenne] {
-            assert_eq!(
-                AcceleratorRuntimeConfig::default_for(engine).engine(),
-                engine,
-                "default_for({engine}) must produce the {engine} variant"
-            );
-        }
+        let engine = Engine::Cayenne;
+        assert_eq!(
+            AcceleratorRuntimeConfig::default_for(engine).engine(),
+            engine,
+            "default_for({engine}) must produce the {engine} variant"
+        );
     }
 }
 

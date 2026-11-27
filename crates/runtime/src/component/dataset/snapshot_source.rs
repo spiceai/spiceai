@@ -26,7 +26,7 @@ limitations under the License.
 //! `Runtime::resolve_snapshot_source`), recording the engine in the
 //! [`SnapshotSourceRegistry`] that every later build reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -383,12 +383,13 @@ const LOCAL_COPY_PARAMS: &[&str] = &[
     "cayenne_s3_zone_ids",
 ];
 
-/// The engines this process has found snapshot sources were created with, keyed by
-/// dataset and location, so building a dataset — which cannot wait on the network —
-/// can complete its acceleration once its snapshots have been described.
+/// The snapshot sources (dataset and location) this process has found the engine of, so
+/// building a dataset — which cannot wait on the network — can complete its acceleration
+/// once its snapshots have been described. Cayenne is the only engine, so a recorded
+/// source is a Cayenne one.
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotSourceRegistry {
-    engines: RwLock<HashMap<(TableReference, String), Engine>>,
+    engines: RwLock<HashSet<(TableReference, String)>>,
     resolutions: Mutex<HashMap<TableReference, u64>>,
 }
 
@@ -397,15 +398,18 @@ impl SnapshotSourceRegistry {
     pub(crate) fn engine(&self, dataset: &TableReference, location: &str) -> Option<Engine> {
         self.engines
             .read()
-            .get(&(dataset.clone(), registry_location(location)))
-            .copied()
+            .contains(&(dataset.clone(), registry_location(location)))
+            .then_some(Engine::Cayenne)
     }
 
     /// Records that `dataset`'s snapshots at `location` were created with `engine`.
     pub(crate) fn record(&self, dataset: &TableReference, location: &str, engine: Engine) {
+        match engine {
+            Engine::Cayenne => {}
+        }
         self.engines
             .write()
-            .insert((dataset.clone(), registry_location(location)), engine);
+            .insert((dataset.clone(), registry_location(location)));
     }
 
     /// Forgets `dataset`: the engines recorded for it, and any resolution in flight, which
@@ -414,7 +418,7 @@ impl SnapshotSourceRegistry {
     pub(crate) fn forget(&self, dataset: &TableReference) {
         self.engines
             .write()
-            .retain(|(recorded, _), _| recorded != dataset);
+            .retain(|(recorded, _)| recorded != dataset);
         if let Some(generation) = self.resolutions.lock().get_mut(dataset) {
             *generation += 1;
         }

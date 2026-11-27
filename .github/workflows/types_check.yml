@@ -76,7 +76,6 @@ jobs:
       matrix:
         acceleration:
           [
-            { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
           ]
         target:

@@ -1,0 +1,77 @@
+name: cluster-partitioned-acceleration
+duration: 60s
+description: >
+  On a scheduler with two executors, two Cayenne file accelerations
+  partitioned by `bucket(4, id)` are spread across both executors and answer
+  as the source does: every row once, aggregates, ORDER BY ... LIMIT with and
+  without a predicate, and a join of the two tables. Each executor is sent
+  the ORDER BY and LIMIT, so it returns at most the limit, and no executor is
+  sent a bucket filter, since each holds only the partitions it was assigned.
+  (Losing an executor of a Cayenne acceleration is
+  known-failing/cluster-operations/cluster-executor-loss-cayenne.yaml.)
+
+sources:
+  duck: { kind: duckdb }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-partitioned-acceleration
+  runtime:
+    scheduler:
+      # bucket(4, id) makes 5 partitions per table, 10 in all; at most 5 per
+      # executor spreads them over both executors.
+      max_partitions_per_executor: 5
+  datasets:
+    - from: duckdb:test_data
+      name: test_data
+      params: ${sources.duck.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, partition_by: ['bucket(4, id)'] }
+    - from: duckdb:categories
+      name: categories
+      params: ${sources.duck.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, partition_by: ['bucket(4, id)'] }
+
+defaults:
+  cluster: { executors: 2 }
+  expect: { oracle: duck }
+
+steps:
+  - source-exec:
+      duck: >-
+        CREATE TABLE test_data (id BIGINT, name VARCHAR, age BIGINT, city VARCHAR, score BIGINT);
+        INSERT INTO test_data VALUES
+          (1, 'John Doe', 28, 'New York', 85), (2, 'Jane Smith', 34, 'Los Angeles', 92),
+          (3, 'Mike Johnson', 45, 'Chicago', 78), (4, 'Emily Brown', 31, 'Houston', 89),
+          (5, 'David Lee', 39, 'Phoenix', 76), (6, 'Sarah Wilson', 26, 'Philadelphia', 94),
+          (7, 'Tom Anderson', 52, 'San Antonio', 81), (8, 'Lisa Taylor', 29, 'San Diego', 88),
+          (9, 'Chris Martin', 37, 'Dallas', 79), (10, 'Anna Garcia', 41, 'San Jose', 90);
+        CREATE TABLE categories (id BIGINT, category VARCHAR, rating DOUBLE);
+        INSERT INTO categories VALUES
+          (1, 'A', 4.5), (2, 'B', 3.2), (3, 'A', 4.8), (4, 'C', 2.1), (5, 'B', 3.9),
+          (6, 'A', 4.2), (7, 'C', 1.8), (8, 'B', 3.5), (9, 'A', 4.6), (10, 'C', 2.7);
+  - start: {}
+
+  # Every row once, from both executors.
+  - query: SELECT id, name, age, city, score FROM test_data ORDER BY id
+    eventually: 60s
+  - query: SELECT id, category, rating FROM categories ORDER BY id
+    eventually: 60s
+  - query: SELECT count(*) AS total_rows, sum(score) AS total_score, min(age) AS min_age, max(age) AS max_age FROM test_data
+  - explain: SELECT id, name, age, city, score FROM test_data ORDER BY id
+    contains: [FlightSqlExec]
+    omits: ['bucket(']
+
+  # ORDER BY ... LIMIT reaches each executor, which returns at most the limit.
+  - query: SELECT id, name, score FROM test_data ORDER BY score DESC LIMIT 3
+  - explain: SELECT id, name, score FROM test_data ORDER BY score DESC LIMIT 3
+    contains: ['FlightSqlExec sql=SELECT id, name, score FROM test_data ORDER BY score DESC NULLS FIRST LIMIT 3']
+  - query: SELECT id, name, score FROM test_data WHERE score > 80 ORDER BY id ASC LIMIT 5
+  - explain: SELECT id, name, score FROM test_data WHERE score > 80 ORDER BY id ASC LIMIT 5
+    contains: [FlightSqlExec, 'LIMIT 5']
+
+  # A join of two partitioned tables, whose matching ids may be on different
+  # executors.
+  - query: SELECT t.id, t.name, c.category, c.rating FROM test_data t JOIN categories c ON t.id = c.id ORDER BY t.id
+  - explain: SELECT t.id, t.name, c.category, c.rating FROM test_data t JOIN categories c ON t.id = c.id ORDER BY t.id
+    contains: [FlightSqlExec]

@@ -1,47 +1,53 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-arrow-secondary_hash_index
+name: file[parquet]-cayenne[memory]-secondary_index
 datasets:
   - from: file:data/customer.parquet
     name: customer
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         c_name: unique
   - from: file:data/nation.parquet
     name: nation
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         n_name: unique
   - from: file:data/orders.parquet
     name: orders
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         o_orderkey: unique
   - from: file:data/part.parquet
     name: part
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         p_name: unique
   - from: file:data/region.parquet
     name: region
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         r_name: unique
   - from: file:data/supplier.parquet
     name: supplier
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
       indexes:
         s_name: unique
   # lineitem and partsupp don't have natural unique columns for secondary index
@@ -49,9 +55,11 @@ datasets:
     name: lineitem
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
   - from: file:data/partsupp.parquet
     name: partsupp
     acceleration:
       enabled: true
-      engine: arrow
+      engine: cayenne
+      mode: memory
