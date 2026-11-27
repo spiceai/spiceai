@@ -2278,7 +2278,10 @@ impl Runtime {
         // A dataset whose writer changes (another instance took its shared
         // acceleration over, or this one did) reloads.
         if let Some(changes) = self.df.take_writer_role_changes() {
-            tokio::spawn(Arc::clone(&self).reload_on_writer_changes(changes));
+            tokio::spawn(Self::reload_on_writer_changes(
+                Arc::downgrade(&self),
+                changes,
+            ));
         }
 
         // Spawn each remaining component load in its own task to run in parallel
