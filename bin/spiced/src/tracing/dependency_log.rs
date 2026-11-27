@@ -30,8 +30,8 @@ static DEFAULT_RULES: &[&dyn LogTransformRule] = &[&OpenDalS3ReadRetryRule];
 /// Recognizes a dependency diagnostic and supplies its replacement message.
 ///
 /// Rules are tried in registration order until one returns a transformation.
-/// Return `None` for unsupported records so later rules can try them, or the
-/// original record can pass through unchanged if no rule matches.
+/// Return `None` for unsupported records so later rules can try them. A record
+/// that no rule matches is forwarded with the credentials in its URLs redacted.
 trait LogTransformRule: Send + Sync {
     fn transform(&self, record: &Record<'_>) -> Option<LogTransform>;
 }
