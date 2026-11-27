@@ -6398,37 +6398,6 @@ mod tests {
         );
     }
 
-    /// Another engine's settings are refused rather than quietly treated as absent.
-    ///
-    /// The registration slice stores one function type for every engine, so this mismatch
-    /// cannot be a compile error; `register_all` and `build_with_defaults` both choose the
-    /// settings by engine, which is what keeps it from arising. This pins the remaining
-    /// behaviour of the case they prevent.
-    #[test]
-    fn another_engines_configuration_is_refused() {
-        use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
-
-        let registration = DATA_ACCELERATOR_REGISTRATIONS
-            .iter()
-            .find(|registration| registration.engine == Engine::Cayenne)
-            .expect("this crate registers the Cayenne engine");
-
-        let error = (registration.constructor)(&AcceleratorRuntimeConfig::Arrow)
-            .err()
-            .expect("Cayenne must refuse Arrow configuration rather than build from it");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("cayenne") && message.contains("arrow"),
-            "the error must name both engines, got: {message}"
-        );
-
-        // Its own settings still build, so the refusal is about the mismatch and not about
-        // the engine being unbuildable.
-        (registration.constructor)(&AcceleratorRuntimeConfig::default_for(Engine::Cayenne))
-            .expect("the engine must still build from its own configuration");
-    }
-
     /// The write profile is the engine's answer about its *own* acceleration, so an
     /// acceleration naming another engine must get `None` rather than a Cayenne
     /// classification. The runtime filters by engine before asking, so only this test

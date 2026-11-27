@@ -286,17 +286,12 @@ macro_rules! register_data_accelerator {
         fn $fn_name(
             config: &$crate::AcceleratorRuntimeConfig,
         ) -> $crate::Result<::std::sync::Arc<dyn $crate::DataAccelerator>> {
-            // The only fallible step: once the engine's own settings are in hand, building
-            // it is total, and that `&`-reference is what gets passed on.
+            // Matched without a catch-all arm: a second `AcceleratorRuntimeConfig` variant
+            // makes this fail to compile until the mismatch is handled.
             match config {
                 $crate::AcceleratorRuntimeConfig::$variant(engine_config) => Ok(
                     ::std::sync::Arc::new(<$accelerator>::from_runtime_config(engine_config)),
                 ),
-                mismatched => $crate::MismatchedEngineConfigSnafu {
-                    expected: $engine,
-                    actual: mismatched.engine(),
-                }
-                .fail(),
             }
         }
 
@@ -361,12 +356,6 @@ pub enum Error {
     RebuildRequired {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    // Worded as the cause clause it appears as: the messages that embed it supply the
-    // impact and where to report it. Reaching this means a caller paired an engine's
-    // registration with another engine's settings, which every path here chooses by engine.
-    #[snafu(display("the {expected} engine was given {actual} configuration"))]
-    MismatchedEngineConfig { expected: Engine, actual: Engine },
 }
 
 #[derive(Debug, Snafu)]
