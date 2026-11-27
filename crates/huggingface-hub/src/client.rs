@@ -539,9 +539,9 @@ impl Hub {
             })
             .transpose()?;
         // Redirects are followed by hand: the CDN target of a file is cached, the token is sent
-        // only to the Hub's own origin, and a redirect off the endpoint's host cannot reach an
-        // internal address. Transparent decompression is off: a byte range must address the
-        // file as stored, and its length must be the file's.
+        // only to the Hub's own origin, and a redirect off the endpoint's host is checked for
+        // internal addresses (see `Hub::check_redirect`). Transparent decompression is off: a
+        // byte range must address the file as stored, and its length must be the file's.
         let redirect_hosts = (!ssrf::allow_private_hosts()).then(|| {
             RedirectHostResolver::new(DestinationGuard::new(
                 ssrf::is_internal_ip,
@@ -1065,7 +1065,8 @@ impl Hub {
 
     /// Refuses a download redirect off the endpoint's host to an internal IP literal or a
     /// well-known internal name, and has the addresses of any other host it names checked when
-    /// the download connects. The endpoint's own host is trusted, whatever it resolves to.
+    /// the download connects to it. Through a proxy, which resolves the host itself, only the
+    /// literal and name checks apply. The endpoint's own host is trusted, whatever it resolves to.
     fn check_redirect(&self, repo: &RepoId, path: &str, location: &Url) -> Result<()> {
         let Some(hosts) = &self.redirect_hosts else {
             return Ok(());
