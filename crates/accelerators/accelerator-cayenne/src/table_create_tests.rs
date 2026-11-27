@@ -819,3 +819,43 @@ async fn dropped_accelerator_releases_dir_so_restart_reuses_path() {
         "a Cayenne data directory ends with '/': {first_data}"
     );
 }
+
+/// A restart inside one process shuts the previous `Runtime` down while its
+/// tables and background tasks still hold the accelerator, so that instance is
+/// not dropped. Shutting it down must release its directories: the next
+/// accelerator reopens the configured paths and serves the rows already on
+/// disk, not an empty instance-suffixed sibling.
+#[tokio::test]
+async fn shut_down_accelerator_releases_dir_while_still_referenced() {
+    let dir = tempfile::tempdir().expect("dir");
+    let source = dataset(dir.path(), "orders", "disabled", Mode::File);
+
+    let (first, first_table) = start(&source).await;
+    load(&first, &source, &first_table, 1..4).await;
+    let first_data = first.cayenne_data_dir(&source).expect("first data dir");
+    let first_meta = first.metadata_dir_for(source.acceleration());
+    first
+        .shutdown()
+        .await
+        .expect("shut the first accelerator down");
+
+    // `first` and its table stay alive past the restart, as they do after
+    // `Runtime::shutdown`.
+    let (second, second_table) = start(&source).await;
+    assert_eq!(
+        second.cayenne_data_dir(&source).expect("second data dir"),
+        first_data,
+        "a restart after shutdown must reopen the original data directory"
+    );
+    assert_eq!(
+        second.metadata_dir_for(source.acceleration()),
+        first_meta,
+        "a restart after shutdown must reopen the original metadata directory"
+    );
+    assert_eq!(
+        scanned_ids(&second_table).await,
+        vec![1, 2, 3],
+        "the restarted accelerator must serve the rows the first one loaded"
+    );
+    drop((first, first_table));
+}

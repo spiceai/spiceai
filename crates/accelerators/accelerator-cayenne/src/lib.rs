@@ -584,24 +584,7 @@ impl Drop for InheritedPinsEntry<'_> {
 
 impl Drop for CayenneAccelerator {
     fn drop(&mut self) {
-        // Collect first so this lock is not held with [`LOCAL_DIR_OWNERS`]:
-        // [`Self::isolate_local_dir`] takes the owners lock, then this map.
-        let claimed: Vec<(String, String)> = self
-            .isolated_dirs
-            .lock()
-            .iter()
-            .map(|(key, actual)| (key.clone(), actual.clone()))
-            .collect();
-        let mut owners = LOCAL_DIR_OWNERS.lock();
-        for (key, actual) in claimed {
-            if owners.get(&key).copied() == Some(self.instance_id) {
-                owners.remove(&key);
-            }
-            let actual_key = local_dir_key(&actual);
-            if owners.get(&actual_key).copied() == Some(self.instance_id) {
-                owners.remove(&actual_key);
-            }
-        }
+        self.release_local_dirs();
     }
 }
 
@@ -1797,6 +1780,56 @@ impl CayenneAccelerator {
         };
         self.isolated_dirs.lock().insert(key, actual.clone());
         actual
+    }
+
+    /// Releases every local directory this instance claimed in
+    /// [`LOCAL_DIR_OWNERS`], so the next accelerator in this process (a
+    /// restarted `Runtime`) reopens the configured paths rather than an
+    /// instance-suffixed sibling. [`DataAccelerator::shutdown`] calls it because
+    /// tables and background tasks can keep the engine alive after its
+    /// `Runtime` shuts down; [`Drop`] calls it for an instance never shut down.
+    fn release_local_dirs(&self) {
+        // Take the claims first so this lock is not held with
+        // [`LOCAL_DIR_OWNERS`]: [`Self::isolate_local_dir`] takes the owners
+        // lock, then this map.
+        let claimed = std::mem::take(&mut *self.isolated_dirs.lock());
+        if claimed.is_empty() {
+            return;
+        }
+        let mut owners = LOCAL_DIR_OWNERS.lock();
+        for (key, actual) in claimed {
+            if owners.get(&key).copied() == Some(self.instance_id) {
+                owners.remove(&key);
+            }
+            let actual_key = local_dir_key(&actual);
+            if owners.get(&actual_key).copied() == Some(self.instance_id) {
+                owners.remove(&actual_key);
+            }
+        }
+    }
+
+    /// Shuts down every catalog this instance opened.
+    async fn shutdown_catalogs(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let catalogs: Vec<Arc<dyn cayenne::MetadataCatalog>> = self
+            .catalogs
+            .lock()
+            .values()
+            .filter_map(|cell| cell.get().map(Arc::clone))
+            .collect();
+        let memory_catalog = self.memory_catalog.get().map(Arc::clone);
+
+        if catalogs.is_empty() && memory_catalog.is_none() {
+            tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
+            return Ok(());
+        }
+
+        for catalog in catalogs.into_iter().chain(memory_catalog) {
+            catalog.shutdown().await.map_err(|e| {
+                tracing::warn!("Failed to shutdown Cayenne catalog: {e}");
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        }
+        Ok(())
     }
 
     /// [`Self::resolve_metadata_dir`] after [`Self::isolate_local_dir`], so two
@@ -5177,29 +5210,16 @@ impl DataAccelerator for CayenneAccelerator {
 
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::debug!("Cayenne accelerator shutdown: starting catalog shutdown");
-
-        let catalogs: Vec<Arc<dyn cayenne::MetadataCatalog>> = self
-            .catalogs
-            .lock()
-            .values()
-            .filter_map(|cell| cell.get().map(Arc::clone))
-            .collect();
-        let memory_catalog = self.memory_catalog.get().map(Arc::clone);
-
-        if catalogs.is_empty() && memory_catalog.is_none() {
-            tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
-            return Ok(());
+        let result = self.shutdown_catalogs().await;
+        // After the catalogs close, so the next instance never opens a
+        // `cayenne.db` this one is still closing; and whether or not they closed
+        // cleanly, so a failed close does not leave the directories claimed by an
+        // engine that is going away.
+        self.release_local_dirs();
+        if result.is_ok() {
+            tracing::debug!("Cayenne accelerator shutdown: complete");
         }
-
-        for catalog in catalogs.into_iter().chain(memory_catalog) {
-            catalog.shutdown().await.map_err(|e| {
-                tracing::warn!("Failed to shutdown Cayenne catalog: {e}");
-                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-        }
-        tracing::debug!("Cayenne accelerator shutdown: complete");
-
-        Ok(())
+        result
     }
 }
 
