@@ -1,0 +1,122 @@
+name: object-native-schema-recreate
+description: >
+  Two instances share one object-native state location and one Postgres
+  source, under full refresh. The source changes a column's type in a way no
+  policy applies in place, and the writer restarts with a setting that would
+  drop and recreate the acceleration for it (`on_schema_change:
+  drop_and_recreate`, or `mode: file_update`). Dropping it would drop the copy
+  the other instance serves, so the writer instead fails the dataset, naming
+  the change and the fix, and the replica keeps serving the copy's existing
+  rows. Once the source change is reverted, the writer loads the dataset again
+  and both instances follow the source.
+
+sources:
+  src: { kind: postgres, shared: true }
+  lake: { kind: rustfs }
+
+matrix:
+  trigger: [drop_and_recreate, file_update]
+
+variants:
+  a: {}
+  b: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: object-native-schema-recreate
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 2s
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id integer PRIMARY KEY, v integer, s text);
+        INSERT INTO t SELECT i, i, 's' || i FROM generate_series(1, 200) i;
+    only: a
+
+  - start: {}
+    only: a
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+    only: a
+  - start: {}
+    only: b
+  - query: SELECT id, v, s FROM t
+    id: before
+    eventually: 60s
+    only: b
+
+  # A change no policy applies in place.
+  - source-exec:
+      src: "ALTER TABLE t ALTER COLUMN v TYPE text USING 'v' || v; UPDATE t SET s = s || 'x'"
+    only: a
+  # b stops so a keeps the writer lease across its restart.
+  - stop: {}
+    only: b
+  - restart:
+      ready: false
+      patch: { datasets: { t: { on_schema_change: drop_and_recreate } } }
+    when: { trigger: drop_and_recreate }
+    only: a
+  - restart:
+      ready: false
+      patch: { datasets: { t: { acceleration: { mode: file_update } } } }
+    when: { trigger: file_update }
+    only: a
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "rebuilding it would drop its copy in the state location, which other Spice instances may be serving"
+    eventually: 60s
+    only: a
+  - assert-log:
+      lacks: ["is dropped and recreated with the new schema"]
+    only: a
+
+  # The copy is intact: b, started again, serves the rows it served before.
+  - start: {}
+    only: b
+  - query: SELECT id, v, s FROM t
+    expect: { same-as: before }
+    eventually: 60s
+    only: b
+  - query: SELECT id, v, s FROM t
+    expect: { same-as: before }
+    consistently: 6s
+    only: b
+
+  # The source change is reverted: a loads the dataset again, and both follow
+  # the source.
+  - source-exec:
+      src: "ALTER TABLE t ALTER COLUMN v TYPE integer USING substr(v, 2)::integer"
+    only: a
+  - wait-ready: { timeout: 120s }
+    only: a
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+    only: [a, b]

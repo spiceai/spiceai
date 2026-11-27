@@ -769,6 +769,18 @@ pub trait DataAccelerator: Send + Sync {
         None
     }
 
+    /// Whether the stored table's data lives in a location other instances may serve.
+    /// Recreating such a table must not remove another instance's copy. This asks
+    /// about the stored table, rather than the placement of a newly created table.
+    /// Decorators must forward this method.
+    ///
+    /// # Errors
+    /// Returns an error if the stored table's placement cannot be determined.
+    async fn stored_data_is_shared(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
     /// Drops an existing table from the acceleration engine.
     ///
     /// Used by `file_update` mode to remove a table whose schema is incompatible with

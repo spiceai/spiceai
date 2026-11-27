@@ -19,7 +19,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array, StringArray};
 use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
 use cayenne::metastore::object_native::{Access, NativeCatalogConfig, ObjectNativeCatalog};
 use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, ScanViewReuse};
@@ -37,6 +37,140 @@ use object_store_sim::fault::FaultStore;
 
 const LOCATION: &str = "s3://bucket/state/cayenne/v1";
 const TABLE: &str = "orders";
+
+/// Registration on a replica keeps the writer's settings and schema without
+/// publishing a config change or a schema widening of its own.
+#[tokio::test]
+async fn replica_reopens_with_different_settings_and_wider_schema() {
+    use cayenne::metadata::SchemaEvolutionMode;
+    use futures::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    for inline in [false, true] {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let requests = Arc::new(FaultStore::new(Arc::clone(&objects)));
+        let replica_store: Arc<dyn ObjectStore> = Arc::clone(&requests) as Arc<dyn ObjectStore>;
+        let (a, data_url) = Instance::open(&objects, Access::Writer).await;
+        let writer_config = VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            inline_max_rows: if inline { 1000 } else { 0 },
+            inline_max_bytes: if inline { 1_000_000 } else { 0 },
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: writer_config.clone(),
+        };
+        a.register(
+            a.builder(&objects, &data_url)
+                .create(options.clone())
+                .await
+                .expect("create writer"),
+        );
+        a.run("INSERT INTO orders VALUES (3, 30), (1, 10), (2, 20)")
+            .await
+            .expect("write rows");
+        let stored = a.catalog.get_table(TABLE).await.expect("writer metadata");
+        let heads: Vec<_> = objects
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list heads")
+            .into_iter()
+            .filter(|object| object.location.filename() == Some("head"))
+            .collect();
+        assert_ne!(heads.len(), 0, "the writer's commits wrote a log head");
+        let mut before = Vec::new();
+        for head in &heads {
+            before.push(
+                objects
+                    .get(&head.location)
+                    .await
+                    .expect("head")
+                    .bytes()
+                    .await
+                    .expect("head bytes"),
+            );
+        }
+
+        let (b, _) = Instance::open(&replica_store, Access::Replica).await;
+        let replica = b
+            .builder(&replica_store, &data_url)
+            .create(CreateTableOptions {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                    Field::new("extra", DataType::Utf8, true),
+                ])),
+                vortex_config: VortexConfig {
+                    sort_columns: vec!["v".to_string()],
+                    schema_evolution: SchemaEvolutionMode::Widen,
+                    ..writer_config
+                },
+                ..options
+            })
+            .await
+            .expect("replica opens with its own settings and wider schema");
+        assert_eq!(replica.schema().as_ref(), stored.schema.as_ref());
+        let reopened = b.catalog.get_table(TABLE).await.expect("replica metadata");
+        assert_eq!(reopened.table_id, stored.table_id);
+        assert_eq!(reopened.schema, stored.schema);
+        assert_eq!(
+            serde_json::to_value(&reopened.vortex_config).expect("config"),
+            serde_json::to_value(&stored.vortex_config).expect("config")
+        );
+        b.register(replica);
+        let batches = b
+            .ctx
+            .sql("SELECT id, v FROM orders ORDER BY id")
+            .await
+            .expect("plan rows")
+            .collect()
+            .await
+            .expect("read rows");
+        let rows: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("values");
+                (0..batch.num_rows()).map(move |row| (ids.value(row), values.value(row)))
+            })
+            .collect();
+        assert_eq!(rows, vec![(1, 10), (2, 20), (3, 30)]);
+        for (head, expected) in heads.iter().zip(before) {
+            assert_eq!(
+                objects
+                    .get(&head.location)
+                    .await
+                    .expect("head")
+                    .bytes()
+                    .await
+                    .expect("head bytes"),
+                expected
+            );
+        }
+        assert!(
+            requests.log().iter().all(|request| matches!(
+                request.op,
+                Op::Get | Op::GetConditional | Op::Head | Op::List
+            )),
+            "replica sends only reads"
+        );
+    }
+}
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -608,4 +742,209 @@ async fn a_location_has_one_identity_however_it_is_reached() {
         id,
         "another location at the same URL has an identity of its own"
     );
+}
+
+/// A replica follows both live CDC evolution and registration-time schema
+/// publication without reopening, for files and an inline corpus.
+#[tokio::test]
+async fn replica_adopts_committed_schema() {
+    use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+
+    for live in [false, true] {
+        for inline in [false, true] {
+            let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let (a, data_url) = Instance::open(&objects, Access::Writer).await;
+            let initial = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("v", DataType::Int32, false),
+            ]));
+            let mut writer = Arc::new(
+                a.builder(&objects, &data_url)
+                    .create(CreateTableOptions {
+                        table_name: TABLE.to_string(),
+                        schema: Arc::clone(&initial),
+                        primary_key: Vec::new(),
+                        on_conflict: None,
+                        base_path: data_url.clone(),
+                        partition_column: None,
+                        vortex_config: VortexConfig {
+                            inline_max_rows: if inline { 1000 } else { 0 },
+                            inline_max_bytes: if inline { 1_000_000 } else { 0 },
+                            ..VortexConfig::default()
+                        },
+                    })
+                    .await
+                    .expect("create writer"),
+            );
+            a.ctx
+                .register_table(TABLE, Arc::clone(&writer) as Arc<dyn TableProvider>)
+                .expect("register writer");
+            a.run("INSERT INTO orders VALUES (1, 7)")
+                .await
+                .expect("initial row");
+            let (b, _) = Instance::open(&objects, Access::Replica).await;
+            let replica = Arc::new(
+                b.builder(&objects, &data_url)
+                    .open(TABLE)
+                    .await
+                    .expect("open replica"),
+            );
+            b.ctx
+                .register_table(TABLE, Arc::clone(&replica) as Arc<dyn TableProvider>)
+                .expect("register replica");
+            assert_eq!(b.count_and_sum().await, (1, 7));
+
+            let evolved = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+                Field::new("extra", DataType::Utf8, true),
+            ]));
+            if live {
+                let SchemaEvolution::Widening(plan) = classify(
+                    &initial,
+                    &evolved,
+                    &EvolutionContext {
+                        constraint_columns: &[],
+                    },
+                ) else {
+                    panic!("the change must widen");
+                };
+                writer
+                    .evolve_schema_live(&plan)
+                    .await
+                    .expect("live evolution");
+            } else {
+                a.ctx.deregister_table(TABLE).expect("unregister writer");
+                drop(writer);
+                let metadata = a.catalog.get_table(TABLE).await.expect("stored writer");
+                a.catalog
+                    .update_table_schema(&metadata.table_id, &evolved)
+                    .await
+                    .expect("registration schema publication");
+                writer = Arc::new(
+                    a.builder(&objects, &data_url)
+                        .open(TABLE)
+                        .await
+                        .expect("open evolved writer"),
+                );
+                a.ctx
+                    .register_table(TABLE, Arc::clone(&writer) as Arc<dyn TableProvider>)
+                    .expect("replace writer");
+            }
+            a.run("INSERT INTO orders VALUES (2, 3000000001, 'wide')")
+                .await
+                .unwrap_or_else(|error| panic!("wide row (live={live}, inline={inline}): {error}"));
+            writer
+                .flush_pending_maintenance()
+                .await
+                .expect("drain writer statistics");
+            assert_eq!(
+                a.count_and_sum().await,
+                (2, 3_000_000_008),
+                "live={live}, inline={inline}"
+            );
+
+            // This scan confirms the head using a column whose type did not change.
+            let ids = b
+                .ctx
+                .sql("SELECT id FROM orders ORDER BY id")
+                .await
+                .expect("plan confirmation")
+                .collect()
+                .await
+                .expect("confirm head");
+            let ids: Vec<i64> = ids
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(ids, vec![1, 2], "live={live}, inline={inline}");
+            assert_eq!(
+                replica
+                    .schema()
+                    .field_with_name("v")
+                    .expect("v")
+                    .data_type(),
+                &DataType::Int64
+            );
+
+            let batches = b
+                .ctx
+                .sql("SELECT id, v, extra FROM orders ORDER BY id")
+                .await
+                .expect("plan adopted schema")
+                .collect()
+                .await
+                .expect("read adopted schema");
+            let rows: Vec<(i64, i64, Option<String>)> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let id = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id");
+                    let v = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("v");
+                    // Query output may use view strings; cast to the stored string representation.
+                    let extra =
+                        arrow::compute::cast(batch.column(2), &DataType::Utf8).expect("extra Utf8");
+                    let extra = extra.as_any().downcast_ref::<StringArray>().expect("extra");
+                    (0..batch.num_rows())
+                        .map(|i| {
+                            (
+                                id.value(i),
+                                v.value(i),
+                                (!extra.is_null(i)).then(|| extra.value(i).to_string()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                vec![(1, 7, None), (2, 3_000_000_001, Some("wide".to_string()))],
+                "live={live}, inline={inline}"
+            );
+
+            assert_eq!(
+                b.count_and_sum().await,
+                (2, 3_000_000_008),
+                "live={live}, inline={inline}"
+            );
+            let filtered = b
+                .ctx
+                .sql("SELECT v FROM orders WHERE extra = 'wide' AND v > 2147483647")
+                .await
+                .expect("plan inline pruning at adopted width")
+                .collect()
+                .await
+                .expect("execute filtered scan");
+            let values: Vec<i64> = filtered
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("v")
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(values, vec![3_000_000_001], "live={live}, inline={inline}");
+        }
+    }
 }

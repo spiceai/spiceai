@@ -137,3 +137,85 @@ The control files retain historical FAIL schedules. The revised model includes
 the PK cache and reserve-ahead handout semantics; their historical labels do not
 assert a row failure under the revised model. Temporary engine mutations must
 still be detected by the same full catalog/row comparisons and then reverted.
+
+## Schema-change replay
+
+| File | Run | Content |
+|---|---|---|
+| schema.jsonl | schema | 6 witnesses + 30 walks (seed 42, 40 steps) |
+| schema-positional.jsonl | schema-positional | control: 1 FAIL + 6 REACHED witnesses |
+| schema-no-conform.jsonl | schema-no-conform | control: 1 FAIL + 6 REACHED |
+| schema-no-adopt.jsonl | schema-no-adopt | control: 1 FAIL + 3 REACHED |
+| schema-replica-commits.jsonl | schema-replica-commits | control: 1 FAIL + 4 REACHED |
+| schema-takeover-narrows.jsonl | schema-takeover-narrows | control: 1 FAIL + 6 REACHED |
+| schema-takeover-trusts-checkpoint.jsonl | schema-takeover-trusts-checkpoint | control: 1 FAIL + 6 REACHED |
+| schema-recreate-drops.jsonl | schema-recreate-drops | control: 1 FAIL + 3 REACHED |
+| schema-stale-plan.jsonl | schema-stale-plan | control: 1 FAIL + 4 REACHED |
+
+Generated serially from the repository root, starting with absent output files
+(`TRACE_JSON` appends):
+
+```sh
+cargo build --release -p cayenne-metastore-model
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/schema.jsonl target/release/cayenne-metastore-model run schema
+EXHAUST=1 WALK=42:30:40 TRACE_JSON=crates/cayenne/tests/traces/schema.jsonl target/release/cayenne-metastore-model run schema
+EXHAUST=1 TRACE_JSON=crates/cayenne/tests/traces/schema-<c>.jsonl target/release/cayenne-metastore-model run schema-<c>
+```
+
+`object_native_schema_replay_test.rs` replays the traces through three real
+instances. Each has its own catalog handle, session and request log, all on one
+location. Every trace runs on `InMemory` and on a durable `LocalConditionalPut`,
+with data in files and with inlined data. The test steps the model itself,
+which the model crate exports for it (`SchemaProtocol`, `SchemaState`,
+`SchemaAction`): every trace action must be enabled in the design, the design
+must break no property, and a control's FAIL witness must break its named
+property at its last step and not before.
+
+Source schema 0 is `(id Int64, v Int32)`. Schema 1 is `(id Int64, v Int64,
+extra Utf8)`, the widening that `classify` plans. Instances 0 and 2 open with
+`SchemaEvolutionMode::Widen` and instance 1 with `Disabled`.
+
+| Action | Replay |
+|---|---|
+| `Open`, `Retry` | driven: the instance opens the catalog as `Writer` or `Replica`, as the model makes it, and creates the table. A writer registers at the model's checkpoint schema. A replica registers at its source's schema, which may be wider or narrower than the stored one. Opening a replica must leave every log head byte-identical. |
+| `TakeLease` | driven: the replica's dataset is dropped and reopened as `Writer` at the narrowest schema the instance knows of (the smaller of its bound schema and the checkpoint). A kept plan is planned again. |
+| `CommitSchema` | driven: the writer's `evolve_schema_live`. |
+| `Write` | driven: an `INSERT` of one row under the writer's schema. Under schema 1, rows with an even `id` hold a `v` above `i32::MAX`. |
+| `Follow` | driven: a replica `SELECT count(*)`, which confirms the head. |
+| `Plan`, `Run` | driven: `Plan` keeps a `SELECT *` DataFrame. `Run` first plans it again if its table's schema changed since it was planned, then executes it. A plan that outlives a widening within the query goes through `conform_scan_to_planned_schema`. |
+| `Kill` | driven: the instance's catalog, session and table are dropped. |
+| `CommitCheckpoint`, `Recreate`, source actions | counted: the runtime's checkpoint, its refusal to drop a shared copy (`handle_schema_difference`) and the source schema have no Cayenne counterpart. `Recreate` drops the failed instance's dataset. |
+
+Cayenne has no plan cache. The model's cache check is emulated in `Run` by
+planning the kept DataFrame again when its schema differs from the table's. The
+runtime's own check, `plan_matches_scanned_tables`, is covered by a runtime unit
+test and the spicescripts. After every step the replay drains the writer's
+background work (`wait_for_scan_file_statistics_persistence`,
+`drain_in_flight_maintenance`). An in-process drop cannot stop a detached commit
+the way a process kill does. Without the drain, scan-statistics persistence
+started by a check's query moved a dataset head while a replica was opening.
+
+A replica's schema is checked against the model with one exception: Cayenne
+opens a replica at the stored schema, while the model registers one at the
+runtime's checkpoint. A replica that the model has lagging (its bound is narrower
+than the committed schema and it has not followed) may therefore already hold
+the committed schema. Its rows are not queried until the model has it follow,
+because the query itself would be a follow.
+
+Effects of the controls on the real code:
+
+- `replica-commits`: the replica open commits nothing and leaves the heads
+  unchanged. With the replica guard in `reopen_table_settings` removed, the open
+  fails ("accepts no change").
+- `takeover-narrows`, `takeover-trusts-checkpoint`: the new writer registers at a
+  narrower schema and keeps the stored one.
+- `stale-plan`: the kept plan is planned again.
+- `no-adopt`: the replica in the witness opens after the commit, so it already
+  holds the committed schema. Adoption is exercised by the design replay's
+  witness 0 instead.
+- `positional`, `no-conform`: the replica opens at the stored schema and plans
+  at it, so the witness's misaligned read never happens. The design replay's
+  `Run` steps reach the conform path.
+- `recreate-drops`: the copy survives, and the instances serving it keep
+  answering. The refusal itself is the runtime's, so this witness shows only the
+  Cayenne side.

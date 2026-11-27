@@ -1687,12 +1687,10 @@ impl Runtime {
             return Err(refuse_permanently(&ds, &self.status, &spaced_tracer, &err));
         }
 
-        // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
-        // create_accelerated_table drops + recreates the table with the new schema instead of
-        // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
-        // conditions (`file_update` with refreshes enabled, or `on_schema_change:
-        // drop_and_recreate` + `refresh_mode: full` on a recreate-capable engine); sharing it
-        // keeps this gate and the recreate decision in create_accelerated_table aligned.
+        // Let recreate policies reach `handle_schema_difference`, which either
+        // evolves in place, refuses to remove a copy in the shared state location,
+        // or recreates an instance-local table. Deferring here would keep a shared
+        // dataset loaded instead of reporting its schema-change refusal.
         let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
             crate::schema_evolution::recreates_on_schema_mismatch(
                 a,
@@ -2279,9 +2277,8 @@ impl Runtime {
                 }
                 .build()
             })?;
-        // Same recreate-bypass as the initial-load gate. Previously this honored only
-        // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
-        // recreate on an incompatible source change; the shared helper fixes that.
+        // As on initial load, registration decides whether to recreate or
+        // refuse a schema change that would remove a shared copy.
         let allow_schema_mismatch = ds.acceleration.as_ref().is_some_and(|a| {
             crate::schema_evolution::recreates_on_schema_mismatch(
                 a,
@@ -6468,6 +6465,13 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 
     #[async_trait::async_trait]
     impl data_accelerator_api::DataAccelerator for RecordingAccelerator {
+        async fn stored_data_is_shared(
+            &self,
+            _source: &dyn data_accelerator_api::AccelerationSource,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+
         async fn writer_role(
             &self,
             _source: &dyn data_accelerator_api::AccelerationSource,

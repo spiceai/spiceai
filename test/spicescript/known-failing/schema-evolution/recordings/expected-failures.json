@@ -141,6 +141,40 @@
       "may-pass": true
     }
   ],
+  "schema-restored-column": [
+    {
+      "run": "schema-restored-column",
+      "who": "object-native",
+      "key": "query: SELECT id, v, extra FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"extra\", row_number: 1, expected: \"None\", actual: \"\\\"e1\\\"\" }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-restored-column",
+      "who": "object-native",
+      "key": "query: SELECT id, v, extra FROM t #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"extra\", row_number: 1, expected: \"None\", actual: \"\\\"e1\\\"\" }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-restored-column",
+      "who": "sync-all-columns",
+      "key": "query: SELECT id, v, extra FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"extra\", row_number: 1, expected: \"None\", actual: \"\\\"e1\\\"\" }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "schema-restored-column",
+      "who": "sync-all-columns",
+      "key": "query: SELECT id, v, extra FROM t #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"extra\", row_number: 1, expected: \"None\", actual: \"\\\"e1\\\"\" }",
+      "group": "schema-evolution"
+    }
+  ],
   "schema-widen": [
     {
       "run": "schema-widen[refresh_mode=full]",

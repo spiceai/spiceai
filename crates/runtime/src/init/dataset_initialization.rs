@@ -968,6 +968,13 @@ mod tests {
 
     #[async_trait]
     impl DataAccelerator for FlakyInitAccelerator {
+        async fn stored_data_is_shared(
+            &self,
+            source: &dyn data_accelerator_api::AccelerationSource,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.stored_data_is_shared(source).await
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }

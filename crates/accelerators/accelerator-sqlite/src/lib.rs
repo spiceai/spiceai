@@ -391,6 +391,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 #[async_trait]
 impl DataAccelerator for SqliteAccelerator {
+    async fn stored_data_is_shared(
+        &self,
+        _source: &dyn data_accelerator_api::AccelerationSource,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
     async fn writer_role(
         &self,
         _source: &dyn data_accelerator_api::AccelerationSource,
