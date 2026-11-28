@@ -77,10 +77,19 @@ jobs:
         id: spiceio
         if: github.event_name != 'workflow_dispatch'
         env:
-          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || 'HEAD^1' }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
         run: |
           set -euo pipefail
-          changed=$(git diff --name-only "$BASE" HEAD -- crates/object_store_occ test/object_store_occ .github/workflows/object_store_wal.yml)
+          # In a merge group, diff from the merge-base with the target branch rather
+          # than `merge_group.base_sha`, which is the previous queue entry's commit:
+          # the queue merges the entries below one that passes, so this run has to
+          # cover all of them (see .github/actions/check-code-changes).
+          if [ -n "$BASE_REF" ]; then
+            base=$(git merge-base "refs/remotes/origin/${BASE_REF#refs/heads/}" HEAD)
+          else
+            base=HEAD^1
+          fi
+          changed=$(git diff --name-only "$base" HEAD -- crates/object_store_occ test/object_store_occ .github/workflows/object_store_wal.yml)
           echo "relevant=$([ -n "$changed" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Choose legs
         id: legs

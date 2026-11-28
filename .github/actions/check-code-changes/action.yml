@@ -102,6 +102,15 @@ runs:
       uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
       with:
         filters: ${{ inputs.filters }}
+        # On `merge_group`, diff against the target branch, not the default
+        # `merge_group.base_sha`. For an entry queued behind others, `base_sha` is the
+        # previous entry's queue commit, so the default diff holds only this entry's own
+        # PR. The queue's HEADGREEN strategy merges every entry below one whose required
+        # checks pass, so a docs-only entry that skipped its jobs would land a code
+        # change ahead of it whose own run failed or never finished. Naming the branch
+        # makes the filter diff from the merge-base with it: every change the merge
+        # would land. Empty on other events, which keep the filter's default base.
+        base: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || '' }}
 
     - name: Check for relevant changes
       id: check_changes
