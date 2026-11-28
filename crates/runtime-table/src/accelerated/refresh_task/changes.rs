@@ -1318,7 +1318,7 @@ impl RefreshTask {
         );
         let update = StreamingDataUpdate::new(Box::pin(stream), UpdateType::Overwrite);
         if let Err(e) = self
-            .write_streaming_data_update(Some(SystemTime::now()), update, context.refresh_sql, None)
+            .write_streaming_data_update(Some(SystemTime::now()), update, context.refresh_sql)
             .await
         {
             let error_message = format!(
