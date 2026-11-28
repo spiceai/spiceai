@@ -740,8 +740,7 @@ async fn bootstrap_new_kafka_consumer(
         // A checkpoint with no offsets holds nothing read yet: this consumer, in
         // the recorded group, starts each partition at the beginning. Otherwise
         // read as the checkpoint says. Either way, with the recorded schema.
-        if recorded.consumer_group_id != metadata.consumer_group_id
-            || !recorded.offsets.is_empty()
+        if recorded.consumer_group_id != metadata.consumer_group_id || !recorded.offsets.is_empty()
         {
             return consumer_for_metadata(dataset, topic, kafka_config, recorded);
         }
