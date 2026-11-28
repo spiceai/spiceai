@@ -1481,8 +1481,9 @@ impl Domain {
         table
             .live_keys()
             .iter()
-            .chain(&table.retired)
-            .chain(table.files.keys().map(|(_, path)| path))
+            .map(String::as_str)
+            .chain(table.retired.iter().map(String::as_str))
+            .chain(table.files.keys().map(|(_, path)| &**path))
             .map(|key| key.rsplit('/').next().unwrap_or(key).to_string())
             .chain(in_flight.iter().cloned())
             .collect()
