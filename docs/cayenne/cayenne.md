@@ -1581,6 +1581,8 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 | `cayenne_cdc_mem_tier_min_flush_bytes` / `_checkpoint_interval_ms` / `_shards` | periodic-checkpoint byte gate / tick / PK-hash shards | memory-derived (1/8 of the cap, 32–128 MiB) / `1_000` / `1` |
 | `cayenne_sort_columns` / `cayenne_shard_key_columns` | insert sort order / encode-shard hash key | (unset) / (unset: PK hash, else round-robin) |
 
+**Two accelerator instances in one process never share a local directory.** One `spiced` runs one Cayenne accelerator. In-process cluster executors and multi-`Runtime` tests run several, and each opens its file-mode catalogs keyed by metadata directory (`LOCAL_DIR_OWNERS`, `isolate_local_dir`). The first instance to resolve a local data or metadata directory owns it. A second live instance that resolves the same directory uses `{dir}-instance-{id}` beside it, so the two catalogs never serve each other's same-named tables. An instance releases its directories on `shutdown` and on drop, so the next `Runtime` in the same process reopens the configured paths and the files already in them. Object-store paths are never redirected.
+
 ### Changing a setting on an existing table
 
 A file-mode table records the settings it was created with in its `cayenne_table` row, and every open compares them with the dataset's current settings (`validate_existing_table_configuration`). What a difference does depends on whether it changes how rows are *written* or what the stored rows *mean*:

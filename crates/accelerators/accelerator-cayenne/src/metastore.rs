@@ -145,8 +145,8 @@ impl CayenneAccelerator {
     }
 
     /// Whether the local SQLite metastore database exists.
-    pub(super) fn metadata_db_exists(source: &dyn AccelerationSource) -> bool {
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+    pub(super) fn metadata_db_exists(&self, source: &dyn AccelerationSource) -> bool {
+        let metadata_dir = self.metadata_dir_for(source.acceleration());
         let metadata_db_path = format!("{metadata_dir}/{METASTORE_DB_FILE}");
         PathBuf::from(metadata_db_path).exists()
     }
@@ -478,7 +478,15 @@ impl CayenneAccelerator {
             }
             Metastore::Sqlite => {
                 let connection_string = format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}");
-                let catalog = Self::init_cayenne_catalog(&self.catalog, connection_string).await?;
+                let cell = {
+                    let mut catalogs = self.catalogs.lock();
+                    Arc::clone(
+                        catalogs
+                            .entry(connection_string.clone())
+                            .or_insert_with(|| Arc::new(OnceCell::new())),
+                    )
+                };
+                let catalog = Self::init_cayenne_catalog(&cell, connection_string).await?;
                 Ok(OpenedCatalog {
                     catalog,
                     native: None,
@@ -494,8 +502,8 @@ impl CayenneAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
-        Self::ensure_supported_metastore(source).await?;
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        self.ensure_supported_metastore(source).await?;
+        let metadata_dir = self.metadata_dir_for(source.acceleration());
         let metastore_type = self.metastore_type_for(source, &metadata_dir).await?;
         self.get_or_create_catalog(&metadata_dir, metastore_type, source)
             .await
@@ -509,10 +517,13 @@ impl CayenneAccelerator {
     /// the dataset before anything opens, creates, or changes a file. Otherwise the param
     /// has no effect: the dataset runs on the `SQLite` metastore and loads, including in
     /// `mode: memory`, which never had a Turso metastore to select.
-    pub(super) async fn ensure_supported_metastore(source: &dyn AccelerationSource) -> Result<()> {
+    pub(super) async fn ensure_supported_metastore(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<()> {
         let acceleration = source.acceleration();
         if source.is_file_accelerated() {
-            let metadata_dir = Self::resolve_metadata_dir(acceleration);
+            let metadata_dir = self.metadata_dir_for(acceleration);
             let metastore_path = Path::new(&metadata_dir).join(METASTORE_DB_FILE);
             if is_turso_metastore(&metastore_path).await {
                 return TursoMetastoreOnDiskSnafu {
@@ -639,13 +650,13 @@ impl CayenneAccelerator {
 
             // The sidecar opens `cayenne.db` itself, so it refuses a Turso metastore
             // here as well as through the catalog.
-            Self::ensure_supported_metastore(source)
+            self.ensure_supported_metastore(source)
                 .await
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
                 })?;
 
-            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_dir = self.metadata_dir_for(source.acceleration());
             let metastore_type = self
                 .metastore_type_for(source, &metadata_dir)
                 .await
@@ -822,7 +833,7 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         table_name: &str,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_dir = self.metadata_dir_for(source.acceleration());
         if !self
             .existing_native_catalog_holds(&metadata_dir, source, table_name)
             .await?
