@@ -557,6 +557,21 @@ impl ObjectNativeCatalog {
         self.for_key(key).sidecar_value(key).await
     }
 
+    /// The bookkeeping value under `key`, recording `make()` first when there
+    /// is none and this instance writes the log that holds it, so concurrent
+    /// callers all get the one value recorded first. `None` on a replica while
+    /// the writer has recorded none.
+    /// # Errors
+    /// Returns an error when the catalog must be reopened, or the commit is
+    /// not accepted.
+    pub async fn sidecar_value_or_record(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> Vec<u8>,
+    ) -> CatalogResult<Option<Vec<u8>>> {
+        self.for_key(key).sidecar_value_or_record(key, make).await
+    }
+
     /// The counters kept under `key` by [`Self::advance_sidecar_counters`], by name.
     /// # Errors
     /// Returns an error when the catalog must be reopened.

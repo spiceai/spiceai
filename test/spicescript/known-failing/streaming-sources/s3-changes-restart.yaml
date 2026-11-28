@@ -1,0 +1,113 @@
+# Known failing: after a restart over a non-empty acceleration, the S3
+# event-notification source applies no new notification, and the message
+# stays in flight on the queue ("answer differs ... n: expected 31, actual 30";
+# the queue reports 0 visible, 1 in flight).
+name: s3-changes-restart
+duration: 178s
+description: >
+  S3 event notifications through SQS keep being applied after spiced restarts
+  over a non-empty Cayenne acceleration: an object created after the restart
+  is appended once, and its message is deleted from the queue.
+sources:
+  src: { kind: postgres }
+  sqs:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566, 4567]
+    env: { SERVICES: 's3,sqs', AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal sqs list-queues && awslocal s3 ls
+# Port 4567 of `sqs` is a proxy in front of LocalStack's SQS (the
+# connector takes no SQS endpoint parameter; the SDK reads one from
+# AWS_ENDPOINT_URL_SQS).
+variants:
+  cayenne:
+    env: { AWS_ENDPOINT_URL_SQS: 'http://127.0.0.1:${sources.sqs.port.4567}' }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: s3-changes-restart
+  datasets:
+    - from: s3://events/data/
+      name: events
+      params:
+        s3_endpoint: http://127.0.0.1:${sources.sqs.port.4566}
+        s3_region: us-east-1
+        s3_url_style: path
+        s3_auth: key
+        s3_key: test
+        s3_secret: test
+        allow_http: 'true'
+        file_format: csv
+        s3_changes_queue_url: https://sqs.us-east-1.amazonaws.com/000000000000/events
+      # No primary key: an object applied twice appends its rows twice.
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      sqs: >-
+        awslocal s3 mb s3://events &&
+        awslocal sqs create-queue --queue-name events --attributes VisibilityTimeout=10 &&
+        awslocal s3api put-bucket-notification-configuration --bucket events --notification-configuration
+        '{"QueueConfigurations":[{"QueueArn":"arn:aws:sqs:us-east-1:000000000000:events","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"],"Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"data/"}]}}}]}' &&
+        printf '%s\n'
+        'import http.server, os, time, urllib.error, urllib.request'
+        'class Proxy(http.server.BaseHTTPRequestHandler):'
+        '    protocol_version = "HTTP/1.1"'
+        '    def log_message(self, *args): pass'
+        '    def do_GET(self): self.forward()'
+        '    def do_POST(self): self.forward()'
+        '    def forward(self):'
+        '        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))'
+        '        target = self.headers.get("X-Amz-Target", "")'
+        '        if ("DeleteMessage" in target or b"Action=DeleteMessage" in body) and os.path.exists("/tmp/hold-deletes"):'
+        '            with open("/tmp/held-deletes", "a") as held: held.write(target + "\n")'
+        '            while os.path.exists("/tmp/hold-deletes"): time.sleep(0.1)'
+        '            self.send_response(503); self.send_header("Content-Length", "0"); self.end_headers(); return'
+        '        request = urllib.request.Request("http://127.0.0.1:4566" + self.path, data=body if self.command == "POST" else None, method=self.command)'
+        '        for key, value in self.headers.items():'
+        '            if key.lower() not in ("host", "content-length", "connection", "transfer-encoding"): request.add_header(key, value)'
+        '        try:'
+        '            response = urllib.request.urlopen(request, timeout=60)'
+        '            status, headers, data = response.status, response.headers, response.read()'
+        '        except urllib.error.HTTPError as error:'
+        '            status, headers, data = error.code, error.headers, error.read()'
+        '        self.send_response(status)'
+        '        for key, value in headers.items():'
+        '            if key.lower() not in ("content-length", "connection", "transfer-encoding", "date", "server"): self.send_header(key, value)'
+        '        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)'
+        'http.server.ThreadingHTTPServer(("0.0.0.0", 4567), Proxy).serve_forever()' > /tmp/proxy.py &&
+        (nohup python3 /tmp/proxy.py > /tmp/proxy.log 2>&1 < /dev/null &) &&
+        for o in 1 2 3; do
+          printf 'id,v\n' > /tmp/o$o.csv;
+          for i in $(seq $((o * 10 - 9)) $((o * 10))); do echo "$i,$((i * 7))" >> /tmp/o$o.csv; done;
+          awslocal s3 cp /tmp/o$o.csv s3://events/data/o$o.csv;
+        done
+  - source-exec:
+      src: |
+        CREATE TABLE events (id bigint NOT NULL, v bigint NOT NULL);
+        INSERT INTO events SELECT i, i * 7 FROM generate_series(1, 30) AS i;
+  - start: {}
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+  - source-query:
+      sqs: >-
+        awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events
+        --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+        --query 'join(`,`, [Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible])' --output text
+    expect: { rows: [['0,0']] }
+    eventually: 90s
+  - restart: {}
+  - source-exec:
+      sqs: printf 'id,v\n31,217\n' > /tmp/o4.csv && awslocal s3 cp /tmp/o4.csv s3://events/data/o4.csv
+  - source-exec:
+      src: INSERT INTO events VALUES (31, 217)
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events
+    eventually: 60s
+  - source-query:
+      sqs: >-
+        awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events
+        --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+        --query 'join(`,`, [Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible])' --output text
+    expect: { rows: [['0,0']] }
+    eventually: 90s

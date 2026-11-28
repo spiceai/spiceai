@@ -220,5 +220,24 @@
       "group": "streaming-sources",
       "may-pass": true
     }
+  ],
+
+  "s3-changes-restart": [
+    {
+      "run": "s3-changes-restart",
+      "who": "cayenne",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT id) AS ids, sum(v) AS total FROM events #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"31\\\"\", actual: \"\\\"30\\\"\" }",
+      "group": "streaming-sources"
+    },
+    {
+      "run": "s3-changes-restart",
+      "who": "cayenne",
+      "key": "source-query: {\"sqs\":\"awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/events --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --query 'join(`,`, [Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible])' --output text\"} #2",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"0,1\")]], expected [[Some(\"0,0\")]]",
+      "group": "streaming-sources"
+    }
   ]
 }

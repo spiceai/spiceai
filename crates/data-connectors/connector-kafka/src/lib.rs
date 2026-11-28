@@ -507,6 +507,17 @@ async fn init_kafka_consumer(
         );
     }
 
+    consumer_for_metadata(dataset, topic, kafka_config, metadata)
+}
+
+/// The consumer that reads `topic` for `dataset` as `metadata`, the dataset's
+/// recorded checkpoint, says: in its consumer group, from its offsets.
+fn consumer_for_metadata(
+    dataset: &DatasetSpec,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+    metadata: KafkaMetadata,
+) -> DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
         &dataset.name.to_string(),
         &metadata.consumer_group_id,
@@ -519,13 +530,8 @@ async fn init_kafka_consumer(
         connector_component: ConnectorComponent::from(dataset),
     })?;
 
-    kafka_consumer
-        .subscribe(topic)
-        .boxed()
-        .context(UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    // Only the instance that reads the change stream joins the group.
+    kafka_consumer.subscribe_on_read(topic);
 
     Ok((kafka_consumer, metadata.schema))
 }
@@ -556,23 +562,39 @@ async fn get_metadata_from_accelerator(
     }))
 }
 
-async fn set_metadata_to_accelerator(
+/// [`KafkaCheckpointStore::get_or_record`], as the consumer speaks it.
+async fn record_metadata_to_accelerator(
     kafka_sys: &dyn KafkaCheckpointStore,
     metadata: &KafkaMetadata,
-) -> Result<(), CheckpointError> {
+) -> Result<Option<KafkaMetadata>, CheckpointError> {
     let schema_json = arrow_tools::schema::schema_to_json(&metadata.schema).map_err(|source| {
         CheckpointError::Store {
             source: Box::new(source),
         }
     })?;
-    kafka_sys
-        .upsert(&KafkaCheckpoint {
+    let Some(checkpoint) = kafka_sys
+        .get_or_record(&KafkaCheckpoint {
             consumer_group_id: metadata.consumer_group_id.clone(),
             topic: metadata.topic.clone(),
             schema_json,
             offsets: metadata.offsets.clone(),
         })
-        .await
+        .await?
+    else {
+        return Ok(None);
+    };
+    let schema =
+        arrow_tools::schema::schema_from_json(&checkpoint.schema_json).map_err(|source| {
+            CheckpointError::Store {
+                source: Box::new(source),
+            }
+        })?;
+    Ok(Some(KafkaMetadata {
+        consumer_group_id: checkpoint.consumer_group_id,
+        topic: checkpoint.topic,
+        schema,
+        offsets: checkpoint.offsets,
+    }))
 }
 
 pub(crate) struct SidecarOffsetCommitHook {
@@ -604,18 +626,16 @@ async fn bootstrap_new_kafka_consumer(
     kafka_sys: Option<&dyn KafkaCheckpointStore>,
 ) -> DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    let kafka_consumer = KafkaConsumer::create_for_dataset(
-        &dataset_name,
-        kafka_config.consumer_group_id.clone(),
-        kafka_config,
-    )
-    .boxed()
-    .context(UnableToGetReadProviderSnafu {
-        dataconnector: "kafka",
-        connector_component: ConnectorComponent::from(dataset),
-    })?;
+    // Sample in a consumer group of the sampler's own: the dataset's group is
+    // joined only by the instance that reads the change stream.
+    let sampler = KafkaConsumer::create_for_sampling(&dataset_name, kafka_config)
+        .boxed()
+        .context(UnableToGetReadProviderSnafu {
+            dataconnector: "kafka",
+            connector_component: ConnectorComponent::from(dataset),
+        })?;
 
-    kafka_consumer
+    sampler
         .subscribe(topic)
         .boxed()
         .context(UnableToGetReadProviderSnafu {
@@ -632,7 +652,7 @@ async fn bootstrap_new_kafka_consumer(
     let mut sample_values = Vec::with_capacity(schema_inference_sample_count);
 
     for _ in 0..schema_inference_sample_count {
-        match kafka_consumer
+        match sampler
             .next_json::<serde_json::Value, serde_json::Value>()
             .await
         {
@@ -672,6 +692,19 @@ async fn bootstrap_new_kafka_consumer(
         })?
         .into();
 
+    drop(sampler);
+
+    let kafka_consumer = KafkaConsumer::create_for_dataset(
+        &dataset_name,
+        kafka_config.consumer_group_id.clone(),
+        kafka_config,
+    )
+    .boxed()
+    .context(UnableToGetReadProviderSnafu {
+        dataconnector: "kafka",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
+
     let metadata = KafkaMetadata {
         consumer_group_id: kafka_consumer.group_id().to_string(),
         topic: topic.to_string(),
@@ -679,24 +712,45 @@ async fn bootstrap_new_kafka_consumer(
         offsets: Vec::new(),
     };
 
-    if let Some(kafka_sys) = kafka_sys {
-        set_metadata_to_accelerator(kafka_sys, &metadata)
+    // Instances that start together on one shared state location each propose
+    // a consumer group; the location keeps the first recorded, and an instance
+    // whose proposal lost reads as that checkpoint says. A replica records
+    // nothing: it never reads the change stream, so it never joins a group,
+    // and it reloads the recorded checkpoint when it takes over writing.
+    if let Some(kafka_sys) = kafka_sys
+        && let Some(recorded) = record_metadata_to_accelerator(kafka_sys, &metadata)
             .await
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
-            })?;
+            })?
+    {
+        ensure!(
+            topic == recorded.topic,
+            InvalidConfigurationNoSourceSnafu {
+                dataconnector: "kafka",
+                message: format!(
+                    "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
+                    recorded.topic
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
+        // A checkpoint with no offsets holds nothing read yet: this consumer, in
+        // the recorded group, starts each partition at the beginning. Otherwise
+        // read as the checkpoint says. Either way, with the recorded schema.
+        if recorded.consumer_group_id != metadata.consumer_group_id || !recorded.offsets.is_empty()
+        {
+            return consumer_for_metadata(dataset, topic, kafka_config, recorded);
+        }
+        kafka_consumer.subscribe_on_read(topic);
+        return Ok((kafka_consumer, recorded.schema));
     }
 
-    // Restart the stream from the beginning
-    kafka_consumer
-        .restart_topic(topic)
-        .boxed()
-        .context(UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    // Only the instance that reads the change stream joins the group; it starts
+    // each partition at the beginning of the topic.
+    kafka_consumer.subscribe_on_read(topic);
 
     Ok((kafka_consumer, schema))
 }

@@ -191,9 +191,16 @@ impl Container {
                 network_mode: spec.network.clone(),
                 // On the host's network the container's loopback is the
                 // host's; this name then means the host on every platform,
-                // as it does under Docker Desktop.
-                extra_hosts: (spec.network.as_deref() == Some("host"))
-                    .then(|| vec!["host.docker.internal:127.0.0.1".to_string()]),
+                // as it does under Docker Desktop. On a bridge network it is
+                // the host's gateway, which Docker Desktop provides on its own
+                // and Linux Docker only when asked.
+                extra_hosts: match spec.network.as_deref() {
+                    Some("host") => Some(vec!["host.docker.internal:127.0.0.1".to_string()]),
+                    None if cfg!(target_os = "linux") => {
+                        Some(vec!["host.docker.internal:host-gateway".to_string()])
+                    }
+                    _ => None,
+                },
                 ..Default::default()
             }),
             ..Default::default()

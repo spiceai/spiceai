@@ -590,8 +590,12 @@ pub struct KafkaConsumer {
     group_id: String,
     consumer: StreamConsumer<KafkaConsumerContext>,
     metrics: Arc<KafkaMetrics>,
-    /// The topic passed to [`KafkaConsumer::subscribe`].
+    /// The topic passed to [`KafkaConsumer::subscribe`] or
+    /// [`KafkaConsumer::subscribe_on_read`].
     topic: OnceLock<String>,
+    /// Set by [`KafkaConsumer::subscribe_on_read`] until the change stream
+    /// subscribes.
+    subscribe_pending: std::sync::atomic::AtomicBool,
 }
 
 /// How a polled offset relates to the current backward-scan window end.
@@ -731,6 +735,20 @@ impl KafkaConsumer {
         )
     }
 
+    /// Construct a consumer that reads a topic from its beginning in a consumer group
+    /// of its own, for sampling messages (to infer a schema) without joining the group
+    /// the dataset reads with. Dropping it leaves its group, which has no committed
+    /// offsets and so no lasting state.
+    pub fn create_for_sampling(dataset: &str, kafka_config: &KafkaConfig) -> Result<Self> {
+        Self::create(
+            dataset,
+            format!("spice-schema-sample-{}", uuid::Uuid::new_v4()),
+            kafka_config,
+            StartOffsets::Stored(HashMap::new()),
+            true,
+        )
+    }
+
     #[must_use]
     pub fn group_id(&self) -> &str {
         &self.group_id
@@ -744,6 +762,45 @@ impl KafkaConsumer {
             .context(UnableToSubscribeToTopicSnafu { topic })?;
         let _ = self.topic.set(topic.to_string());
         Ok(())
+    }
+
+    /// Subscribe to `topic` when the change stream first reads it, rather than now.
+    ///
+    /// Subscribing joins the consumer group, and a member that never polls holds
+    /// the partitions it is assigned and stalls every rebalance of the group
+    /// until `max.poll.interval.ms` expels it. An instance that registers a
+    /// dataset but does not consume it (a replica of a shared acceleration)
+    /// must therefore not join the group: only the instance that reads the
+    /// change stream does.
+    pub fn subscribe_on_read(&self, topic: &str) {
+        let _ = self.topic.set(topic.to_string());
+        self.subscribe_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Subscribe to the topic named by [`KafkaConsumer::subscribe_on_read`], if
+    /// the consumer has not subscribed yet.
+    fn subscribe_if_pending(&self) -> Result<()> {
+        if !self
+            .subscribe_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let Some(topic) = self.topic.get() else {
+            return Ok(());
+        };
+        let subscribed = self
+            .consumer
+            .subscribe(&[topic])
+            .context(UnableToSubscribeToTopicSnafu { topic });
+        if subscribed.is_err() {
+            // The next change stream subscribes again rather than read a
+            // consumer that holds no assignment.
+            self.subscribe_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        subscribed
     }
 
     /// Receive a JSON message from the Kafka topic.
@@ -1124,6 +1181,7 @@ impl KafkaConsumer {
             consumer,
             metrics,
             topic: OnceLock::new(),
+            subscribe_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2060,9 +2118,16 @@ where
 {
     Box::pin(futures::StreamExt::flatten(futures::stream::once(
         async move {
+            // Only the instance that reads the change stream joins the consumer
+            // group (see `KafkaConsumer::subscribe_on_read`).
+            if let Err(e) = consumer.subscribe_if_pending() {
+                return futures::StreamExt::boxed(futures::stream::iter([Err(
+                    cdc::StreamError::Kafka(e),
+                )]));
+            }
             let mut catch_up = consumer.catch_up().await;
             let ready = catch_up.ready_signal(&schema);
-            futures::stream::iter(ready).chain(changes(catch_up))
+            futures::StreamExt::boxed(futures::stream::iter(ready).chain(changes(catch_up)))
         },
     )))
 }
@@ -2642,6 +2707,27 @@ mod tests {
             .expect("consumer");
         consumer.subscribe("t").expect("subscribe");
         consumer
+    }
+
+    /// A subscription the change stream could not make is attempted again by the
+    /// next stream, rather than treated as made: a retried stream would
+    /// otherwise read a consumer with no assignment and wait forever.
+    #[tokio::test]
+    async fn failed_subscribe_on_read_is_retried() {
+        let cluster = cluster_holding_payloads(&[]);
+        let consumer = KafkaConsumer::create_for_dataset("t", None, &mock_cluster_config(&cluster))
+            .expect("consumer");
+        // librdkafka refuses an empty topic name before contacting the cluster.
+        consumer.subscribe_on_read("");
+        for attempt in 1..=2 {
+            let Err(err) = consumer.subscribe_if_pending() else {
+                panic!("attempt {attempt}: subscribing to an empty topic name succeeded");
+            };
+            assert!(
+                matches!(&err, Error::UnableToSubscribeToTopic { topic, .. } if topic.is_empty()),
+                "attempt {attempt}: {err}"
+            );
+        }
     }
 
     /// The next envelope of `stream`.
