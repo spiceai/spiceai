@@ -229,15 +229,6 @@ pub enum Error {
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to apply retention_sql to accelerated dataset {dataset_name} after refresh data was written: {}. The accelerated dataset may contain rows that should have been retained away.",
-        format_datafusion_error(source)
-    ))]
-    FailedToApplyRetentionSql {
-        dataset_name: String,
-        source: DataFusionError,
-    },
-
-    #[snafu(display(
         "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratedTableDoesntSupportDelete {},
@@ -1305,7 +1296,6 @@ impl Builder {
             WriteMode::WriteThrough
         };
         let refresh_mode = self.refresh.mode;
-        let write_retention_sql_delete_expr = self.refresh.write_retention_sql_delete_expr.clone();
         let change_sink = if matches!(
             refresh_mode,
             RefreshMode::Changes | RefreshMode::Append | RefreshMode::Caching
@@ -1598,7 +1588,7 @@ impl Builder {
                     Some(keep) => Some(keep),
                     None => fallback_retention::FallbackRetentionKeep::from_configured(
                         self.retention.as_ref(),
-                        write_retention_sql_delete_expr,
+                        None,
                     )
                     .ok()
                     .flatten(),
@@ -3402,11 +3392,12 @@ const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accel
 /// reached through a different missing setting, so [`Self::message`] states that impact
 /// once and each variant supplies its own cause and fix.
 ///
-/// The impact stops at "nothing deletes on a schedule" deliberately. Two callers install
-/// something that still evicts: `create_accelerated_table` copies `retention_sql` into
-/// `refresh.write_retention_sql_delete_expr` for Arrow engines *before* building this, so
+/// The impact stops at "nothing deletes on a schedule" deliberately. Something else may
+/// still evict: Cayenne applies `retention_sql` from its post-write maintenance, shortly
+/// after each commit, so its
 /// refreshes go on deleting matching rows while `Unscheduled` or `TimeColumnUnset` refuses;
-/// and caching mode derives a policy after it (see [`RetentionBuilder::build_unreported`]).
+/// and caching mode derives a policy after this builder (see
+/// [`RetentionBuilder::build_unreported`]).
 /// A claim about the table being unbounded is therefore not this builder's to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetentionRefusal {

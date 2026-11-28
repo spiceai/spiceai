@@ -21,7 +21,6 @@ use super::refresh_completion::RefreshRequestId;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated::caching::CacheRefreshHelper;
-use crate::accelerated::retention;
 use crate::accelerated::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use crate::federated::FederatedTable;
 use crate::filter_converter::TimestampFilterConvert;
@@ -1126,7 +1125,6 @@ impl RefreshTask {
                 Some(start_time),
                 streaming_data_update,
                 refresh.display_sql().as_deref(),
-                refresh.write_retention_sql_delete_expr.clone(),
             )
             .await
         {
@@ -1291,7 +1289,6 @@ impl RefreshTask {
         start_time: Option<SystemTime>,
         data_update: StreamingDataUpdate,
         sql: Option<&str>,
-        retention_sql_delete_expr: Option<Expr>,
     ) -> Result<(), RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
 
@@ -1461,20 +1458,6 @@ impl RefreshTask {
             return Err(e);
         }
 
-        let retention_error = if let Some(retention_sql_delete_expr) = retention_sql_delete_expr {
-            retention::apply_retention_filters_once(
-                &self.dataset_name,
-                &self.accelerator,
-                &self.federated,
-                retention_sql_delete_expr,
-                &self.io_runtime,
-            )
-            .await
-            .err()
-        } else {
-            None
-        };
-
         // Rows the table did not keep, counted only once the write succeeded:
         // a failed refresh changes nothing.
         super::superseded::record(&self.dataset_metric_labels, &superseded);
@@ -1500,28 +1483,6 @@ impl RefreshTask {
         // subscribers.
         self.publish_written_append(commit_guard, published_append, schema)
             .await;
-
-        if let Some(error) = retention_error {
-            self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
-
-            let error_message = format!(
-                "Failed to apply retention_sql after writing data for dataset {}: {}",
-                self.dataset_name,
-                format_datafusion_error(&error)
-            );
-            self.set_refresh_status(
-                sql,
-                status::ComponentStatus::error_with_message(error_message),
-            )
-            .await;
-
-            return Err(RetryError::permanent(
-                super::Error::FailedToApplyRetentionSql {
-                    dataset_name: self.dataset_name.to_string(),
-                    source: error,
-                },
-            ));
-        }
 
         if data_update.update_type == UpdateType::Overwrite {
             self.runtime_status
@@ -3607,8 +3568,7 @@ impl RefreshTask {
             | super::Error::UnableToScanTableProvider { source }
             | super::Error::UnableToCreateMemTableFromUpdate { source }
             | super::Error::FailedToQueryLatestTimestamp { source }
-            | super::Error::FailedToWriteData { source }
-            | super::Error::FailedToApplyRetentionSql { source, .. } => {
+            | super::Error::FailedToWriteData { source } => {
                 // Match against an Internal error with the message "Non Panic Task error":
                 // <https://github.com/apache/datafusion/blob/f6c92fecb23c927bdc6a9feb058f03a2fb61d63f/datafusion/physical-plan/src/stream.rs#L132>
                 if let DataFusionError::Internal(msg) = &source
@@ -5754,7 +5714,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let Err(error) = tokio::time::timeout(
             timeout * 2,
-            task.write_streaming_data_update(None, update, None, None),
+            task.write_streaming_data_update(None, update, None),
         )
         .await
         .expect("a refresh whose source went silent must not wait for ever") else {
@@ -5839,7 +5799,6 @@ mod tests {
             None,
             id_update(&schema, vec![1001, 1002, 1003], UpdateType::Append),
             None,
-            None,
         )
         .await
         .expect("append refresh should write");
@@ -5912,7 +5871,6 @@ mod tests {
             None,
             StreamingDataUpdate::new(source, UpdateType::Append),
             None,
-            None,
         )
         .await
         .expect("append refresh should write");
@@ -5979,7 +5937,6 @@ mod tests {
             None,
             id_update(&schema, vec![1, 2], UpdateType::Append),
             None,
-            None,
         )
         .await
         .expect("append refresh should write");
@@ -6006,7 +5963,6 @@ mod tests {
             None,
             id_update(&schema, vec![1], UpdateType::Overwrite),
             None,
-            None,
         )
         .await
         .expect("full refresh should write");
@@ -6021,7 +5977,6 @@ mod tests {
                 None,
                 StreamingDataUpdate::new(failing, UpdateType::Append),
                 None,
-                None,
             )
             .await
             .is_err(),
@@ -6034,78 +5989,6 @@ mod tests {
                 .is_err(),
             "nothing was forwarded"
         );
-    }
-
-    #[tokio::test]
-    async fn test_retention_failure_after_insert_is_permanent_and_advances_watermark() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-
-        let accelerator = Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
-                .expect("accelerator mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-        let federated_table = Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
-                .expect("federated mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-        let federated = Arc::new(FederatedTable::new_unchecked(federated_table));
-
-        let task = RefreshTaskBuilder::new(
-            runtime_status::RuntimeStatus::new(),
-            TableReference::bare("retention_failure_after_insert"),
-            federated,
-            None,
-            Arc::clone(&accelerator),
-            Handle::current(),
-            Arc::new(Mutex::new(())),
-        )
-        .build();
-
-        let update_batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .expect("update batch should be created");
-        let update_stream: SendableRecordBatchStream = Box::pin(
-            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
-                .expect("update stream should be created"),
-        );
-        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
-
-        let result = task
-            .write_streaming_data_update(
-                None,
-                update,
-                None,
-                Some(col("missing_retention_column").eq(datafusion::prelude::lit(1_i32))),
-            )
-            .await;
-
-        let Err(RetryError::Permanent(super::super::Error::FailedToApplyRetentionSql {
-            dataset_name,
-            ..
-        })) = result
-        else {
-            panic!("retention failure after insert should return a permanent retention error");
-        };
-        assert_eq!(dataset_name, "retention_failure_after_insert");
-        assert!(
-            task.last_updated_at
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0,
-            "append watermark should advance after the insert commits"
-        );
-
-        let ctx = SessionContext::new();
-        let plan = accelerator
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .expect("accelerator scan should succeed");
-        let batches = collect(plan, ctx.task_ctx())
-            .await
-            .expect("accelerator rows should be collected");
-        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        assert_eq!(row_count, 1, "insert should remain committed");
     }
 
     /// The ids an acceleration holds after `refresh`, when it held ids 7 to 12 (ts 107 to 112)

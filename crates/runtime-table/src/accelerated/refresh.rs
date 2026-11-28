@@ -39,7 +39,6 @@ use data_accelerator_api::BootstrapStatus;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::RngExt;
@@ -158,10 +157,6 @@ pub struct Refresh {
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
     pub(crate) caching_ttl: Option<Duration>,
-    /// Retention SQL delete expression to apply after a successful accelerator write.
-    /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
-    /// `DuckDB` and Cayenne apply retention in their own write paths.
-    pub write_retention_sql_delete_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -889,7 +884,6 @@ impl Default for Refresh {
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
-            write_retention_sql_delete_expr: None,
         }
     }
 }
@@ -2010,10 +2004,7 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 }
 
 fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) -> bool {
-    matches!(
-        result,
-        Ok(RefreshOutcome::Refreshed) | Err(super::Error::FailedToApplyRetentionSql { .. })
-    )
+    matches!(result, Ok(RefreshOutcome::Refreshed))
 }
 
 /// After a refresh task finishes: invalidate plans and search caches, then publish
@@ -2718,15 +2709,6 @@ mod tests {
         )));
         assert!(!refresh_result_changed_accelerator(&Ok(
             RefreshOutcome::UpToDate
-        )));
-
-        assert!(refresh_result_changed_accelerator(&Err(
-            super::super::Error::FailedToApplyRetentionSql {
-                dataset_name: "retained_table".to_string(),
-                source: datafusion::error::DataFusionError::Execution(
-                    "retention failed after write".to_string(),
-                ),
-            }
         )));
 
         assert!(!refresh_result_changed_accelerator(&Err(
