@@ -48,6 +48,23 @@ cluster:
 # updateStrategy:
 #   type: RollingUpdate
 
+auth:
+  # api_key: HTTP and Flight require an API key (default).
+  # none:    no API key. Anonymous callers get the runtime's rules for unauthenticated
+  #          callers on a non-loopback listener. Refused with a NodePort or LoadBalancer Service
+  #          unless the Spicepod requires client certificates (`runtime.tls.client_auth_mode:
+  #          required` with `runtime.tls.enabled: true`).
+  # Ignored when the Spicepod below configures `runtime.auth` itself; with a NodePort or
+  # LoadBalancer Service, that `runtime.auth` must then enable an API key, or the Spicepod
+  # must require client certificates.
+  mode: api_key
+  apiKey:
+    # A Secret holding the read-write API key under the entry `api-key`. Empty: on first
+    # install the chart creates `<release>-spiceai-api-key` with a random 32-character key
+    # and keeps it on upgrade and uninstall. Required when the chart is rendered without
+    # access to the cluster (helm template, Argo CD).
+    existingSecret: ''
+
 service:
   # type can be null, ClusterIP, NodePort, or LoadBalancer
   type: null
@@ -59,6 +76,13 @@ service:
   # The selector to use for the service
   # selector:
   #   custom-selector: value
+  # The Service's ports. The default is http (8090) and flight (50051), plus the
+  # cluster port for a scheduler or executor. To scrape metrics through the Service,
+  # list the ports, metrics included:
+  # ports:
+  #   - {port: 8090, name: http}
+  #   - {port: 50051, name: flight}
+  #   - {port: 9090, name: metrics}
 
 serviceAccount:
   # Specifies whether a ServiceAccount should be created
@@ -160,6 +184,16 @@ monitoring:
     enabled: false
     # Set labels for the PodMonitor, use this to define your scrape label for Prometheus Operator
     additionalLabels: {}
+    # TLS for the scrape, passed through as the Prometheus Operator's
+    # `PodMetricsEndpoint.tlsConfig` (`SafeTLSConfig`). When set, the PodMonitor
+    # scrapes over HTTPS. With `runtime.tls.client_auth_mode: required`, `cert` and
+    # `keySecret` name the scrape's client certificate, signed by the client CA.
+    tlsConfig: {}
+    # Example:
+    # tlsConfig:
+    #   ca:   {secret: {name: spice-scrape-tls, key: ca.crt}}
+    #   cert: {secret: {name: spice-scrape-tls, key: tls.crt}}
+    #   keySecret: {name: spice-scrape-tls, key: tls.key}
 
 spicepod:
   name: app

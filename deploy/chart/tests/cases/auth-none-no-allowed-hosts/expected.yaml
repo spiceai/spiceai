@@ -1,0 +1,28 @@
+---
+# Source: spiceai/templates/spiceai-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spiceai-spicepod
+  namespace: spice
+data:
+  spicepod.yaml: |
+    datasets: []
+    kind: Spicepod
+    name: app
+    runtime:
+      allowed_hosts:
+      - spiceai
+      - spiceai.spice
+      - spiceai.spice.svc
+      - spiceai.spice.svc.cluster.local
+    version: v1

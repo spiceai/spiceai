@@ -1,1 +1,4 @@
 fullnameOverride: spice-server-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx--z
+auth:
+  apiKey:
+    existingSecret: spice-key

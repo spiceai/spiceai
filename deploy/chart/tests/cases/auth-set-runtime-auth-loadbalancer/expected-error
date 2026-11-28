@@ -1,0 +1,1 @@
+command passes --set-runtime for runtime.auth or runtime.tls and service.type is LoadBalancer: the chart cannot tell whether the runtime authenticates callers outside the cluster. Set runtime.auth and runtime.tls in spicepod.runtime instead, or use a ClusterIP Service.

@@ -38,7 +38,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use axum::{
-    Extension,
+    Extension, Json,
     body::Body,
     http::{Request, StatusCode},
     middleware::Next,
@@ -141,7 +141,11 @@ pub(crate) async fn require_channel_identity(req: Request<Body>, next: Next) -> 
         && matches!(per_conn.client_auth, ClientAuthEnforcement::Required)
         && per_conn.channel_identity.is_none()
     {
-        return (StatusCode::UNAUTHORIZED, "client certificate required").into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": runtime_tls::CLIENT_CERTIFICATE_REQUIRED })),
+        )
+            .into_response();
     }
     next.run(req).await
 }

@@ -250,9 +250,24 @@ pub struct VariantSpec {
     /// Extra environment for this variant's `spiced`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The address this variant's `spiced` serves HTTP on.
+    #[serde(default)]
+    pub http_bind: HttpBind,
     /// Run this variant only in matrix combinations with these values.
     #[serde(default)]
     pub when: Map<String, Value>,
+}
+
+/// Where a variant's `spiced` serves HTTP. The runner reaches it at
+/// `127.0.0.1` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpBind {
+    /// `127.0.0.1`, the default.
+    #[default]
+    Loopback,
+    /// `0.0.0.0`, as in a container or on a server.
+    EveryInterface,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -451,6 +466,9 @@ pub enum Action {
         wait: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
+        /// `spiced` must refuse to start: exit with a failure, before it
+        /// answers `/health`, with a log matching this pattern.
+        exits: Option<regex::Regex>,
     },
     /// Stop `spiced` with SIGTERM, escalating to SIGKILL.
     Stop,
@@ -1846,14 +1864,17 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "start" => {
             let wait = start_waits(&arg)?;
             ensure!(
-                wait || (arg.get("ready").is_none() && arg.get("ready-timeout").is_none()),
-                "`start` with `wait: false` waits for nothing, so it takes no `ready` or `ready-timeout`; put them on a later `wait-ready`"
+                wait || (arg.get("ready").is_none()
+                    && arg.get("ready-timeout").is_none()
+                    && arg.get("exits").is_none()),
+                "`start` with `wait: false` waits for nothing, so it takes no `ready`, `ready-timeout` or `exits`; put `ready` and `ready-timeout` on a later `wait-ready`"
             );
             Action::Start {
                 ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
                 wait_ready: wait_ready(&arg)?,
                 wait,
                 patch: patch(&arg)?,
+                exits: exits(&arg)?,
             }
         }
         "stop" => Action::Stop,
@@ -2845,6 +2866,18 @@ fn wait_ready(arg: &Value) -> Result<bool> {
         None => Ok(true),
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => bail!("`ready` must be true or false"),
+    }
+}
+
+/// `exits:` on `start`: the pattern the log of a `spiced` that refuses to
+/// start must match.
+fn exits(arg: &Value) -> Result<Option<regex::Regex>> {
+    match arg.get("exits") {
+        None => Ok(None),
+        Some(Value::String(pattern)) => regex::Regex::new(pattern)
+            .map(Some)
+            .with_context(|| format!("`exits` is not a valid pattern: {pattern}")),
+        Some(_) => bail!("`exits` must be the pattern spiced's log must match"),
     }
 }
 

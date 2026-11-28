@@ -1,0 +1,15 @@
+service:
+  type: NodePort
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    auth: {}
+    tls:
+      enabled: true
+      certificate_file: /etc/spice/tls/tls.crt
+      key_file: /etc/spice/tls/tls.key
+      client_auth_ca_file: /etc/spice/tls/ca.crt
+      client_auth_mode: required
+  datasets: []

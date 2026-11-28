@@ -9,4 +9,4 @@ metadata:
   namespace: {{ template "spiceai.namespace" . }}
 data:
   spicepod.yaml: |
-    {{- toYaml .Values.spicepod | nindent 4 }}
+    {{- include "spiceai.spicepod" . | nindent 4 }}

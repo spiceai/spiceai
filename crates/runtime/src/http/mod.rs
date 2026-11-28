@@ -38,6 +38,7 @@ pub use routes::get_api_doc;
 #[cfg(test)]
 #[cfg(feature = "models")]
 mod gemini_tests;
+pub(crate) mod host_policy;
 #[cfg(feature = "mcp")]
 mod mcp_transport;
 #[cfg(test)]
@@ -152,18 +153,27 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    // Resolve effective MCP config following the same pattern as builder.rs:
-    // Config.runtime, if present, replaces the whole runtime — read .mcp from that.
-    // Otherwise fall back to the app's runtime .mcp. MCP Origin CORS is resolved
-    // from the same override in `routes::mcp_origin_cors` so hosts and origins
-    // cannot diverge. HTTP CORS stays on the app spicepod (a cache-only
-    // Config.runtime override must not disable browser CORS).
-    #[cfg(feature = "mcp")]
-    let mcp_config: Option<spicepod::component::runtime::McpConfig> =
-        config.runtime.as_ref().map_or_else(
-            || app.as_ref().and_then(|a| a.runtime.mcp.clone()),
-            |r| r.mcp.clone(),
-        );
+    // `runtime.allowed_hosts` follows the same pattern as builder.rs: Config.runtime,
+    // if present, replaces the whole runtime. MCP Origin CORS is resolved from the
+    // same override in `routes::mcp_origin_cors`. HTTP CORS stays on the app
+    // spicepod (a cache-only Config.runtime override must not disable browser CORS).
+    // The runtime requires authentication when it checks API keys or client
+    // certificates on every request; otherwise the listener answers only to
+    // local hosts and origins (see `host_policy`).
+    let requires_auth = auth_provider.is_some()
+        || tls_config
+            .as_ref()
+            .is_some_and(|tls| tls.client_auth == runtime_tls::ClientAuthEnforcement::Required);
+    let effective_runtime = config
+        .runtime
+        .as_ref()
+        .or_else(|| app.as_ref().map(|app| &app.runtime));
+    let request_origin = Arc::new(host_policy::RequestOriginPolicy::new(
+        requires_auth,
+        effective_runtime.and_then(spicepod::component::runtime::Runtime::effective_allowed_hosts),
+        &cors_config,
+        tls_config.is_some(),
+    ));
     let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
@@ -172,8 +182,7 @@ where
         auth_layer,
         &cors_config,
         tls_config.is_some(),
-        #[cfg(feature = "mcp")]
-        mcp_config.as_ref(),
+        request_origin,
     );
     drop(app);
 

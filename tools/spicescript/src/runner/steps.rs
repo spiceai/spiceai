@@ -397,6 +397,7 @@ async fn run_step(
             wait_ready,
             wait,
             patch,
+            exits,
         } => {
             ensure!(
                 *wait || (instance.executors.is_empty() && instance.sidecar.is_none()),
@@ -408,6 +409,10 @@ async fn run_step(
                 return Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()));
             }
             let timeout = ready_timeout.unwrap_or(ready_default);
+            if let Some(pattern) = exits {
+                instance.spiced.wait_exit(timeout, pattern).await?;
+                return Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()));
+            }
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;

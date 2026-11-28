@@ -1,12 +1,25 @@
 name: auth
-duration: 4s
+duration: 17s
 description: >
   With API keys required, HTTP and Flight accept a valid key (as `x-api-key`
   or a Bearer token, read-write or read-only) and refuse a missing or wrong
-  one with 401 / Unauthenticated, while /health stays public.
+  one with 401 / Unauthenticated, while /health stays public. Databricks user
+  tokens in a request's `spice-databricks-auth` header load the deferred
+  datasets they authorize only once the request is authenticated: a probe or a
+  refused request carrying them loads nothing. An API key whose secret part
+  does not resolve, or resolves to an empty value, stops spiced from starting
+  instead of being accepted as its literal part, and a key whose secret
+  resolves serves.
 
 sources:
   src: { kind: postgres }
+
+# The secrets the API keys at the end of the script reference.
+variants:
+  as-written:
+    env:
+      SPICESCRIPT_AUTH_EMPTY_KEY: ''
+      SPICESCRIPT_AUTH_SET_KEY: resolved-secret-key
 
 spicepod:
   version: v1
@@ -22,6 +35,18 @@ spicepod:
       name: t
       params: ${sources.src.params}
       acceleration: { enabled: true }
+    # Deferred until a request carries a Databricks token for its client ID
+    # (user-to-machine OAuth). The endpoint does not resolve, so a load fails
+    # and logs that it ran.
+    - from: databricks:main.default.u2m
+      name: u2m
+      params:
+        mode: sql_warehouse
+        databricks_endpoint: dbc-spicescript.invalid
+        databricks_sql_warehouse_id: warehouse
+        databricks_auth_mode: u2m
+        databricks_client_id: spicescript-u2m
+        http_max_retries: '0'
 
 defaults:
   api-key: valid-key
@@ -65,3 +90,36 @@ steps:
   - query: SELECT count(*) AS n FROM t
     api-key: wrong-key
     expect-error: true
+
+  # Databricks user tokens load a deferred dataset only for an authenticated
+  # request: neither a probe nor a request with a wrong key loads it.
+  - http: { path: /health, api-key: none, headers: { spice-databricks-auth: 'spicescript-u2m:user-token' } }
+    expect: { status: 200 }
+  - http: { path: /v1/ready, api-key: none, headers: { spice-databricks-auth: 'spicescript-u2m:user-token' } }
+    expect: { status: 200 }
+  - http: { path: /v1/status, api-key: wrong-key, headers: { spice-databricks-auth: 'spicescript-u2m:user-token' } }
+    expect: { status: 401 }
+  - assert-log: { lacks: 'Failed to load dataset u2m' }
+  - http: { path: /v1/status, headers: { spice-databricks-auth: 'spicescript-u2m:user-token' } }
+    expect: { status: 200 }
+  - assert-log: { count: { 'Failed to load dataset u2m': 1 } }
+    eventually: 30s
+
+  # An API key is a credential, so every secret it references must resolve to
+  # a value: spiced refuses to start rather than accept the key's literal part.
+  - stop: {}
+  - start:
+      patch:
+        spicepod: { runtime: { auth: { api-key: { keys: [valid-key, 'prefix-${ env:SPICESCRIPT_AUTH_UNSET_KEY }:rw'] } } } }
+      exits: 'Failed to load API key 2 of `runtime.auth.api_key.keys`: Secret `\$\{ env:SPICESCRIPT_AUTH_UNSET_KEY \}` not found in secret store `env`'
+  - start:
+      patch:
+        spicepod: { runtime: { auth: { api-key: { keys: [valid-key, 'prefix-${ env:SPICESCRIPT_AUTH_EMPTY_KEY }:ro'] } } } }
+      exits: 'Failed to load API key 2 of `runtime.auth.api_key.keys`: Secret `\$\{ env:SPICESCRIPT_AUTH_EMPTY_KEY \}` resolved to an empty value'
+  - start:
+      patch:
+        spicepod: { runtime: { auth: { api-key: { keys: [valid-key, '${ env:SPICESCRIPT_AUTH_SET_KEY }:rw'] } } } }
+  - http: { path: /v1/status, api-key: resolved-secret-key }
+    expect: { status: 200 }
+  - http: { path: /v1/status, api-key: prefix- }
+    expect: { status: 401 }

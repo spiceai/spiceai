@@ -57,6 +57,12 @@ spec:
               "0.0.0.0:50051"
             ]
           env:
+            # The API key the rendered Spicepod's `runtime.auth` reads.
+            - name: SPICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spice-key
+                  key: api-key
           ports:
             - containerPort: 8090
               name: http

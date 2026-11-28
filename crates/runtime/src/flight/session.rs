@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,9 +22,15 @@ limitations under the License.
 //!
 //! ## Session Lifecycle
 //!
-//! Sessions are automatically expired after 1 hour of inactivity (configurable via
-//! `SESSION_TTL_SECS`). The store also enforces a maximum of 10,000 concurrent sessions
-//! (configurable via `MAX_SESSIONS`) with LRU eviction when the limit is reached.
+//! Sessions expire after 1 hour of inactivity (`SESSION_TTL_SECS`). The store
+//! holds at most 10,000 sessions (`MAX_SESSIONS`). A new session is always
+//! admitted: when the store is full, it evicts the least recently used session
+//! of the principal holding the most sessions. One principal creating sessions
+//! therefore evicts its own before any other principal's, and a principal
+//! holding fewer sessions than another never loses one to that other's churn.
+//! Without this, a client with any valid credential could evict every other
+//! client's Handshake session, whose id is the Bearer token that client
+//! authenticates with.
 //!
 //! ## Session ID Resolution
 //!
@@ -53,39 +59,206 @@ limitations under the License.
 
 use datafusion::prelude::SessionContext;
 use http::HeaderMap;
-use moka::sync::Cache;
+use parking_lot::Mutex;
 use runtime_auth::AuthPrincipal;
 use spicepod::component::runtime::ApiKey;
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use util::session_state::builder_from_existing;
 use uuid::Uuid;
 
 /// Default session time-to-live in seconds (1 hour)
 const SESSION_TTL_SECS: u64 = 3600;
 
-/// Maximum number of concurrent sessions (with LRU eviction)
-const MAX_SESSIONS: u64 = 10_000;
+/// Maximum number of sessions the store holds.
+const MAX_SESSIONS: usize = 10_000;
 
 /// Manages Flight SQL sessions, mapping session IDs to `DataFusion` `SessionContext` instances.
 ///
 /// This enables stateful operations like SQL PREPARE/EXECUTE across multiple Flight SQL requests.
-/// Sessions are automatically expired after `SESSION_TTL_SECS` of inactivity and the store
-/// enforces a maximum of `MAX_SESSIONS` concurrent sessions with LRU eviction.
+/// Sessions expire after `SESSION_TTL_SECS` of inactivity, and the store holds at most
+/// `MAX_SESSIONS`, evicting by fair share when full (see the module documentation).
 ///
 /// Each session is associated with an optional API key that was used during the handshake.
 /// This allows validating session IDs in the auth layer.
 #[derive(Clone)]
 pub struct SessionStore {
-    sessions: Cache<String, FlightSession>,
+    sessions: Arc<Mutex<Sessions>>,
+    capacity: usize,
+    ttl: Duration,
 }
 
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")
-            .field("session_count", &self.sessions.entry_count())
+            .field("session_count", &self.session_count())
             .finish_non_exhaustive()
+    }
+}
+
+/// The principal a session belongs to: its stable id, or `None` for a session
+/// created without an authenticated principal.
+type Owner = Option<Arc<str>>;
+
+/// The sessions and the orders eviction and expiry read them in.
+///
+/// Every session is in `by_id`, at its last-use tick in `by_use`, and at the
+/// same tick in its owner's map in `owners`; `by_size` holds `(count, owner)`
+/// for each owner with at least one session. Ticks are unique and increase
+/// with every use, so the lowest tick is the least recently used session.
+#[derive(Default)]
+struct Sessions {
+    by_id: HashMap<Arc<str>, Slot>,
+    by_use: BTreeMap<u64, Arc<str>>,
+    owners: HashMap<Owner, BTreeMap<u64, Arc<str>>>,
+    by_size: BTreeSet<(usize, Owner)>,
+    next_tick: u64,
+}
+
+struct Slot {
+    session: FlightSession,
+    owner: Owner,
+    tick: u64,
+    last_used: Instant,
+}
+
+impl Sessions {
+    fn tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.wrapping_add(1);
+        tick
+    }
+
+    /// The session named `id`, marked as used now, or `None` if there is none
+    /// or it has been idle for longer than `ttl` (it is then removed).
+    fn get(&mut self, id: &str, now: Instant, ttl: Duration) -> Option<&FlightSession> {
+        let (old_tick, owner, expired) = {
+            let slot = self.by_id.get(id)?;
+            (
+                slot.tick,
+                slot.owner.clone(),
+                now.saturating_duration_since(slot.last_used) > ttl,
+            )
+        };
+        if expired {
+            self.remove(id);
+            return None;
+        }
+        let tick = self.tick();
+        let id = self.by_use.remove(&old_tick)?;
+        if let Some(owned) = self.owners.get_mut(&owner) {
+            owned.remove(&old_tick);
+            owned.insert(tick, Arc::clone(&id));
+        }
+        self.by_use.insert(tick, Arc::clone(&id));
+        let slot = self.by_id.get_mut(&id)?;
+        slot.tick = tick;
+        slot.last_used = now;
+        Some(&slot.session)
+    }
+
+    /// Adds a session, first evicting expired sessions and then, while the
+    /// store is full, the least recently used session of the owner holding the
+    /// most. `owner` counts as holding the most when it ties, so a principal at
+    /// its fair share evicts its own session rather than a peer's.
+    fn insert(
+        &mut self,
+        id: Arc<str>,
+        session: FlightSession,
+        owner: Owner,
+        now: Instant,
+        ttl: Duration,
+        capacity: usize,
+    ) {
+        self.remove(&id);
+        self.remove_expired(now, ttl);
+        while self.by_id.len() >= capacity.max(1) {
+            let Some(victim) = self.eviction_victim(&owner) else {
+                break;
+            };
+            if self.remove(&victim).is_none() {
+                break;
+            }
+        }
+
+        let tick = self.tick();
+        let count = self.count(&owner);
+        self.set_count(&owner, count, count.saturating_add(1));
+        self.owners
+            .entry(owner.clone())
+            .or_default()
+            .insert(tick, Arc::clone(&id));
+        self.by_use.insert(tick, Arc::clone(&id));
+        self.by_id.insert(
+            id,
+            Slot {
+                session,
+                owner,
+                tick,
+                last_used: now,
+            },
+        );
+    }
+
+    /// The least recently used session of the owner holding the most sessions,
+    /// preferring `inserting` among owners tied for the most.
+    fn eviction_victim(&self, inserting: &Owner) -> Option<Arc<str>> {
+        let (largest, _) = self.by_size.last()?;
+        let owner = if self.count(inserting) == *largest {
+            inserting
+        } else {
+            &self.by_size.last()?.1
+        };
+        self.owners
+            .get(owner)?
+            .first_key_value()
+            .map(|(_, id)| Arc::clone(id))
+    }
+
+    /// Removes the sessions idle for longer than `ttl`, least recently used
+    /// first, stopping at the first that is not.
+    fn remove_expired(&mut self, now: Instant, ttl: Duration) {
+        while let Some((&tick, id)) = self.by_use.first_key_value() {
+            if self
+                .by_id
+                .get(id)
+                .is_some_and(|slot| now.saturating_duration_since(slot.last_used) <= ttl)
+            {
+                break;
+            }
+            let id = Arc::clone(id);
+            self.remove(&id);
+            self.by_use.remove(&tick);
+        }
+    }
+
+    fn remove(&mut self, id: &str) -> Option<FlightSession> {
+        let slot = self.by_id.remove(id)?;
+        self.by_use.remove(&slot.tick);
+        let count = self.count(&slot.owner);
+        if let Some(owned) = self.owners.get_mut(&slot.owner) {
+            owned.remove(&slot.tick);
+            if owned.is_empty() {
+                self.owners.remove(&slot.owner);
+            }
+        }
+        self.set_count(&slot.owner, count, count.saturating_sub(1));
+        Some(slot.session)
+    }
+
+    fn count(&self, owner: &Owner) -> usize {
+        self.owners.get(owner).map_or(0, BTreeMap::len)
+    }
+
+    fn set_count(&mut self, owner: &Owner, old: usize, new: usize) {
+        if old > 0 {
+            self.by_size.remove(&(old, owner.clone()));
+        }
+        if new > 0 {
+            self.by_size.insert((new, owner.clone()));
+        }
     }
 }
 
@@ -125,12 +298,29 @@ impl SessionStore {
     /// Creates a new empty session store with default TTL and max capacity.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limits(MAX_SESSIONS, Duration::from_secs(SESSION_TTL_SECS))
+    }
+
+    fn with_limits(capacity: usize, ttl: Duration) -> Self {
         Self {
-            sessions: Cache::builder()
-                .max_capacity(MAX_SESSIONS)
-                .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
-                .build(),
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            capacity,
+            ttl,
         }
+    }
+
+    /// Adds `session`, owned by `owner_stable_id`, evicting by fair share if
+    /// the store is full.
+    fn insert(&self, session_id: &str, session: FlightSession) {
+        let owner: Owner = session.owner_stable_id.as_deref().map(Arc::from);
+        self.sessions.lock().insert(
+            Arc::from(session_id),
+            session,
+            owner,
+            Instant::now(),
+            self.ttl,
+            self.capacity,
+        );
     }
 
     /// Creates a new session with a unique ID and returns both the ID and the context.
@@ -166,8 +356,7 @@ impl SessionStore {
             ..FlightSession::new(base_ctx, &session_id, owner_stable_id)
         };
         let session_ctx = Arc::clone(&session.context);
-        self.sessions.insert(session_id.clone(), session);
-        self.sessions.run_pending_tasks();
+        self.insert(&session_id, session);
         (session_id, session_ctx)
     }
 
@@ -177,7 +366,11 @@ impl SessionStore {
     /// Returns `None` if the session doesn't exist or wasn't created with an API key.
     #[must_use]
     pub fn validate_session(&self, session_id: &str) -> Option<String> {
-        self.sessions.get(session_id)?.api_key
+        self.sessions
+            .lock()
+            .get(session_id, Instant::now(), self.ttl)?
+            .api_key
+            .clone()
     }
 
     /// Gets an existing session context by ID.
@@ -186,7 +379,10 @@ impl SessionStore {
     /// Accessing a session refreshes its TTL.
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
-        self.sessions.get(session_id).map(|session| session.context)
+        self.sessions
+            .lock()
+            .get(session_id, Instant::now(), self.ttl)
+            .map(|session| Arc::clone(&session.context))
     }
 
     /// The stable id of the principal an API key authenticates as.
@@ -220,14 +416,36 @@ impl SessionStore {
             "Flight SQL session lookup"
         );
 
-        let entry = self.sessions.entry_by_ref(&session_id).or_insert_with(|| {
-            FlightSession::new(base_ctx, &session_id, owner_stable_id.map(str::to_string))
-        });
-        if entry.is_fresh() {
-            tracing::debug!("Created Flight SQL session from request");
-            self.sessions.run_pending_tasks();
+        if let Some(session) = self
+            .sessions
+            .lock()
+            .get(&session_id, Instant::now(), self.ttl)
+        {
+            return Some(session.clone());
         }
-        Some(entry.into_value())
+
+        // Built outside the lock: cloning the base session state is the
+        // expensive part of creating a session.
+        let created =
+            FlightSession::new(base_ctx, &session_id, owner_stable_id.map(str::to_string));
+        let mut sessions = self.sessions.lock();
+        let now = Instant::now();
+        // Another request may have created the session while this one built its own.
+        if let Some(session) = sessions.get(&session_id, now, self.ttl) {
+            return Some(session.clone());
+        }
+        let owner: Owner = owner_stable_id.map(Arc::from);
+        sessions.insert(
+            Arc::from(session_id.as_str()),
+            created.clone(),
+            owner,
+            now,
+            self.ttl,
+            self.capacity,
+        );
+        drop(sessions);
+        tracing::debug!("Created Flight SQL session from request");
+        Some(created)
     }
 
     /// Removes a session from the store.
@@ -235,25 +453,13 @@ impl SessionStore {
     /// Returns `true` if the session existed and was removed.
     #[must_use]
     pub fn remove_session(&self, session_id: &str) -> bool {
-        let removed = self.sessions.remove(session_id).is_some();
-        self.sessions.run_pending_tasks();
-        removed
+        self.sessions.lock().remove(session_id).is_some()
     }
 
     /// Returns the number of active sessions.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        // MAX_SESSIONS is 10,000 which fits in usize on all platforms,
-        // but we use try_from for explicit safety and better code quality
-        if let Ok(count) = usize::try_from(self.sessions.entry_count()) {
-            count
-        } else {
-            tracing::warn!(
-                "Flight SQL session count {} exceeded usize::MAX; returning 0 sessions",
-                self.sessions.entry_count()
-            );
-            0
-        }
+        self.sessions.lock().by_id.len()
     }
 }
 
@@ -480,5 +686,136 @@ mod tests {
             .get_or_create_session_from_http(&header("anonymous-label"), &base_ctx, None)
             .expect("creates the session");
         assert_eq!(anonymous.owner_stable_id, None);
+    }
+
+    fn handshake_session(store: &SessionStore, base_ctx: &SessionContext, key: &str) -> String {
+        let owner = SessionStore::api_key_stable_id(key);
+        store.create_session(base_ctx, Some(key), owner).0
+    }
+
+    /// Regression test: one principal creating sessions must not evict another
+    /// principal's, whose session id is the Bearer token it authenticates with.
+    #[test]
+    fn a_churning_principal_evicts_only_its_own_sessions() {
+        let store = SessionStore::with_limits(4, Duration::from_secs(SESSION_TTL_SECS));
+        let base_ctx = SessionContext::new();
+
+        let victim = handshake_session(&store, &base_ctx, "victim-key");
+        let churned: Vec<String> = (0..20)
+            .map(|_| handshake_session(&store, &base_ctx, "churn-key"))
+            .collect();
+
+        assert_eq!(store.session_count(), 4);
+        assert_eq!(
+            store.validate_session(&victim),
+            Some("victim-key".to_string())
+        );
+        // The churner keeps its three most recent sessions, and every new one
+        // is admitted.
+        let kept: Vec<bool> = churned
+            .iter()
+            .map(|id| store.validate_session(id).is_some())
+            .collect();
+        let mut expected = vec![false; 17];
+        expected.extend([true; 3]);
+        assert_eq!(kept, expected);
+    }
+
+    /// Sessions a principal names with `x-session-id` count toward its share
+    /// the same as Handshake sessions.
+    #[test]
+    fn sessions_named_by_header_are_evicted_from_their_owner() {
+        let store = SessionStore::with_limits(4, Duration::from_secs(SESSION_TTL_SECS));
+        let base_ctx = SessionContext::new();
+        let header = |session_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-session-id",
+                session_id.parse().expect("valid header value"),
+            );
+            headers
+        };
+
+        let a = store
+            .get_or_create_session_from_http(&header("a-1"), &base_ctx, Some("apikey:a"))
+            .expect("creates the session");
+        store
+            .get_or_create_session_from_http(&header("a-2"), &base_ctx, Some("apikey:a"))
+            .expect("creates the session");
+        for i in 0..10 {
+            store
+                .get_or_create_session_from_http(
+                    &header(&format!("b-{i}")),
+                    &base_ctx,
+                    Some("apikey:b"),
+                )
+                .expect("creates the session");
+        }
+
+        // `a` holds two, fewer than `b`, so `b` evicted only its own.
+        let a_again = store
+            .get_or_create_session_from_http(&header("a-1"), &base_ctx, Some("apikey:a"))
+            .expect("the session exists");
+        assert!(Arc::ptr_eq(&a.context, &a_again.context));
+        assert!(store.get_session("a-2").is_some());
+        assert!(store.get_session("b-7").is_none());
+        assert!(store.get_session("b-8").is_some());
+        assert!(store.get_session("b-9").is_some());
+        assert_eq!(store.session_count(), 4);
+    }
+
+    /// When the store is full, the principal holding the most sessions loses
+    /// its least recently used one, even to another principal's new session.
+    #[test]
+    fn a_full_store_evicts_from_the_largest_owner() {
+        let ttl = Duration::from_secs(SESSION_TTL_SECS);
+        let base_ctx = SessionContext::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::default();
+        let session = |owner: &str| FlightSession::new(&base_ctx, "id", Some(owner.to_string()));
+        let insert = |sessions: &mut Sessions, id: &str, owner: &str| {
+            sessions.insert(
+                Arc::from(id),
+                session(owner),
+                Some(Arc::from(owner)),
+                now,
+                ttl,
+                4,
+            );
+        };
+
+        insert(&mut sessions, "big-1", "big");
+        insert(&mut sessions, "big-2", "big");
+        insert(&mut sessions, "big-3", "big");
+        insert(&mut sessions, "small-1", "small");
+        // `big-1` is used, so `big-2` is now the least recently used of `big`'s.
+        assert!(sessions.get("big-1", now, ttl).is_some());
+        insert(&mut sessions, "small-2", "small");
+
+        let mut held: Vec<&str> = sessions.by_id.keys().map(|id| &**id).collect();
+        held.sort_unstable();
+        assert_eq!(held, ["big-1", "big-3", "small-1", "small-2"]);
+    }
+
+    #[test]
+    fn an_idle_session_expires() {
+        let ttl = Duration::from_secs(60);
+        let base_ctx = SessionContext::new();
+        let start = Instant::now();
+        let mut sessions = Sessions::default();
+        let session = FlightSession::new(&base_ctx, "idle", None);
+        sessions.insert(Arc::from("idle"), session.clone(), None, start, ttl, 4);
+        sessions.insert(Arc::from("used"), session, None, start, ttl, 4);
+
+        // Using a session restarts its idle time.
+        let later = start + Duration::from_secs(45);
+        assert!(sessions.get("used", later, ttl).is_some());
+
+        let after_ttl = start + Duration::from_secs(61);
+        assert!(sessions.get("idle", after_ttl, ttl).is_none());
+        assert!(sessions.get("used", after_ttl, ttl).is_some());
+        assert_eq!(sessions.by_id.len(), 1);
+        assert_eq!(sessions.by_use.len(), 1);
+        assert_eq!(sessions.by_size.len(), 1);
     }
 }

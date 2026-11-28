@@ -268,8 +268,12 @@ async fn runtime_with(models: Vec<Model>) -> (Arc<Runtime>, Router) {
         None,
         &CorsConfig::default(),
         false,
-        #[cfg(feature = "mcp")]
-        None,
+        Arc::new(super::host_policy::RequestOriginPolicy::new(
+            false,
+            None,
+            &CorsConfig::default(),
+            false,
+        )),
     );
     (rt, routes)
 }

@@ -10,3 +10,6 @@ spicepod:
   runtime:
     state:
       location: s3://bucket/spice-state
+auth:
+  apiKey:
+    existingSecret: spice-key

@@ -1,0 +1,11 @@
+auth:
+  apiKey:
+    existingSecret: spice-key
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  secrets:
+    - from: env
+      name: project_env
+  datasets: []

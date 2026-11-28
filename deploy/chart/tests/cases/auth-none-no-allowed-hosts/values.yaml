@@ -1,0 +1,4 @@
+auth:
+  mode: none
+service:
+  type: ClusterIP

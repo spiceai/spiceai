@@ -257,7 +257,6 @@ mod tests {
         let df = defer(&rt, &source).await;
         let request = |client_id: &str| {
             crate::request::DatabricksAuthExtension::new(
-                None,
                 Some(Arc::clone(&df)),
                 Arc::new(std::collections::HashMap::from([(
                     client_id.to_string(),

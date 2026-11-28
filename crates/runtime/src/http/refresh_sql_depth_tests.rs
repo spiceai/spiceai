@@ -54,8 +54,12 @@ async fn routes(rt: &Arc<Runtime>) -> Router {
         None,
         &CorsConfig::default(),
         false,
-        #[cfg(feature = "mcp")]
-        None,
+        Arc::new(super::host_policy::RequestOriginPolicy::new(
+            false,
+            None,
+            &CorsConfig::default(),
+            false,
+        )),
     )
 }
 

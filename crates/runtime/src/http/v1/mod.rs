@@ -42,6 +42,21 @@ pub mod workers;
 
 use std::{borrow::Borrow, sync::Arc};
 
+/// The text of an error that a layer in front of a handler answered, for an
+/// API that wraps it in its own error envelope: the `error` string of the
+/// runtime's `{"error": "…"}` body, a JSON `message` field, or the body's text.
+pub(crate) fn layer_error_text(bytes: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Some(text) = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+    {
+        return text.to_string();
+    }
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
 use crate::{
     component::dataset::Dataset,
     datafusion::{

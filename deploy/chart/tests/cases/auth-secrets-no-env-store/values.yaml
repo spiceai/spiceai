@@ -1,0 +1,15 @@
+auth:
+  apiKey:
+    existingSecret: spice-key
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  secrets:
+    - from: env
+      name: env
+      params:
+        file_path: /secrets/app.env
+    - from: kubernetes:spice-secrets
+      name: spiceai_chart_env
+  datasets: []

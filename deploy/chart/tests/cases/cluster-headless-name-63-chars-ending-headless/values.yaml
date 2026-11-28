@@ -4,3 +4,6 @@ cluster:
   schedulerAddress: https://spice-scheduler-spiceai:50052
   tls:
     secretName: spice-executor-tls
+auth:
+  apiKey:
+    existingSecret: spice-key

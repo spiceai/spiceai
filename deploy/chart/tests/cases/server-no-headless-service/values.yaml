@@ -3,3 +3,6 @@ spicepod:
   kind: Spicepod
   name: app
   datasets: []
+auth:
+  apiKey:
+    existingSecret: spice-key

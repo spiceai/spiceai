@@ -1,0 +1,32 @@
+---
+# Source: spiceai/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai
+  name: spiceai
+  namespace: spice
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8090
+      name: http
+    - port: 50051
+      name: flight
+  selector:    
+    helm.sh/chart: VERSION
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: spiceai
+    app.kubernetes.io/name: spiceai
+    app.kubernetes.io/instance: spiceai
+    app.kubernetes.io/version: VERSION
+    app: spiceai

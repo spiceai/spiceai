@@ -72,6 +72,12 @@ spec:
             - --node-mtls-key-file
             - /etc/spice/cluster-tls/tls.key
           env:
+            # The API key the rendered Spicepod's `runtime.auth` reads.
+            - name: SPICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spice-key
+                  key: api-key
             - name: SPICE_POD_IP
               valueFrom:
                 fieldRef:

@@ -1421,7 +1421,9 @@ async fn create_instances(
             if let Some(port) = port("http_port") {
                 spiced.set_http_port(port);
             }
-            spiced.set_http_on_every_interface(rootless_reach);
+            spiced.set_http_on_every_interface(
+                rootless_reach || variant.http_bind == crate::script::HttpBind::EveryInterface,
+            );
             if let Some(port) = port("flight_port") {
                 spiced.set_flight_port(port);
             }
@@ -1913,6 +1915,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
         patch.env.is_empty(),
         "a start's `patch` cannot change `env`; an instance's environment is fixed when it is created"
     );
+    ensure!(
+        patch.http_bind == crate::script::HttpBind::Loopback,
+        "a start's `patch` cannot change `http-bind`; an instance's listeners are fixed when it is created"
+    );
     let resolved = VariantSpec {
         spicepod: patch
             .spicepod
@@ -1930,6 +1936,7 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
             .map(|(k, v)| Ok((k.clone(), template::substitute(v, &instance.context)?)))
             .collect::<Result<_>>()?,
         env: patch.env.clone(),
+        http_bind: crate::script::HttpBind::Loopback,
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;

@@ -1,0 +1,9 @@
+service:
+  type: ClusterIP
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  runtime:
+    auth: {}
+  datasets: []

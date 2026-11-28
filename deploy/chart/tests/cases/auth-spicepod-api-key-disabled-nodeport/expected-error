@@ -1,0 +1,1 @@
+spicepod.runtime.auth.api-key.enabled is false and service.type is NodePort: the runtime would serve callers outside the cluster without an API key. Set spicepod.runtime.auth.api-key.enabled to true, or use a ClusterIP Service.

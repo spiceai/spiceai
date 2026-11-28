@@ -252,3 +252,238 @@ periodSeconds: 10
 failureThreshold: 3
 {{- end -}}
 {{- end -}}
+
+{{/*
+The chart's authentication posture:
+  spicepod  the Spicepod configures `runtime.auth` itself, and the chart adds nothing;
+  api_key   the chart supplies an API key from a Secret (the default);
+  none      no API key.
+*/}}
+{{- define "spiceai.authMode" -}}
+{{- $runtime := .Values.spicepod.runtime | default dict -}}
+{{- if hasKey $runtime "auth" -}}
+spicepod
+{{- else -}}
+{{- $mode := (.Values.auth | default dict).mode | default "api_key" -}}
+{{- if not (has $mode (list "api_key" "none")) -}}
+{{- fail (printf "auth.mode is '%s'. Set it to api_key (the default) or none." $mode) -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The render failure for a NodePort or LoadBalancer Service in front of a runtime that does not
+authenticate its callers; empty when the runtime authenticates every caller. It decides as
+`spiced` does, from the rendered Spicepod and the flags in `command` that override it:
+
+  - client certificates: TLS is on (`runtime.tls.enabled: true`, or `--tls-enabled true`)
+    and requires one (`runtime.tls.client_auth_mode: required`, or `--tls-client-auth-mode
+    required`, which takes precedence). This authenticates callers whatever `runtime.auth`
+    says. `request` admits a caller without a certificate, and `client_auth_mode` does
+    nothing while TLS is off, so neither counts;
+  - an API key: `runtime.auth` has an `api-key` entry (or its alias `api_key`) whose
+    `enabled` is not false. `auth.mode: api_key` writes one and `auth.mode: none` writes
+    none; a Spicepod that sets `runtime.auth` is read as written.
+
+`--set-runtime auth…` or `--set-runtime tls…` in `command` changes these after the chart has
+read them, so the chart refuses unless the path it does not change authenticates.
+
+`command` is read one argument at a time, as `spiced`'s parser reads it: a flag's value is the
+argument after it, or the text after its `=`, and text inside a value is never read as a flag.
+An argument that starts with `-` is a flag, so it is never the value of the flag before it.
+Everything after `--` is a positional argument.
+*/}}
+{{- define "spiceai.unauthenticatedExposure" -}}
+{{- $type := .Values.service.type -}}
+{{- $runtime := .Values.spicepod.runtime | default dict -}}
+{{- $flags := list "--tls-enabled" "--tls-client-auth-mode" "--set-runtime" -}}
+{{- $values := dict "--tls-enabled" (list) "--tls-client-auth-mode" (list) "--set-runtime" (list) -}}
+{{- $pending := "" -}}
+{{- $positional := false -}}
+{{- range $arg := .Values.command | default list -}}
+{{- $arg = toString $arg -}}
+{{- if $positional -}}
+{{- else if and $pending (not (hasPrefix "-" $arg)) -}}
+{{- $_ := set $values $pending (append (get $values $pending) $arg) -}}
+{{- $pending = "" -}}
+{{- else -}}
+{{- $pending = "" -}}
+{{- if eq $arg "--" -}}
+{{- $positional = true -}}
+{{- else if has $arg $flags -}}
+{{- $pending = $arg -}}
+{{- else -}}
+{{- range $flag := $flags -}}
+{{- if hasPrefix (printf "%s=" $flag) $arg -}}
+{{- $_ := set $values $flag (append (get $values $flag) (trimPrefix (printf "%s=" $flag) $arg)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $authOverridden := false -}}
+{{- $tlsOverridden := false -}}
+{{- range $value := get $values "--set-runtime" -}}
+{{- if regexMatch "^auth[.=]" $value -}}
+{{- $authOverridden = true -}}
+{{- end -}}
+{{- if regexMatch "^tls(=|\\.enabled=|\\.client_auth_mode=)" $value -}}
+{{- $tlsOverridden = true -}}
+{{- end -}}
+{{- end -}}
+{{- $tls := dict -}}
+{{- if kindIs "map" $runtime.tls -}}
+{{- $tls = $runtime.tls -}}
+{{- end -}}
+{{- $tlsFlagValues := get $values "--tls-enabled" -}}
+{{- $tlsFlagOn := gt (len $tlsFlagValues) 0 -}}
+{{- range $value := $tlsFlagValues -}}
+{{- if ne $value "true" -}}
+{{- $tlsFlagOn = false -}}
+{{- end -}}
+{{- end -}}
+{{- $tlsOn := or (and (kindIs "bool" $tls.enabled) $tls.enabled) $tlsFlagOn -}}
+{{- $certRequired := eq (toString $tls.client_auth_mode) "required" -}}
+{{- $modeFlagValues := get $values "--tls-client-auth-mode" -}}
+{{- if $modeFlagValues -}}
+{{- $certRequired = true -}}
+{{- range $value := $modeFlagValues -}}
+{{- if ne $value "required" -}}
+{{- $certRequired = false -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and $tlsOn $certRequired (not $tlsOverridden)) -}}
+{{- $reason := "" -}}
+{{- $fix := "" -}}
+{{- if not $authOverridden -}}
+{{- $mode := include "spiceai.authMode" . -}}
+{{- $removeAuth := "remove spicepod.runtime.auth and the chart sets an API key (auth.mode: api_key), or use a ClusterIP Service." -}}
+{{- if eq $mode "none" -}}
+{{- $reason = "auth.mode is none" -}}
+{{- $fix = "Set auth.mode to api_key, or use a ClusterIP Service." -}}
+{{- else if eq $mode "spicepod" -}}
+{{- $auth := $runtime.auth -}}
+{{- $addKey := printf "Add an `api-key` entry with `keys` to spicepod.runtime.auth, or %s" $removeAuth -}}
+{{- if kindIs "invalid" $auth -}}
+{{- $reason = "spicepod.runtime.auth is null" -}}
+{{- $fix = $addKey -}}
+{{- else if not (kindIs "map" $auth) -}}
+{{- $reason = "spicepod.runtime.auth is not a mapping" -}}
+{{- $fix = $addKey -}}
+{{- else if not (or (hasKey $auth "api-key") (hasKey $auth "api_key")) -}}
+{{- $reason = ternary "spicepod.runtime.auth is empty" "spicepod.runtime.auth has no `api-key` entry" (empty $auth) -}}
+{{- $fix = $addKey -}}
+{{- else -}}
+{{- range $name := list "api-key" "api_key" -}}
+{{- if and (not $reason) (hasKey $auth $name) -}}
+{{- $apiKey := index $auth $name -}}
+{{- $setting := printf "spicepod.runtime.auth.%s" $name -}}
+{{- if not (kindIs "map" $apiKey) -}}
+{{- $reason = printf "%s is %s" $setting (ternary "null" "not a mapping" (kindIs "invalid" $apiKey)) -}}
+{{- $fix = printf "Set %s.keys, or %s" $setting $removeAuth -}}
+{{- else if and (kindIs "bool" $apiKey.enabled) (not $apiKey.enabled) -}}
+{{- $reason = printf "%s.enabled is false" $setting -}}
+{{- $fix = printf "Set %s.enabled to true, or use a ClusterIP Service." $setting -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or $authOverridden (and $reason $tlsOverridden) -}}
+{{- printf "command passes --set-runtime for runtime.auth or runtime.tls and service.type is %s: the chart cannot tell whether the runtime authenticates callers outside the cluster. Set runtime.auth and runtime.tls in spicepod.runtime instead, or use a ClusterIP Service." $type -}}
+{{- else if $reason -}}
+{{- printf "%s and service.type is %s: the runtime would serve callers outside the cluster without an API key. %s" $reason $type $fix -}}
+{{- if and $certRequired (not $tlsOn) }} spicepod.runtime.tls.client_auth_mode: required takes effect only with spicepod.runtime.tls.enabled: true.{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The Secret holding the API key under `api-key`: `auth.apiKey.existingSecret`, or the one the
+chart creates.
+*/}}
+{{- define "spiceai.apiKeySecretName" -}}
+{{- $apiKey := (.Values.auth | default dict).apiKey | default dict -}}
+{{- $apiKey.existingSecret | default (printf "%s-spiceai-api-key" .Release.Name | trunc 63 | trimSuffix "-") -}}
+{{- end -}}
+
+{{/*
+Whether this render can read the cluster: `helm template`, a client-side dry run and Argo CD
+cannot, and `lookup` then answers nothing. Listing Secrets in the release namespace answers a
+list, empty or not, whenever the cluster is readable, including before the namespace exists.
+*/}}
+{{- define "spiceai.clusterReadable" -}}
+{{- if lookup "v1" "Secret" (include "spiceai.namespace" .) "" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The Spicepod the runtime reads: `spicepod`, plus what `auth.mode` adds to it.
+
+api_key: `runtime.auth` with one read-write key, the `SPICE_API_KEY` that the Deployment sets
+from the API key Secret. A `${ store:KEY }` reference resolves only through a store the
+Spicepod declares, and the runtime adds its own `env` store only when the Spicepod declares
+none, so the key is read through:
+  - `env`, when `secrets` is empty;
+  - else the first `from: env` store without `params`, which reads the process environment
+    first (a `file_path` store reads its file first, and the file could hold another key);
+  - else a `from: env` store the chart adds, with a name no declared store has. It goes first
+    in `secrets`: the last-declared store wins `${ secrets:KEY }`, so the chart's store is
+    consulted after every store the Spicepod declares.
+
+none: the Service's own names, so that in-cluster clients that address the Service by name are
+answered. They join the hosts list the Spicepod already has, `runtime.allowed_hosts` or the
+deprecated `runtime.mcp.allowed_hosts` (the runtime refuses to start with both), or
+`runtime.allowed_hosts` when it has neither.
+*/}}
+{{- define "spiceai.spicepod" -}}
+{{- $pod := deepCopy .Values.spicepod -}}
+{{- $runtime := $pod.runtime | default dict -}}
+{{- $mode := include "spiceai.authMode" . -}}
+{{- if eq $mode "api_key" -}}
+{{- $store := "env" -}}
+{{- $secrets := $pod.secrets | default list -}}
+{{- if $secrets -}}
+{{- $names := list -}}
+{{- $envStores := list -}}
+{{- range $secrets -}}
+{{- $names = append $names .name -}}
+{{- if and (eq (toString .from) "env") (not .params) -}}
+{{- $envStores = append $envStores .name -}}
+{{- end -}}
+{{- end -}}
+{{- if $envStores -}}
+{{- $store = first $envStores -}}
+{{- else -}}
+{{- $store = "spiceai_chart_env" -}}
+{{- range $i := until 10 -}}
+{{- if has $store $names -}}
+{{- $store = printf "spiceai_chart_env_%d" (add1 $i) -}}
+{{- end -}}
+{{- end -}}
+{{- if has $store $names -}}
+{{- fail "spicepod.secrets declares stores named spiceai_chart_env through spiceai_chart_env_10, so the chart has no name left for the store it reads the API key through. Add a `from: env` store without `params` to spicepod.secrets, and the chart reads the key through that store." -}}
+{{- end -}}
+{{- $_ := set $pod "secrets" (prepend $secrets (dict "from" "env" "name" $store "description" "Added by the Helm chart to read the API key in SPICE_API_KEY.")) -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $runtime "auth" (dict "api-key" (dict "enabled" true "keys" (list (printf "${ %s:SPICE_API_KEY }:rw" $store)))) -}}
+{{- else if eq $mode "none" -}}
+{{- $name := include "spiceai.fullname" . -}}
+{{- $namespace := include "spiceai.namespace" . -}}
+{{- $serviceHosts := list $name (printf "%s.%s" $name $namespace) (printf "%s.%s.svc" $name $namespace) (printf "%s.%s.svc.cluster.local" $name $namespace) -}}
+{{- $mcp := $runtime.mcp | default dict -}}
+{{- if and (kindIs "invalid" $runtime.allowed_hosts) (not (kindIs "invalid" $mcp.allowed_hosts)) -}}
+{{- $_ := set $mcp "allowed_hosts" (concat $mcp.allowed_hosts $serviceHosts | uniq) -}}
+{{- $_ := set $runtime "mcp" $mcp -}}
+{{- else -}}
+{{- $_ := set $runtime "allowed_hosts" (concat ($runtime.allowed_hosts | default list) $serviceHosts | uniq) -}}
+{{- end -}}
+{{- end -}}
+{{- if $runtime -}}
+{{- $_ := set $pod "runtime" $runtime -}}
+{{- end -}}
+{{- toYaml $pod -}}
+{{- end -}}

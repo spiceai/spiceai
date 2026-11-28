@@ -70,6 +70,12 @@ spec:
             - --node-mtls-key-file
             - /etc/spice/cluster-tls/tls.key
           env:
+            # The API key the rendered Spicepod's `runtime.auth` reads.
+            - name: SPICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spice-key
+                  key: api-key
             - name: SPICE_POD_IP
               valueFrom:
                 fieldRef:
@@ -146,8 +152,6 @@ spec:
   ports:
     - port: 8090
       name: http
-    - port: 9090
-      name: metrics
     - port: 50051
       name: flight
     - port: 50052
