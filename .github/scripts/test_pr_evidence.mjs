@@ -5,7 +5,7 @@
 // section for PRs a workflow opens. Run: node .github/scripts/test_pr_evidence.mjs
 
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -295,12 +295,48 @@ test('a merge of a branch other than the base counts everything it brings in', a
 
 test('a newer run of the same command keeps an older entry current: before and after', async () => {
   const result = await check({
-    body: describe(`Before the fix, at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make  test\n1 failed\n\`\`\`\n\nRe-ran \`make test\` at ${SECOND.slice(0, 12)}: ${RUN}`),
+    body: describe(`Before the fix, at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\n1 failed\n\`\`\`\n\nRe-ran \`make test\` at ${SECOND.slice(0, 12)}: ${RUN}`),
     commits: [{ sha: FIRST }, { sha: SECOND }],
     changes: { [SECOND]: files('crates/runtime/src/lib.rs') },
   });
   assert.deepEqual(result.problems, []);
   assert.equal(result.cited, SECOND);
+});
+
+const staleAfterHead = (line) =>
+  `"${line}" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
+  `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`;
+const withLaterChange = { commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: files('crates/runtime/src/lib.rs') } };
+
+test('an older entry needs a newer run of every command it ran', async () => {
+  const result = await check({
+    ...withLaterChange,
+    body: describe(`At ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\nok\n$ make lint\nok\n\`\`\`\n\nAt ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ make lint\nok\n\`\`\``),
+  });
+  assert.deepEqual(result.problems, [staleAfterHead(`At ${FIRST.slice(0, 12)}:`)]);
+});
+
+test('commands compare as written: whitespace inside an argument matters', async () => {
+  const result = await check({
+    ...withLaterChange,
+    body: describe(`At ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ grep "a  b" x\nok\n\`\`\`\n\nAt ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ grep "a b" x\nok\n\`\`\``),
+  });
+  assert.deepEqual(result.problems, [staleAfterHead(`At ${FIRST.slice(0, 12)}:`)]);
+});
+
+test('an entry naming two commits from the PR is ambiguous', async () => {
+  const line = `Ran at ${FIRST.slice(0, 12)} (the head is now ${HEAD.slice(0, 12)}):`;
+  const result = await check({ ...withLaterChange, body: describe(`${line}\n\n\`\`\`\n$ make test\nok\n\`\`\``) });
+  assert.deepEqual(result.problems, [
+    `"${line}" names more than one commit from this PR (${FIRST.slice(0, 12)}, ${HEAD.slice(0, 12)}): ` +
+      'give each result its own entry, naming only the commit it ran at.',
+  ]);
+});
+
+test('an older entry that names no command cannot be shown re-run', async () => {
+  const line = `Green at ${FIRST.slice(0, 12)}: ${RUN}`;
+  const result = await check({ ...withLaterChange, body: describe(`${line}\n\n${ran(HEAD)}`) });
+  assert.deepEqual(result.problems, [staleAfterHead(line)]);
 });
 
 test('a newer run of a different check does not refresh an older entry', async () => {
@@ -388,26 +424,57 @@ test('the section bot_pr_evidence.sh writes passes the check', async () => {
   assert.deepEqual(result.problems, []);
 });
 
-/** Run `bot_pr_evidence.sh update` against a fake `gh` serving `body`; returns the edited body. */
-function updateBody(body, what, sha = repoHead) {
+/**
+ * Run `bot_pr_evidence.sh update` against a fake `gh` that keeps the description in
+ * a file. `overwrites` edits are undone right after they land, as a concurrent
+ * writer working from an older read would. Returns { body, status, stderr }.
+ */
+function runUpdate(body, what, { sha = repoHead, overwrites = 0 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
     writeFileSync(join(dir, 'body.md'), body);
-    // A fake `gh` that serves the body and records the edit, and a fake `git` for the generated commit.
+    writeFileSync(join(dir, 'original.md'), body);
+    writeFileSync(join(dir, 'overwrites'), String(overwrites));
     writeFileSync(
       join(dir, 'gh'),
-      `#!/usr/bin/env bash\nif [ "$1 $2" = "pr view" ]; then cat "${join(dir, 'body.md')}"; fi\n` +
-        `if [ "$1 $2" = "pr edit" ]; then while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "${join(dir, 'edited.md')}"; shift; done; fi\n`
+      `#!/usr/bin/env bash\nd="${dir}"\n` +
+        'if [ "$1 $2" = "pr view" ]; then cat "$d/body.md"; fi\n' +
+        'if [ "$1 $2" = "pr edit" ]; then\n' +
+        '  while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "$d/body.md"; shift; done\n' +
+        '  n=$(cat "$d/overwrites"); if [ "$n" -gt 0 ]; then cp "$d/original.md" "$d/body.md"; echo $((n - 1)) > "$d/overwrites"; fi\n' +
+        'fi\n'
     );
     writeFileSync(join(dir, 'git'), `#!/usr/bin/env bash\necho ${sha}\n`);
     chmodSync(join(dir, 'gh'), 0o755);
     chmodSync(join(dir, 'git'), 0o755);
-    execFileSync('bash', [HELPER, 'update', '7', what], { env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}` } });
-    return readFileSync(join(dir, 'edited.md'), 'utf8');
+    const result = spawnSync('bash', [HELPER, 'update', '7', what], {
+      encoding: 'utf8',
+      env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}`, EVIDENCE_RECHECK_DELAY: '0' },
+    });
+    return { body: readFileSync(join(dir, 'body.md'), 'utf8'), status: result.status, stderr: result.stderr };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+const updateBody = (body, what, sha) => {
+  const { body: edited, status, stderr } = runUpdate(body, what, { sha });
+  assert.equal(status, 0, stderr);
+  return edited;
+};
+
+test('bot_pr_evidence.sh update puts back an entry a concurrent update dropped', () => {
+  const { body, status, stderr } = runUpdate('Automated update.', 'the benchmark run for tpch on a.yaml', { overwrites: 2 });
+  assert.equal(status, 0, stderr);
+  assert.match(stderr, /missing from 7 after a concurrent update; adding it again\./);
+  assert.match(body, /Generated at [0-9a-f]{12} by `the benchmark run for tpch on a\.yaml`/);
+});
+
+test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
+  const { body, status, stderr } = runUpdate('Automated update.', 'the benchmark run for tpch on a.yaml', { overwrites: 99 });
+  assert.equal(status, 1);
+  assert.match(stderr, /could not be kept in 7's description; add it by hand: Generated at/);
+  assert.equal(body, 'Automated update.');
+});
 
 test('bot_pr_evidence.sh update adds an entry and keeps every earlier entry and section', async () => {
   const run1 = 'https://github.com/spiceai/spiceai/actions/runs/1';

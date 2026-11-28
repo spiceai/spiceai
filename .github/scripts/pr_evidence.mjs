@@ -16,8 +16,8 @@
 // passes it (AGENTS.md, *Evidence*). Each entry names a commit from the PR and
 // carries its output, as a fenced block or a link to the run; every check marked
 // not run gives a reason; and every entry is current: no later commit changes
-// shipped code (a clean merge of the base aside), unless a newer entry re-runs
-// the same command.
+// shipped code (a clean merge of the base aside), unless newer entries re-run
+// every command it ran.
 //
 // Attestation (`.github/workflows/pr.yml`) imports this from a checkout of the
 // *base* commit, never the PR's, so a PR cannot change the rule that judges it.
@@ -62,7 +62,8 @@ const DECORATION = /[*_`]+/g;
 // that is not a SHA: what identifies a re-run of the same check.
 const PROMPT = /^\s*\$\s+(.+?)\s*$/;
 const CODE_SPAN = /`([^`]+)`/g;
-const normalize = (command) => command.replace(/\s+/g, ' ').trim();
+// Compared as written: whitespace inside a command can be part of an argument.
+const normalize = (command) => command.trim();
 const TABLE_EDGE = /\s*\|\s*$/;
 
 /** Each line of a body with HTML comments removed, marked as inside a fenced block or not. */
@@ -261,6 +262,12 @@ export async function checkEvidence({ github, owner, repo, pullNumber, now = new
     );
     return { problems, enforced, cited: null };
   }
+  for (const entry of entries.filter((candidate) => candidate.shas.length > 1)) {
+    problems.push(
+      `"${entry.line}" names more than one commit from this PR (${entry.shas.map(short).join(', ')}): ` +
+        'give each result its own entry, naming only the commit it ran at.'
+    );
+  }
   for (const entry of entries.filter((candidate) => !candidate.hasOutput)) {
     problems.push(
       `"${entry.line}" names ${entry.shas.map(short).join(', ')} but carries no output: put the output in a fenced block under it, or link the run.`
@@ -268,9 +275,9 @@ export async function checkEvidence({ github, owner, repo, pullNumber, now = new
   }
 
   // Every entry with output must describe the current code: nothing after its
-  // commit changes shipped code, or a newer entry re-runs the same command (the
-  // "after" of a before-and-after pair). A newer run of a different check proves
-  // nothing about this one.
+  // commit changes shipped code, or newer entries re-run every command it ran
+  // (the "after" of a before-and-after pair). A newer run of a different check,
+  // or of some of its commands, proves nothing about the rest.
   const position = (sha) => (sha === head ? Number.MAX_SAFE_INTEGER : listed.indexOf(sha));
   const newestOf = (entry) => entry.shas.reduce((newest, sha) => (position(sha) > position(newest) ? sha : newest));
   const withOutput = entries.filter((entry) => entry.hasOutput);
@@ -300,9 +307,8 @@ export async function checkEvidence({ github, owner, repo, pullNumber, now = new
   for (const entry of withOutput) {
     const at = newestOf(entry);
     if (at === head) continue;
-    const rerun = withOutput.some(
-      (other) => position(newestOf(other)) > position(at) && [...entry.commands].some((command) => other.commands.has(command))
-    );
+    const newer = withOutput.filter((other) => position(newestOf(other)) > position(at));
+    const rerun = entry.commands.size > 0 && [...entry.commands].every((command) => newer.some((other) => other.commands.has(command)));
     if (rerun) continue;
     if (truncated) {
       problems.push(

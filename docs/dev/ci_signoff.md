@@ -153,24 +153,25 @@ status is not a verdict and does not block inheritance.
 Every PR that needs a sign-off also needs evidence in its description, in the
 `🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
 (the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). **Attestation**
-checks it with `.github/scripts/pr_evidence.mjs`, from a checkout of the base
-commit it verifies before importing it:
+checks it with `.github/scripts/pr_evidence.mjs`, from a checkout of the
+default branch it verifies before importing it (so a PR into an older release
+branch is judged by the current rule):
 
 - The section exists and says more than the template comment. A heading that
   is just "Evidence" is used; heading-shaped lines inside pasted output don't
   count.
-- Each entry names a commit from this PR, on a line outside its output, and
+- Each entry names one commit from this PR, on a line outside its output, and
   carries that output: a non-empty fenced block under it, or a link to a
   workflow run, a PR's checks, or an uploaded file. Other links are not output.
 - Every check marked not run gives a real reason (`Not run — <reason>`, not the
   placeholder and not "TODO").
 - Every entry is current: no later commit changes a file the sign-off covers
   (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
-  checked by old and new path), unless a newer entry re-runs the same command.
-  An entry's commands are the `$ ` lines in its output and the code spans on its
-  line. That is the before-and-after pattern: the failing run at an older
-  commit, the same command passing at the head. A newer run of a different check
-  refreshes nothing. A merge of the base counts only for covered files it
+  checked by old and new path), unless newer entries re-run every command it
+  ran. An entry's commands are the `$ ` lines in its output and the code spans
+  on its line, compared as written. That is the before-and-after pattern: the
+  failing run at an older commit, the same command passing at the head. A newer
+  run of a different check, or of only some of the commands, refreshes nothing. A merge of the base counts only for covered files it
   changes against both parents: files both sides touched, or edited while
   merging. Any other merge counts for everything it brings in. Evidence at the
   head is current by definition, however many commits the PR has.
@@ -179,13 +180,23 @@ It checks form, not truth: whether the output shows what the PR claims is for
 review. Editing the description re-runs **Attestation**. The fast-tracks skip
 the check for the same reason they skip the sign-off. Until `ENFORCED_FROM`
 (2026-12-07T00:00Z, in the module) the check only warns; from then on it fails
-every PR it finds a problem with, whenever the PR was opened.
+every PR it finds a problem with, whenever the PR was opened. A green
+**Attestation** from the warning period stays green until the PR's next event,
+so at the cutover a maintainer re-runs **Attestation** on open PRs
+(`gh run rerun <run-id>` on each PR's latest `pull_request` run of `pr`). A Git or
+API error while verifying the checker fails the check rather than skipping it.
+
+Like the rest of **Attestation**, the check runs the workflow file from the PR's
+merge commit, as every `pull_request` workflow does, so a PR that edits `pr.yml`
+can change what it checks. Code-owner review of workflow changes guards that.
 
 Workflows that open PRs with generated commits (snapshot and schema updates)
 write the section with `.github/scripts/bot_pr_evidence.sh`: an entry naming
-the generated commit and the run that produced it. A later run adds an entry
-and keeps the earlier ones; because it names the same generation, it keeps
-them current. When a maintainer adds commits to such a
+the generated commit, the workload, and the run that produced it. A later run
+adds an entry and keeps the earlier ones; a later run of the same workload keeps
+that workload's entry current, while another workload's does not. Because
+GitHub has no conditional edit, the helper reads the description back after
+editing and fails its run if a concurrent update dropped its entry. When a maintainer adds commits to such a
 PR, or to a Dependabot bump that has left its fast-track, they add an entry for
 their own run, as for any other PR.
 

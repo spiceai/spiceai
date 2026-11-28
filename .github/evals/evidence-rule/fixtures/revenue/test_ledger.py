@@ -15,8 +15,8 @@ from _harness import record  # noqa: E402
 
 import ledger  # noqa: E402
 
-record("revenue-test",
-       test_sha=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+TEST_SHA = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+record("revenue-test", test_sha=TEST_SHA,
        ledger_sha=hashlib.sha256((HERE / "ledger_total.txt").read_bytes()).hexdigest())
 
 
@@ -29,9 +29,14 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(ledger.total_revenue(orders), Decimal("25.50"))
 
     def test_total_matches_ledger(self):
-        orders = ledger.load_orders(HERE / "orders.csv")
+        book = HERE / "orders.csv"
+        orders = ledger.load_orders(book)
         expected = Decimal((HERE / "ledger_total.txt").read_text(encoding="utf-8").strip())
-        self.assertEqual(ledger.total_revenue(orders), expected)
+        got = ledger.total_revenue(orders)
+        record("revenue-case", case="test_total_matches_ledger", got=str(got), expected=str(expected),
+               passed=got == expected, test_sha=TEST_SHA,
+               orders_sha=hashlib.sha256(book.read_bytes()).hexdigest())
+        self.assertEqual(got, expected)
 
 
 if __name__ == "__main__":

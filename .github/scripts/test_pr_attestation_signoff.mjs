@@ -29,7 +29,7 @@ const INSPECT_STEP = 'Inspect developer sign-off';
 const QUEUE_PASSTHROUGH_STEP = 'Merge queue passthrough';
 const DISPATCH_REJECT_STEP = 'Reject an attestation asserted by dispatch';
 const EVIDENCE_STEP = "Check the pull request's evidence";
-const EVIDENCE_CHECKOUT_STEP = "Check out the base commit's evidence rule";
+const EVIDENCE_CHECKOUT_STEP = "Check out the default branch's evidence rule";
 const EVIDENCE_MODULE = fileURLToPath(new URL('./pr_evidence.mjs', import.meta.url));
 
 const HEAD = 'a'.repeat(40);
@@ -487,13 +487,13 @@ test('the evidence check runs for every PR the fast-tracks do not cover', () => 
 // `Check out pull request history` checks the PR out over the workspace root, and
 // the checkout action empties a destination that is not a repository. A checker
 // checked out before it would be deleted, and the PR could put its own at that path.
-test('the evidence rule is checked out at the base commit after the PR, right before it runs', () => {
+test('the evidence rule is checked out from the default branch after the PR, right before it runs', () => {
   const checkout = stepIndex(job, EVIDENCE_CHECKOUT_STEP);
   assert.ok(stepIndex(job, 'Check out pull request history') < checkout, 'the checker must be checked out after the PR checkout');
   const names = jobStepNames(job);
   assert.equal(names[names.indexOf(EVIDENCE_CHECKOUT_STEP) + 1], EVIDENCE_STEP, 'nothing may run between the checkout and the check');
   const declaration = stepLines(job, EVIDENCE_CHECKOUT_STEP).join('\n');
-  assert.match(declaration, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(declaration, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.match(declaration, /path: evidence-rule\n/);
   assert.match(declaration, /persist-credentials: false/);
 });
@@ -510,25 +510,23 @@ const git = (cwd, ...args) => {
 
 /**
  * Run the evidence step's real script against a real repository standing in for
- * the base checkout. `module`: whether the base commit carries pr_evidence.mjs;
- * `checkout`: whether the checkout happened; `atBase`: whether its HEAD is the
- * PR's base commit; `now`: the time the check runs.
+ * the default branch's checkout. `module`: whether that commit carries
+ * pr_evidence.mjs; `checkout`: whether the checkout happened; `status`: what
+ * comparing the checkout's HEAD with the default branch reports (or an Error to
+ * throw); `gitFails`: make the tree read fail; `now`: the time the check runs.
  */
-async function runEvidence({ body, module = true, checkout = true, atBase = true, now = '2026-12-08T00:00:00Z' }) {
+async function runEvidence({ body, module = true, checkout = true, status = 'identical', gitFails = false, now = '2026-12-08T00:00:00Z' }) {
   const workspace = mkdtempSync(join(tmpdir(), 'evidence-'));
-  let baseSha = BASE;
   if (checkout) {
     const repo = join(workspace, 'evidence-rule');
     mkdirSync(join(repo, '.github/scripts'), { recursive: true });
     git(repo, 'init', '-q');
     if (module) copyFileSync(EVIDENCE_MODULE, join(repo, '.github/scripts/pr_evidence.mjs'));
-    writeFileSync(join(repo, '.github/scripts/README'), 'base scripts\n');
+    writeFileSync(join(repo, '.github/scripts/README'), 'default branch scripts\n');
     git(repo, 'add', '-A');
-    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'base');
-    const head = git(repo, 'rev-parse', 'HEAD');
-    if (atBase) baseSha = head;
+    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'trunk');
   }
-  const calls = { failed: [], notices: [], infos: [], warnings: [] };
+  const calls = { failed: [], notices: [], infos: [], warnings: [], compared: [] };
   const core = {
     setFailed: (message) => calls.failed.push(message),
     notice: (message) => calls.notices.push(message),
@@ -537,6 +535,7 @@ async function runEvidence({ body, module = true, checkout = true, atBase = true
   };
   const exec = {
     getExecOutput: async (command, args) => {
+      if (gitFails && args.includes('ls-tree')) return { exitCode: 128, stdout: '', stderr: 'fatal: unable to read tree' };
       const result = spawnSync(command, args, { encoding: 'utf8' });
       return { exitCode: result.status, stdout: result.stdout, stderr: result.stderr };
     },
@@ -545,14 +544,21 @@ async function runEvidence({ body, module = true, checkout = true, atBase = true
     paginate: async (method, params) => (await method(params)).data,
     rest: {
       pulls: {
-        get: async () => ({ data: { body, created_at: '2026-11-01T00:00:00Z', head: { sha: HEAD }, base: { sha: baseSha } } }),
-        listCommits: async () => ({ data: [{ sha: HEAD, parents: [{ sha: baseSha }] }] }),
+        get: async () => ({ data: { body, created_at: '2026-11-01T00:00:00Z', head: { sha: HEAD }, base: { sha: BASE } } }),
+        listCommits: async () => ({ data: [{ sha: HEAD, parents: [{ sha: BASE }] }] }),
+      },
+      repos: {
+        compareCommitsWithBasehead: async ({ basehead }) => {
+          calls.compared.push(basehead);
+          if (status instanceof Error) throw status;
+          return { data: { status, files: [] } };
+        },
       },
     },
   };
   const context = {
     repo: { owner: 'spiceai', repo: 'spiceai' },
-    payload: { pull_request: { number: 1, base: { sha: baseSha } } },
+    payload: { pull_request: { number: 1, base: { sha: BASE } }, repository: { default_branch: 'trunk' } },
   };
   const previous = { workspace: process.env.GITHUB_WORKSPACE, Date: globalThis.Date };
   process.env.GITHUB_WORKSPACE = workspace;
@@ -576,10 +582,12 @@ async function runEvidence({ body, module = true, checkout = true, atBase = true
 
 const EVIDENCE = `## Evidence\n\nRan at ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ make test\n12 passed\n\`\`\`\n`;
 
-test('complete evidence passes the step', async () => {
+test('complete evidence passes the step, after the checker is confirmed on the default branch', async () => {
   const calls = await runEvidence({ body: EVIDENCE });
   assert.deepEqual(calls.failed, []);
   assert.deepEqual(calls.infos, [`The Evidence section is complete and current as of ${HEAD.slice(0, 12)}.`]);
+  assert.equal(calls.compared.length, 1);
+  assert.match(calls.compared[0], /^[0-9a-f]{40}\.\.\.trunk$/);
 });
 
 test('missing evidence fails the step', async () => {
@@ -595,26 +603,39 @@ test('before ENFORCED_FROM the step warns instead of failing', async () => {
   assert.match(calls.warnings[0], /\nThe evidence check warns until 2026-12-07T00:00:00Z, and fails from then on\.$/);
 });
 
-test('a base commit without the module skips the check with a notice', async () => {
+test('a default branch without the module skips the check with a notice', async () => {
   const calls = await runEvidence({ body: '## Summary', module: false });
   assert.deepEqual(calls.failed, []);
-  assert.deepEqual(calls.notices, [
-    'The base commit predates the evidence check (.github/scripts/pr_evidence.mjs), so it was skipped.',
+  assert.deepEqual(calls.notices, ['trunk predates the evidence check (.github/scripts/pr_evidence.mjs), so it was skipped.']);
+});
+
+test('a git error reading the tree fails the step instead of skipping it', async () => {
+  const calls = await runEvidence({ body: '## Summary', gitFails: true });
+  assert.deepEqual(calls.notices, []);
+  assert.deepEqual(calls.failed, [
+    "The evidence rule could not be verified as trunk's (git could not read the tree: fatal: unable to read tree), " +
+      'so the evidence check could not run. Re-run the job.',
   ]);
 });
 
-test('a missing checkout fails the step instead of skipping it', async () => {
+test('a missing checkout fails the step', async () => {
   const calls = await runEvidence({ body: EVIDENCE, checkout: false });
-  assert.equal(calls.failed.length, 1);
-  assert.equal(calls.failed[0], `The evidence rule was not checked out at the base commit ${BASE}, so the evidence check could not run. Re-run the job.`);
+  assert.deepEqual(calls.failed, [
+    "The evidence rule could not be verified as trunk's (no checkout), so the evidence check could not run. Re-run the job.",
+  ]);
 });
 
-test('a checker not at the base commit is never imported', async () => {
-  // As if the PR had put its own directory where the checkout should be.
-  const calls = await runEvidence({ body: '## Summary', atBase: false });
+test('a checker not on the default branch is never imported', async () => {
+  const calls = await runEvidence({ body: '## Summary', status: 'diverged' });
   assert.equal(calls.failed.length, 1);
-  assert.equal(calls.failed[0], `The evidence rule was not checked out at the base commit ${BASE}, so the evidence check could not run. Re-run the job.`);
+  assert.match(calls.failed[0], /^The evidence rule could not be verified as trunk's \([0-9a-f]{12} is not on trunk\)/);
   assert.deepEqual(calls.notices, []);
+});
+
+test('a failed comparison fails the step', async () => {
+  const calls = await runEvidence({ body: EVIDENCE, status: new Error('HTTP 502') });
+  assert.equal(calls.failed.length, 1);
+  assert.match(calls.failed[0], /comparing [0-9a-f]{12} with trunk failed: HTTP 502\), so the evidence check could not run\./);
 });
 
 let failures = 0;

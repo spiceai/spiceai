@@ -551,48 +551,73 @@ jobs:
       # Evidence): entries that name a PR commit and carry its output, a reason on
       # each check not run, and no later change to shipped code an entry has not
       # been re-run after. The rule lives in .github/scripts/pr_evidence.mjs and is
-      # read from the base commit, so a PR cannot rewrite the check that judges it.
-      # It gets a checkout of its own, made here, after `Check out pull request
-      # history`: that step checks the PR out over the workspace root, and the
-      # checkout action empties a destination that is not a repository, so the
-      # `trusted` checkout above is gone by now and the PR could have put files at
-      # its path. The fast-tracks skip the check for the reason they skip the
-      # sign-off: those PRs change no shipped code. `!cancelled()` so a failed
-      # sign-off and missing evidence are reported in one run.
-      - name: Check out the base commit's evidence rule
+      # read from the default branch, never the PR, so a PR cannot rewrite the
+      # module that judges it, and a PR into an older release branch is judged by
+      # the current rule. It gets a checkout of its own, made here, after `Check
+      # out pull request history`: that step checks the PR out over the workspace
+      # root, and the checkout action empties a destination that is not a
+      # repository, so the `trusted` checkout above is gone by now and the PR could
+      # have put files at its path. The fast-tracks skip the check for the reason
+      # they skip the sign-off: those PRs change no shipped code. `!cancelled()` so
+      # a failed sign-off and missing evidence are reported in one run.
+      #
+      # This job runs the workflow file from the PR's merge commit, as every
+      # `pull_request` workflow does, so a PR that edits this file can change what
+      # it checks. That holds for the whole Attestation job, sign-off included, and
+      # code-owner review of workflow changes is what guards it.
+      - name: Check out the default branch's evidence rule
         if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: evidence-rule
           sparse-checkout: .github/scripts
           persist-credentials: false
 
-      # The checker is imported only from a checkout whose HEAD is the base commit,
-      # and the check is skipped only when that commit's tree lacks the module (a
-      # base branch older than the check). Anything else that stops the check
-      # reaching a verdict fails Attestation: a check that passes when it cannot run
-      # checks nothing.
+      # The checker is imported only from a checkout whose HEAD is on the default
+      # branch, and the check is skipped only when Git reads that commit's tree and
+      # finds no module (before this check reached the default branch). Anything
+      # else that stops the check reaching a verdict fails Attestation, a Git error
+      # included: a check that passes when it cannot run checks nothing.
       - name: Check the pull request's evidence
         if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const checkout = `${process.env.GITHUB_WORKSPACE}/evidence-rule`;
-            const baseSha = context.payload.pull_request.base.sha;
+            const defaultBranch = context.payload.repository.default_branch;
             const git = (...args) => exec.getExecOutput('git', ['-C', checkout, ...args], { ignoreReturnCode: true, silent: true });
+            const unverified = (why) =>
+              core.setFailed(`The evidence rule could not be verified as ${defaultBranch}'s (${why}), so the evidence check could not run. Re-run the job.`);
 
             const head = await git('rev-parse', 'HEAD');
-            if (head.exitCode !== 0 || head.stdout.trim() !== baseSha) {
-              core.setFailed(
-                `The evidence rule was not checked out at the base commit ${baseSha}, so the ` +
-                'evidence check could not run. Re-run the job.'
-              );
+            if (head.exitCode !== 0) {
+              unverified('no checkout');
+              return;
+            }
+            const sha = head.stdout.trim();
+            try {
+              const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                basehead: `${sha}...${defaultBranch}`,
+              });
+              if (data.status !== 'ahead' && data.status !== 'identical') {
+                unverified(`${sha.slice(0, 12)} is not on ${defaultBranch}`);
+                return;
+              }
+            } catch (error) {
+              unverified(`comparing ${sha.slice(0, 12)} with ${defaultBranch} failed: ${error.message}`);
               return;
             }
             const module = '.github/scripts/pr_evidence.mjs';
-            if ((await git('cat-file', '-e', `HEAD:${module}`)).exitCode !== 0) {
-              core.notice(`The base commit predates the evidence check (${module}), so it was skipped.`);
+            const listed = await git('ls-tree', '--name-only', 'HEAD', '--', module);
+            if (listed.exitCode !== 0) {
+              unverified(`git could not read the tree: ${listed.stderr.trim()}`);
+              return;
+            }
+            if (listed.stdout.trim() !== module) {
+              core.notice(`${defaultBranch} predates the evidence check (${module}), so it was skipped.`);
               return;
             }
 
