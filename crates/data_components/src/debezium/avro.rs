@@ -283,6 +283,13 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
     Ok(schema)
 }
 
+/// The schema kind of an Avro value, for errors. A value's `Debug` output
+/// would include the row data (a record prints every field), which can hold
+/// credentials, so errors name only the kind.
+fn avro_kind(value: &AvroValue) -> apache_avro::schema::SchemaKind {
+    apache_avro::schema::SchemaKind::from(value)
+}
+
 fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
     let record = match value {
         AvroValue::Record(fields) => fields,
@@ -291,7 +298,7 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
         }
         other => {
             return MapPayloadSnafu {
-                message: format!("expected Avro record at root, got {other:?}"),
+                message: format!("expected Avro record at root, got {:?}", avro_kind(other)),
             }
             .fail();
         }
@@ -316,14 +323,14 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
             AvroValue::String(s) => parse_op(s)?,
             other => {
                 return MapPayloadSnafu {
-                    message: format!("op must be a string, got {other:?}"),
+                    message: format!("op must be a string, got {:?}", avro_kind(other)),
                 }
                 .fail();
             }
         },
         other => {
             return MapPayloadSnafu {
-                message: format!("missing or invalid op field: {other:?}"),
+                message: format!("missing or invalid op field: {:?}", other.map(avro_kind)),
             }
             .fail();
         }
@@ -387,7 +394,7 @@ fn avro_to_i64(value: &AvroValue) -> Result<i64> {
         AvroValue::Int(v) => Ok(i64::from(*v)),
         AvroValue::Union(_, inner) => avro_to_i64(inner),
         other => MapPayloadSnafu {
-            message: format!("expected int/long, got {other:?}"),
+            message: format!("expected int/long, got {:?}", avro_kind(other)),
         }
         .fail(),
     }
@@ -443,7 +450,10 @@ fn avro_to_json(value: &AvroValue) -> Result<serde_json::Value> {
         AvroValue::Duration(d) => serde_json::Value::String(format!("{d:?}")),
         other => {
             return MapPayloadSnafu {
-                message: format!("unsupported Avro value type for JSON conversion: {other:?}"),
+                message: format!(
+                    "unsupported Avro value type for JSON conversion: {:?}",
+                    avro_kind(other)
+                ),
             }
             .fail();
         }
@@ -452,6 +462,39 @@ fn avro_to_json(value: &AvroValue) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Avro mapping errors name the value's kind, never its contents: a
+    /// record's `Debug` output prints every field of the row.
+    #[test]
+    fn mapping_errors_never_show_row_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let not_a_record = AvroValue::Array(vec![AvroValue::Record(vec![(
+            "api_key".to_string(),
+            AvroValue::String(FAKE_SECRET.to_string()),
+        )])]);
+        let bad_op = AvroValue::Record(vec![(
+            "op".to_string(),
+            AvroValue::Union(
+                0,
+                Box::new(AvroValue::Record(vec![(
+                    "api_key".to_string(),
+                    AvroValue::String(FAKE_SECRET.to_string()),
+                )])),
+            ),
+        )]);
+        for value in [not_a_record, bad_op] {
+            let Err(err) = super::avro_value_to_change_event(&value) else {
+                panic!("must not map");
+            };
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                assert!(
+                    !rendered.contains(FAKE_SECRET),
+                    "row value leaked: {rendered}"
+                );
+                assert!(!rendered.contains("api_key"), "row leaked: {rendered}");
+            }
+        }
+    }
     use super::*;
     use apache_avro::{to_avro_datum, types::Record};
 

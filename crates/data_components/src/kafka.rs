@@ -1444,11 +1444,11 @@ fn json_bytes_to_change_batch(
     // to avoid silently dropping rows beyond the first batch.
     let reader = ReaderBuilder::new(Arc::clone(schema))
         .build(std::io::Cursor::new(json))
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     let batches: Vec<_> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     if batches.is_empty() {
         return Err(cdc::StreamError::Arrow(
@@ -1461,6 +1461,65 @@ fn json_bytes_to_change_batch(
 
     cdc::wrap_data_as_change_batch(schema, &rb)
         .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+}
+
+/// Describes a JSON-to-Arrow decode failure without the message values.
+///
+/// The Arrow JSON reader quotes the offending value (`failed to parse "<v>" as
+/// Int64`, `expected { got <v>`) and passes value-carrying parse errors through
+/// unchanged. Kafka payloads are source rows that can hold credentials, and
+/// stream errors are logged verbatim, so only the field path and the kind of
+/// failure are kept.
+fn redact_json_decode_error(err: &arrow::error::ArrowError) -> String {
+    use arrow::error::ArrowError;
+
+    const NOT_SHOWN: &str = "the value is not shown";
+    let message = match err {
+        ArrowError::JsonError(message) => message,
+        ArrowError::ParseError(_)
+        | ArrowError::CastError(_)
+        | ArrowError::ComputeError(_)
+        | ArrowError::InvalidArgumentError(_) => {
+            return format!(
+                "Failed to decode a Kafka message: a value could not be converted to its column type ({NOT_SHOWN})"
+            );
+        }
+        other => return other.to_string(),
+    };
+
+    let mut rest = message.as_str();
+    let mut path = Vec::new();
+    while let Some(after) = rest.strip_prefix("whilst decoding field '")
+        && let Some(end) = after.find("': ")
+    {
+        path.push(&after[..end]);
+        rest = &after[end + 3..];
+    }
+
+    let kind = if rest.starts_with("failed to parse") {
+        format!("a value could not be parsed as the column's type ({NOT_SHOWN})")
+    } else if let Some(expected) = rest
+        .strip_prefix("expected ")
+        .and_then(|r| r.split_once(" got "))
+        .map(|(expected, _)| expected)
+    {
+        format!("expected {expected} but found a different JSON value ({NOT_SHOWN})")
+    } else if path.is_empty() {
+        // Structural reader errors (malformed JSON, schema mismatches) name
+        // characters, fields or types, never a decoded value.
+        return err.to_string();
+    } else {
+        format!("the value could not be decoded ({NOT_SHOWN})")
+    };
+
+    if path.is_empty() {
+        format!("Failed to decode a Kafka message: {kind}")
+    } else {
+        format!(
+            "Failed to decode field '{}' of a Kafka message: {kind}",
+            path.join(".")
+        )
+    }
 }
 
 // Public wrappers for benchmarking the two JSON decode paths head-to-head.
@@ -1800,6 +1859,37 @@ mod tests {
             matches!(&err, cdc::StreamError::Arrow(message) if message == expected),
             "payload decode path returned an unexpected error: {err:?}"
         );
+    }
+
+    /// A message whose value does not match its column must not put the value
+    /// in the error: payloads are source rows that can hold credentials, and
+    /// stream errors are logged verbatim. The field name must still appear.
+    #[test]
+    fn decode_errors_never_show_message_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = test_schema(); // id Int64, name Utf8
+        let cases = [
+            json!({"id": FAKE_SECRET, "name": "app"}),
+            json!({"id": 1, "name": {"api_key": FAKE_SECRET}}),
+            json!({"id": [FAKE_SECRET], "name": "app"}),
+        ];
+        for value in cases {
+            let payload = value.to_string();
+            for err in [
+                values_to_change_batch(std::iter::once(&value), None, &schema)
+                    .expect_err("a mistyped value must be refused"),
+                payloads_to_change_batch(&[payload.as_bytes()], &schema)
+                    .expect_err("a mistyped value must be refused"),
+            ] {
+                for rendered in [err.to_string(), format!("{err:?}")] {
+                    assert!(!rendered.contains(FAKE_SECRET), "value leaked: {rendered}");
+                    assert!(
+                        rendered.contains("field 'id'") || rendered.contains("field 'name'"),
+                        "the field must be named: {rendered}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
