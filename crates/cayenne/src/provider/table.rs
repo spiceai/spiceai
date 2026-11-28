@@ -34610,6 +34610,29 @@ impl CayenneTableProvider {
             return;
         }
 
+        self.rebuild_stale_maintained_aggregates().await;
+    }
+
+    /// Rebuild a stale maintained-aggregate registry now, once, from the
+    /// table's visible rows.
+    ///
+    /// A write that the registry cannot absorb incrementally, such as a first
+    /// load published as one append, marks it stale. The checkpoint rearm
+    /// would rebuild it, but a table loaded in one append has no mem-tier
+    /// checkpoint to wait for, so the write rebuilds it itself. The rebuild
+    /// shares the rearm's failure budget and logging.
+    pub(crate) async fn rebuild_stale_maintained_aggregates(&self) {
+        if self.maintained_aggregates.is_empty() || !self.maintained_aggregates.is_stale() {
+            return;
+        }
+        if self
+            .maintained_aggregate_rebuild_failures
+            .load(Ordering::Acquire)
+            >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES
+        {
+            return;
+        }
+
         let (retained, budget) = self.maintained_aggregates.retained_bytes_and_budget();
         match self
             .rebuild_maintained_aggregates_from_visible_state()
@@ -74056,6 +74079,64 @@ mod tests {
             collect_id_count_sum(&served),
             vec![(1, 1, 10), (2, 1, 20)],
             "staged feed must populate count(*)=1 and sum(value)=value per key"
+        );
+    }
+
+    /// A first load into an empty table publishes as one append without feeding
+    /// the maintained aggregates, which marks them stale. The load rebuilds them
+    /// before it returns, so the registry serves the loaded rows as soon as the
+    /// write is visible, with no later write or checkpoint to rearm it. A CDC
+    /// initial snapshot loads an empty acceleration this way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_first_load_leaves_maintained_aggregates_serving_its_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "ma_first_load",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        assert!(
+            provider.takes_first_load() && provider.holds_no_rows().await,
+            "precondition: the append is taken as a first load"
+        );
+
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![id_value_batch(
+                Arc::clone(&schema),
+                &[1, 2, 3],
+                &[10, 20, 30],
+            )]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("memory exec created");
+        let insert = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+        collect(insert, ctx.task_ctx())
+            .await
+            .expect("first load publishes");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_first_load").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "precondition: the table holds the loaded rows"
+        );
+        // No polling: the load returned only after the rebuild installed.
+        let epoch = provider
+            .maintained_aggregate_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let served = provider
+            .maintained_aggregates
+            .batch_for_aggregate(&build_id_count_sum_aggregate_exec(), epoch)
+            .expect("maintained serve must not error")
+            .expect("the registry serves the first load as soon as it returns");
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
         );
     }
 

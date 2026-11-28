@@ -1105,7 +1105,7 @@ fn snapshot_watermark_envelope(
     dataset: String,
     history_unavailable: bool,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+    let (_, batch, _, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
         .map_err(|e| StreamError::External(e.to_string()))?
         .into_parts()
         .map_err(|e| StreamError::External(e.to_string()))?;
@@ -1122,6 +1122,7 @@ fn snapshot_watermark_envelope(
         // Readiness stays lag-based: an acceleration being loaded is not ready.
         false,
         history_unavailable,
+        false,
     ))
 }
 
@@ -1138,7 +1139,7 @@ fn rebuild_request_envelope(
     member: &Arc<MemberHandle>,
     lsn: u64,
 ) -> std::result::Result<ChangeEnvelope, StreamError> {
-    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
+    let (_, batch, _, _, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
         .map_err(|e| StreamError::External(e.to_string()))?
         .into_parts()
         .map_err(|e| StreamError::External(e.to_string()))?;
@@ -1156,6 +1157,7 @@ fn rebuild_request_envelope(
         // The whole point of the envelope: the consumer replaces the acceleration's
         // contents from the source rather than applying anything onto them.
         true,
+        false,
     ))
 }
 

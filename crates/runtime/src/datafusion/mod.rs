@@ -1546,6 +1546,11 @@ pub struct DataFusion {
     write_stats_notify: tokio::sync::Notify,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    /// Names of datasets whose writer changed (`DataAccelerator::writer_role`),
+    /// for the runtime to reload; see [`Self::take_writer_role_changes`].
+    writer_role_changes: tokio::sync::mpsc::UnboundedSender<TableReference>,
+    writer_role_changes_rx:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>>>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
@@ -1760,6 +1765,14 @@ impl DataFusion {
         }
 
         None
+    }
+
+    /// The names of datasets whose writer changed, to reload: taken once, by
+    /// the runtime.
+    pub fn take_writer_role_changes(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>> {
+        self.writer_role_changes_rx.lock().take()
     }
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
@@ -5161,7 +5174,43 @@ impl DataFusion {
             accelerated_table_builder.metrics(metrics.clone());
         }
 
-        if refresh_mode == RefreshMode::Changes {
+        // With accelerations shared through one location, another instance may
+        // write this one: then this instance serves its queries, runs no refresh
+        // and consumes no change stream, and the dataset reloads when that
+        // changes (see `watch_writer_role`).
+        let writer_role = match self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+        {
+            Some(engine) => engine.writer_role(dataset).await,
+            None => None,
+        };
+        let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
+        if writer_role.is_some() {
+            // The writer records its completed initial load in the location;
+            // a replica is ready from then on.
+            let initial_load = shared_initial_load_record(dataset).await?;
+            accelerated_table_builder.shared(if replica {
+                runtime_table::accelerated::SharedAcceleration::Replica { initial_load }
+            } else {
+                runtime_table::accelerated::SharedAcceleration::Writer { initial_load }
+            });
+        }
+        if replica {
+            // Never polled: the refresh that would consume it does not start.
+            match refresh_mode {
+                RefreshMode::Changes => {
+                    accelerated_table_builder.changes_stream(futures::stream::empty().boxed());
+                }
+                RefreshMode::Append if dataset.time_column.is_none() => {
+                    accelerated_table_builder.append_stream(futures::stream::empty().boxed());
+                }
+                _ => {}
+            }
+        }
+
+        if refresh_mode == RefreshMode::Changes && !replica {
             // Make the dataset's `on_schema_change` policy + constraint columns
             // available to the CDC apply loop before the changes stream starts.
             // Connectors (e.g. Debezium) may have pre-installed a default; this
@@ -5215,7 +5264,7 @@ impl DataFusion {
         // accelerator engine, including Cayenne. When the source does not
         // provide an append_stream, Cayenne falls back to its own validation
         // (supports primary_key); other engines require time_column.
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() && !replica {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
             } else if acceleration_settings.engine != Engine::Cayenne {
@@ -5312,6 +5361,14 @@ impl DataFusion {
                 dataset_name: dataset.name.to_string(),
             },
         )?;
+        if let Some(role) = writer_role {
+            accelerated_table.attach_task(self.io_runtime.spawn(watch_writer_role(
+                role,
+                !replica,
+                dataset.name.clone(),
+                self.writer_role_changes.clone(),
+            )));
+        }
 
         if let Some((subscription, state)) = snapshot_subscription
             && let Some(requester) = accelerated_table.refresh_requester()
@@ -7013,8 +7070,8 @@ impl DataFusion {
 
         let ctx = Arc::clone(&self.ctx);
         let df_ref = Arc::clone(self);
-        let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
+        let dependent_table_names = view::get_view_dependencies(&statements[0], &status);
 
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
@@ -8286,6 +8343,64 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
     inner
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
+}
+
+/// Where the instance writing `dataset`'s shared acceleration records its
+/// completed initial load, and the other instances read it.
+async fn shared_initial_load_record(
+    dataset: &Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>> {
+    crate::dataaccelerator::spice_sys::checkpoint_store(
+        dataset,
+        runtime_checkpoint_api::INITIAL_LOAD_TABLE,
+    )
+    .await
+    .ok_or_else(|| Error::AccelerationRegistration {
+        source: format!(
+            "Dataset '{}' could not open the record of its initial load in the shared state location",
+            dataset.name
+        )
+        .into(),
+    })
+}
+
+/// How often a table that serves the wrong writer role asks again for its
+/// dataset to be reloaded, after a reload that did not replace it.
+const WRITER_ROLE_RELOAD_RETRY: Duration = Duration::from_secs(15);
+
+/// Ask for `dataset` to be reloaded once this instance starts or stops
+/// writing its acceleration: a takeover reopens it from the committed state
+/// and starts its refresh, a handover stops it. `built_as_writer` is the role
+/// the table was built for, so a change between reading the role and starting
+/// this watch reloads it too. The task belongs to the table: while the table
+/// still serves the wrong role, because a reload failed (its source could not
+/// be reached, say), it asks again, and a reload that replaces the table ends
+/// it.
+async fn watch_writer_role(
+    mut role: data_accelerator_api::WriterRole,
+    built_as_writer: bool,
+    dataset: TableReference,
+    reloads: tokio::sync::mpsc::UnboundedSender<TableReference>,
+) {
+    loop {
+        if *role.borrow_and_update() == built_as_writer {
+            if role.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if reloads.send(dataset.clone()).is_err() {
+            return;
+        }
+        tokio::select! {
+            changed = role.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY).await;
+                }
+            }
+            () = tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY) => {}
+        }
+    }
 }
 
 impl Drop for DataFusion {

@@ -57,7 +57,7 @@ serde.workspace = true
 serde_json.workspace = true
 yaml = { path = "../yaml" }
 spiceai = { workspace = true }
-spicepod = { path = "../spicepod" }
+spicepod = { path = "../spicepod", default-features = false }
 sysinfo = "0.38.4"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
@@ -65,7 +65,6 @@ time = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
-util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(not(windows))'.dependencies]
@@ -75,28 +74,6 @@ nix = { version = "0.30", features = ["signal"] }
 rstest = "0.26.1"
 
 [features]
-anonymous_telemetry = []
-aws-secrets-manager = []
-clickhouse = []
-databricks = []
-debezium = []
-delta_lake = []
-dremio = []
-duckdb = []
-flightsql = []
-ftp = []
-imap = []
-keyring-secret-store = []
-models = []
-mssql = []
-mysql = []
-odbc = []
-postgres = []
-sharepoint = []
-snowflake = []
-spark = []
-sqlite = []
-
 file_append = ["dep:duckdb-oracle"]
 
 [lints]

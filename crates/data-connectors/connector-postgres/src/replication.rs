@@ -199,7 +199,7 @@ pub(crate) async fn load_write_back_xid_registry(
     context: &dyn ConnectorContext,
 ) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     let dataset_name = dataset.name.to_string();
-    let repl_params = replication_params_from_connector_params(params, &dataset_name)?;
+    let repl_params = replication_params_for(params, dataset, context).await?;
     let (schema_name, table_name) = split_schema_table(&dataset.from);
     let identity = source_identity(&repl_params, &schema_name, &table_name);
 
@@ -415,9 +415,7 @@ async fn resolve_applied_lsn(
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
 ) -> u64 {
-    let Ok(repl_params) =
-        replication_params_from_connector_params(params, &dataset.name.to_string())
-    else {
+    let Ok(repl_params) = replication_params_for(params, dataset, context).await else {
         return 0;
     };
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -449,16 +447,15 @@ pub async fn build_changes_stream(
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
 
-    let mut params_for_stream =
-        match replication_params_from_connector_params(params, &dataset_name) {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!("postgres replication: {e}");
-                return Box::pin(futures::stream::once(async move {
-                    Err(StreamError::External(msg))
-                }));
-            }
-        };
+    let mut params_for_stream = match replication_params_for(params, dataset, context).await {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("postgres replication: {e}");
+            return Box::pin(futures::stream::once(async move {
+                Err(StreamError::External(msg))
+            }));
+        }
+    };
 
     // A non-persistent accelerator starts empty on every boot, so resuming
     // from an existing slot without a snapshot would silently serve only the
@@ -1142,9 +1139,29 @@ fn accelerator_is_ephemeral(
     }
 }
 
+/// `dataset`'s replication parameters, its default slot named for the location
+/// its acceleration is shared through when it is (see
+/// `ConnectorContext::shared_location_id`).
+async fn replication_params_for(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> std::result::Result<ReplicationParams, String> {
+    let shared_location = context
+        .shared_location_id(dataset)
+        .await
+        .map_err(|error| error.to_string())?;
+    replication_params_from_connector_params(
+        params,
+        &dataset.name.to_string(),
+        shared_location.as_deref(),
+    )
+}
+
 fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
+    shared_location: Option<&str>,
 ) -> std::result::Result<ReplicationParams, String> {
     // Same override rule / parser as `PostgresConnectionPool` (see
     // `crate::connection`): `pg_connection_string` wins over discrete
@@ -1178,7 +1195,7 @@ fn replication_params_from_connector_params(
             (slot, publication)
         }
         None => (
-            config::default_slot_name(dataset_name),
+            config::default_slot_name_on(dataset_name, shared_location),
             optional_string(params, "publication")
                 .unwrap_or_else(|| config::default_publication_name(dataset_name)),
         ),
@@ -1524,9 +1541,12 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     /// must reach the replication stream as a usable trust anchor.
     #[test]
     fn inline_pem_sslrootcert_reaches_replication_params_as_content() {
-        let repl =
-            replication_params_from_connector_params(&params_with_sslrootcert(TEST_CA_PEM), "hits")
-                .expect("inline PEM sslrootcert should parse");
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert(TEST_CA_PEM),
+            "hits",
+            None,
+        )
+        .expect("inline PEM sslrootcert should parse");
 
         assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
         assert_eq!(
@@ -1541,6 +1561,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         let repl = replication_params_from_connector_params(
             &params_with_sslrootcert(&TEST_CA_PEM.replace('\n', "\\n")),
             "hits",
+            None,
         )
         .expect("single-line inline PEM sslrootcert should parse");
 
@@ -1555,6 +1576,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         let repl = replication_params_from_connector_params(
             &params_with_sslrootcert("/etc/ssl/pg-ca.pem"),
             "hits",
+            None,
         )
         .expect("sslrootcert path should parse");
 
@@ -1635,7 +1657,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             "pg",
             crate::PARAMETERS,
         );
-        let repl = replication_params_from_connector_params(&params, "hits")
+        let repl = replication_params_from_connector_params(&params, "hits", None)
             .expect("valid connection_string should parse");
         assert_eq!(repl.host, "db.internal");
         assert_eq!(repl.port, 5433);
@@ -1661,7 +1683,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             "pg",
             crate::PARAMETERS,
         );
-        let repl = replication_params_from_connector_params(&params, "hits")
+        let repl = replication_params_from_connector_params(&params, "hits", None)
             .expect("URI connection_string should parse for CDC");
         assert_eq!(repl.host, "db.internal");
         assert_eq!(repl.port, 5433);
@@ -1716,7 +1738,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
                 "pg",
                 crate::PARAMETERS,
             );
-            if let Err(e) = replication_params_from_connector_params(&params, "hits") {
+            if let Err(e) = replication_params_from_connector_params(&params, "hits", None) {
                 panic!("pg_replication_temporary_slot={value} must be ignored, not rejected: {e}");
             }
         }
@@ -1876,7 +1898,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     fn replication_params_rejects_invalid_slot_name() {
         let params =
             replication_connection_params(Some("scp-onboarding-realtime-analytics-prod-us-east-1"));
-        let err = replication_params_from_connector_params(&params, "hits")
+        let err = replication_params_from_connector_params(&params, "hits", None)
             .expect_err("hyphenated slot must be rejected");
         assert!(
             err.starts_with("parameter `pg_replication_slot` must contain only lowercase"),
@@ -1891,7 +1913,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     #[test]
     fn replication_params_accepts_valid_explicit_slot_name() {
         let params = replication_connection_params(Some("spice_hits_cdc"));
-        let parsed = replication_params_from_connector_params(&params, "hits")
+        let parsed = replication_params_from_connector_params(&params, "hits", None)
             .expect("valid slot must parse");
         assert_eq!(parsed.slot_name, "spice_hits_cdc");
         assert!(parsed.shared);

@@ -310,6 +310,20 @@ jobs:
           dockerhub-oidc-connection-id: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           hf-token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
+      # The checked-out commit sets up the runner: testoperator, which takes the
+      # `script` subcommand, or on a release branch or an older run's commit that
+      # predates it, the standalone spicescript binary, which takes none.
+      - name: Resolve the runner's subcommand
+        id: runner
+        env:
+          RUNNER_PATH: ${{ steps.spicescript.outputs.path }}
+        run: |
+          case "$(basename "$RUNNER_PATH")" in
+            testoperator) echo "subcommand=script" >> "$GITHUB_OUTPUT" ;;
+            spicescript) echo "subcommand=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Unexpected spicescript runner '$RUNNER_PATH'"; exit 1 ;;
+          esac
+
       # Upgrade scripts start on the release their `from:` names; the token is
       # for the releases API's rate limit.
       - name: Run scripts
@@ -317,7 +331,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+          "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 4 \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -371,7 +385,7 @@ jobs:
           # credentials, so a script whose `requires-env` finds one unset (a
           # secret gone, a token step skipped) fails the job rather than
           # quietly testing less.
-          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+          "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 3 \
             --require-all-env \
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -397,7 +411,7 @@ jobs:
               "--matrix source=ducklake test/spicescript" \
               "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
               # shellcheck disable=SC2086 # args holds several words
-              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+              "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 4 \
                 --duckdb-version "$version" \
                 --spiced "$(command -v spiced)" \
                 --spice-cli "$(command -v spice)" \
@@ -451,7 +465,7 @@ jobs:
 
   # The metastore model's `all` set with its controls, and the object-native
   # data-path suites on every store at full depth (cayenne_object_native.yml).
-  # Pull requests and the merge queue run its quick set.
+  # The merge queue runs its quick set.
   cayenne-object-native:
     name: Cayenne object-native
     needs: resolve
@@ -459,10 +473,8 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.sha }}
       set: all
-    # The called jobs' own permissions: its path filter reads pull requests.
     permissions:
       contents: read
-      pull-requests: read
 
   # The nextest tests that sign-off and the merge queue skip: the SF1
   # result-correctness lanes, which compare Cayenne with standalone DuckDB and
