@@ -58,6 +58,7 @@ opentelemetry.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http-body-limit = { path = "../http-body-limit" }
+http-egress = { path = "../http-egress" }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true

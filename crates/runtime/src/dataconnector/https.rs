@@ -95,36 +95,8 @@ fn parse_max_request_partitions(value: &str) -> Option<usize> {
     value.trim().parse::<usize>().ok().filter(|max| *max > 0)
 }
 
-/// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
-/// redirect cannot reach an internal address by name. The dataset's own host and a proxy's
-/// resolve unchecked.
-#[derive(Default)]
-struct RedirectHostResolver {
-    redirect_hosts: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-}
-
-/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
-fn redirect_host_key(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
-
-impl reqwest::dns::Resolve for RedirectHostResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        let guarded = self
-            .redirect_hosts
-            .lock()
-            .contains(&redirect_host_key(&host));
-        Box::pin(async move {
-            let addresses: Vec<std::net::SocketAddr> = if guarded {
-                ssrf::redirect_destination_guard().resolve(&host).await?
-            } else {
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
-            };
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
+/// Redirects the JSON API client follows before a request fails.
+const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug)]
 pub struct Https {
@@ -997,7 +969,18 @@ impl Https {
         )
     }
 
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+    /// The client a JSON API dataset fetches with, and the egress state the provider follows its
+    /// redirects under.
+    ///
+    /// The dataset's own host is trusted as its first DNS answer leaves it, and every host a
+    /// redirect introduces is checked, with the classifier URL tables use. `reqwest` follows no
+    /// redirect itself: the provider follows them through [`http_egress::send`], which keeps the
+    /// dataset's headers and credentials on its origin. An `https` dataset never makes a
+    /// plaintext request.
+    async fn build_http_client(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<(Client, http_egress::Egress)> {
         let client_timeout = self.configured_client_timeout();
         let connect_timeout = self.configured_connect_timeout();
 
@@ -1017,15 +1000,56 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        let from = Url::parse(dataset.from.as_str()).ok();
-        let origin_host = from
-            .as_ref()
-            .and_then(|url| url.host_str().map(redirect_host_key));
-        let resolver = RedirectHostResolver::default();
-        let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
-        // `http_headers`, an OAuth2 token header that `auth_header_name` names other than
-        // `Authorization`, and enabled header filters (which send the headers a query names) are
-        // credentials reqwest does not remove when a redirect leaves the dataset's origin.
+        let egress = http_egress::Egress::new(
+            Some(ssrf::redirect_destination_guard().redirects_only()),
+            MAX_REDIRECTS,
+        );
+        let https_only = Url::parse(dataset.from.as_str()).is_ok_and(|url| url.scheme() == "https");
+
+        let mut builder = http_egress::configure(
+            Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .connect_timeout(connect_timeout)
+                .timeout(client_timeout)
+                .pool_max_idle_per_host(pool_max_idle_per_host)
+                .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+                .https_only(https_only),
+            &egress,
+        );
+
+        if let Some(identity) = self.resolve_client_identity(dataset).await? {
+            // `Identity::from_pem` yields a rustls identity, but the workspace transitively
+            // enables reqwest's `default-tls` (native-tls) feature, which makes native-tls the
+            // default backend. Building a native-tls client with a PEM identity fails with
+            // "incompatible TLS identity type", so pin this client to rustls to match the
+            // identity type and load the mTLS client certificate.
+            builder = builder.use_rustls_tls().identity(identity);
+        }
+
+        // The provider decodes compressed bodies itself, so it can refuse one that
+        // expands like a compression bomb before it is held in memory.
+        let client = http_body_limit::decode_manually(builder)
+            .build()
+            .boxed()
+            .map_err(|e| DataConnectorError::InternalWithSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })?;
+        Ok((client, egress))
+    }
+
+    /// Which redirects off the dataset's origin its requests refuse, for the credentials they
+    /// carry.
+    ///
+    /// `http_headers`, an `OAuth2` token header that `auth_header_name` names other than
+    /// `Authorization`, and enabled header filters (which send the headers a query names) are
+    /// custom credential headers meant only for the dataset's origin, so a redirect that leaves
+    /// it is refused. Credentials in the `Authorization` header (`OAuth2` with the default token
+    /// header, or the dataset URL's user info, sent as Basic credentials) follow a redirect off
+    /// the origin, which carries none of the request's headers, but not a redirect chain that
+    /// continues on the host it moved to.
+    fn on_origin_change(&self, dataset: &DatasetSpec) -> http_egress::OnOriginChange {
         let sends_custom_header = param_is_set(&self.params, "http_headers")
             || self
                 .params
@@ -1042,72 +1066,17 @@ impl Https {
                 .expose()
                 .ok()
                 .is_some_and(util::parse_enabled);
-        // The dataset URL's user info is sent as Basic credentials.
-        let sends_credentials = sends_custom_header
-            || any_oauth_param_set(&self.params)
-            || from
-                .as_ref()
-                .is_some_and(|url| !url.username().is_empty() || url.password().is_some());
-
-        let mut builder = Client::builder()
-            .user_agent(util::spiceai_user_agent())
-            .connect_timeout(connect_timeout)
-            .timeout(client_timeout)
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                const MAX_REDIRECTS: usize = 5;
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    return attempt.error("too many redirects");
-                }
-                if sends_custom_header
-                    && ssrf::redirect_leaves_origin(attempt.previous(), attempt.url())
-                {
-                    let refused = ssrf::DestinationRefused::off_origin(attempt.url());
-                    return attempt.error(refused);
-                }
-                if sends_credentials
-                    && ssrf::redirect_continues_off_origin(attempt.previous(), attempt.url())
-                {
-                    let refused = ssrf::DestinationRefused::redirect_chain(attempt.url());
-                    return attempt.error(refused);
-                }
-                // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target, with the same classifier URL tables use.
-                if ssrf::redirect_target_is_internal(attempt.url()) {
-                    return attempt.error("redirect to a private address is not allowed");
-                }
-                // This closure cannot resolve DNS, so the resolver checks the
-                // addresses of each new host a redirect names.
-                if let Some(url::Host::Domain(host)) = attempt.url().host() {
-                    let host = redirect_host_key(host);
-                    if origin_host.as_deref() != Some(host.as_str()) {
-                        redirect_hosts.lock().insert(host);
-                    }
-                }
-                attempt.follow()
-            }))
-            .dns_resolver(Arc::new(resolver))
-            .pool_max_idle_per_host(pool_max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
-
-        if let Some(identity) = self.resolve_client_identity(dataset).await? {
-            // `Identity::from_pem` yields a rustls identity, but the workspace transitively
-            // enables reqwest's `default-tls` (native-tls) feature, which makes native-tls the
-            // default backend. Building a native-tls client with a PEM identity fails with
-            // "incompatible TLS identity type", so pin this client to rustls to match the
-            // identity type and load the mTLS client certificate.
-            builder = builder.use_rustls_tls().identity(identity);
+        if sends_custom_header {
+            return http_egress::OnOriginChange::Refuse;
         }
-
-        // The provider decodes compressed bodies itself, so it can refuse one that
-        // expands like a compression bomb before it is held in memory.
-        http_body_limit::decode_manually(builder)
-            .build()
-            .boxed()
-            .map_err(|e| DataConnectorError::InternalWithSource {
-                dataconnector: "https".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            })
+        let sends_credentials = any_oauth_param_set(&self.params)
+            || Url::parse(dataset.from.as_str())
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+        if sends_credentials {
+            http_egress::OnOriginChange::FollowWithCredentials
+        } else {
+            http_egress::OnOriginChange::Follow
+        }
     }
 
     /// Parse `OAuth2` parameters into a config and grant.
@@ -1269,6 +1238,12 @@ impl Https {
                 scopes,
                 client_auth,
                 header,
+                // The token endpoint is the operator's: its host is pinned to its first
+                // DNS answer, and a redirect never takes the token request to another origin.
+                egress: http_egress::Egress::new(
+                    Some(ssrf::redirect_destination_guard().redirects_only()),
+                    MAX_REDIRECTS,
+                ),
             },
             grant,
         )))
@@ -1318,6 +1293,7 @@ impl Https {
         match err {
             AuthErr::InvalidTokenUrl { .. }
             | AuthErr::InsecureTokenUrl { .. }
+            | AuthErr::TokenRedirectRefused { .. }
             | AuthErr::UnsupportedTokenType { .. }
             | AuthErr::TokenEndpointStatus {
                 status: 400 | 401 | 403,
@@ -1350,7 +1326,8 @@ impl Https {
             }
         })?;
 
-        let client = self.build_http_client(dataset).await?;
+        let (client, egress) = self.build_http_client(dataset).await?;
+        let on_origin_change = self.on_origin_change(dataset);
 
         let HttpProviderParams {
             file_format,
@@ -1387,6 +1364,7 @@ impl Https {
             file_format,
             acceleration_enabled,
         )
+        .with_egress(egress, on_origin_change)
         .with_table_reference(dataset.name.clone())
         .with_max_retries(max_retries)
         .with_backoff_method(backoff_method)
@@ -4926,16 +4904,20 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let origin = format!("http://127.0.0.1:{origin_port}/data");
         let connector = test_connector(Some("json")).await;
         let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
+        let (client, egress) = connector
             .build_http_client(&dataset)
             .await
             .expect("build the HTTP client");
 
-        let error = client
-            .get(&origin)
-            .send()
-            .await
-            .expect_err("the redirect is refused");
+        let request = client.get(&origin).build().expect("the request builds");
+        let error = http_egress::send(
+            &client,
+            request,
+            &egress,
+            http_egress::OnOriginChange::Follow,
+        )
+        .await
+        .expect_err("the redirect is refused");
 
         let message =
             std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
@@ -4962,7 +4944,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let origin = format!("http://localhost.:{port}/data");
         let connector = test_connector(Some("json")).await;
         let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
+        let (client, _) = connector
             .build_http_client(&dataset)
             .await
             .expect("build the HTTP client");
@@ -4978,7 +4960,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     /// Answers `/a` with a redirect to its own `/b`, and every other path with [`OK_RESPONSE`].
-    /// Counts the requests for `/b`.
+    /// Counts the requests for `/b`, so a request for another path (the endpoint probe) is not
+    /// counted.
     async fn serve_chain_target() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -5000,95 +4983,15 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 let response = if request.starts_with(b"GET /a ") {
                     "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 } else {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if request.starts_with(b"GET /b ") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     OK_RESPONSE
                 };
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
         (port, second_hops)
-    }
-
-    /// Requests a dataset at `http://{userinfo}localhost.:<port>/data` whose origin redirects to
-    /// `/a` on another port, which redirects to its own `/b`. Every hop keeps the dataset's host
-    /// name, so no hop is refused as internal. Returns the result, the number of requests for
-    /// `/b`, and the target's port.
-    async fn get_through_a_redirect_chain(
-        userinfo: &str,
-        extra: &[(&str, &str)],
-    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
-        let (target_port, second_hops) = serve_chain_target().await;
-        let (origin_port, _) = serve_fixed(format!(
-            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/a\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
-        ))
-        .await;
-        let origin = format!("http://{userinfo}localhost.:{origin_port}/data");
-        let mut params = vec![("file_format", "json")];
-        params.extend_from_slice(extra);
-        let connector = test_connector_with(&params).await;
-        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
-            .build_http_client(&dataset)
-            .await
-            .expect("build the HTTP client");
-        let result = client.get(&origin).send().await;
-        (
-            result,
-            second_hops.load(std::sync::atomic::Ordering::SeqCst),
-            target_port,
-        )
-    }
-
-    #[tokio::test]
-    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
-     {
-        for (userinfo, extra) in [
-            ("svc:s3cret@", &[][..]),
-            (
-                "",
-                &[("auth_token_url", "https://example.com/oauth/token")][..],
-            ),
-        ] {
-            let (result, second_hops, target_port) =
-                get_through_a_redirect_chain(userinfo, extra).await;
-
-            let error = result.expect_err("the redirect chain is refused");
-            let chain = || {
-                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
-                    e.source()
-                })
-            };
-            let message = chain()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(": ");
-            assert!(
-                message.contains(&format!(
-                    "Refused to connect to http://localhost.:{target_port}: {}",
-                    ssrf::REDIRECT_CHAIN_REFUSED
-                )),
-                "the refusal names only the target's origin with {userinfo:?} {extra:?}: {message}"
-            );
-            assert!(
-                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
-                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
-            );
-            assert_eq!(
-                second_hops, 0,
-                "the second hop on the target is never requested with {userinfo:?} {extra:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
-    {
-        let (result, second_hops, _) = get_through_a_redirect_chain("", &[]).await;
-
-        let response = result.expect("the redirect chain is followed");
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(second_hops, 1);
     }
 
     /// Parameters that send a custom credential header.
@@ -5098,112 +5001,125 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         ("request_header_filters", "enabled"),
     ];
 
-    /// Requests a dataset at `http://localhost.:<port>/data` whose origin redirects to `/data` on
-    /// another port of the same host. Returns the result, the number of requests the target
-    /// received, and the target's port.
-    async fn get_through_a_redirect_off_the_origin(
-        extra: &[(&str, &str)],
-    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
-        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
-        let (origin_port, _) = serve_fixed(format!(
-            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
-             Content-Length: 0\r\nConnection: close\r\n\r\n"
-        ))
-        .await;
-        let origin = format!("http://localhost.:{origin_port}/data");
-        let mut params = vec![("file_format", "json")];
-        params.extend_from_slice(extra);
-        let connector = test_connector_with(&params).await;
-        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
-        let client = connector
-            .build_http_client(&dataset)
-            .await
-            .expect("build the HTTP client");
-        let result = client.get(&origin).send().await;
-        (
-            result,
-            target_requests.load(std::sync::atomic::Ordering::SeqCst),
-            target_port,
-        )
+    /// A custom credential header refuses every redirect off the dataset's origin, credentials in
+    /// the `Authorization` header refuse a redirect chain that continues on the host it moved to,
+    /// and a dataset without credentials follows both.
+    #[tokio::test]
+    async fn a_datasets_credentials_choose_which_redirects_off_its_origin_are_refused() {
+        use http_egress::OnOriginChange::{Follow, FollowWithCredentials, Refuse};
+
+        const TOKEN_URL: (&str, &str) = ("auth_token_url", "https://example.com/oauth/token");
+        for (userinfo, params, expected) in [
+            ("", &[][..], Follow),
+            ("", &[CUSTOM_HEADER_PARAMS[0]][..], Refuse),
+            ("", &[TOKEN_URL, CUSTOM_HEADER_PARAMS[1]][..], Refuse),
+            ("", &[CUSTOM_HEADER_PARAMS[2]][..], Refuse),
+            ("svc:s3cret@", &[CUSTOM_HEADER_PARAMS[0]][..], Refuse),
+            ("", &[TOKEN_URL][..], FollowWithCredentials),
+            (
+                "",
+                &[TOKEN_URL, ("auth_header_name", "authorization")][..],
+                FollowWithCredentials,
+            ),
+            ("svc:s3cret@", &[][..], FollowWithCredentials),
+            ("svc@", &[][..], FollowWithCredentials),
+        ] {
+            let connector = test_connector_with(params).await;
+            let dataset = test_dataset(
+                &format!("https://{userinfo}api.example.com/data"),
+                RefreshMode::Append,
+                None,
+            )
+            .await;
+            assert_eq!(
+                connector.on_origin_change(&dataset),
+                expected,
+                "{userinfo:?} {params:?}"
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn a_dataset_with_a_custom_credential_header_does_not_follow_a_redirect_off_its_origin() {
-        for extra in CUSTOM_HEADER_PARAMS {
-            let (result, target_requests, target_port) =
-                get_through_a_redirect_off_the_origin(&[*extra]).await;
+    /// Queries a JSON API dataset at `url` with `params` through the connector's own provider
+    /// and returns the number of rows, or the query's error. Query filters make it a JSON API
+    /// dataset rather than a file.
+    async fn query_rows(url: &str, params: &[(&str, &str)]) -> datafusion::error::Result<usize> {
+        let mut all = vec![
+            ("file_format", "json"),
+            ("request_query_filters", "enabled"),
+        ];
+        all.extend_from_slice(params);
+        let connector = test_connector_with(&all).await;
+        let dataset = test_dataset(url, RefreshMode::Append, None).await;
+        let provider = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+            .expect("build the HTTP provider");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("origin", provider)
+            .expect("register the table");
+        let batches = ctx.sql("SELECT * FROM origin").await?.collect().await?;
+        Ok(batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum())
+    }
 
-            let error = result.expect_err("the redirect is refused");
-            let chain = || {
-                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
-                    e.source()
-                })
-            };
-            let message = chain()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(": ");
+    /// The provider follows its redirects under the dataset's choice: with `http_headers`, a
+    /// redirect to another origin fails the query before the target is resolved; without it,
+    /// the same redirect is followed until the target resolves to loopback. A target that does
+    /// not look internal until it resolves (`localhost.`, with its trailing dot) keeps the two
+    /// refusals apart.
+    #[tokio::test]
+    async fn the_provider_refuses_a_redirect_off_the_origin_for_a_custom_credential_header() {
+        for (params, refused) in [
+            (
+                &[CUSTOM_HEADER_PARAMS[0]][..],
+                "the server redirected to another origin, http://localhost.:{target}, and this \
+                 request carries a credential that is sent only to http://127.0.0.1:{origin}",
+            ),
+            (&[][..], "Refused to connect to localhost."),
+        ] {
+            let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+            let (origin_port, origin_requests) = serve_fixed(format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let refused = refused
+                .replace("{target}", &target_port.to_string())
+                .replace("{origin}", &origin_port.to_string());
+
+            let error = query_rows(&format!("http://127.0.0.1:{origin_port}/data"), params)
+                .await
+                .expect_err("the redirect is refused");
+
             assert!(
-                message.contains(&format!(
-                    "Refused to connect to http://localhost.:{target_port}: {}",
-                    ssrf::OFF_ORIGIN_REDIRECT_REFUSED
-                )),
-                "the refusal names the target's origin with {extra:?}: {message}"
+                error.to_string().contains(&refused),
+                "{params:?}: expected {refused:?} in {error}"
             );
             assert!(
-                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
-                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
+                origin_requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "{params:?}: the query reached the origin"
             );
             assert_eq!(
-                target_requests, 0,
-                "the redirect target is never requested with {extra:?}"
+                target_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{params:?}: the redirect target is never requested"
             );
         }
     }
 
     #[tokio::test]
     async fn a_dataset_with_a_custom_credential_header_follows_a_redirect_within_its_origin() {
-        for extra in CUSTOM_HEADER_PARAMS {
-            let (port, second_hops) = serve_chain_target().await;
-            let url = format!("http://localhost.:{port}/a");
-            let connector = test_connector_with(&[("file_format", "json"), *extra]).await;
-            let dataset = test_dataset(&url, RefreshMode::Append, None).await;
-            let client = connector
-                .build_http_client(&dataset)
-                .await
-                .expect("build the HTTP client");
+        let (port, second_hops) = serve_chain_target().await;
+        let rows = query_rows(
+            &format!("http://127.0.0.1:{port}/a"),
+            &[CUSTOM_HEADER_PARAMS[0]],
+        )
+        .await
+        .expect("the redirect within the origin is followed");
 
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
-
-            assert_eq!(response.status(), reqwest::StatusCode::OK);
-            assert_eq!(
-                second_hops.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "{extra:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_dataset_without_a_custom_credential_header_follows_a_redirect_off_its_origin() {
-        for extra in [
-            &[][..],
-            &[("auth_token_url", "https://example.com/oauth/token")][..],
-            &[
-                ("auth_token_url", "https://example.com/oauth/token"),
-                ("auth_header_name", "authorization"),
-            ][..],
-        ] {
-            let (result, target_requests, _) = get_through_a_redirect_off_the_origin(extra).await;
-
-            let response =
-                result.unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
-            assert_eq!(response.status(), reqwest::StatusCode::OK);
-            assert_eq!(target_requests, 1, "{extra:?}");
-        }
+        assert_eq!(rows, 0, "the target answers an empty array");
+        assert_eq!(second_hops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

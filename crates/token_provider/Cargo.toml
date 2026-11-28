@@ -13,6 +13,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 http-body-limit = { path = "../http-body-limit" }
+http-egress = { path = "../http-egress" }
 http-retry = { path = "../http-retry" }
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 reqwest = { workspace = true, features = ["form"] }

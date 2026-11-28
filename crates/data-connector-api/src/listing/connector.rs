@@ -2262,6 +2262,18 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         }
     }
 
+    async fn object_store_scope(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<crate::ObjectStoreScope>> {
+        let store_url = self.get_object_store_url(dataset, None)?;
+        let (_, listing_suffix) = self.get_file_format_and_extension(dataset).await?;
+        Ok(Some(crate::ObjectStoreScope {
+            store_url,
+            listing_suffix: listing_suffix.as_str().to_string(),
+        }))
+    }
+
     async fn register_object_stores(
         &self,
         dataset: &DatasetSpec,

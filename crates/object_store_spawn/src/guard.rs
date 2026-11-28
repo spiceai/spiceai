@@ -17,16 +17,26 @@ limitations under the License.
 //! Destination checks for [`SpawnedReqwestConnector`](crate::SpawnedReqwestConnector).
 //!
 //! `object_store` builds its `reqwest` client privately and follows up to ten redirects to any
-//! host. A guarded connector builds a minimal client itself and adds two checks:
+//! host. A guarded connector builds a minimal client itself and applies the shared egress policy
+//! of [`http_egress`] to it:
 //!
-//! - a redirect policy that refuses any hop whose URL the guard blocks, and
+//! - a redirect policy that refuses a downgrade from HTTPS to HTTP, and any hop that changes the
+//!   origin onto a destination the guard blocks, and
 //! - a DNS resolver that refuses a host when any address it resolves to is blocked, so a
 //!   hostname cannot be used to reach an address the redirect check would have refused.
 //!
 //! Hosts given as IP literals are not resolved, so callers check the first URL themselves;
 //! redirect targets are checked by the policy. A guard made with
-//! [`DestinationGuard::redirects_only`] leaves the request's own host unchecked and checks only
-//! redirects to other hosts and the addresses those hosts resolve to.
+//! [`DestinationGuard::redirects_only`] trusts the store's own host as its first answer leaves
+//! it: an internal first answer is a host the operator configured, and a public one is checked
+//! from then on. A redirect that changes the port or scheme on that host is a new destination.
+//!
+//! `reqwest` removes `Authorization` and the other standard credential headers when a redirect
+//! changes the host or port, which covers the only credential these stores send (`http_auth`'s
+//! `Authorization: Basic`); with downgrades refused, a scheme change is an upgrade. It removes
+//! them only from the hop that changes the host or port, so a client with default headers
+//! refuses a redirect chain that continues on the host it moved to
+//! ([`http_egress::OnOriginChange::FollowWithCredentials`]).
 //!
 //! The client applies only `allow_http`, `timeout`, `connect_timeout`, `http1_only`,
 //! `user_agent`, and default headers. Building fails if any other client option differs from
@@ -39,15 +49,10 @@ limitations under the License.
 //! blocked address is refused with the guard's reason. The guard cannot see the address a proxy
 //! resolves the destination to; the caller's first-URL check and the redirect policy still apply.
 
-use std::{
-    collections::HashSet,
-    error::Error as StdError,
-    fmt,
-    net::IpAddr,
-    net::SocketAddr,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{error::Error as StdError, sync::Arc};
 
+pub use http_egress::{DestinationGuard, DestinationRefused};
+use http_egress::{Egress, OnOriginChange, RedirectRefused};
 use object_store::{
     ClientConfigKey, ClientOptions,
     client::{HttpError, HttpErrorKind},
@@ -56,45 +61,9 @@ use reqwest::{
     dns::{Addrs, Name, Resolve, Resolving},
     redirect,
 };
-use snafu::Snafu;
-use url::Url;
 
 /// Redirects followed before the request fails; the same limit `object_store`'s client uses.
 const MAX_REDIRECTS: usize = 10;
-
-/// Why a client that sends credentials refuses a redirect for which
-/// [`redirect_continues_off_origin`] is true.
-pub const REDIRECT_CHAIN_REFUSED: &str = "a request that carries credentials does not follow a redirect chain that continues on another host. Configure the endpoint URL as the redirect target directly.";
-
-/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), stays on
-/// the host and port of the previous URL when that URL is not on the request's own host and port.
-/// A client that sends credentials refuses such a redirect, so its credentials stay on the
-/// request's origin across a redirect chain.
-#[must_use]
-pub fn redirect_continues_off_origin(chain: &[Url], next: &Url) -> bool {
-    let same_host_and_port = |a: &Url, b: &Url| {
-        a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
-    };
-    match (chain.first(), chain.last()) {
-        (Some(first), Some(previous)) => {
-            same_host_and_port(previous, next) && !same_host_and_port(first, previous)
-        }
-        _ => false,
-    }
-}
-
-/// Why a client that sends a custom credential header refuses a redirect for which
-/// [`redirect_leaves_origin`] is true.
-pub const OFF_ORIGIN_REDIRECT_REFUSED: &str = "a request that carries a custom credential header follows a redirect only to its own scheme, host, and port. Configure the endpoint URL as the redirect target directly.";
-
-/// Whether a redirect to `next`, after the URLs in `chain` (the request's own URL first), leaves
-/// the request's own scheme, host, or port.
-#[must_use]
-pub fn redirect_leaves_origin(chain: &[Url], next: &Url) -> bool {
-    chain
-        .first()
-        .is_none_or(|own| own.origin() != next.origin())
-}
 
 /// Client options [`build_client`] does not apply; each must keep its default.
 const UNAPPLIED: &[ClientConfigKey] = &[
@@ -112,131 +81,24 @@ const UNAPPLIED: &[ClientConfigKey] = &[
     ClientConfigKey::RandomizeAddresses,
 ];
 
-type AddressCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
-type UrlCheck = Arc<dyn Fn(&Url) -> bool + Send + Sync>;
-
-/// Which hosts a [`DestinationGuard`] checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResolvedHosts {
-    All,
-    RedirectTargets,
-}
-
-/// Which destinations a guarded connector refuses to reach.
-#[derive(Clone)]
-pub struct DestinationGuard {
-    blocks_address: AddressCheck,
-    blocks_redirect: UrlCheck,
-    reason: Arc<str>,
-    checked_hosts: ResolvedHosts,
-}
-
-impl DestinationGuard {
-    /// `blocks_address` is asked about every address a hostname resolves to, and
-    /// `blocks_redirect` about every redirect target. `reason` completes the error a refused
-    /// request returns: "Refused to connect to {target}: {reason}".
-    #[must_use]
-    pub fn new(
-        blocks_address: impl Fn(IpAddr) -> bool + Send + Sync + 'static,
-        blocks_redirect: impl Fn(&Url) -> bool + Send + Sync + 'static,
-        reason: impl Into<Arc<str>>,
-    ) -> Self {
-        Self {
-            blocks_address: Arc::new(blocks_address),
-            blocks_redirect: Arc::new(blocks_redirect),
-            reason: reason.into(),
-            checked_hosts: ResolvedHosts::All,
-        }
-    }
-
-    /// Checks only redirects to a host other than the request's own, and the addresses of the
-    /// hosts those redirects name. The request's own host is allowed whatever it resolves to,
-    /// including a redirect to another path or port on it.
-    #[must_use]
-    pub fn redirects_only(mut self) -> Self {
-        self.checked_hosts = ResolvedHosts::RedirectTargets;
-        self
-    }
-
-    /// Resolves `host` with the system resolver and refuses it if any address it resolves to is
-    /// blocked, so a name that resolves to both a public and a blocked address is refused too.
-    ///
-    /// # Errors
-    ///
-    /// Returns the lookup error, or a [`DestinationRefused`] when an address is blocked.
-    pub async fn resolve(
-        &self,
-        host: &str,
-    ) -> Result<Vec<SocketAddr>, Box<dyn StdError + Send + Sync>> {
-        let host = host.to_ascii_lowercase();
-        let addresses: Vec<SocketAddr> =
-            tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-        if addresses
-            .iter()
-            .any(|address| (self.blocks_address)(address.ip()))
-        {
-            return Err(Box::new(self.refused(host)));
-        }
-        Ok(addresses)
-    }
-
-    fn refused(&self, target: impl Into<String>) -> DestinationRefused {
-        DestinationRefused {
-            target: target.into(),
-            reason: Arc::clone(&self.reason),
-        }
-    }
-}
-
-impl fmt::Debug for DestinationGuard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DestinationGuard")
-            .field("reason", &self.reason)
-            .finish_non_exhaustive()
-    }
-}
-
-/// A request refused by a [`DestinationGuard`] or by a redirect policy.
-#[derive(Debug, Clone, Snafu)]
-#[snafu(display("Refused to connect to {target}: {reason}"))]
-pub struct DestinationRefused {
-    target: String,
-    reason: Arc<str>,
-}
-
-impl DestinationRefused {
-    /// The refusal of a redirect to `target` that [`redirect_continues_off_origin`] reports for a
-    /// request that carries credentials. It names only the target's origin, because a path or
-    /// query can hold secrets.
-    #[must_use]
-    pub fn redirect_chain(target: &Url) -> Self {
-        Self {
-            target: target.origin().ascii_serialization(),
-            reason: Arc::from(REDIRECT_CHAIN_REFUSED),
-        }
-    }
-
-    /// The refusal of a redirect to `target` that [`redirect_leaves_origin`] reports for a request
-    /// that carries a custom credential header. It names only the target's origin, because a path
-    /// or query can hold secrets.
-    #[must_use]
-    pub fn off_origin(target: &Url) -> Self {
-        Self {
-            target: target.origin().ascii_serialization(),
-            reason: Arc::from(OFF_ORIGIN_REDIRECT_REFUSED),
-        }
-    }
-}
-
 /// Returns the refusal behind `error`, if a guard caused it.
 ///
-/// `reqwest` reports a refused DNS lookup as a connect error, which `object_store` retries
-/// with backoff; the caller re-wraps the refusal so the request fails at once instead.
+/// `reqwest` reports a refused DNS lookup as a connect error, and a refused redirect as a
+/// redirect error, which `object_store` may retry with backoff; the caller re-wraps the refusal
+/// so the request fails at once instead.
 pub(crate) fn refusal(error: &HttpError) -> Option<HttpError> {
     let mut source: Option<&(dyn StdError + 'static)> = Some(error);
     while let Some(current) = source {
         if let Some(refused) = current.downcast_ref::<DestinationRefused>() {
             return Some(HttpError::new(HttpErrorKind::Unknown, refused.clone()));
+        }
+        if let Some(refused) = current.downcast_ref::<RedirectRefused>() {
+            return Some(match refused {
+                RedirectRefused::Destination { source } => {
+                    HttpError::new(HttpErrorKind::Unknown, source.clone())
+                }
+                other => HttpError::new(HttpErrorKind::Unknown, other.clone()),
+            });
         }
         source = current.source();
     }
@@ -261,56 +123,36 @@ pub(crate) fn build_client(
         )));
     }
 
-    let redirect_guard = guard.clone();
-    let sends_credentials = options
+    let egress = Egress::new(Some(guard.clone()), MAX_REDIRECTS);
+    let policy_egress = egress.clone();
+    // A default header is sent on every request, so a store that sets one (such as the Basic
+    // credentials from a URL's user name and password) carries credentials.
+    let on_origin_change = if options
         .get_default_headers()
-        .is_some_and(|headers| !headers.is_empty());
-    let redirect_hosts = Arc::new(Mutex::new(HashSet::new()));
-    let new_redirect_hosts = Arc::clone(&redirect_hosts);
+        .is_some_and(|headers| !headers.is_empty())
+    {
+        OnOriginChange::FollowWithCredentials
+    } else {
+        OnOriginChange::Follow
+    };
     let mut builder = reqwest::Client::builder()
         // Compression changes `Content-Length`, which `object_store` reads as the object size.
         .no_gzip()
         .no_brotli()
         .no_zstd()
         .no_deflate()
-        .redirect(redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.error("too many redirects");
-            }
-            if sends_credentials && redirect_continues_off_origin(attempt.previous(), attempt.url())
-            {
-                let refused = DestinationRefused::redirect_chain(attempt.url());
-                return attempt.error(refused);
-            }
-            // The chain's first URL names the request's own host.
-            let own_host = attempt
-                .previous()
-                .first()
-                .and_then(Url::host_str)
-                .map(host_key);
-            let target_host = attempt.url().host_str().map(host_key);
-            if redirect_guard.checked_hosts == ResolvedHosts::RedirectTargets
-                && target_host.is_some()
-                && own_host == target_host
-            {
-                return attempt.follow();
-            }
-            if (redirect_guard.blocks_redirect)(attempt.url()) {
-                let refused = redirect_guard.refused(attempt.url().as_str());
-                return attempt.error(refused);
-            }
-            if let (Some(url::Host::Domain(_)), Some(host)) = (attempt.url().host(), target_host) {
-                new_redirect_hosts
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(host);
-            }
-            attempt.follow()
-        }))
-        .dns_resolver(Arc::new(GuardedResolver {
-            guard: guard.clone(),
-            redirect_hosts,
-        }))
+        .redirect(redirect::Policy::custom(
+            move |attempt| match http_egress::follow_redirect(
+                &policy_egress,
+                attempt.previous(),
+                attempt.url(),
+                on_origin_change,
+            ) {
+                Ok(_) => attempt.follow(),
+                Err(refused) => attempt.error(refused),
+            },
+        ))
+        .dns_resolver(Arc::new(GuardedResolver { egress }))
         .https_only(!flag(value(ClientConfigKey::AllowHttp))?);
 
     if let Some(user_agent) = value(ClientConfigKey::UserAgent) {
@@ -331,35 +173,17 @@ pub(crate) fn build_client(
     builder.build().map_err(generic)
 }
 
-/// `host` as the redirect host set keys it: `example.com.` and `example.com` name the same host.
-fn host_key(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
-
-/// Resolves the hosts `guard` checks through [`DestinationGuard::resolve`], and other hosts
-/// with the system resolver.
+/// Resolves every host through the client's [`Egress`].
 struct GuardedResolver {
-    guard: DestinationGuard,
-    /// Hosts named by redirects that leave the request's own host; in
-    /// [`ResolvedHosts::RedirectTargets`] mode only these are checked.
-    redirect_hosts: Arc<Mutex<HashSet<String>>>,
+    egress: Egress,
 }
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let guard = self.guard.clone();
-        let checked = guard.checked_hosts == ResolvedHosts::All
-            || self
-                .redirect_hosts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&host_key(name.as_str()));
+        let egress = self.egress.clone();
+        let name = name.as_str().to_string();
         Box::pin(async move {
-            let addresses: Vec<SocketAddr> = if checked {
-                guard.resolve(name.as_str()).await?
-            } else {
-                tokio::net::lookup_host((name.as_str(), 0)).await?.collect()
-            };
+            let addresses = egress.resolve(&name).await?;
             Ok(Box::new(addresses.into_iter()) as Addrs)
         })
     }
@@ -381,76 +205,5 @@ fn flag(value: Option<String>) -> object_store::Result<bool> {
         "1" | "true" | "on" | "yes" | "y" => Ok(true),
         "0" | "false" | "off" | "no" | "n" => Ok(false),
         _ => Err(generic(format!("failed to parse \"{value}\" as a boolean"))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::redirect_continues_off_origin;
-    use url::Url;
-
-    fn chain(urls: &[&str]) -> Vec<Url> {
-        urls.iter()
-            .map(|url| Url::parse(url).expect("valid URL"))
-            .collect()
-    }
-
-    #[test]
-    fn a_redirect_chain_may_not_continue_on_a_host_it_moved_to() {
-        let endpoint = "https://api.example.com/data";
-        for (previous, next) in [
-            (
-                vec![endpoint, "https://cdn.example.net/a"],
-                "https://cdn.example.net/b",
-            ),
-            (
-                vec![endpoint, "https://cdn.example.net/a"],
-                "http://cdn.example.net:443/b",
-            ),
-            (
-                vec![endpoint, "https://api.example.com:8443/a"],
-                "https://api.example.com:8443/b",
-            ),
-            (
-                vec![
-                    endpoint,
-                    "https://cdn.example.net/a",
-                    "https://edge.example.org/x",
-                ],
-                "https://edge.example.org/y",
-            ),
-        ] {
-            let next = Url::parse(next).expect("valid URL");
-            assert!(
-                redirect_continues_off_origin(&chain(&previous), &next),
-                "{previous:?} -> {next} must be refused"
-            );
-        }
-        for (previous, next) in [
-            (vec![endpoint], "https://cdn.example.net/a"),
-            (vec![endpoint], "https://api.example.com/other"),
-            (
-                vec![endpoint, "https://api.example.com/x"],
-                "https://api.example.com:443/y",
-            ),
-            (
-                vec![endpoint, "https://api.example.com/x"],
-                "https://cdn.example.net/a",
-            ),
-            (
-                vec![endpoint, "https://cdn.example.net/a"],
-                "https://edge.example.org/x",
-            ),
-            (
-                vec![endpoint, "https://cdn.example.net/a"],
-                "https://api.example.com/back",
-            ),
-        ] {
-            let next = Url::parse(next).expect("valid URL");
-            assert!(
-                !redirect_continues_off_origin(&chain(&previous), &next),
-                "{previous:?} -> {next} must be followed"
-            );
-        }
     }
 }

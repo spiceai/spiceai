@@ -23,10 +23,12 @@ fundu.workspace = true
 
 futures.workspace = true
 http.workspace = true
+http-egress = { path = "../http-egress" }
 libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
 object_store_spawn = { path = "../object_store_spawn" }
+percent-encoding.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true

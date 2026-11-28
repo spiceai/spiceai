@@ -59,6 +59,14 @@ pub enum Error {
     ))]
     ReqwestInternal { source: reqwest::Error },
 
+    #[snafu(display(
+        "Failed to send the GraphQL request to {endpoint}: {source}. Point the dataset at the URL the server redirects to. See: https://spiceai.org/docs/components/data-connectors/graphql"
+    ))]
+    RedirectRefused {
+        endpoint: String,
+        source: http_egress::RedirectRefused,
+    },
+
     /// The response body could not be read: refused as a compression bomb, or because the
     /// query memory pool could not hold it, or it could not be read as sent.
     #[snafu(display(

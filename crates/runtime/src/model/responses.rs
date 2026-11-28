@@ -260,9 +260,10 @@ async fn openai(
         });
     }
 
-    Ok(Arc::new(llms::openai::new_openai_client(
-        model, api_base, api_key, org_id, project_id, usage_tier,
-    )) as Arc<dyn Responses>)
+    Ok(Arc::new(
+        llms::openai::new_openai_client(model, api_base, api_key, org_id, project_id, usage_tier)
+            .map_err(super::chat::client_error)?,
+    ) as Arc<dyn Responses>)
 }
 
 async fn azure(
@@ -284,7 +285,10 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Respon
             source: "No `xai_api_key` provided for xAI model.".into(),
         });
     };
-    Ok(Arc::new(llms::xai::Xai::new(model_id, api_key)) as Arc<dyn Responses>)
+    Ok(
+        Arc::new(llms::xai::Xai::new(model_id, api_key).map_err(super::chat::client_error)?)
+            as Arc<dyn Responses>,
+    )
 }
 
 #[cfg(test)]

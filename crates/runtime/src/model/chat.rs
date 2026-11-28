@@ -394,7 +394,7 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Chat>,
             source: "No `xai_api_key` provided for xAI model.".into(),
         });
     };
-    Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
+    Ok(Arc::new(Xai::new(model_id, api_key).map_err(client_error)?) as Arc<dyn Chat>)
 }
 
 async fn anthropic(
@@ -735,13 +735,16 @@ async fn databricks(
         )
         .await
         .map_err(model_error)?;
-        return Ok(Arc::new(llms::databricks::from_token_provider(
-            endpoint,
-            model_id.as_str(),
-            token_provider,
-            user_agent,
-            HealthCheck::Required,
-        )) as Arc<dyn Chat>);
+        return Ok(Arc::new(
+            llms::databricks::from_token_provider(
+                endpoint,
+                model_id.as_str(),
+                token_provider,
+                user_agent,
+                HealthCheck::Required,
+            )
+            .map_err(client_error)?,
+        ) as Arc<dyn Chat>);
     }
 
     match (token_opt, client_id, client_secret) {
@@ -768,12 +771,10 @@ async fn databricks(
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
-            endpoint,
-            model_id.as_str(),
-            token,
-            user_agent,
-        )) as Arc<dyn Chat>),
+        (Some(token), None, None) => Ok(Arc::new(
+            llms::databricks::from_access_token(endpoint, model_id.as_str(), token, user_agent)
+                .map_err(client_error)?,
+        ) as Arc<dyn Chat>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
                 .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
@@ -798,6 +799,7 @@ async fn databricks(
                     user_agent,
                     HealthCheck::Required,
                 )
+                .map_err(client_error)?,
             ) as Arc<dyn Chat>)
         }
         (None, Some(client_id), None) => {
@@ -821,9 +823,18 @@ async fn databricks(
                     token_provider,
                     user_agent,
                     HealthCheck::Skip,
-                ),
+                )
+                .map_err(client_error)?,
             ) as Arc<dyn Chat>)
         }
+    }
+}
+
+/// The load error for a model whose HTTP client could not be built, which happens only when its
+/// TLS backend cannot be initialized.
+pub(crate) fn client_error(source: async_openai::error::OpenAIError) -> LlmError {
+    LlmError::FailedToLoadModel {
+        source: Box::new(source),
     }
 }
 
@@ -854,11 +865,10 @@ fn spiceai(
         });
     }
 
-    Ok(Arc::new(llms::spiceai::new_spiceai_client(
-        model_id,
-        Some(endpoint),
-        api_key,
-    )) as Arc<dyn Chat>)
+    Ok(Arc::new(
+        llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key)
+            .map_err(client_error)?,
+    ) as Arc<dyn Chat>)
 }
 
 async fn openai(
@@ -898,15 +908,18 @@ async fn openai(
         });
     }
 
-    Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
-        model,
-        api_base,
-        api_key,
-        org_id,
-        project_id,
-        usage_tier,
-        chat_backend,
-    )) as Arc<dyn Chat>)
+    Ok(Arc::new(
+        llms::openai::new_openai_client_with_chat_backend(
+            model,
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+            usage_tier,
+            chat_backend,
+        )
+        .map_err(client_error)?,
+    ) as Arc<dyn Chat>)
 }
 
 /// Rejects a negative or unparseable `temperature` override at load time rather
@@ -1000,7 +1013,8 @@ pub(crate) async fn azure_client(
             entra_token,
             api_key,
             params.responses_api,
-        ),
+        )
+        .map_err(client_error)?,
     ))
 }
 

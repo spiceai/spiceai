@@ -33,9 +33,12 @@ use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, http::HttpBuilder};
 use object_store_spawn::{DestinationGuard, SpawnedReqwestConnector};
 use tokio::runtime::Handle;
-use url::{Url, form_urlencoded::parse};
+use url::{
+    Url,
+    form_urlencoded::{self, parse},
+};
 
-use crate::{http_auth, ssrf};
+use crate::{http_auth, ssrf, url_table};
 
 /// Records how a cached object store entry was built so fragment-aware lookups
 /// can repair a poisoned (env-default) entry without clobbering deliberate
@@ -826,8 +829,50 @@ impl SpiceObjectStoreRegistry {
         crate::builder::build_gcs_object_store(bucket_name, &params, self.io_runtime.clone())
     }
 
+    /// Builds the store for `url` without registering it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no store serves `url`'s scheme, or the store's settings in the URL
+    /// fragment are invalid.
+    pub fn build_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.get_feature_store(url)
+    }
+
+    /// Builds the store a URL table reads an object-store location through when no dataset
+    /// covers it: the location's store with no credentials at all, so it reads only what is
+    /// public. Of the URL's settings, only those a query may choose are kept.
+    fn prepare_url_table_anonymous_object_store(
+        &self,
+        target: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let mut unsigned = target.clone();
+        let mut fragment = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in parse(target.fragment().unwrap_or_default().as_bytes()) {
+            if url_table::ANONYMOUS_FRAGMENT_KEYS.contains(&key.as_ref()) {
+                fragment.append_pair(&key, &value);
+            }
+        }
+        match url_table::StoreFamily::of_scheme(target.scheme()) {
+            Some(url_table::StoreFamily::S3) => fragment.append_pair("auth", "public"),
+            Some(url_table::StoreFamily::Azure | url_table::StoreFamily::Gcs) => {
+                fragment.append_pair("skip_signature", "true")
+            }
+            None => {
+                return Err(DataFusionError::Execution(format!(
+                    "No object store available for: {target:?}"
+                )));
+            }
+        };
+        unsigned.set_fragment(Some(&fragment.finish()));
+        self.get_feature_store(&unsigned)
+    }
+
     fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with(ssrf::URL_TABLE_SCHEME_PREFIX) {
+            if let Some(target) = url_table::anonymous_target(url) {
+                return self.prepare_url_table_anonymous_object_store(&target);
+            }
             let target = ssrf::url_table_target(url).ok_or_else(|| {
                 DataFusionError::Execution(format!("No object store available for: {url:?}"))
             })?;
@@ -1201,55 +1246,39 @@ mod tests {
 
     #[tokio::test]
     async fn http_redirect_is_followed_only_when_allow_http_is_set() {
-        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+        use axum::{Router, body::Body, http::Request, response::Response};
         use object_store::ObjectStoreExt;
 
-        async fn record(
-            State(seen): State<Arc<Mutex<Vec<String>>>>,
-            request: Request<Body>,
-        ) -> Response<Body> {
-            seen.lock()
-                .expect("the request log is not poisoned")
-                .push(request.uri().path().to_string());
-            Response::builder()
-                .status(404)
-                .body(Body::empty())
-                .expect("a 404 response builds")
-        }
-
-        let target_seen = Arc::new(Mutex::new(Vec::new()));
-        let target = Router::new()
-            .fallback(axum::routing::any(record))
-            .with_state(Arc::clone(&target_seen));
-        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the redirect target binds");
-        let target_addr = target_listener
-            .local_addr()
-            .expect("the redirect target has an address");
-        tokio::spawn(async move {
-            let _ = axum::serve(target_listener, target).await;
-        });
-
+        // One origin that redirects `/items.csv` to `/secret` on itself, so the redirect stays
+        // on the dataset's origin and only `allow_http` decides whether it is followed.
         let origin_seen = Arc::new(Mutex::new(Vec::new()));
-        let location = format!("http://{target_addr}/secret");
-        let origin = Router::new()
-            .fallback(axum::routing::any(
-                move |State(seen): State<Arc<Mutex<Vec<String>>>>, request: Request<Body>| {
-                    let location = location.clone();
-                    async move {
-                        seen.lock()
-                            .expect("the request log is not poisoned")
-                            .push(request.uri().path().to_string());
-                        Response::builder()
-                            .status(302)
-                            .header("location", location)
-                            .body(Body::empty())
-                            .expect("a redirect response builds")
-                    }
-                },
-            ))
-            .with_state(Arc::clone(&origin_seen));
+        let target_seen = Arc::new(Mutex::new(Vec::new()));
+        let (origin_log, target_log) = (Arc::clone(&origin_seen), Arc::clone(&target_seen));
+        let origin = Router::new().fallback(axum::routing::any(move |request: Request<Body>| {
+            let (origin_log, target_log) = (Arc::clone(&origin_log), Arc::clone(&target_log));
+            async move {
+                let path = request.uri().path().to_string();
+                if path == "/secret" {
+                    target_log
+                        .lock()
+                        .expect("the request log is not poisoned")
+                        .push(path);
+                    return Response::builder()
+                        .status(404)
+                        .body(Body::empty())
+                        .expect("a 404 response builds");
+                }
+                origin_log
+                    .lock()
+                    .expect("the request log is not poisoned")
+                    .push(path);
+                Response::builder()
+                    .status(302)
+                    .header("location", "/secret")
+                    .body(Body::empty())
+                    .expect("a redirect response builds")
+            }
+        }));
         let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("the redirect origin binds");
@@ -1442,12 +1471,10 @@ mod tests {
     }
 
     /// A dataset's HTTP store for a host must not be served to a URL table for the same host,
-    /// and the dataset's store follows a redirect that stays on its own host.
+    /// and the dataset's store follows a redirect that stays on its own origin.
     #[tokio::test]
     async fn url_table_and_dataset_stores_for_one_host_are_separate() {
-        use std::sync::atomic::Ordering;
-
-        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let origin = same_host_redirecting_origin("127.0.0.1").await;
         let registry = SpiceObjectStoreRegistry::new(Handle::current());
 
         let dataset_store = registry
@@ -1456,7 +1483,7 @@ mod tests {
         assert_eq!(
             get_items(&dataset_store)
                 .await
-                .expect("a dataset store follows a redirect on its own host"),
+                .expect("a dataset store reads its own loopback origin, redirect included"),
             "id\n1\n"
         );
 
@@ -1473,7 +1500,6 @@ mod tests {
             error.contains("targets a private, loopback, or link-local address"),
             "{error}"
         );
-        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     }
 
     /// A loopback origin that serves a CSV body at `/moved/items.csv` and redirects every other

@@ -33,6 +33,7 @@ datafusion-table-providers = { workspace = true }
 document_parse = { path = "../document_parse" }
 futures.workspace = true
 globset = { workspace = true }
+http-egress = { path = "../http-egress" }
 itertools.workspace = true
 linkme.workspace = true
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }

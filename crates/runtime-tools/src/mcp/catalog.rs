@@ -621,7 +621,8 @@ impl McpToolCatalog {
                 auth_token,
                 headers,
             } => {
-                // Security: Validate URL scheme (only https allowed, http for localhost testing)
+                // `MCPConfig::from_type` has already refused plaintext to a host that is not
+                // loopback unless the tool allows it; only the scheme is left to check.
                 if url.scheme() != "https" && url.scheme() != "http" {
                     return Err(Error::CouldNotConstructTool {
                         name: "mcp_streamable_http".to_string(),
@@ -630,16 +631,6 @@ impl McpToolCatalog {
                             url.scheme()
                         ),
                     });
-                }
-
-                // Security: Warn if using http (unencrypted) for non-localhost
-                let host = url.host_str().unwrap_or("<unknown>");
-                if url.scheme() == "http" && !util::net::is_loopback_host(host) {
-                    tracing::warn!(
-                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
-                        host,
-                        redact::redact_url_credentials(url.as_str())
-                    );
                 }
 
                 let http_client =

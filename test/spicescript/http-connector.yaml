@@ -13,11 +13,24 @@ description: >
   server answers, without a restart, federated and accelerated; a
   json_object catch-all column; JSON nulls, missing keys, nested documents
   and arrays, federated and accelerated into Cayenne; the runtime's own
-  Server-Timing and trace-id headers; and its streamed vnd JSON and CSV SQL
-  answers, which keep every DECIMAL digit.
+  Server-Timing and trace-id headers; its streamed vnd JSON and CSV SQL
+  answers, which keep every DECIMAL digit; and redirects: one within the
+  dataset's origin keeps the dataset's headers, while one that changes the
+  origin (another port on the same host included) is refused before the
+  other origin is reached when it is internal, and an OAuth token request
+  never follows its endpoint to another origin. The GraphQL connector follows
+  the same rule: a redirect within its endpoint's origin keeps its auth
+  header, and one to another internal origin is refused before it is made.
+  So do hosted models (Anthropic, OpenAI-compatible, Azure OpenAI): a model
+  whose endpoint redirects to another origin fails to load, naming the fix,
+  and that origin never receives its key or prompt, while a model on a
+  loopback endpoint reached by name loads through a redirect within its
+  origin. A Databricks service principal's and a Google service account's
+  token request stay on their token endpoint's origin too.
 
 sources:
   api: { kind: mock-http }
+  elsewhere: { kind: mock-http }
 
 # The spicepod as written, and the same with the deferred dataset `late_items`
 # accelerated, whose first query hands off to the accelerated load.
@@ -115,6 +128,40 @@ spicepod:
       columns:
         - { name: id, type: bigint }
         - { name: price, type: bigint }
+    - from: ${sources.api.url}/moved
+      name: moved
+      params:
+        file_format: json
+        allowed_request_paths: '/old,/away'
+        http_headers: 'X-Api-Key: k3y'
+        response_cache_max_size_bytes: '0'
+    - from: ${sources.api.url}/oauth-moved
+      name: token_moved
+      params:
+        file_format: json
+        allowed_request_paths: /items
+        auth_token_url: ${sources.api.url}/oauth/moved
+        auth_grant_type: client_credentials
+        http_auth_client_id: demo-id
+        http_auth_client_secret: demo-secret
+        auth_client_auth: body
+    - from: ${sources.api.url}/files/hop.csv
+      name: hop_csv
+      params: { file_format: csv }
+    - from: graphql:${sources.api.url}/gql-moved
+      name: gql_moved
+      params:
+        graphql_query: '{ items { id } }'
+        json_pointer: /data/items
+        graphql_auth_header: X-Api-Key
+        graphql_auth_token: k3y
+    - from: graphql:${sources.api.url}/gql-away
+      name: gql_away
+      params:
+        graphql_query: '{ items { id } }'
+        json_pointer: /data/items
+        graphql_auth_header: X-Api-Key
+        graphql_auth_token: k3y
     - from: ${sources.api.url}/files/items.csv
       name: items_deferred
       params: { file_format: csv }
@@ -129,6 +176,45 @@ spicepod:
       columns:
         - { name: id, type: bigint }
         - { name: name, type: text }
+  models:
+    - from: anthropic:claude-sonnet-4-6
+      name: claude_moved
+      params:
+        anthropic_api_key: sk-ant-guard
+        endpoint: ${sources.api.url}/anthropic/v1
+    - from: openai:gpt-4o-mini
+      name: gpt_moved
+      params:
+        openai_api_key: sk-openai-guard
+        endpoint: ${sources.api.url}/openai/v1
+    - from: azure:gpt-4o-mini
+      name: azure_moved
+      params:
+        azure_api_key: azure-guard
+        azure_deployment_name: chat
+        azure_api_version: '2024-10-21'
+        endpoint: ${sources.api.url}/azure
+    # A Databricks model authenticating as a service principal, and a Vertex model whose service
+    # account key names its token endpoint: each token request stays on its endpoint's origin.
+    - from: databricks:probe-endpoint
+      name: dbx_moved
+      params:
+        databricks_endpoint: ${sources.api.url}/dbx
+        databricks_client_id: probe-client
+        databricks_client_secret: dbx-guard
+    - from: google:gemini-2.5-flash
+      name: gemini_moved
+      params:
+        google_project: probe-project
+        google_location: us-central1
+        # The RSA key is the one `crates/token_provider` tests sign with; it grants nothing.
+        google_service_account_key: '{"type": "service_account", "client_email": "redirect-probe@example.iam.gserviceaccount.com", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDLod/dmzVBXYoi\n/DqI2Gs/FU8nR2qPtaUWn7Z9+B4xFTVtXUvK16EaGWxBC1GdyUTJbDf6fweA3xQx\nXqcD6vuAV9A2gF+VnW4iJJYpAo5HtQEnyE2Dkm3dq4eJqB9TTPGr0q3xwZnV26PP\nDX4EhkoAfRvHYvG49KU8mL4lHvvMuuuMt15j6CQXFFieCw26tUvWNM+oEIcS+qtU\nC1S1ZIqctuinWrvyXIrQPE4mzInD9zhHOmm7mm6ORMGeG4RdxU7aCDwmTjSXQNrB\nCUaOv9DN89H/eGhbkxMRRFuG6yqu/p23IBPq9xVzRujR/JahGAv1AD8ekRNwY0nH\nAGVDNE2VAgMBAAECggEABhnR9rY9OLmgN18eM9ZkFC5DwlYB689R5GUhlxGVefv8\nL0whxrCCK6GCXEqGBfevP2emH7OpmmNUnAwNbfEe2uAGpXNgKb/fOlelRhJFCAH0\nyGfYZq4+62rFs0qdsaW3AeJcgsc9oCol9MCfO2x4kB4vdGBTBKsTvkaHP953RdFw\nI6G9WyTNkD9jVCTlYcMD5Xpe2PS3/tL8RThEApD0jz+YSdR2p6UaUrrafRtjlnI7\ntPwtIFi62Ywc/mA6E+jYzu4PdEeuLqd0DK+JbYFCajfwY7gFjR7C0EBCEDquctz2\naq5PFOdykNtBcEiClrZ6IVQO7C+JnszFR4cVN1Dp8QKBgQDyTZtoaUHFf+QaTlxc\nYYnhasE4fcgMH7szZFEEhShslqQGaJ9uiQtDrs1ZPQu6H1Cb4eUwW40ldVImmhYH\nIQ6bBAPaxtVigVdM67qqoXLYezrCESgTImV113oYebVWNA6bIlTr7Iy9XHfr+WrC\nSjlV3ZiCj9zcAFbrA6vKu9DVvQKBgQDXJKhyPvKt/Cxz0+xLLOtQR4/4hBsdVQj1\nI501athLoUU0luaGcDGqPaM12OKN0rK3Wx0EHLrLgYRMmAnc6vnBGT6s0XihR7MY\nFR3VF8eq4XE1hlkIegBQ4xQUtBBjThk9GlZ/YqxinDXA3cqgWqRzwPBoGt32mFmL\nYQrXn/K4uQKBgQCAyrWHSyN1qiQBw5MeW44hblAkCd+Sai9kArd5spmpFm07JtNP\nurJtGHX4MBWSqeB76xeam58rwO+YqyB4S57q0LiHylZT1LIlpcsDtWtJHD9ANkRZ\n31eUyqMQbWjw2BzHYvlGqeapJIRtvpZ7jV5qgK33ACcCHYAVzU68JRa89QKBgH5V\nlGSh+jeYoTHS/CqY0gVuQGiaiqGK0ZvBsgswFpsytETRZ8UCFOf3EeQI2+CUHUX2\nRu+nPzlJcLrZfNExWj+950PsLX3ncI9vtvju4dzCTYw0vAtyOMVG0v/lTMpDjiaH\nVMuw0bGGMTp0AwxurasbXRCE1lp70/k4nvlHf2xhAoGAJHrFZb651bLr1Lap0Ged\njK2Fwy/3ROiX5ohV6/7nNgRkEyVozi9lg0qfSskLLCkJAvJFxHUMgP3a6zBcyq0G\nZzPq/jR3RXoVFrRypUNKYjSp+RrM8VEMOEbNTcqgJFnSu0HR3ZpeUpuSmtBe5gH/\nDnjLo+9WUFjVlKHwAG/JjgU=\n-----END PRIVATE KEY-----\n", "token_uri": "${sources.api.url}/gtoken"}'
+    # A local server (an Ollama or vLLM on this host) reached by name, through the resolver.
+    - from: openai:gpt-4o-mini
+      name: gpt_local
+      params:
+        openai_api_key: sk-openai-local
+        endpoint: http://localhost:${sources.api.port}${sources.api.prefix}/local/v1
 
 steps:
   - source-exec:
@@ -246,6 +332,96 @@ steps:
           path: /files/late.csv
           status: 503
           body: busy
+        - |
+          path: /moved/old
+          status: 302
+          headers: { location: '${sources.api.url}/moved/new' }
+        - |
+          path: /moved/new
+          status: 401
+          body: missing key
+        - |
+          path: /moved/new
+          headers-match: { x-api-key: k3y }
+          headers: { content-type: application/json }
+          body: '[{"moved": "within the origin"}]'
+        - |
+          path: /moved/away
+          status: 302
+          headers: { location: '${sources.elsewhere.url}/landing' }
+        - |
+          path: /oauth/moved
+          method: POST
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/collect' }
+        - |
+          path: /files/hop.csv
+          status: 302
+          headers: { location: '${sources.elsewhere.url}/files/internal.csv' }
+        - |
+          path: /gql-moved
+          status: 307
+          headers: { location: '${sources.api.url}/gql-new' }
+        - |
+          path: /gql-new
+          status: 401
+          body: missing key
+        - |
+          path: /gql-new
+          headers-match: { x-api-key: k3y }
+          headers: { content-type: application/json }
+          body: '{"data": {"items": [{"id": 1}]}}'
+        - |
+          path: /gql-away
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/gql' }
+        - |
+          path: /anthropic/v1/messages
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/anthropic/v1/messages' }
+        - |
+          path: /openai/v1/chat/completions
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/openai/v1/chat/completions' }
+        - |
+          path: /azure/openai/deployments/chat/chat/completions
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/azure/openai/deployments/chat/chat/completions' }
+        - |
+          path: /dbx/oidc/v1/token
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/dbx/oidc/v1/token' }
+        - |
+          path: /gtoken
+          status: 307
+          headers: { location: '${sources.elsewhere.url}/gtoken' }
+        - |
+          path: /local/v1/chat/completions
+          status: 307
+          headers: { location: 'http://localhost:${sources.api.port}${sources.api.prefix}/local2/v1/chat/completions' }
+        - |
+          path: /local2/v1/chat/completions
+          headers: { content-type: application/json }
+          body: '{"id": "c1", "object": "chat.completion", "created": 1, "model": "gpt-4o-mini", "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}'
+  - source-exec:
+      elsewhere:
+        - |
+          path: /landing
+          headers: { content-type: application/json }
+          body: '[{"landed": true}]'
+        - |
+          path: /collect
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"access_token": "collected", "token_type": "Bearer", "expires_in": 3600}'
+        - |
+          path: /files/internal.csv
+          headers: { content-type: text/csv }
+          body: "id,secret\n1,internal\n"
+        - |
+          path: /gql
+          headers: { content-type: application/json }
+          body: '{"data": {"items": [{"id": 7}]}}'
   - start: { ready: false }
 
   # Declared columns: nothing is fetched until the dataset is queried.
@@ -314,6 +490,73 @@ steps:
     expect: { rows: [[POST, /oauth/token, 'grant_type=client_credentials&client_id=demo-id&client_secret=demo-secret']] }
   - source-query: { api: header /secure/items authorization }
     expect: { rows: [[Bearer t0k], [Bearer t0k]] }
+
+  # Redirects. One within the dataset's origin is followed, and keeps the
+  # dataset's headers.
+  - query: SELECT content FROM moved WHERE request_path = '/old'
+    expect: { rows: [['{"moved":"within the origin"}']] }
+  - source-query: { api: header /moved/new x-api-key }
+    expect: { rows: [[k3y]] }
+  # One to another origin on an internal address is refused before that
+  # origin is reached.
+  - query: SELECT content FROM moved WHERE request_path = '/away'
+    expect-error: does not follow a redirect to a private, loopback, or link-local address
+  - source-query: { elsewhere: count /landing }
+    expect: { rows: [['0']] }
+  # Another port on the dataset's own internal host is another origin, so a
+  # file dataset cannot be redirected to it.
+  - assert-status: { dataset: hop_csv, status: Error, message-contains: 'does not follow a redirect to a private, loopback, or link-local address' }
+    eventually: 30s
+  - source-query: { elsewhere: count /files/internal.csv }
+    expect: { rows: [['0']] }
+  # A token request carries the client secret in its body, and a 307 would
+  # resend that body: a token endpoint that redirects to another origin fails
+  # the dataset, and the other origin never receives the request.
+  - assert-status: { dataset: token_moved, status: Error, message-contains: 'Set `auth_token_url` to the URL the token endpoint redirects to' }
+    eventually: 30s
+  - source-query: { elsewhere: count /collect }
+    expect: { rows: [['0']] }
+
+  # GraphQL: a redirect within the endpoint's origin keeps the auth header; one to another
+  # internal origin is refused before that origin is reached.
+  - query: SELECT id FROM gql_moved
+    expect: { rows: [['1']] }
+    eventually: 30s
+  - assert-status: { dataset: gql_away, status: Error, message-contains: 'the GraphQL data connector does not follow a redirect to a private, loopback, or link-local address' }
+    eventually: 30s
+  - source-query: { elsewhere: count /gql }
+    expect: { rows: [['0']] }
+
+  # Hosted models: an endpoint that redirects to another origin fails the model, naming the
+  # fix, and the other origin never receives the key or the prompt. A loopback endpoint reached
+  # by name loads through a redirect within its origin, which keeps the key.
+  - assert-log:
+      contains:
+        - "Failed to load model 'claude_moved': the server redirected to another origin, http://127\\.0\\.0\\.1:[0-9]+, and this request carries a credential that is sent only to http://127\\.0\\.0\\.1:[0-9]+\\. Set `endpoint` to the URL the endpoint redirects to\\. See: https://spiceai\\.org/docs/components/models"
+        - "Failed to load model 'gpt_moved': the server redirected to another origin, .* Set `endpoint` to the URL the endpoint redirects to"
+        - "Failed to load model 'azure_moved': the server redirected to another origin, .* Set `endpoint` to the URL the endpoint redirects to"
+        - "Model \\[gpt_local\\] deployed, ready for inferencing"
+    eventually: 60s
+  - source-query: { elsewhere: count /anthropic/v1/messages }
+    expect: { rows: [['0']] }
+  - source-query: { elsewhere: count /openai/v1/chat/completions }
+    expect: { rows: [['0']] }
+  - source-query: { elsewhere: count /azure/openai/deployments/chat/chat/completions }
+    expect: { rows: [['0']] }
+  - source-query: { api: header /local2/v1/chat/completions authorization }
+    expect: { rows: [[Bearer sk-openai-local]] }
+
+  # Token requests: a Databricks service principal's and a Google service account's token
+  # request never follows its endpoint to another origin, and the error names the setting.
+  - assert-log:
+      contains:
+        - "dbx_moved.*the server redirected to another origin, http://127\\.0\\.0\\.1:[0-9]+, .*`databricks_endpoint` to the (workspace )?URL the (token )?endpoint redirects to"
+        - "gemini_moved.*the server redirected to another origin, http://127\\.0\\.0\\.1:[0-9]+, .*`token_uri`.* to the URL the (token )?endpoint redirects to"
+    eventually: 60s
+  - source-query: { elsewhere: count /dbx/oidc/v1/token }
+    expect: { rows: [['0']] }
+  - source-query: { elsewhere: count /gtoken }
+    expect: { rows: [['0']] }
 
   # Two 503s, then an answer: retried, and three requests in all.
   - query: SELECT content FROM flaky WHERE request_path = '/data'

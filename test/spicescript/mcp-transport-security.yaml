@@ -1,0 +1,80 @@
+name: mcp-transport-security
+duration: 1s
+description: >
+  A Streamable HTTP MCP tool sends its credentials and results over plaintext
+  HTTP only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), decided
+  from the URL as written, or when the tool sets `mcp_transport_security:
+  allow_plaintext`. Any other `mcp:http://` tool, the wildcard address
+  `0.0.0.0` included, fails to load with an error that names the fix and
+  sends nothing; `mcp_transport_security` on a stdio tool fails to load
+  without running the program.
+
+sources:
+  mcp: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mcp-transport-security
+  tools:
+    - name: local_tools
+      from: 'mcp:http://127.0.0.1:${sources.mcp.port}${sources.mcp.prefix}/local'
+      params: { mcp_auth_token: t0k }
+    - name: localhost_tools
+      from: 'mcp:http://localhost:${sources.mcp.port}${sources.mcp.prefix}/localhost'
+      params: { mcp_auth_token: t0k }
+    - name: remote_tools
+      from: 'mcp:http://tools.example.invalid/mcp'
+      params: { mcp_auth_token: t0k }
+    - name: wildcard_tools
+      from: 'mcp:http://0.0.0.0:${sources.mcp.port}${sources.mcp.prefix}/wild'
+      params: { mcp_auth_token: t0k }
+    - name: mesh_tools
+      from: 'mcp:http://0.0.0.0:${sources.mcp.port}${sources.mcp.prefix}/mesh'
+      params: { mcp_auth_token: t0k, mcp_transport_security: allow_plaintext }
+    - name: maps
+      from: 'mcp:/bin/echo'
+      params: { mcp_transport_security: allow_plaintext }
+
+steps:
+  # Each allowed endpoint holds its first request open, so it is asked exactly once while the
+  # script looks; what it receives is the check, not whether the handshake succeeds.
+  - source-exec:
+      mcp:
+        - |
+          path: /local
+          delay-ms: 60000
+        - |
+          path: /localhost
+          delay-ms: 60000
+        - |
+          path: /mesh
+          delay-ms: 60000
+        - |
+          path: /wild
+          delay-ms: 60000
+  - start: { ready: false }
+
+  # Loopback, by address and by name: plaintext is allowed, and the token arrives.
+  - source-query: { mcp: header /local authorization }
+    expect: { rows: [[Bearer t0k]] }
+    eventually: 30s
+  - source-query: { mcp: header /localhost authorization }
+    expect: { rows: [[Bearer t0k]] }
+    eventually: 30s
+  # Not loopback, but the tool states that the network protects it.
+  - source-query: { mcp: header /mesh authorization }
+    expect: { rows: [[Bearer t0k]] }
+    eventually: 30s
+
+  - assert-log:
+      contains:
+        - "Failed to load tool 'remote_tools': MCP server URL 'http://tools\\.example\\.invalid/mcp' uses plaintext HTTP to a host that is not loopback, which would send the tool's credentials and results unencrypted\\. Use https://, or set `mcp_transport_security: allow_plaintext` on the tool if the network already encrypts this connection\\. See: https://spiceai\\.org/docs/components/tools/mcp"
+        - "Failed to load tool 'wildcard_tools': MCP server URL 'http://0\\.0\\.0\\.0:[0-9]+/[^']*/wild' uses plaintext HTTP to a host that is not loopback \\(0\\.0\\.0\\.0 is not a loopback address\\), which would send the tool's credentials and results unencrypted\\. Use http://127\\.0\\.0\\.1:[0-9]+/[^ ]*/wild for a local server, https:// for a remote one, or set `mcp_transport_security: allow_plaintext` on the tool"
+        - "Failed to load tool 'maps': `mcp_transport_security` applies only to an MCP server reached over HTTP \\(`mcp:http://` or `mcp:https://`\\), and tool 'maps' runs a local program\\. Remove `mcp_transport_security` from tool 'maps'\\."
+      lacks:
+        - "This is insecure"
+    eventually: 30s
+  # A refused tool sends nothing.
+  - source-query: { mcp: count /wild }
+    expect: { rows: [['0']] }

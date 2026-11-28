@@ -4722,6 +4722,7 @@ dependencies = [
  "graphql-parser",
  "http 1.4.1",
  "http-body-limit",
+ "http-egress",
  "linkme",
  "paste",
  "regex",
@@ -4729,6 +4730,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-metrics",
+ "runtime-object-store",
  "runtime-parameters",
  "runtime-rate-control",
  "runtime-secrets",
@@ -6239,6 +6241,7 @@ dependencies = [
  "document_parse",
  "futures",
  "globset",
+ "http-egress",
  "itertools 0.14.0",
  "linkme",
  "object_store 0.13.2",
@@ -6357,6 +6360,7 @@ dependencies = [
  "hash-index",
  "http 1.4.1",
  "http-body-limit",
+ "http-egress",
  "httpdate",
  "iceberg",
  "iceberg-catalog-rest",
@@ -10168,6 +10172,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-egress"
+version = "2.5.0-unstable"
+dependencies = [
+ "axum",
+ "bytes",
+ "http 1.4.1",
+ "reqwest 0.13.4",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "http-retry"
 version = "2.5.0-unstable"
 dependencies = [
@@ -11892,6 +11909,7 @@ dependencies = [
  "governor",
  "http 1.4.1",
  "http-body-limit",
+ "http-egress",
  "http-retry",
  "huggingface-hub",
  "indexmap 2.14.0",
@@ -14071,12 +14089,12 @@ dependencies = [
  "bytes",
  "futures",
  "http-body 1.0.1",
+ "http-egress",
  "humantime",
  "object_store 0.13.2",
  "reqwest 0.12.24",
  "snafu",
  "tokio",
- "url",
 ]
 
 [[package]]
@@ -17714,6 +17732,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-limit",
  "http-body-util",
+ "http-egress",
  "hyper 1.10.1",
  "hyper-util",
  "iceberg",
@@ -18331,11 +18350,13 @@ dependencies = [
  "fundu",
  "futures",
  "http 1.4.1",
+ "http-egress",
  "insta",
  "libnfs",
  "nix 0.30.1",
  "object_store 0.13.2",
  "object_store_spawn",
+ "percent-encoding",
  "rand 0.10.4",
  "reqwest 0.13.4",
  "secrecy",
@@ -22310,6 +22331,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "http-body-limit",
+ "http-egress",
  "http-retry",
  "jsonwebtoken",
  "reqwest 0.13.4",

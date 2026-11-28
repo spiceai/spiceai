@@ -84,7 +84,7 @@ impl Anthropic {
             );
 
         Ok(Self {
-            client: crate::provider::client_without_retry(cfg),
+            client: crate::provider::client_without_retry(cfg)?,
             model: variant,
             model_from_default,
             endpoint_from_default,
@@ -106,7 +106,7 @@ impl Anthropic {
             .config()
             .clone()
             .with_header_value("anthropic-workspace-id", value);
-        self.client = crate::provider::client_without_retry(cfg);
+        self.client = crate::provider::client_without_retry(cfg)?;
         Ok(self)
     }
 }

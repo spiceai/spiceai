@@ -219,6 +219,13 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.metadata_provider(dataset).await
     }
 
+    async fn object_store_scope(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<data_connector_api::ObjectStoreScope>> {
+        self.inner_connector.object_store_scope(dataset).await
+    }
+
     async fn register_object_stores(
         &self,
         dataset: &DatasetSpec,
