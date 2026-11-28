@@ -25,6 +25,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
+use data_components::SOURCE_TYPE_METADATA_KEY;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -173,8 +174,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
             .map(|row| {
                 let name: String = row.get("name")?;
                 let type_str: String = row.get("type")?;
-                let data_type = map_clickhouse_type_to_arrow(&type_str)?;
-                Ok(Field::new(name, data_type, true))
+                column_field(name, type_str)
             })
             .collect::<Result<Vec<Field>, clickhouse_rs::errors::Error>>()
             .boxed()
@@ -259,6 +259,14 @@ fn query_to_stream(
             }
        }
     }
+}
+
+/// The field for a column of this type, as `system.columns` names it, with the type
+/// under `source_type`.
+fn column_field(name: String, type_str: String) -> Result<Field, clickhouse_rs::errors::Error> {
+    let data_type = map_clickhouse_type_to_arrow(&type_str)?;
+    Ok(Field::new(name, data_type, true)
+        .with_metadata([(SOURCE_TYPE_METADATA_KEY.to_string(), type_str)].into()))
 }
 
 /// Maps a column type, as `system.columns` names it, to the Arrow type `block_to_arrow`
@@ -435,6 +443,24 @@ mod tests {
             0,
             "with no projected schema there is nothing to preserve"
         );
+    }
+
+    #[test]
+    fn a_column_carries_its_clickhouse_type() -> Result<(), clickhouse_rs::errors::Error> {
+        let field = column_field("u".to_string(), "Nullable(UUID)".to_string())?;
+        assert_eq!(
+            field
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some("Nullable(UUID)")
+        );
+        assert!(crate::federation::orders_by_stored_value(&field));
+        assert!(!crate::federation::orders_by_stored_value(&column_field(
+            "s".to_string(),
+            "String".to_string()
+        )?));
+        Ok(())
     }
 
     #[test]
