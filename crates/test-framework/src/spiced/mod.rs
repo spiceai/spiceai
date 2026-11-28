@@ -64,7 +64,50 @@ pub enum SpicedInstance {
         child: Child,
         tempdir: TempDir,
         version: SpicedVersion,
+        flight_url: String,
+        http_base_url: String,
     },
+}
+
+/// The interface a spawned spiced binds its ports on.
+const LOOPBACK: &str = "127.0.0.1";
+
+/// The ports a spawned spiced listens on, so that several instances can run on one host. A port
+/// that is not set keeps the spiced default ([`HTTP_BASE_URL`], [`FLIGHT_URL`]) and adds nothing to
+/// the spiced command line. A spiced in the default `server` role binds no other port: its
+/// `--open_telemetry` address is deprecated and unused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpicedPorts {
+    pub http: Option<u16>,
+    pub flight: Option<u16>,
+}
+
+impl SpicedPorts {
+    /// The spiced arguments that bind each set port on the loopback interface.
+    fn spiced_args(self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(port) = self.http {
+            args.extend(["--http".to_string(), format!("{LOOPBACK}:{port}")]);
+        }
+        if let Some(port) = self.flight {
+            args.extend(["--flight".to_string(), format!("{LOOPBACK}:{port}")]);
+        }
+        args
+    }
+
+    fn http_base_url(self) -> String {
+        self.http.map_or_else(
+            || HTTP_BASE_URL.to_string(),
+            |port| format!("http://{LOOPBACK}:{port}"),
+        )
+    }
+
+    fn flight_url(self) -> String {
+        self.flight.map_or_else(
+            || FLIGHT_URL.to_string(),
+            |port| format!("http://{LOOPBACK}:{port}"),
+        )
+    }
 }
 
 pub struct StartRequest {
@@ -73,6 +116,7 @@ pub struct StartRequest {
     tempdir: TempDir,
     data_dir: Option<PathBuf>,
     additional_args: Vec<String>,
+    ports: SpicedPorts,
     prepared: bool,
 }
 
@@ -85,7 +129,14 @@ impl StartRequest {
             prepared: false,
             data_dir: None,
             additional_args: Vec::new(),
+            ports: SpicedPorts::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_ports(mut self, ports: SpicedPorts) -> Self {
+        self.ports = ports;
+        self
     }
 
     #[must_use]
@@ -196,11 +247,21 @@ impl SpicedInstance {
             return Ok(Self::external(spiced_path_str));
         }
 
+        let ports = start_request.ports;
+        anyhow::ensure!(
+            ports.http != Some(0),
+            "Invalid HTTP port 0. Set the HTTP port to a value between 1 and 65535."
+        );
+        anyhow::ensure!(
+            ports.flight != Some(0),
+            "Invalid Flight port 0. Set the Flight port to a value between 1 and 65535."
+        );
+        let http_base_url = ports.http_base_url();
         let client = reqwest::Client::new();
-        let health_url = format!("{HTTP_BASE_URL}{HEALTH_ENDPOINT}");
+        let health_url = format!("{http_base_url}{HEALTH_ENDPOINT}");
         let response = client.get(&health_url).send().await;
         if response.is_ok() {
-            anyhow::bail!("Spiced instance is already running");
+            anyhow::bail!("Spiced instance is already running at {http_base_url}");
         }
 
         if !start_request.prepared {
@@ -233,6 +294,7 @@ impl SpicedInstance {
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
+        cmd.args(ports.spiced_args());
 
         // Optionally expose the Prometheus `/metrics` endpoint on the spawned
         // spiced. Off by default so concurrent spiced instances in the test
@@ -259,6 +321,8 @@ impl SpicedInstance {
             child,
             tempdir,
             version: SpicedVersion::new(version),
+            flight_url: ports.flight_url(),
+            http_base_url,
         })
     }
 
@@ -307,13 +371,8 @@ impl SpicedInstance {
             spice_client = spice_client.cache_control("no-cache");
         }
 
-        let flight_url = match self {
-            Self::External { flight_url, .. } => flight_url.as_str(),
-            Self::Existing | Self::Owned { .. } => FLIGHT_URL,
-        };
-
         let spice_client = spice_client
-            .flight_url(flight_url)
+            .flight_url(self.flight_url())
             .user_agent("spice-test-framework/1.0")
             .build()
             .await
@@ -348,12 +407,7 @@ impl SpicedInstance {
             None => Credentials::anonymous(),
         };
 
-        let flight_url = match self {
-            Self::External { flight_url, .. } => flight_url.as_str(),
-            Self::Existing | Self::Owned { .. } => FLIGHT_URL,
-        };
-
-        FlightClient::try_new(Arc::from(flight_url), credentials, None, None)
+        FlightClient::try_new(Arc::from(self.flight_url()), credentials, None, None)
             .await
             .map_err(|e| anyhow!("{e}"))
     }
@@ -382,12 +436,25 @@ impl SpicedInstance {
         Ok(builder.build()?)
     }
 
+    /// Get the Arrow Flight URL for this instance
+    #[must_use]
+    pub fn flight_url(&self) -> &str {
+        match self {
+            Self::External { flight_url, .. } | Self::Owned { flight_url, .. } => {
+                flight_url.as_str()
+            }
+            Self::Existing => FLIGHT_URL,
+        }
+    }
+
     /// Get the HTTP base URL for this instance
     #[must_use]
     pub fn http_base_url(&self) -> &str {
         match self {
-            Self::External { http_base_url, .. } => http_base_url.as_str(),
-            Self::Existing | Self::Owned { .. } => HTTP_BASE_URL,
+            Self::External { http_base_url, .. } | Self::Owned { http_base_url, .. } => {
+                http_base_url.as_str()
+            }
+            Self::Existing => HTTP_BASE_URL,
         }
     }
 

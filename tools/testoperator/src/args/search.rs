@@ -35,6 +35,12 @@ pub struct SearchTestArgs {
     /// must be in rank order. A value that ends with `.sql` or has no whitespace must be a file.
     #[arg(long, value_name = "FILE_OR_SQL", value_parser = SqlPipelineArg::parse)]
     pub(crate) sql_pipeline: Option<SqlPipelineArg>,
+
+    /// Record the per-query metrics at every rank cutoff from 1 to the primary cutoff (10), not
+    /// only at the primary cutoff. This multiplies the number of per-query metric points by the
+    /// primary cutoff.
+    #[arg(long)]
+    pub(crate) per_query_all_k: bool,
 }
 
 /// The `--sql-pipeline` value: a file that holds the SQL, or the SQL text itself.

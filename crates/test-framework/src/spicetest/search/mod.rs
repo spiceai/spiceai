@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     collections::{BTreeMap, HashMap},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -94,11 +95,12 @@ impl TestCompleted for Completed {
 
 impl SpiceTest<NotStarted> {
     pub fn start(self) -> Result<SpiceTest<Running>> {
-        let http_client = self
+        let spiced_instance = self
             .spiced_instance
             .as_ref()
-            .context("Spiced instance should be present")?
-            .http_client()?;
+            .context("Spiced instance should be present")?;
+        let http_client = spiced_instance.http_client()?;
+        let http_base_url: Arc<str> = Arc::from(spiced_instance.http_base_url());
 
         // Split the requests among workers based on the parallel_count
         let method = self.state.config.method().clone();
@@ -116,7 +118,13 @@ impl SpiceTest<NotStarted> {
                 let worker_config = SearchConfig::new()
                     .with_method(method.clone())
                     .add_requests(chunk.iter().cloned());
-                VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
+                VectorSearchWorker::new(
+                    worker_id,
+                    http_client.clone(),
+                    Arc::clone(&http_base_url),
+                    worker_config,
+                )
+                .start()
             })
             .collect();
 

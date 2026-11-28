@@ -17,6 +17,7 @@ limitations under the License.
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
+use test_framework::spiced::SpicedPorts;
 
 mod dataset;
 pub use dataset::{
@@ -114,6 +115,16 @@ pub struct CommonArgs {
     /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: String,
+
+    /// The port the spawned spiced serves HTTP on, so that several runs can share one host.
+    /// Defaults to the spiced default (8090).
+    #[arg(long)]
+    pub(crate) spiced_http_port: Option<u16>,
+
+    /// The port the spawned spiced serves Arrow Flight on, so that several runs can share one
+    /// host. Defaults to the spiced default (50051).
+    #[arg(long)]
+    pub(crate) spiced_flight_port: Option<u16>,
 
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
@@ -214,6 +225,15 @@ impl CommonArgs {
     #[must_use]
     pub fn spiced_path_buf(&self) -> PathBuf {
         PathBuf::from(&self.spiced_path)
+    }
+
+    /// The ports a spawned spiced listens on.
+    #[must_use]
+    pub fn spiced_ports(&self) -> SpicedPorts {
+        SpicedPorts {
+            http: self.spiced_http_port,
+            flight: self.spiced_flight_port,
+        }
     }
 }
 

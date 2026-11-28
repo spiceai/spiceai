@@ -198,7 +198,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let telemetry = super::create_telemetry_with_resource(&test_args.common, benchmark_resource);
 
-    let health_monitor = HealthMonitor::spawn()?;
+    let health_monitor = HealthMonitor::spawn(spiced_instance.http_base_url())?;
 
     // Always scrape spiced metrics in HTAP mode — replication metrics are essential.
     let metrics_scraper = Some(MetricsScraper::spawn()?);
