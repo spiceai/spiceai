@@ -1,0 +1,78 @@
+name: view-reload-default-chat-model
+description: An accelerated view refreshes when its default chat model changes, even when its prompt names a reranker.
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: view-reload-default-chat-model
+  models:
+    - name: chat
+      from: openai:gpt-4o-mini
+      params: { endpoint: '${sources.api.url}/old', openai_api_key: test }
+  rerankers:
+    - name: ranker
+      from: '${sources.api.url}/rerank'
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      api:
+        - |
+          path: /rerank
+          headers: { content-type: application/json }
+          body: '{"results":[{"index":0,"relevance_score":1.0}]}'
+        - |+
+          path: /old/chat/completions
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"before"},"finish_reason":null}]}
+
+            data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+        # The model's startup health check takes the first response.
+        - |
+          path: /old/chat/completions
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"health","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}'
+        - |+
+          path: /new/chat/completions
+          headers: { content-type: text/event-stream }
+          body: |+
+            data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"after"},"finish_reason":null}]}
+
+            data: {"id":"answer","object":"chat.completion.chunk","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+        # The model's startup health check takes the first response.
+        - |
+          path: /new/chat/completions
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id":"health","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}'
+  - start: {}
+  - edit-spicepod:
+      spicepod:
+        views:
+          - name: answers
+            sql: SELECT ai('ranker') AS answer
+            acceleration: { enabled: true, engine: cayenne }
+  - query: SELECT answer FROM answers
+    expect: { rows: [[before]] }
+    eventually: 30s
+  - edit-spicepod:
+      spicepod:
+        models:
+          - name: chat
+            from: openai:gpt-4o-mini
+            params: { endpoint: '${sources.api.url}/new', openai_api_key: test }
+  - query: SELECT answer FROM answers
+    expect: { rows: [[after]] }
+    eventually: 30s

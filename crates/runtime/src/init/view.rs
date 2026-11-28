@@ -195,15 +195,16 @@ fn view_function_calls(sql: &str) -> Vec<view::FunctionCall> {
     }
 }
 
-/// Whether `name` is a function that calls a model the Spicepod declares: `ai`, the
-/// decision functions and `rerank`.
-fn calls_model(name: &str) -> bool {
+/// The model parameter name and optional positional index for a model function.
+fn model_parameter(name: &str) -> Option<(&'static str, Option<usize>)> {
     #[cfg(feature = "models")]
     if name == runtime_datafusion_udfs::ai::AI_UDF_NAME {
-        return true;
+        return Some(("model_name", Some(1)));
     }
-    name == runtime_search::rerank::RERANK_UDTF_NAME
-        || runtime_decide::DECISION_FUNCTION_NAMES.contains(&name)
+    if name == runtime_search::rerank::RERANK_UDTF_NAME {
+        return Some(("model", None));
+    }
+    runtime_decide::model_parameter_position(name).map(|position| ("model", Some(position)))
 }
 
 /// The names of the components that `new` adds, removes or changes.
@@ -229,9 +230,6 @@ fn changed_by_name<T: PartialEq>(
 struct ChangedCalls {
     functions: HashSet<String>,
     models: HashSet<String>,
-    /// Every model name in either app, to tell a call that names its model from one
-    /// that lets the runtime choose.
-    model_names: HashSet<String>,
 }
 
 impl ChangedCalls {
@@ -253,20 +251,7 @@ impl ChangedCalls {
             &new_app.rerankers,
             |r| &r.name,
         ));
-        let model_names = [current_app, new_app]
-            .into_iter()
-            .flat_map(|app| {
-                app.models
-                    .iter()
-                    .map(|m| m.name.clone())
-                    .chain(app.rerankers.iter().map(|r| r.name.clone()))
-            })
-            .collect();
-        Self {
-            functions,
-            models,
-            model_names,
-        }
+        Self { functions, models }
     }
 
     fn is_empty(&self) -> bool {
@@ -280,15 +265,10 @@ impl ChangedCalls {
         calls.iter().any(|call| {
             self.functions.contains(&call.name)
                 || (!self.models.is_empty()
-                    && calls_model(&call.name)
-                    && (call
-                        .string_arguments
-                        .iter()
-                        .any(|a| self.models.contains(a))
-                        || !call
-                            .string_arguments
-                            .iter()
-                            .any(|a| self.model_names.contains(a))))
+                    && model_parameter(&call.name).is_some_and(|(name, position)| {
+                        call.string_argument(name, position)
+                            .is_none_or(|model| self.models.contains(model))
+                    }))
         })
     }
 }
@@ -1355,11 +1335,10 @@ mod changed_calls_tests {
         names.iter().map(|&n| n.to_string()).collect()
     }
 
-    fn changed(functions: &[&str], models: &[&str], model_names: &[&str]) -> ChangedCalls {
+    fn changed(functions: &[&str], models: &[&str]) -> ChangedCalls {
         ChangedCalls {
             functions: names(functions),
             models: names(models),
-            model_names: names(model_names),
         }
     }
 
@@ -1369,7 +1348,7 @@ mod changed_calls_tests {
 
     #[test]
     fn user_function_change_affects_views_that_call_it() {
-        let changed = changed(&["search_pipeline"], &[], &[]);
+        let changed = changed(&["search_pipeline"], &[]);
         assert!(affects(&changed, "SELECT search_pipeline(q) FROM t"));
         assert!(affects(
             &changed,
@@ -1382,7 +1361,18 @@ mod changed_calls_tests {
     #[cfg(feature = "models")]
     #[test]
     fn model_change_affects_views_that_name_it() {
-        let changed = changed(&[], &["luna"], &["luna", "jev", "ranker"]);
+        let changed = changed(&[], &["luna"]);
+        assert!(affects(&changed, "SELECT ai('ranker')"));
+        assert!(!affects(&changed, "SELECT ai('luna', 'jev')"));
+        assert!(affects(&changed, "SELECT ai_if(body, 'ranker') FROM t"));
+        assert!(!affects(
+            &changed,
+            "SELECT ai_if(body, 'luna', 'jev') FROM t"
+        ));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM rerank(t, document => 'ranker')"
+        ));
         assert!(affects(&changed, "SELECT ai(q, 'luna') FROM t"));
         assert!(!affects(&changed, "SELECT ai(q, 'jev') FROM t"));
         assert!(affects(
@@ -1405,7 +1395,7 @@ mod changed_calls_tests {
     #[cfg(feature = "models")]
     #[test]
     fn model_change_affects_views_that_let_the_runtime_choose() {
-        let changed = changed(&[], &["ranker"], &["luna", "ranker"]);
+        let changed = changed(&[], &["ranker"]);
         assert!(affects(&changed, "SELECT ai(q) FROM t"));
         assert!(affects(
             &changed,
@@ -1432,10 +1422,6 @@ mod changed_calls_tests {
             .build();
         let changed = ChangedCalls::new(&current, &new);
         assert_eq!(changed.models, names(&["changed", "removed", "added"]));
-        assert_eq!(
-            changed.model_names,
-            names(&["kept", "changed", "removed", "added"])
-        );
         assert!(changed.functions.is_empty());
     }
 }

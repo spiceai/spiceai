@@ -165,11 +165,33 @@ impl TableFunctionArguments {
 }
 
 /// A function a SQL statement calls: its name as the planner looks it up, and the
-/// string literals among its arguments, like the `'luna'` of `ai(q, 'luna')`.
+/// arguments in SQL order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
     pub name: String,
-    pub string_arguments: Vec<String>,
+    arguments: Vec<CallArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallArgument {
+    name: Option<String>,
+    string_literal: Option<String>,
+}
+
+impl FunctionCall {
+    /// The string literal bound to a named parameter or its positional equivalent.
+    #[must_use]
+    pub fn string_argument(&self, parameter: &str, position: Option<usize>) -> Option<&str> {
+        let (_, argument) = self
+            .arguments
+            .iter()
+            .enumerate()
+            .find(|(index, argument)| match &argument.name {
+                Some(name) => name.eq_ignore_ascii_case(parameter),
+                None => Some(*index) == position,
+            })?;
+        argument.string_literal.as_deref()
+    }
 }
 
 /// Returns the scalar and table functions the statement calls, including calls in
@@ -227,24 +249,27 @@ impl FunctionCalls {
         } else {
             ident.value.to_lowercase()
         };
-        let string_arguments = args
+        let arguments = args
             .iter()
-            .filter_map(|arg| {
-                let (ast::FunctionArg::Unnamed(arg)
-                | ast::FunctionArg::Named { arg, .. }
-                | ast::FunctionArg::ExprNamed { arg, .. }) = arg;
-                match arg {
+            .map(|arg| {
+                let (name, arg) = match arg {
+                    ast::FunctionArg::Unnamed(arg) => (None, arg),
+                    ast::FunctionArg::Named { name, arg, .. } => (Some(name.value.clone()), arg),
+                    ast::FunctionArg::ExprNamed { name, arg, .. } => (Some(name.to_string()), arg),
+                };
+                let string_literal = match arg {
                     ast::FunctionArgExpr::Expr(ast::Expr::Value(value)) => {
                         value.clone().into_string()
                     }
                     _ => None,
+                };
+                CallArgument {
+                    name,
+                    string_literal,
                 }
             })
             .collect();
-        self.0.push(FunctionCall {
-            name,
-            string_arguments,
-        });
+        self.0.push(FunctionCall { name, arguments });
     }
 }
 
@@ -473,38 +498,18 @@ mod tests {
 
     #[test]
     fn test_function_calls() {
-        let cases: [(&str, &[(&str, &[&str])]); 6] = [
-            ("SELECT ai(q, 'luna') FROM t", &[("ai", &["luna"])]),
-            (
-                "SELECT * FROM t WHERE ai_if(body, 'is spam', model => 'jev')",
-                &[("ai_if", &["is spam", "jev"])],
-            ),
-            (
-                "SELECT * FROM rerank(text_search(docs, 'fox'), model => 'ranker')",
-                &[("rerank", &["ranker"]), ("text_search", &["fox"])],
-            ),
-            (
-                "SELECT Search_Pipeline(a), \"MyFn\"(b) FROM t",
-                &[("search_pipeline", &[]), ("MyFn", &[])],
-            ),
-            (
-                "SELECT id FROM t WHERE id IN (SELECT upper(name) FROM u)",
-                &[("upper", &[])],
-            ),
-            ("SELECT a FROM t", &[]),
-        ];
-
-        for (sql, expected) in cases {
-            let statements =
-                DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
-            let expected: Vec<FunctionCall> = expected
+        let sql = "SELECT \"MyFn\"(q) FROM rerank(text_search(docs, 'fox'), MODEL => 'ranker') WHERE id IN (SELECT UPPER(name) FROM u)";
+        let statements =
+            DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
+        let calls = function_calls(&statements[0]);
+        assert_eq!(
+            calls
                 .iter()
-                .map(|(name, args)| FunctionCall {
-                    name: (*name).to_string(),
-                    string_arguments: args.iter().map(|&a| a.to_string()).collect(),
-                })
-                .collect();
-            assert_eq!(expected, function_calls(&statements[0]), "{sql}");
-        }
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["MyFn", "rerank", "text_search", "upper"]
+        );
+        assert_eq!(calls[1].string_argument("model", None), Some("ranker"));
+        assert_eq!(calls[2].string_argument("query", Some(1)), Some("fox"));
     }
 }
