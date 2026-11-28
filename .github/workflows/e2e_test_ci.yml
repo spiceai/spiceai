@@ -199,8 +199,8 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the compile step's own bound below, leaving room for the artifact
-    # upload and the post steps.
-    timeout-minutes: 200
+    # upload and the post steps, including rust-cache's save on a trunk push.
+    timeout-minutes: ${{ github.ref == 'refs/heads/trunk' && 260 || 200 }}
     env:
       # `http-functions` for test/spicescript/secret-redaction.yaml, which registers
       # remote functions.
@@ -262,7 +262,16 @@ jobs:
         # so that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
         # being cancelled.
-        timeout-minutes: 150
+        #
+        # A trunk push gets 210. It is the only run that saves the rust-cache entry
+        # (`save-if` above), and it saves only when the build succeeds. When a
+        # dependency change gives the entry a new key, every build restores the previous
+        # entry by prefix and recompiles most dependencies, which takes 130-160 minutes. A
+        # trunk build cut at 150 then saves nothing, so every later build is nearly cold
+        # too, and merge groups keep timing out until one trunk build happens to finish
+        # under the bound. Letting the trunk build finish ends that after one push. Merge
+        # groups keep 150, for the dequeue cost described above.
+        timeout-minutes: ${{ github.ref == 'refs/heads/trunk' && 210 || 150 }}
         id: build
         uses: $/.github/actions/build-spiced
         with:
