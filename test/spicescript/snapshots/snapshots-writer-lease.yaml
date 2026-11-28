@@ -1,4 +1,5 @@
 name: snapshots-writer-lease
+duration: 71s
 description: >
   Two replicas (variants a and b, each with its own copy of the source) keep
   snapshots of one dataset in one shared state location. Only the writer

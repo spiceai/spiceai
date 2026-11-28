@@ -3,6 +3,7 @@
 # grouping answers.
 # Move this script to test/spicescript/ once it passes.
 name: collation-semantics
+duration: 36s
 description: >
   Comparing, grouping and ordering strings gives the same answer whether a
   dataset is federated (evaluated by the source, under its collation) or

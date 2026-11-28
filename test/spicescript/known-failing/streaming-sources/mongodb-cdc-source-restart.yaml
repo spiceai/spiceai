@@ -1,5 +1,6 @@
 # Known failing (#15544).
 name: mongodb-cdc-source-restart
+duration: 8s
 description: >
   A MongoDB collection followed by change streams into Cayenne keeps following
   it across a replica-set restart: changes made after MongoDB is back are

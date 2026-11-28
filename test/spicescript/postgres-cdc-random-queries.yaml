@@ -1,4 +1,5 @@
 name: postgres-cdc-random-queries
+duration: 275s
 tags: [long]
 description: >
   Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations
@@ -34,10 +35,6 @@ defaults:
   cluster-partition-by: { '*': id }
   compare-variants: false
 
-# `avoid` keeps clear of the defects random-queries.yaml lists, and of
-# `decimal-int` (a decimal times an integer in a Cayenne filter,
-# known-failing/cayenne/cayenne-decimal-int-filter.yaml).
-#
 # Each instance reads its own database, which is also its oracle, so the
 # changes may use random(): every instance is checked against the rows its own
 # source ended up with.
@@ -75,7 +72,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src }
 
   # Round 1: single statements.
   - source-exec:
@@ -93,7 +90,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src }
 
   # Round 2: key changes and a transaction mixing every kind of change.
   - source-exec:
@@ -114,4 +111,4 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src }

@@ -1,4 +1,5 @@
 name: distinct-on-scopes
+duration: 8s
 description: >
   DISTINCT ON preserves output bindings, duplicate elimination, NULL groups
   and the position of filters when the local table has a different source name.

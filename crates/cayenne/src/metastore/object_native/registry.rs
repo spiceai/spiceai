@@ -482,8 +482,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Dropping a dataset removes its name from the registry, which ends its
-    /// log; its bookkeeping values move to the registry, where they were kept
-    /// before datasets had logs, so they outlive the table as they did then.
+    /// log, and forgets its bookkeeping (load record, append cursor and every
+    /// source position) in the same commit: the next dataset created under the
+    /// name starts empty, so its source must not resume from where this one
+    /// stopped. Values the registry holds for the name while no log has it are
+    /// forgotten with them.
     pub(super) async fn drop_dataset(&self, name: &str) -> CatalogResult<bool> {
         let (domain, own) = {
             let routes = self.routes.read();
@@ -518,11 +521,11 @@ impl ObjectNativeCatalog {
                 .map_err(invalid)?;
             let mut unregister = vec![position(REGISTRY, name, None)];
             unregister.extend(
-                domain
+                self.registry
                     .positions_of(name)
                     .await
                     .into_iter()
-                    .map(|((source, partition), value)| position(&source, &partition, Some(value))),
+                    .map(|((source, partition), _)| position(&source, &partition, None)),
             );
             self.registry.commit_actions(unregister).await?;
             {

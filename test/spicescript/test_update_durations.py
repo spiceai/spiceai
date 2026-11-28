@@ -54,5 +54,34 @@ class Medians(unittest.TestCase):
             self.assertEqual(update_durations.medians(files), {SCRIPT: 201})
 
 
+class WriteDurations(unittest.TestCase):
+    def test_each_script_is_rewritten_in_its_duration_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            scripts = Path(d) / "test/spicescript"
+            scripts.mkdir(parents=True)
+            (scripts / "full-refresh-chaos.yaml").write_text("name: full-refresh-chaos\nduration: 100s\nsteps: []\n")
+            (scripts / "auth.yaml").write_text("name: auth\nduration: 4s\nsteps: []\n")
+            (scripts / "j.yaml").write_text('{\n  "name": "j",\n  "duration": "3s",\n  "steps": []\n}\n')
+            changed = update_durations.write_durations(Path(d), {
+                SCRIPT: 458,
+                "test/spicescript/auth.yaml": 4,
+                "test/spicescript/j.yaml": 12,
+            })
+            self.assertEqual(changed, 2)
+            self.assertEqual((scripts / "full-refresh-chaos.yaml").read_text(),
+                             "name: full-refresh-chaos\nduration: 458s\nsteps: []\n")
+            self.assertEqual((scripts / "auth.yaml").read_text(), "name: auth\nduration: 4s\nsteps: []\n")
+            self.assertEqual((scripts / "j.yaml").read_text(), '{\n  "name": "j",\n  "duration": "12s",\n  "steps": []\n}\n')
+
+    def test_a_script_without_a_recorded_duration_gets_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            scripts = Path(d) / "test/spicescript"
+            scripts.mkdir(parents=True)
+            text = "name: full-refresh-chaos\nsteps:\n  - load: { duration: 30s }\n"
+            (scripts / "full-refresh-chaos.yaml").write_text(text)
+            self.assertEqual(update_durations.write_durations(Path(d), {SCRIPT: 458}), 0)
+            self.assertEqual((scripts / "full-refresh-chaos.yaml").read_text(), text)
+
+
 if __name__ == "__main__":
     unittest.main()

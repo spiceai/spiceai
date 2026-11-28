@@ -1,4 +1,5 @@
 name: tlp
+duration: 488s
 tags: [long]
 description: >
   Ternary logic partitioning over random predicates: for each predicate p the

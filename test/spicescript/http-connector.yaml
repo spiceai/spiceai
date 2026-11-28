@@ -1,4 +1,5 @@
 name: http-connector
+duration: 4s
 description: >
   The HTTP connector against a server whose answers the script sets: static
   JSON and CSV files; a dynamic JSON API whose request_path and

@@ -1,4 +1,5 @@
 name: mysql-connection-pool
+duration: 86s
 tags: [long]
 description: >
   A MySQL dataset's connection pool takes its size and connection lifetime from

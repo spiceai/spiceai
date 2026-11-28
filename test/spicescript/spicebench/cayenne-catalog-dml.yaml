@@ -1,4 +1,5 @@
 name: cayenne-catalog-dml
+duration: 15s
 description: >
   A Cayenne catalog on a cluster scheduler, with one executor, takes CREATE SCHEMA, CREATE
   TABLE (with PARTITION BY, primary keys and IF NOT EXISTS), INSERT (an insert

@@ -3,6 +3,7 @@
 # dataset status never records it: `last_refresh` stays as it was, so nothing
 # can tell when the refresh finished.
 name: cluster-refresh-status
+duration: 40s
 description: >
   On a cluster scheduler with one executor, a refresh requested through the
   API is reported finished in the dataset's status, and the acceleration

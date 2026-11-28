@@ -1,4 +1,5 @@
 name: cluster-shuffle
+duration: 95s
 tags: [long]
 description: >
   A scheduler and three executors, each executor in a container of its own,

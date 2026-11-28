@@ -27,13 +27,57 @@ use crate::script::{LogStep, MetricCondition, MetricWait, StatusStep};
 
 use super::{Instance, POLL, Sources, namespace, one_line, settled};
 
+/// Every file under an instance's directory at a `mark-files`, by its path
+/// relative to the directory: its size and a digest of its contents.
+pub(super) type FileMarks = BTreeMap<String, (u64, u64)>;
+
+/// Files the harness itself writes in an instance's directory, which
+/// `mark-files` leaves out.
+const HARNESS_WRITTEN: &[&str] = &["spicepod.yaml", "spiced.log"];
+
+/// The size and digest of every file under `dir`, but the harness's own.
+pub(super) fn mark_files(dir: &std::path::Path) -> Result<FileMarks> {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut marks = FileMarks::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next)
+            .with_context(|| format!("Failed to list {}", next.display()))?
+        {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(dir) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().into_owned();
+            if HARNESS_WRITTEN.contains(&relative.as_str()) {
+                continue;
+            }
+            let contents = std::fs::read(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let mut hasher = DefaultHasher::new();
+            hasher.write(&contents);
+            let size = std::fs::metadata(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+                .len();
+            marks.insert(relative, (size, hasher.finish()));
+        }
+    }
+    Ok(marks)
+}
+
 /// Checks the files under `dir` by their paths relative to it: each
-/// `contains` pattern matches one, and no `lacks` pattern matches any.
+/// `contains` pattern matches one, no `lacks` pattern matches any, and each
+/// file of `unchanged` is still there with the size and digest it had then.
 pub(super) fn assert_files(
     dir: &std::path::Path,
     contains: &[regex::Regex],
     lacks: &[regex::Regex],
     lacks_dirs: &[regex::Regex],
+    unchanged: Option<&FileMarks>,
 ) -> Result<String> {
     let mut files = Vec::new();
     // Directories, empty ones included, as `<relative path>/`.
@@ -68,6 +112,21 @@ pub(super) fn assert_files(
     for pattern in lacks_dirs {
         for found in dirs.iter().filter(|d| pattern.is_match(d)) {
             problems.push(format!("/{pattern}/ matches directory {found}"));
+        }
+    }
+    if let Some(marked) = unchanged {
+        let now = mark_files(dir)?;
+        for (file, then) in marked {
+            match now.get(file) {
+                None => problems.push(format!("{file} is gone")),
+                Some(current) if current != then => {
+                    problems.push(format!(
+                        "{file} changed ({} bytes, then {})",
+                        current.0, then.0
+                    ));
+                }
+                Some(_) => {}
+            }
         }
     }
     // The directory goes after ` --- `, which an expected failure's signature

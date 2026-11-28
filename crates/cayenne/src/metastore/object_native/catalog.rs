@@ -461,9 +461,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
         self.for_table(table_id)
-            .set_snapshot_sequence(table_id, snapshot_id, sequence_number)
+            .set_snapshot_sequence(table_id, snapshot_id, sequence_number, files)
             .await
     }
     async fn clear_snapshot_sequence(

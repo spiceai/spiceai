@@ -3,6 +3,7 @@
 # "Internal error: Schema metadata mismatch", and an accelerated view built on
 # that never loads.
 name: http-headers-from-subquery
+duration: 34s
 description: >
   The HTTP connector's request_headers can come from an IN subquery over a
   PostgreSQL table, in a query and in an accelerated view.

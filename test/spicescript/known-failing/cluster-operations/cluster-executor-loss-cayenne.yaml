@@ -3,6 +3,7 @@
 # the survivor, so every query of the table fails ("no ready executor serves 2
 # of its 5 partitions; retry the query") until the executor returns.
 name: cluster-executor-loss-cayenne
+duration: 42s
 description: >
   A scheduler with two executors answers queries over PostgreSQL, federated
   and accelerated into Cayenne, as PostgreSQL does; while one executor is

@@ -5,6 +5,7 @@
 # on a schedule; and a misspelled connector param is ignored with a warning
 # that does not name the dataset.
 name: config-errors-known
+duration: 124s
 description: >
   Every configuration mistake leaves its dataset reported in Error, naming the
   dataset and what to fix: an unknown acceleration engine, an unparseable
