@@ -52,7 +52,7 @@ env:
     test(/^deletion_vector/) | test(/^orphan_dv_compaction_test::/) |
     test(/^object_store_reclaim_test::/) | test(/^per_dataset_store_test::/) |
     test(/^object_native_data_test::/) | test(/^snapshot_cleanup_convergence_test::/) |
-    test(/^uncommitted_file_adoption_test::/)
+    test(/^uncommitted_file_adoption_test::/) | test(/^disk_cache_test::/)
 
 jobs:
   changes:
@@ -89,6 +89,7 @@ jobs:
               - 'crates/cayenne-metastore-actions/**'
               - 'crates/object_store_occ/**'
               - 'crates/object_store_sim/**'
+              - 'crates/object-store-cache/**'
               - '.github/workflows/cayenne_object_native.yml'
               - 'Cargo.toml'
               - 'Cargo.lock'

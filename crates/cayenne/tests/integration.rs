@@ -68,6 +68,8 @@ mod deletion_test;
 mod deletion_vector_bug_test;
 mod deletion_vector_integration_test;
 mod delta_encoding_test;
+mod disk_cache_process_lifecycle_test;
+mod disk_cache_test;
 mod dynamic_filter_sharing_lineage_test;
 mod file_based_retention_delete_test;
 mod file_pruning_test;

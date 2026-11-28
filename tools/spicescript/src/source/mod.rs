@@ -84,6 +84,28 @@ pub trait Source: Send + Sync {
         }
     }
 
+    /// Stops the source's server (`stop-source`). A source whose other
+    /// containers depend on its `container` overrides these four where they
+    /// would otherwise leave those containers broken.
+    async fn stop_server(&self) -> Result<()> {
+        server(self.container())?.stop().await
+    }
+
+    /// Starts the stopped server again, on the same host ports, and waits for
+    /// it to be healthy (`start-source`).
+    async fn start_server(&self) -> Result<()> {
+        server(self.container())?.start_stopped().await
+    }
+
+    /// Freezes the server; open connections stay open (`pause-source`).
+    async fn pause_server(&self) -> Result<()> {
+        server(self.container())?.pause().await
+    }
+
+    async fn unpause_server(&self) -> Result<()> {
+        server(self.container())?.unpause().await
+    }
+
     /// Creates an isolated namespace and returns the connector `params` a
     /// spicepod needs to read it, exposed as `${sources.<name>.params}`, and
     /// other facts about it (a directory, a bucket) exposed as
@@ -163,6 +185,11 @@ pub trait Source: Send + Sync {
         });
         self.load(namespace, &spec.table, &columns, &mut rows).await
     }
+}
+
+/// The container of a source with a server to stop, start or pause.
+fn server(container: Option<&Container>) -> Result<&Container> {
+    container.context("the source has no server to stop, start or pause")
 }
 
 /// How many containers [`start`] runs for a source of `kind`, which is what it

@@ -829,8 +829,9 @@ Model: `source-positions`, `source-ack-before-acceptance`, `source-position-befo
 Decisions 1.11 to 1.14 set how data files are written and found, and decision
 1.10 reclaims them.
 This section gives the rules and the evidence for them; reclamation is under
-[Garbage collection](#data-files-retirement-and-orphans). A local-disk cache in
-front of the destination is out of scope.
+[Garbage collection](#data-files-retirement-and-orphans). The node disk cache
+in front of the destination is out of scope here; see
+[the disk cache design](object-native-disk-cache-technical.md).
 
 ### Storage: one store per dataset
 

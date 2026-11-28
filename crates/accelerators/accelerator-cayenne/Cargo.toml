@@ -28,6 +28,7 @@ description = "Cayenne data accelerator: implements data-accelerator-api::DataAc
 data-accelerator-api = { path = "../../data-accelerator-api" }
 app = { path = "../../app" }
 cayenne = { path = "../../cayenne", features = ["partition-table-provider"] }
+object-store-cache = { path = "../../object-store-cache" }
 data_components = { path = "../../data_components" }
 runtime-acceleration = { path = "../../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }

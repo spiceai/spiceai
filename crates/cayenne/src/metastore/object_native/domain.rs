@@ -726,6 +726,46 @@ impl Inner {
 }
 
 impl Domain {
+    /// [`super::ObjectNativeCatalog::cacheable_files`] for a table this log holds.
+    pub(super) async fn cacheable_files(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Option<super::CacheableFiles>> {
+        let inner = self.inner.take().await;
+        // A replica's log is stopped for changes only; its state is what the
+        // writer committed, unless a batch failed to apply partway and the
+        // log is read again on its next follow.
+        let stopped = !matches!(inner.stop, None | Some(Stop::Replica));
+        if stopped || inner.reread || inner.has_uncommitted(table_id) || inner.reserved(table_id) {
+            return Ok(None);
+        }
+        let table = inner.table(table_id)?;
+        let size = |size: i64| u64::try_from(size).unwrap_or(0);
+        let data = table
+            .live_files()
+            .into_iter()
+            .map(|(path, (_, entry))| super::CommittedFile {
+                key: cayenne_metastore_actions::TableState::file_key(path),
+                size: size(entry.size),
+                seq: entry.max_seq,
+            })
+            .collect();
+        let deletions = table
+            .delete_files
+            .values()
+            .map(|dv| super::CommittedFile {
+                key: table.delete_file_key(dv),
+                size: size(dv.size),
+                seq: dv.seq,
+            })
+            .collect();
+        Ok(Some(super::CacheableFiles {
+            data,
+            deletions,
+            retired: table.retired.iter().cloned().collect(),
+        }))
+    }
+
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
     /// checkpoint), kept in the catalog beside the data it describes. On a
     /// replica, the value as of the writer's latest commit: the log follows

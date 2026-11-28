@@ -338,12 +338,47 @@ pub async fn build_object_store(
     state: &StateLocation,
     feature: StateFeature,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    let (store, prefix) = build_unmetered_object_store(secrets, io_runtime, state, feature).await?;
+    let (store, prefix, _) =
+        build_unmetered_object_store(secrets, io_runtime, state, feature).await?;
     Ok((metrics::metered(store, feature), prefix))
+}
+
+/// What decides which bytes an object path of an `s3://` location names: the
+/// endpoint the store sends requests to, the bucket, and the location's prefix.
+/// It holds no credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreIdentity {
+    pub scheme: String,
+    /// The endpoint, lower case and without a trailing `/`; `None` for AWS's
+    /// default endpoint.
+    pub endpoint: Option<String>,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl StoreIdentity {
+    /// A name for the backend that differs whenever any part of the identity
+    /// differs: the hex BLAKE3 hash of its parts.
+    #[must_use]
+    pub fn namespace(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for part in [
+            self.scheme.as_str(),
+            self.endpoint.as_deref().unwrap_or(""),
+            self.bucket.as_str(),
+            self.prefix.as_str(),
+        ] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 /// [`build_object_store`] without the metrics: the caller meters the store with
 /// [`metrics::metered`], once for each feature whose requests go through it.
+/// Also returns the store's [`StoreIdentity`] for an `s3://` location (`None`
+/// for every other scheme).
 ///
 /// # Errors
 ///
@@ -353,7 +388,7 @@ pub async fn build_unmetered_object_store(
     io_runtime: Handle,
     state: &StateLocation,
     feature: StateFeature,
-) -> Result<(Arc<dyn ObjectStore>, String)> {
+) -> Result<(Arc<dyn ObjectStore>, String, Option<StoreIdentity>)> {
     let usage = feature.usage();
     let state_location = state.location.as_str();
     let params = state.params.as_ref();
@@ -417,7 +452,7 @@ pub async fn build_unmetered_object_store(
         } else {
             feature_prefix("")
         };
-        return Ok((store, prefix));
+        return Ok((store, prefix, None));
     }
 
     let base_prefix = if matches!(url.scheme(), "abfs" | "abfss")
@@ -443,13 +478,14 @@ pub async fn build_unmetered_object_store(
         feature_prefix(url.path().trim_matches('/'))
     };
 
+    let mut identity = None;
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = params.map(Params::as_string_map);
         let s3_params =
             build_s3_parameters(Arc::clone(&secrets), params.as_ref(), feature, state.source)
                 .await?;
 
-        S3ObjectStoreBuilder::from_url(&url, io_runtime)
+        let builder = S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {
                 usage,
                 location: url.to_string(),
@@ -458,13 +494,20 @@ pub async fn build_unmetered_object_store(
             .context(S3ObjectStoreInitSnafu {
                 usage,
                 location: url.to_string(),
-            })?
-            .build()
-            .await
-            .context(S3ObjectStoreInitSnafu {
-                usage,
-                location: url.to_string(),
-            })?
+            })?;
+        identity = Some(StoreIdentity {
+            scheme: url.scheme().to_string(),
+            endpoint: builder
+                .effective_endpoint()
+                .map(|endpoint| endpoint.trim_end_matches('/').to_ascii_lowercase())
+                .filter(|endpoint| !endpoint.is_empty()),
+            bucket: url.host_str().unwrap_or_default().to_string(),
+            prefix: base_prefix.clone(),
+        });
+        builder.build().await.context(S3ObjectStoreInitSnafu {
+            usage,
+            location: url.to_string(),
+        })?
     } else if matches!(url.scheme(), "abfs" | "abfss") {
         let params = params.map(Params::as_string_map);
         let azure_params = build_secret_resolved_parameters(secrets, params.as_ref()).await;
@@ -506,7 +549,7 @@ pub async fn build_unmetered_object_store(
             })?
     };
 
-    Ok((store, base_prefix))
+    Ok((store, base_prefix, identity))
 }
 
 /// Validates an `s3://` location's `params`, given by `source`, against
@@ -844,6 +887,60 @@ mod tests {
                 assert_eq!(prefix, expected, "{location} for {feature:?}");
             }
         }
+    }
+
+    /// An `s3://` location's identity carries the endpoint as the store uses
+    /// it (lower case, no trailing `/`), the bucket and the prefix, so two
+    /// endpoints serving the same bucket name get different namespaces; a
+    /// `file://` location has none.
+    #[tokio::test]
+    async fn s3_location_identity_names_endpoint_bucket_and_prefix() {
+        let identity = |endpoint: &'static str| async move {
+            let params = [
+                ("s3_endpoint", endpoint),
+                ("s3_key", "AKID"),
+                ("s3_secret", "SECRET"),
+                ("s3_region", "us-east-1"),
+            ];
+            build_unmetered_object_store(
+                secrets(),
+                Handle::current(),
+                &runtime_state("s3://bucket/state/", &params),
+                StateFeature::CayenneData,
+            )
+            .await
+            .expect("runtime.state store should build")
+            .2
+            .expect("an s3 location has an identity")
+        };
+        let first = identity("http://LocalHost:9000/").await;
+        assert_eq!(
+            first,
+            StoreIdentity {
+                scheme: "s3".to_string(),
+                endpoint: Some("http://localhost:9000".to_string()),
+                bucket: "bucket".to_string(),
+                prefix: "state/cayenne".to_string(),
+            }
+        );
+        assert_eq!(
+            first.namespace(),
+            identity("http://localhost:9000").await.namespace()
+        );
+        assert_ne!(
+            first.namespace(),
+            identity("http://localhost:9001").await.namespace()
+        );
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let (_, _, local) = build_unmetered_object_store(
+            secrets(),
+            Handle::current(),
+            &runtime_state(&format!("file://{}/", temp_dir.path().display()), &[]),
+            StateFeature::CayenneData,
+        )
+        .await
+        .expect("file state store should build");
+        assert_eq!(local, None);
     }
 
     #[tokio::test]

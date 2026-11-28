@@ -47,6 +47,7 @@ bytes.workspace = true
 ctor.workspace = true
 cache = { path = "../cache" }
 cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
+object-store-cache = { path = "../object-store-cache" }
 chrono.workspace = true
 chunking = { path = "../chunking" }
 clap.workspace = true

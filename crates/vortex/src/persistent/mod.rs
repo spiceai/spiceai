@@ -23,6 +23,7 @@ pub use access_plan::{
     VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, exclude_by_index,
     include_by_index,
 };
+pub use format::DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES;
 pub use format::ProjectionPushdown;
 pub use format::ScanConcurrency;
 pub use format::VortexFormat;

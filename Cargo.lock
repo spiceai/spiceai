@@ -43,6 +43,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "linkme",
+ "object-store-cache",
  "object_store 0.13.2",
  "object_store_occ",
  "object_store_sim",
@@ -3652,6 +3653,7 @@ dependencies = [
  "key-index",
  "libc",
  "loom",
+ "object-store-cache",
  "object_store 0.13.2",
  "object_store_occ",
  "object_store_sim",
@@ -3680,6 +3682,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
+ "tokio-util",
  "tpcdsgen",
  "tpchgen",
  "tracing",
@@ -13943,6 +13946,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "object-store-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "chrono",
+ "crc-fast",
+ "fs4",
+ "futures",
+ "libc",
+ "object_store 0.13.2",
+ "parking_lot",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "object_store"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17738,6 +17761,7 @@ dependencies = [
  "mysql_async",
  "notify",
  "ns_lookup",
+ "object-store-cache",
  "object_store 0.13.2",
  "object_store_occ",
  "opendal",
@@ -18599,6 +18623,7 @@ version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
+ "blake3",
  "bytes",
  "datafusion",
  "futures",

@@ -51,6 +51,7 @@ key-index = { path = "../key-index" }
 range-rescale = { path = "../range-rescale" }
 im = "15.1"
 object_store = { workspace = true }
+object-store-cache = { path = "../object-store-cache" }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -63,6 +64,7 @@ tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 write-retry = { workspace = true }
 url = { workspace = true }

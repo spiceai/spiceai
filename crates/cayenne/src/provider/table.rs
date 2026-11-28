@@ -3054,6 +3054,11 @@ pub struct CayenneTableProvider {
     /// bucket/endpoint than `object_store_config` (the warm tier). Registered
     /// with the query `RuntimeEnv` at scan time via `register_object_store_if_needed`.
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    /// The node disk cache this table's data store reads through, for a table
+    /// whose data is in the object-native location; the table keeps what the
+    /// cache holds of it in step with its committed state
+    /// ([`Self::reconcile_disk_cache`]).
+    disk_cache: Option<Arc<crate::disk_cache::TableDiskCache>>,
     /// The `RuntimeEnv`s where `object_store_config` has already been
     /// verified/registered, held weakly (see
     /// [`Self::register_object_store_for_runtime`]). This avoids probing the
@@ -4149,6 +4154,7 @@ pub struct CayenneTableProviderBuilder {
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    disk_cache: Option<crate::disk_cache::DiskCacheBinding>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
@@ -4327,6 +4333,7 @@ struct CayenneTableProviderOpenOptions {
     time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     cold_object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    disk_cache: Option<crate::disk_cache::DiskCacheBinding>,
     context: Option<Arc<CayenneContext>>,
     maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
     durable_write_back: bool,
@@ -4400,6 +4407,7 @@ impl CayenneTableProviderBuilder {
             time_retention_filter_builder: None,
             object_store_config: None,
             cold_object_store_config: None,
+            disk_cache: None,
             context: None,
             maintained_aggregates: Vec::new(),
             durable_write_back: false,
@@ -4485,6 +4493,16 @@ impl CayenneTableProviderBuilder {
     #[must_use]
     pub fn with_cold_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
         self.cold_object_store_config = Some(config);
+        self
+    }
+
+    /// The node disk cache the table's object store (see
+    /// [`Self::with_object_store`]) reads through. A table whose data is in the
+    /// object-native location then evicts from it what its committed state no
+    /// longer names and prefetches what it does.
+    #[must_use]
+    pub fn with_disk_cache(mut self, binding: crate::disk_cache::DiskCacheBinding) -> Self {
+        self.disk_cache = Some(binding);
         self
     }
 
@@ -4586,6 +4604,7 @@ impl CayenneTableProviderBuilder {
             time_retention_filter_builder: self.time_retention_filter_builder,
             object_store_config: self.object_store_config,
             cold_object_store_config: self.cold_object_store_config,
+            disk_cache: self.disk_cache,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
@@ -4630,6 +4649,7 @@ impl CayenneTableProviderBuilder {
             time_retention_filter_builder: self.time_retention_filter_builder,
             object_store_config: self.object_store_config,
             cold_object_store_config: self.cold_object_store_config,
+            disk_cache: self.disk_cache,
             context: self.context,
             maintained_aggregate_specs: self.maintained_aggregates,
             durable_write_back: self.durable_write_back,
@@ -10607,6 +10627,155 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Keep what the node disk cache holds of this table in step with its
+    /// committed state. Evicts the cached files of the table's dataset folder
+    /// that are neither live nor retired within
+    /// [`crate::metastore_layout::DATA_FILE_RETENTION`] (timed as the
+    /// retired-file sweep times it), notes the live files' sizes so a read
+    /// needs no HEAD, and prefetches the live files this node did not upload:
+    /// their tails first, newest first, within a tenth of the cache's
+    /// capacity, then whole files into the room the cache has. A round that is
+    /// not `full` (after a reload) prefetches only the files the last round did
+    /// not see. Does nothing while the committed state is not settled.
+    async fn reconcile_disk_cache(&self, full: bool) {
+        let Some(disk_cache) = self.disk_cache.as_deref() else {
+            return;
+        };
+        if !self.data_in_object_native_location() {
+            return;
+        }
+        let Some(native) = self
+            .catalog
+            .as_any()
+            .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
+        else {
+            return;
+        };
+        let table_name = self.table_metadata.table_name.as_str();
+        let files = match native.cacheable_files(&self.table_metadata.table_id).await {
+            Ok(Some(files)) => files,
+            Ok(None) => return,
+            Err(error) => {
+                disk_cache.report_failure(
+                    table_name,
+                    crate::disk_cache::ReconcileFailure::ReadFiles,
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        let (Ok(root), Some(storage)) = (
+            self.snapshot_root_key_prefix(),
+            self.dataset_storage.as_ref(),
+        ) else {
+            return;
+        };
+        self.observe_retired_files(&files.retired);
+        let cache = disk_cache.binding.cache();
+        let namespace = disk_cache.binding.namespace();
+        let location = |key: &str| Self::retired_file_location(&root, key);
+        let keep: HashSet<ObjectStorePath> = {
+            let timers = self.retired_file_timers.lock();
+            crate::disk_cache::kept_keys(
+                files
+                    .data
+                    .iter()
+                    .chain(&files.deletions)
+                    .map(|file| file.key.as_str()),
+                &files.retired,
+                &timers,
+                Instant::now(),
+                crate::metastore_layout::DATA_FILE_RETENTION,
+            )
+        }
+        .iter()
+        .map(|key| location(key.as_str()))
+        .collect();
+        // A data path belongs to one table, the only table in its dataset's
+        // log (partitioned datasets stay on the SQLite metastore, and a new or
+        // rebuilt dataset gets a fresh folder), so what this table's committed
+        // state does not name under it is unreferenced.
+        let evicted = cache
+            .evict_unreferenced(namespace, storage.prefix(), |path| keep.contains(path))
+            .await;
+
+        let previously_seen = std::mem::take(&mut *disk_cache.seen.lock());
+        let mut seen = HashSet::with_capacity(files.data.len() + files.deletions.len());
+        let mut candidates = Vec::new();
+        // New files to prefetch, by path: each leaves `seen` again unless its
+        // whole-file prefetch is queued in full, so the next round retries a
+        // file the cache declined or the round never reached.
+        let mut unsettled: HashMap<ObjectStorePath, String> = HashMap::new();
+        let tagged = files
+            .data
+            .iter()
+            .map(|file| (file, false))
+            .chain(files.deletions.iter().map(|file| (file, true)));
+        for (file, deletion) in tagged {
+            let path = location(&file.key);
+            cache.note_size(namespace, &path, file.size);
+            let new = seen.insert(file.key.clone()) && !previously_seen.contains(&file.key);
+            if (full || new) && !cache.written_here(namespace, &path) {
+                if new {
+                    unsettled.insert(path.clone(), file.key.clone());
+                }
+                candidates.push(crate::disk_cache::PrefetchCandidate {
+                    path,
+                    size: file.size,
+                    seq: file.seq,
+                    deletion,
+                });
+            }
+        }
+        let plan = crate::disk_cache::plan_prefetch(
+            candidates,
+            cache.block_bytes(),
+            cache.stats().capacity_bytes,
+        );
+        let mut queued = 0_u64;
+        for crate::disk_cache::Prefetch { path, size, range } in plan {
+            let whole = range.is_none();
+            let prefetched =
+                match cache.prefetch(namespace, &path, size, range.map(|range| vec![range])) {
+                    Ok(prefetched) => prefetched,
+                    Err(error) => {
+                        disk_cache.report_failure(
+                            table_name,
+                            crate::disk_cache::ReconcileFailure::Prefetch,
+                            &error.to_string(),
+                        );
+                        break;
+                    }
+                };
+            queued = queued.saturating_add(prefetched.queued_bytes);
+            // A whole file the cache had no room for: neither has it for the
+            // older files after it.
+            if whole && prefetched.declined_bytes > 0 {
+                break;
+            }
+            if whole {
+                unsettled.remove(&path);
+            }
+        }
+        for key in unsettled.values() {
+            seen.remove(key);
+        }
+        *disk_cache.seen.lock() = seen;
+        tracing::debug!(
+            table = table_name,
+            evicted_bytes = evicted,
+            queued_bytes = queued,
+            full,
+            "Reconciled the disk cache with the table's committed files"
+        );
+    }
+
+    /// Test-only: one full [`Self::reconcile_disk_cache`] round now.
+    #[doc(hidden)]
+    pub async fn reconcile_disk_cache_now(&self) {
+        self.reconcile_disk_cache(true).await;
+    }
+
     /// The object a retired file's key names: a deletion vector
     /// (`<snapshot>/deletions/<file>.arrow`) beside the table's directory, any
     /// other file under it.
@@ -10694,10 +10863,11 @@ impl CayenneTableProvider {
                     let Some(&observed) = timers.get(key.as_str()) else {
                         return false;
                     };
-                    let waited = now.duration_since(observed);
-                    if waited < crate::metastore_layout::DATA_FILE_RETENTION {
-                        let left =
-                            crate::metastore_layout::DATA_FILE_RETENTION.saturating_sub(waited);
+                    if let Some(left) = crate::metastore_layout::retention_left(
+                        observed,
+                        now,
+                        crate::metastore_layout::DATA_FILE_RETENTION,
+                    ) {
                         next_due = Some(next_due.map_or(left, |due| due.min(left)));
                         return false;
                     }
@@ -12437,6 +12607,7 @@ impl CayenneTableProvider {
             time_retention_filter_builder,
             object_store_config,
             cold_object_store_config,
+            disk_cache,
             context,
             maintained_aggregate_specs,
             durable_write_back,
@@ -12885,6 +13056,8 @@ impl CayenneTableProvider {
             dataset_storage,
             data_root,
             cold_object_store_config,
+            disk_cache: disk_cache
+                .map(|binding| Arc::new(crate::disk_cache::TableDiskCache::new(binding))),
             object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
                 object_store_registered_runtime_envs,
             )),
@@ -15387,6 +15560,7 @@ impl CayenneTableProvider {
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
             cold_object_store_config: self.cold_object_store_config.clone(),
+            disk_cache: self.disk_cache.clone(),
             object_store_registered_runtime_envs: Arc::clone(
                 &self.object_store_registered_runtime_envs,
             ),
@@ -36683,6 +36857,9 @@ impl CayenneTableProvider {
             "Refreshed in-memory state for table {} from catalog",
             self.table_metadata.table_name
         );
+        if let Some(disk_cache) = &self.disk_cache {
+            disk_cache.wake.notify_one();
+        }
 
         Ok(())
     }
@@ -39679,6 +39856,11 @@ impl CayenneTableProvider {
     const WRITER_REFRESH_RECHECK: Duration = Duration::from_secs(30);
     /// The shortest period between a replica's background view refreshes.
     const REPLICA_VIEW_REFRESH_MIN_PERIOD: Duration = Duration::from_millis(100);
+    /// How often the disk-cache reconciler runs a full round without a reload
+    /// waking it.
+    const DISK_CACHE_SWEEP_PERIOD: Duration = Duration::from_mins(5);
+    /// The shortest period between two disk-cache reconciliation rounds.
+    const DISK_CACHE_MIN_ROUND_GAP: Duration = Duration::from_secs(1);
 
     /// Initialize the demand scan-view cache once the provider is wrapped in an `Arc`:
     /// record a weak self-reference (so the cache can obtain an owned `Arc<Self>` for
@@ -39694,6 +39876,9 @@ impl CayenneTableProvider {
             task::spawn(Self::run_scan_view_evictor(Arc::downgrade(self)));
             if self.data_in_object_native_location() {
                 task::spawn(Self::run_replica_view_refresh(Arc::downgrade(self)));
+                if self.disk_cache.is_some() {
+                    task::spawn(Self::run_disk_cache_reconciler(Arc::downgrade(self)));
+                }
             }
         }
     }
@@ -39768,6 +39953,32 @@ impl CayenneTableProvider {
                 );
             }
         }
+    }
+
+    /// Background reconciliation of the node disk cache with this table's
+    /// committed files ([`Self::reconcile_disk_cache`]): a full round at once,
+    /// a round for the new files after each reload from the catalog, and a full
+    /// round every [`Self::DISK_CACHE_SWEEP_PERIOD`], at most one a
+    /// [`Self::DISK_CACHE_MIN_ROUND_GAP`]. Holds only a `Weak<Self>` between
+    /// rounds and exits after the table is torn down or its maintenance closed.
+    async fn run_disk_cache_reconciler(weak: std::sync::Weak<Self>) {
+        crate::disk_cache::reconcile_rounds(
+            |full| {
+                let weak = std::sync::Weak::clone(&weak);
+                async move {
+                    let provider = weak.upgrade()?;
+                    if provider.is_maintenance_closed() {
+                        return None;
+                    }
+                    provider.reconcile_disk_cache(full).await;
+                    let disk_cache = provider.disk_cache.as_ref()?;
+                    Some(Arc::clone(&disk_cache.wake))
+                }
+            },
+            Self::DISK_CACHE_SWEEP_PERIOD,
+            Self::DISK_CACHE_MIN_ROUND_GAP,
+        )
+        .await;
     }
 
     /// Whether a query planned a scan of this table within the idle window

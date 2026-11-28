@@ -61,9 +61,7 @@ impl OpenedCatalog {
 
 const OBJECT_NATIVE_DIR: &str = "object_native";
 
-/// `runtime.params` key that puts new file-mode Cayenne datasets on the
-/// object-native metastore: `enabled` or `disabled` (the default).
-pub(super) const CAYENNE_VNEXT_PARAM: &str = "cayenne_vnext";
+pub(super) use cayenne::CAYENNE_VNEXT_PARAM;
 
 /// The `SQLite` database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
@@ -266,22 +264,11 @@ impl CayenneAccelerator {
     /// Whether `runtime.params.cayenne_vnext` is `enabled`: new file-mode datasets
     /// then use the object-native metastore.
     pub(super) fn vnext_enabled(source: &dyn AccelerationSource) -> Result<bool> {
-        match source
-            .app()
-            .runtime
-            .params
-            .get(CAYENNE_VNEXT_PARAM)
-            .map(String::as_str)
-        {
-            None | Some("disabled") => Ok(false),
-            Some("enabled") => Ok(true),
-            Some(other) => InvalidConfigurationSnafu {
-                detail: Arc::from(format!(
-                    "`runtime.params.{CAYENNE_VNEXT_PARAM}` is '{other}'. Set it to 'enabled' or 'disabled'."
-                )),
+        cayenne::vnext_enabled(&source.app().runtime.params).map_err(|error| {
+            Error::InvalidConfiguration {
+                detail: Arc::from(error.to_string()),
             }
-            .fail(),
-        }
+        })
     }
 
     /// The metastore holding `source`'s file-mode acceleration.
@@ -553,15 +540,16 @@ impl CayenneAccelerator {
             .get_or_try_init(move || async move {
                 // One client for the location; the logs' requests and the data files'
                 // are measured apart.
-                let (store, prefix) = runtime_state_location::build_unmetered_object_store(
-                    Arc::clone(&secrets),
-                    tokio::runtime::Handle::current(),
-                    &location,
-                    runtime_state_location::StateFeature::CayenneMetastore,
-                )
-                .await
-                .boxed()
-                .context(AccelerationInitializationFailedSnafu)?;
+                let (store, prefix, identity) =
+                    runtime_state_location::build_unmetered_object_store(
+                        Arc::clone(&secrets),
+                        tokio::runtime::Handle::current(),
+                        &location,
+                        runtime_state_location::StateFeature::CayenneMetastore,
+                    )
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
                 let prefix = object_store::path::Path::parse(&prefix)
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
@@ -588,12 +576,19 @@ impl CayenneAccelerator {
                         config,
                     )
                     .await
-                    .map(|native| native.with_data_store(data_store));
-                let catalog = Arc::new(
-                    native
-                        .boxed()
-                        .context(AccelerationInitializationFailedSnafu)?,
-                );
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                let native = native.with_data_store(data_store);
+                // The node disk cache reads data files through the meter, so the
+                // data requests measured are the cache's misses and prefetches.
+                let native = match cayenne::disk_cache::process_disk_cache_or_open()
+                    .await
+                    .zip(identity)
+                {
+                    Some((cache, identity)) => native.with_disk_cache(cache, &identity.namespace()),
+                    None => native,
+                };
+                let catalog = Arc::new(native);
                 cayenne::MetadataCatalog::init(catalog.as_ref())
                     .await
                     .boxed()
@@ -881,7 +876,7 @@ impl CayenneAccelerator {
                 return Ok(false);
             }
             let location = effective_state_location(&source.app())?;
-            let (store, prefix) = runtime_state_location::build_unmetered_object_store(
+            let (store, prefix, _) = runtime_state_location::build_unmetered_object_store(
                 source.secrets(),
                 tokio::runtime::Handle::current(),
                 &location,
