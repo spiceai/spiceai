@@ -435,7 +435,7 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls", "gzip", "br
 reqsign-core = "3.0.0"
 rmcp = { version = "3.10.0", default-features = false }
 rayon = "1.11.0"
-roaring = "0.11"
+roaring = "0.11.5"
 rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
 rust_decimal = "1.42"
 rustls = "0.23"

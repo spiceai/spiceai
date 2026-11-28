@@ -126,6 +126,7 @@ tracing.workspace = true
 twox-hash.workspace = true
 url.workspace = true
 redact = { path = "../redact" }
+roaring = { workspace = true, optional = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "9.1"
@@ -146,7 +147,7 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
-delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
+delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine", "dep:roaring"]
 elasticsearch = ["dep:elasticsearch"]
 flightsql = []
 kafka = ["dep:rdkafka"]

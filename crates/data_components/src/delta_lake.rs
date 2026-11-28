@@ -40,29 +40,38 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
 use datafusion::logical_expr::{ColumnarValue, Expr, Operator, TableProviderFilterPushDown, lit};
-use datafusion::parquet::arrow::arrow_reader::RowSelection;
+use datafusion::parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
-use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::engine_data::{GetData, RowIndexIterator, TypedGetData};
+use delta_kernel::expressions::{
+    BinaryExpressionOp, ColumnName, DecimalData, Expression, Scalar, column_name,
+};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::scan::state::ScanFile;
+use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
+use delta_kernel::{
+    DeltaResult, Engine, ExpressionRef, FilteredRowVisitor, Predicate, SnapshotRef,
+};
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
+use roaring::RoaringTreemap;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::sync::RwLock;
+use std::collections::VecDeque;
+use std::ops::Range;
+use std::sync::{LazyLock, RwLock};
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
@@ -1449,6 +1458,11 @@ impl TableProvider for DeltaTable {
 
                 for scan_result in scan_iter {
                     let scan = scan_result.map_err(map_delta_error_to_datafusion_err)?;
+                    let mut deletion_vectors = DeletionVectorVisitor::default();
+                    deletion_vectors
+                        .visit_rows_of(&scan.scan_files)
+                        .map_err(map_delta_error_to_datafusion_err)?;
+                    scan_context.deletion_vectors = deletion_vectors.descriptors;
                     scan_context = scan
                         .visit_scan_files(scan_context, handle_scan_file)
                         .map_err(map_delta_error_to_datafusion_err)?;
@@ -1535,12 +1549,12 @@ impl TableProvider for DeltaTable {
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
 
-            // If there is a selection vector, create a ParquetAccessPlan that will be used to skip rows based on the selection vector
-            if let Some(selection_vector) = file.selection_vector {
+            // If the file has a deletion vector, create a ParquetAccessPlan that skips the deleted rows
+            if let Some(deleted_rows) = &file.deleted_rows {
                 let access_plan = get_parquet_access_plan(
                     &parquet_file_reader_factory,
                     &partitioned_file,
-                    selection_vector,
+                    deleted_rows,
                 )
                 .await?;
                 partitioned_file = partitioned_file.with_extension(access_plan);
@@ -1656,6 +1670,9 @@ struct ScanContext {
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     pub files: Vec<PartitionFileContext>,
     table_root: Url,
+    /// The deletion vectors of the scan metadata batch being visited, in the order in which
+    /// `handle_scan_file` receives their files.
+    deletion_vectors: VecDeque<DeletionVectorDescriptor>,
 }
 
 impl ScanContext {
@@ -1665,7 +1682,86 @@ impl ScanContext {
             errs: Vec::new(),
             files: Vec::new(),
             table_root,
+            deletion_vectors: VecDeque::new(),
         }
+    }
+}
+
+/// Reads the deletion vector descriptors of a batch of scan metadata, in the order in which
+/// `ScanMetadata::visit_scan_files` visits their files: the selected rows that have a path.
+#[derive(Default)]
+struct DeletionVectorVisitor {
+    descriptors: VecDeque<DeletionVectorDescriptor>,
+}
+
+impl FilteredRowVisitor for DeletionVectorVisitor {
+    fn selected_column_names_and_types(
+        &self,
+    ) -> (
+        &'static [ColumnName],
+        &'static [delta_kernel::schema::DataType],
+    ) {
+        static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<delta_kernel::schema::DataType>)> =
+            LazyLock::new(|| {
+                use delta_kernel::schema::DataType;
+                [
+                    (column_name!("path"), DataType::STRING),
+                    (column_name!("deletionVector.storageType"), DataType::STRING),
+                    (
+                        column_name!("deletionVector.pathOrInlineDv"),
+                        DataType::STRING,
+                    ),
+                    (column_name!("deletionVector.offset"), DataType::INTEGER),
+                    (
+                        column_name!("deletionVector.sizeInBytes"),
+                        DataType::INTEGER,
+                    ),
+                    (column_name!("deletionVector.cardinality"), DataType::LONG),
+                ]
+                .into_iter()
+                .unzip()
+            });
+        (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+    }
+
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        for row in rows {
+            let Some(path): Option<&str> = getters[0].get_opt(row, "scanFile.path")? else {
+                continue;
+            };
+            let Some(storage_type): Option<&str> =
+                getters[1].get_opt(row, "deletionVector.storageType")?
+            else {
+                continue;
+            };
+            let path_or_inline_dv: String = getters[2].get(row, "deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> = getters[3].get_opt(row, "deletionVector.offset")?;
+            let size_in_bytes: i32 = getters[4].get(row, "deletionVector.sizeInBytes")?;
+            let cardinality: i64 = getters[5].get(row, "deletionVector.cardinality")?;
+            let descriptor = storage_type
+                .parse()
+                .and_then(|storage_type| {
+                    DeletionVectorDescriptor::try_new(
+                        storage_type,
+                        path_or_inline_dv,
+                        offset,
+                        size_in_bytes,
+                        cardinality,
+                    )
+                })
+                .map_err(|e| {
+                    delta_kernel::Error::generic(format!(
+                        "Delta Lake table is corrupt: the deletion vector of data file '{path}' is \
+                         not valid: {e}"
+                    ))
+                })?;
+            self.descriptors.push_back(descriptor);
+        }
+        Ok(())
     }
 }
 
@@ -1691,7 +1787,8 @@ fn project_delta_schema(
 
 struct PartitionFileContext {
     partitioned_file: PartitionedFile,
-    selection_vector: Option<Vec<bool>>,
+    /// Row indexes that the file's deletion vector deletes.
+    deleted_rows: Option<RoaringTreemap>,
     partition_values: HashMap<String, String>,
 
     /// These are transforms that Delta wants to apply to the physical data read from the Parquet files.
@@ -1716,6 +1813,10 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
         ..
     } = scan_file;
 
+    let deletion_vector = dv_info
+        .has_vector()
+        .then(|| scan_context.deletion_vectors.pop_front());
+
     let root_url = &scan_context.table_root;
 
     let partitioned_file_path = match data_file_location(root_url, &path) {
@@ -1738,23 +1839,33 @@ fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
 
     let partitioned_file = PartitionedFile::from(partitioned_file_object_meta);
 
-    // Get the selection vector (i.e. inverse deletion vector)
-    let selection_vector =
-        match dv_info.get_selection_vector(scan_context.engine.as_ref(), root_url) {
-            Ok(selection_vector) => selection_vector,
-            Err(e) => {
-                scan_context
-                    .errs
-                    .push(datafusion::error::DataFusionError::Execution(format!(
-                        "Error getting selection vector: {e}",
-                    )));
-                return;
-            }
-        };
+    let deleted_rows = deletion_vector
+        .map(|descriptor| {
+            descriptor
+                .filter(|descriptor| DvInfo::from(descriptor.clone()) == dv_info)
+                .ok_or_else(|| {
+                    delta_kernel::Error::internal_error(
+                        "the deletion vector read from the scan metadata is not the file's",
+                    )
+                })?
+                .read(scan_context.engine.storage_handler(), root_url)
+        })
+        .transpose();
+    let deleted_rows = match deleted_rows {
+        Ok(deleted_rows) => deleted_rows,
+        Err(e) => {
+            scan_context
+                .errs
+                .push(datafusion::error::DataFusionError::Execution(format!(
+                    "Error reading the deletion vector of Delta Lake data file '{path}': {e}",
+                )));
+            return;
+        }
+    };
 
     scan_context.files.push(PartitionFileContext {
         partitioned_file,
-        selection_vector,
+        deleted_rows,
         partition_values,
         _transform: transform,
     });
@@ -1813,47 +1924,87 @@ fn map_delta_error_to_datafusion_err(e: delta_kernel::Error) -> datafusion::erro
     datafusion::error::DataFusionError::External(Box::new(e))
 }
 
-fn get_row_group_access(
-    selection_vector: &[bool],
-    row_group_row_start: usize,
-    row_group_num_rows: usize,
-) -> RowGroupAccess {
-    // If all rows in the row group are deleted (i.e. not selected), skip the row group
-    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
-        .iter()
-        .all(|&x| !x)
-    {
-        return RowGroupAccess::Skip;
-    }
-    // If all rows in the row group are present (i.e. selected), scan the full row group
-    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
-        .iter()
-        .all(|&x| x)
-    {
-        return RowGroupAccess::Scan;
+/// Plans how to read each row group of a data file, given the row indexes its deletion vector
+/// deletes and the row count of each row group from the file's footer.
+///
+/// A row group with no deleted rows is scanned and one with every row deleted is skipped. Any
+/// other row group selects the runs of rows between deleted ones, so the work and memory follow
+/// the deleted rows and the number of runs, not the file's row count.
+fn row_group_accesses(
+    deleted_rows: &RoaringTreemap,
+    row_group_num_rows: &[i64],
+    file: &str,
+) -> Result<Vec<RowGroupAccess>, DataFusionError> {
+    let mut row_groups = Vec::with_capacity(row_group_num_rows.len());
+    let mut total_rows = 0_u64;
+    for &num_rows in row_group_num_rows {
+        let end = u64::try_from(num_rows)
+            .ok()
+            .and_then(|num_rows| total_rows.checked_add(num_rows))
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Delta Lake data file '{file}' is corrupt: its row group row counts are not \
+                     valid."
+                ))
+            })?;
+        row_groups.push(total_rows..end);
+        total_rows = end;
     }
 
-    let mask =
-        selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows].to_vec();
+    if let Some(last_deleted) = deleted_rows.max()
+        && last_deleted >= total_rows
+    {
+        return Err(DataFusionError::Execution(format!(
+            "Delta Lake table is corrupt: the deletion vector of data file '{file}' deletes row \
+             {last_deleted}, but the file has {total_rows} rows."
+        )));
+    }
 
-    // If some rows are deleted, get a row selection that skips the deleted rows
-    let row_selection = RowSelection::from_filters(&[mask.into()]);
-    RowGroupAccess::Selection(row_selection)
+    Ok(row_groups
+        .into_iter()
+        .map(|rows| {
+            let deleted = deleted_rows.range_cardinality(rows.clone());
+            if deleted == rows.end - rows.start {
+                RowGroupAccess::Skip
+            } else if deleted == 0 {
+                RowGroupAccess::Scan
+            } else {
+                RowGroupAccess::Selection(row_selection(deleted_rows, &rows))
+            }
+        })
+        .collect())
 }
 
-fn get_full_selection_vector(selection_vector: &[bool], total_rows: usize) -> Vec<bool> {
-    let mut new_selection_vector = vec![true; total_rows];
-    let copy_len = std::cmp::min(selection_vector.len(), total_rows);
-    new_selection_vector[..copy_len].copy_from_slice(&selection_vector[..copy_len]);
-    new_selection_vector
+/// Selects the rows of a row group, which spans `rows` of its file, that `deleted_rows` keeps.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "row counts fit in usize on the 64-bit runtime"
+)]
+fn row_selection(deleted_rows: &RoaringTreemap, rows: &Range<u64>) -> RowSelection {
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut next = rows.start;
+    let mut deleted = deleted_rows.iter();
+    deleted.advance_to(rows.start);
+    for row in deleted.take_while(|&row| row < rows.end) {
+        if row > next {
+            selectors.push(RowSelector::select((row - next) as usize));
+        }
+        match selectors.last_mut() {
+            Some(selector) if selector.skip => selector.row_count += 1,
+            _ => selectors.push(RowSelector::skip(1)),
+        }
+        next = row + 1;
+    }
+    if next < rows.end {
+        selectors.push(RowSelector::select((rows.end - next) as usize));
+    }
+    RowSelection::from(selectors)
 }
 
-#[expect(clippy::cast_possible_truncation)]
-#[expect(clippy::cast_sign_loss)]
 async fn get_parquet_access_plan(
     parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
     partitioned_file: &PartitionedFile,
-    selection_vector: Vec<bool>,
+    deleted_rows: &RoaringTreemap,
 ) -> Result<ParquetAccessPlan, datafusion::error::DataFusionError> {
     let mut parquet_file_reader = parquet_file_reader_factory.create_reader(
         0,
@@ -1868,31 +2019,16 @@ async fn get_parquet_access_plan(
         ))
     })?;
 
-    let total_rows = parquet_metadata
+    let row_group_num_rows = parquet_metadata
         .row_groups()
         .iter()
         .map(RowGroupMetaData::num_rows)
-        .sum::<i64>();
-
-    let selection_vector = get_full_selection_vector(&selection_vector, total_rows as usize);
-
-    // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
-    let mut row_groups: Vec<RowGroupAccess> = vec![];
-    let mut row_group_row_start = 0;
-    for (i, row_group) in parquet_metadata.row_groups().iter().enumerate() {
-        // If all rows in the row group are deleted, skip the row group
-        tracing::debug!(
-            "Row group {i} num_rows={} row_group_row_start={row_group_row_start}",
-            row_group.num_rows()
-        );
-        let row_group_access = get_row_group_access(
-            &selection_vector,
-            row_group_row_start,
-            row_group.num_rows() as usize,
-        );
-        row_groups.push(row_group_access);
-        row_group_row_start += row_group.num_rows() as usize;
-    }
+        .collect::<Vec<_>>();
+    let row_groups = row_group_accesses(
+        deleted_rows,
+        &row_group_num_rows,
+        partitioned_file.object_meta.location.as_ref(),
+    )?;
 
     tracing::debug!("Created ParquetAccessPlan with {row_groups:?}");
     Ok(ParquetAccessPlan::new(row_groups))
@@ -3137,91 +3273,194 @@ mod tests {
         assert!(dk_expr.is_some(), "NOT expression should be supported");
     }
 
+    fn deleted(rows: &[u64]) -> RoaringTreemap {
+        rows.iter().copied().collect()
+    }
+
+    /// Plans the row groups of a data file named `part-0.parquet`.
+    fn accesses(
+        deleted_rows: &[u64],
+        row_group_num_rows: &[i64],
+    ) -> Result<Vec<RowGroupAccess>, DataFusionError> {
+        row_group_accesses(&deleted(deleted_rows), row_group_num_rows, "part-0.parquet")
+    }
+
+    fn selection(selectors: Vec<RowSelector>) -> RowGroupAccess {
+        RowGroupAccess::Selection(selectors.into())
+    }
+
+    /// The plan built from a boolean per row of the file, with `false` for a deleted row.
+    fn dense_mask_plan(deleted_rows: &[u64], row_group_num_rows: &[usize]) -> Vec<RowGroupAccess> {
+        let mut keep = vec![true; row_group_num_rows.iter().sum()];
+        for &row in deleted_rows {
+            keep[usize::try_from(row).expect("row index")] = false;
+        }
+        let mut start = 0;
+        row_group_num_rows
+            .iter()
+            .map(|&num_rows| {
+                let mask = &keep[start..start + num_rows];
+                start += num_rows;
+                if mask.iter().all(|&kept| !kept) {
+                    RowGroupAccess::Skip
+                } else if mask.iter().all(|&kept| kept) {
+                    RowGroupAccess::Scan
+                } else {
+                    RowGroupAccess::Selection(RowSelection::from_filters(&[mask.to_vec().into()]))
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn test_get_row_group_access() {
-        // Test case where all rows are selected (should use Scan)
-        let selection_vector = &[true, true, true, true, true];
-        let row_group_row_start = 0;
-        let row_group_num_rows = 5;
-        let row_group_access =
-            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
-        assert_eq!(row_group_access, RowGroupAccess::Scan);
-
-        // Test case where all rows are deleted (should use Skip)
-        let selection_vector = &[false, false, false, false, false];
-        let row_group_access =
-            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
-        assert_eq!(row_group_access, RowGroupAccess::Skip);
-
-        // Test case with mixed selection (should use Selection)
-        let selection_vector = &[true, true, true, false, true];
-        let row_group_access =
-            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
-
-        // Expected selection should have:
-        // - Select first 3 rows
-        // - Skip 1 row
-        // - Select 1 row
-        let selectors = vec![
-            RowSelector::select(3),
-            RowSelector::skip(1),
-            RowSelector::select(1),
-        ];
+    fn a_row_group_is_scanned_skipped_or_read_around_its_deleted_rows() {
+        assert_eq!(accesses(&[], &[5]).expect("plan"), [RowGroupAccess::Scan]);
         assert_eq!(
-            row_group_access,
-            RowGroupAccess::Selection(selectors.into())
+            accesses(&[0, 1, 2, 3, 4], &[5]).expect("plan"),
+            [RowGroupAccess::Skip]
+        );
+        assert_eq!(
+            accesses(&[3], &[5]).expect("plan"),
+            [selection(vec![
+                RowSelector::select(3),
+                RowSelector::skip(1),
+                RowSelector::select(1),
+            ])]
         );
     }
 
     #[test]
-    fn test_get_row_group_access_with_offset() {
-        // Test with offset starting row
-        // Full selection vector: [true, true, true, true, true, false, false, false, true, true]
-        let selection_vector = &[
-            true, true, true, true, true, false, false, false, true, true,
-        ];
-        let row_group_row_start = 5; // Start at index 5
-        let row_group_num_rows = 5; // Take 5 rows (5-9)
-
-        // The selection should consider rows 5-9: [false, false, false, true, true]
-        let row_group_access =
-            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
-
-        // Expected selectors:
-        // - Skip first 3 rows (false, false, false)
-        // - Select last 2 rows (true, true)
-        let selectors = vec![RowSelector::skip(3), RowSelector::select(2)];
+    fn deleted_rows_are_placed_by_their_row_group_offset() {
         assert_eq!(
-            row_group_access,
-            RowGroupAccess::Selection(selectors.into())
+            accesses(&[5, 6, 7], &[5, 5]).expect("plan"),
+            [
+                RowGroupAccess::Scan,
+                selection(vec![RowSelector::skip(3), RowSelector::select(2)]),
+            ]
         );
     }
 
     #[test]
-    fn test_get_full_selection_vector() {
-        // Test expanding a shorter selection vector to a longer one
-        let selection_vector = &[true, false, true];
-        let total_rows = 5;
-        let full_vector = get_full_selection_vector(selection_vector, total_rows);
+    fn rows_after_the_last_deleted_row_are_kept() {
+        assert_eq!(
+            accesses(&[1], &[5]).expect("plan"),
+            [selection(vec![
+                RowSelector::select(1),
+                RowSelector::skip(1),
+                RowSelector::select(3),
+            ])]
+        );
+        assert_eq!(
+            accesses(&[], &[3, 2]).expect("plan"),
+            [RowGroupAccess::Scan, RowGroupAccess::Scan]
+        );
+        assert_eq!(
+            accesses(&[1], &[0, 5]).expect("plan"),
+            [
+                RowGroupAccess::Skip,
+                selection(vec![
+                    RowSelector::select(1),
+                    RowSelector::skip(1),
+                    RowSelector::select(3),
+                ]),
+            ]
+        );
+    }
 
-        // Should copy the provided values and fill the rest with true
-        assert_eq!(full_vector, vec![true, false, true, true, true]);
+    #[test]
+    fn every_deletion_of_a_small_file_plans_what_a_dense_mask_plans() {
+        // Ten rows in three row groups, with every subset of them deleted.
+        for subset in 0_u32..1 << 10 {
+            let deleted_rows = (0..10_u64)
+                .filter(|row| subset & (1 << row) != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                accesses(&deleted_rows, &[3, 4, 3]).expect("plan"),
+                dense_mask_plan(&deleted_rows, &[3, 4, 3]),
+                "deleted rows {deleted_rows:?}"
+            );
+        }
+    }
 
-        // Test truncating a longer selection vector to a shorter one
-        let selection_vector = &[true, false, true, false, true];
-        let total_rows = 3;
-        let full_vector = get_full_selection_vector(selection_vector, total_rows);
+    #[test]
+    fn a_huge_file_with_a_few_deleted_rows_plans_a_few_selectors() {
+        const ROWS: u64 = 1 << 40;
+        let row_group = i64::try_from(ROWS).expect("row count");
+        assert_eq!(
+            accesses(&[7, ROWS / 2, ROWS + 3], &[row_group; 3]).expect("plan"),
+            [
+                selection(vec![
+                    RowSelector::select(7),
+                    RowSelector::skip(1),
+                    RowSelector::select(usize::try_from(ROWS / 2 - 8).expect("rows")),
+                    RowSelector::skip(1),
+                    RowSelector::select(usize::try_from(ROWS / 2 - 1).expect("rows")),
+                ]),
+                selection(vec![
+                    RowSelector::select(3),
+                    RowSelector::skip(1),
+                    RowSelector::select(usize::try_from(ROWS - 4).expect("rows")),
+                ]),
+                RowGroupAccess::Scan,
+            ]
+        );
+    }
 
-        // Should only copy the first 3 values
-        assert_eq!(full_vector, vec![true, false, true]);
+    #[test]
+    fn a_row_group_that_starts_in_a_block_of_2_pow_32_rows_with_no_deleted_row_keeps_its_deletions()
+    {
+        // The deleted row is in the second block of 2^32 rows, at a lower offset in its block than
+        // where its row group starts in the first block.
+        const BLOCK: u64 = 1 << 32;
+        let first_row_group = i64::try_from(BLOCK - 10).expect("row count");
+        assert_eq!(
+            accesses(&[BLOCK + 3], &[first_row_group, 30]).expect("plan"),
+            [
+                RowGroupAccess::Scan,
+                selection(vec![
+                    RowSelector::select(13),
+                    RowSelector::skip(1),
+                    RowSelector::select(16),
+                ]),
+            ]
+        );
+    }
 
-        // Test with empty selection vector
-        let selection_vector = &[];
-        let total_rows = 3;
-        let full_vector = get_full_selection_vector(selection_vector, total_rows);
+    #[test]
+    fn a_deleted_row_past_the_end_of_its_file_is_refused() {
+        // Ten rows: row 9 is the last one, and row 10 does not exist.
+        assert_eq!(
+            accesses(&[9], &[5, 5]).expect("row 9 exists"),
+            [
+                RowGroupAccess::Scan,
+                selection(vec![RowSelector::select(4), RowSelector::skip(1)]),
+            ]
+        );
+        assert_eq!(
+            accesses(&[9, 10], &[5, 5])
+                .expect_err("row 10 does not exist")
+                .to_string(),
+            "Execution error: Delta Lake table is corrupt: the deletion vector of data file \
+             'part-0.parquet' deletes row 10, but the file has 10 rows."
+        );
+    }
 
-        // Should create a vector of all true values
-        assert_eq!(full_vector, vec![true, true, true]);
+    #[test]
+    fn a_row_group_with_a_negative_or_overflowing_row_count_is_refused() {
+        let refusal = "Execution error: Delta Lake data file 'part-0.parquet' is corrupt: its row \
+                       group row counts are not valid.";
+        assert_eq!(
+            accesses(&[1], &[i64::MAX, i64::MAX, i64::MAX])
+                .expect_err("the row counts add up to more than u64::MAX")
+                .to_string(),
+            refusal
+        );
+        assert_eq!(
+            accesses(&[1], &[5, -1])
+                .expect_err("a row group cannot have -1 rows")
+                .to_string(),
+            refusal
+        );
     }
 
     #[test]
@@ -4341,6 +4580,178 @@ mod table_read_tests {
             error.contains(
                 "changed column 'v' after Spice loaded it: the table's column mapping changed"
             ),
+            "{error}"
+        );
+    }
+
+    /// Writes a table with one data file holding the `id`s 0 to 9 in two row groups of five rows,
+    /// and a deletion vector that deletes `deleted_rows` of that file.
+    fn write_table_with_deletion_vector(table: &Path, deleted_rows: &[u64]) {
+        write_table_with_deletion_vectors(table, &[Some(deleted_rows)]);
+    }
+
+    /// Writes a table with one data file `part-<i>.parquet` per entry of `files`, holding the
+    /// `id`s `10 * i` to `10 * i + 9` in two row groups of five rows. A file whose entry is `Some`
+    /// has a deletion vector that deletes those rows of the file.
+    fn write_table_with_deletion_vectors(table: &Path, files: &[Option<&[u64]>]) {
+        use datafusion::arrow::array::Int64Array;
+        use delta_kernel::actions::deletion_vector_writer::{
+            KernelDeletionVector, StreamingDeletionVectorWriter,
+        };
+        use parquet::arrow::ArrowWriter;
+
+        let schema = serde_json::json!({"type": "struct", "fields": [
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}}
+        ]})
+        .to_string();
+        let mut actions = vec![
+            serde_json::json!({"protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors"],
+                "writerFeatures": ["deletionVectors"]
+            }}),
+            serde_json::json!({"metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema,
+                "partitionColumns": [],
+                "configuration": {"delta.enableDeletionVectors": "true"},
+                "createdTime": 0
+            }}),
+        ];
+        for (i, deleted_rows) in (0_i64..).zip(files) {
+            let path = format!("part-{i}.parquet");
+            let file = table.join(&path);
+            let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&arrow_schema),
+                vec![Arc::new(Int64Array::from_iter_values(10 * i..10 * i + 10))],
+            )
+            .expect("batch");
+            let properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(5))
+                .build();
+            let out = std::fs::File::create(&file).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(out, arrow_schema, Some(properties)).expect("parquet writer");
+            writer.write(&batch).expect("write batch");
+            let metadata = writer.close().expect("close parquet file");
+            assert_eq!(metadata.num_row_groups(), 2, "the file has two row groups");
+            let size = std::fs::metadata(&file).expect("parquet file").len();
+
+            let stats = serde_json::json!({
+                "numRecords": 10,
+                "minValues": {"id": 10 * i},
+                "maxValues": {"id": 10 * i + 9},
+                "nullCount": {"id": 0}
+            });
+            let mut add = serde_json::json!({
+                "path": path,
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": true,
+                "stats": stats.to_string()
+            });
+            if let Some(deleted_rows) = deleted_rows {
+                let dv_file = table.join(format!("deletion_vector-{i}.bin"));
+                let mut out = std::fs::File::create(&dv_file).expect("create deletion vector file");
+                let mut dv_writer = StreamingDeletionVectorWriter::new(&mut out);
+                let mut dv = KernelDeletionVector::new();
+                dv.add_deleted_row_indexes(deleted_rows.iter().copied());
+                let written = dv_writer
+                    .write_deletion_vector(dv)
+                    .expect("write deletion vector");
+                dv_writer.finalize().expect("finish deletion vector file");
+                add["deletionVector"] = serde_json::json!({
+                    "storageType": "p",
+                    "pathOrInlineDv": Url::from_file_path(&dv_file).expect("file URL").to_string(),
+                    "offset": written.offset,
+                    "sizeInBytes": written.size_in_bytes,
+                    "cardinality": written.cardinality
+                });
+            }
+            actions.push(serde_json::json!({ "add": add }));
+        }
+        write_commit(table, 0, &actions);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deletion_vector_across_two_row_groups_returns_the_surviving_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vector(dir.path(), &[1, 3, 7]);
+        assert_batches_eq!(
+            [
+                "+----+", "| id |", "+----+", "| 0  |", "| 2  |", "| 4  |", "| 5  |", "| 6  |",
+                "| 8  |", "| 9  |", "+----+",
+            ],
+            &query(dir.path(), "SELECT id FROM t ORDER BY id").await
+        );
+        assert_batches_eq!(
+            ["+---+", "| n |", "+---+", "| 7 |", "+---+"],
+            &query(dir.path(), "SELECT count(*) AS n FROM t").await
+        );
+
+        // Every row of the first row group is deleted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vector(dir.path(), &[0, 1, 2, 3, 4, 8]);
+        assert_batches_eq!(
+            [
+                "+----+", "| id |", "+----+", "| 5  |", "| 6  |", "| 7  |", "| 9  |", "+----+",
+            ],
+            &query(dir.path(), "SELECT id FROM t ORDER BY id").await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_deletion_vector_deletes_rows_of_its_own_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vectors(dir.path(), &[None, Some(&[1, 3, 7]), None, Some(&[0])]);
+        // The ids are 0 to 39 (sum 780), less 11, 13, 17 and 30.
+        assert_batches_eq!(
+            [
+                "+----+-----+",
+                "| n  | s   |",
+                "+----+-----+",
+                "| 36 | 709 |",
+                "+----+-----+",
+            ],
+            &query(dir.path(), "SELECT count(*) AS n, sum(id) AS s FROM t").await
+        );
+        // The file statistics skip files 0 and 1, so the scan metadata deselects their rows,
+        // including the row of the file 1 deletion vector.
+        assert_batches_eq!(
+            [
+                "+----+-----+",
+                "| n  | s   |",
+                "+----+-----+",
+                "| 19 | 560 |",
+                "+----+-----+",
+            ],
+            &query(
+                dir.path(),
+                "SELECT count(*) AS n, sum(id) AS s FROM t WHERE id >= 20"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deletion_vector_that_deletes_a_row_past_the_end_of_its_file_refuses_the_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vector(dir.path(), &[9]);
+        assert_batches_eq!(
+            ["+---+", "| n |", "+---+", "| 9 |", "+---+"],
+            &query(dir.path(), "SELECT count(*) AS n FROM t").await
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_table_with_deletion_vector(dir.path(), &[9, 10]);
+        let error = refusal(&registered(dir.path()), "SELECT id FROM t").await;
+        assert!(
+            error.contains("Delta Lake table is corrupt: the deletion vector of data file '")
+                && error.contains("/part-0.parquet' deletes row 10, but the file has 10 rows."),
             "{error}"
         );
     }
