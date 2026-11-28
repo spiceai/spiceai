@@ -131,19 +131,14 @@ struct Cli {
     #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     cloud: bool,
 
-    /// Spice.ai Cloud runtime endpoint region used with --cloud.
-    ///
-    /// The `--cloud` requirement is enforced by
-    /// [`validate_cloud_region_usage`] so the CLI can provide a specific
-    /// diagnosis.
+    /// Spice.ai Cloud runtime endpoint region used with `--cloud`.
     #[arg(long, global = true, value_parser = parse_cloud_region)]
     cloud_region: Option<String>,
 
-    /// HTTP endpoint of the Spice runtime to talk to (default `http://127.0.0.1:8090`).
-    ///
-    /// The default is applied by the runtime context rather than by clap, so that omitting
-    /// this flag stays distinguishable from passing the default value: `spice sql` refuses to
-    /// send a natural-language query to an HTTP endpoint nobody chose. See #11005.
+    /// HTTP endpoint of the Spice runtime (default `http://127.0.0.1:8090`).
+    // The default is applied by the runtime context rather than by clap, so that omitting
+    // this flag stays distinguishable from passing the default value: `spice sql` refuses to
+    // send a natural-language query to an HTTP endpoint nobody chose. See #11005.
     #[arg(long, global = true)]
     http_endpoint: Option<String>,
 
@@ -255,6 +250,7 @@ enum Commands {
 
     Nsql(nsql::NsqlArgs),
 
+    #[command(disable_help_subcommand = true)]
     Search(search::SearchArgs),
 
     Chat(chat::ChatArgs),
@@ -415,12 +411,16 @@ fn main() {
     //
     // A coding agent's stdout is the agent's own — `spice claude -p … | jq` reads
     // what Claude Code printed — so spice's messages go to stderr there too.
+    //
+    // `spice search` is scriptable in table mode as well as JSON: errors and
+    // logs must not join the result stream a caller is capturing on stdout.
     let agent_stdout = cli.command.coding_agent_args().is_some();
+    let search_command = matches!(cli.command, Commands::Search(_));
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time();
-    if json_stdout || agent_stdout {
+    if json_stdout || agent_stdout || search_command {
         subscriber
             .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stderr))
             .with_writer(std::io::stderr)
@@ -1319,6 +1319,30 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("failed to parse CLI args")
+    }
+
+    #[test]
+    fn search_help_is_a_query_not_a_subcommand() {
+        let cli = parse(&["spice", "search", "help"]);
+        match cli.command {
+            Commands::Search(args) => {
+                assert_eq!(args.query.as_deref(), Some("help"));
+            }
+            _ => panic!("expected search"),
+        }
+    }
+
+    #[test]
+    fn search_help_flag_still_shows_help() {
+        let Err(error) = Cli::try_parse_from(["spice", "search", "--help"]) else {
+            panic!("--help should render help rather than search");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("QUERY"), "{help}");
+        assert!(help.contains("--datasets"), "{help}");
+        assert!(!help.contains("validate_cloud_region_usage"), "{help}");
+        assert!(!help.contains("Within the REPL you can scope"), "{help}");
     }
 
     fn parse_normalized(args: &[&str]) -> Cli {

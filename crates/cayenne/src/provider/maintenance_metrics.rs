@@ -248,8 +248,9 @@ impl CompactionTrigger {
 pub(crate) enum MaintenanceOp {
     /// Reclaim of key-based deletion vectors that shadow nothing live.
     OrphanDvSweep,
-    /// Deletion of objects in a table's object-native location that no commit
-    /// names, past the orphan age floor.
+    /// Objects in a table's object-native location that no commit names, past
+    /// the orphan age floor: a pass retires them (`applied`), and the
+    /// retirement sweep's deletion of them is reclaimed under this operation.
     OrphanFileSweep,
     /// Application of the table's retention filters.
     Retention,

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,6 +42,7 @@ mod bedrock;
 mod decisions;
 mod embedding;
 mod embedding_filter_limit;
+mod fts_and_not;
 mod fts_caching_restart;
 mod fts_restart;
 pub(crate) mod hf;
