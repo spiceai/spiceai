@@ -32,11 +32,14 @@ jobs:
   run-schema:
     # The service principal's federation policy trusts this environment's subject.
     environment: ci
-    # Runs for one Spicepod on one branch share a snapshot branch and its PR
-    # ("Upload schema snapshots to branch"), so they run one at a time: two at once
-    # could publish the PR's evidence out of order.
+    # Runs with the same inputs (ref, Spicepod, spiced commit or the ref's head, and
+    # minimum table count) share a snapshot branch and its PR ("Upload schema
+    # snapshots to branch"), so they run one at a time: two at once could publish
+    # the PR's evidence out of order. The group is the same string the branch key
+    # hashes, so only duplicates share it, and a pending duplicate GitHub replaces
+    # loses nothing.
     concurrency:
-      group: testoperator-schema-${{ github.ref_name }}-${{ github.event.inputs.spicepod_path }}
+      group: testoperator-schema-${{ github.ref_name }}|${{ github.event.inputs.spicepod_path }}|${{ github.event.inputs.spiced_commit || github.sha }}|${{ github.event.inputs.min_tables }}
       cancel-in-progress: false
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
@@ -413,7 +416,10 @@ jobs:
           SLUG="$(printf '%s' '${{ github.ref_name }}/${{ github.event.inputs.spicepod_path }}' \
             | sed -e 's/\.[Yy][Aa][Mm][Ll]$//' -e 's/[^A-Za-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' \
             | tr '[:upper:]' '[:lower:]')"
-          BRANCH_NAME="testoperator-snapshot-update/${SLUG}"
+          # The slug is for reading; the key, a hash of the same inputs the job's
+          # concurrency group names, keeps distinct inputs on distinct branches.
+          SNAPSHOT_KEY="$(printf '%s' "${SNAPSHOT_INPUTS}" | git hash-object --stdin | cut -c1-8)"
+          BRANCH_NAME="testoperator-snapshot-update/${SLUG}-${SNAPSHOT_KEY}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
@@ -476,6 +482,7 @@ jobs:
           bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_INPUTS: ${{ github.ref_name }}|${{ github.event.inputs.spicepod_path }}|${{ github.event.inputs.spiced_commit || github.sha }}|${{ github.event.inputs.min_tables }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'

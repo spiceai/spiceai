@@ -216,7 +216,9 @@ jobs:
     # Runs of one workload against one pinned image share a snapshot branch and its
     # PR ("Open snapshot-update PR"), so they run one at a time: two at once could
     # publish the PR's evidence out of order. The group names the same inputs as the
-    # branch key; a run without a pinned image is keyed by its own run id.
+    # branch key; a run without a pinned image is keyed by its own run id. So only
+    # duplicates share a group, and a pending duplicate GitHub replaces loses
+    # nothing.
     concurrency:
       group: testoperator-cluster-bench-${{ github.event.inputs.custom_image_tag || github.run_id }}-${{ github.event.inputs.query_set || 'tpch' }}-sf${{ github.event.inputs.scale_factor || '1' }}-${{ github.event.inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}-${{ github.event.inputs.scenario_query_file }}
       cancel-in-progress: false

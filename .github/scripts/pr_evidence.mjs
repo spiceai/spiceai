@@ -321,9 +321,15 @@ export async function checkEvidence({ github, owner, repo, pullNumber }) {
     const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(id) });
     let executed = data.status === 'completed' && (data.conclusion === 'success' || data.conclusion === 'failure');
     if (executed) {
-      // eslint-disable-next-line no-await-in-loop
-      const { data: listing } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: Number(id), per_page: 100 });
-      executed = (listing.jobs ?? []).some((job) => (job.steps ?? []).some((step) => step.conclusion === 'success' || step.conclusion === 'failure'));
+      // Every page, until a job that ran steps turns up: the jobs that ran need not come first.
+      executed = false;
+      for (let page = 1; !executed; page += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const { data: listing } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: Number(id), per_page: 100, page });
+        const jobs = listing.jobs ?? [];
+        executed = jobs.some((job) => (job.steps ?? []).some((step) => step.conclusion === 'success' || step.conclusion === 'failure'));
+        if (jobs.length < 100) break;
+      }
     }
     runAt.set(id, executed ? String(data.head_sha ?? '').toLowerCase() : null);
   }

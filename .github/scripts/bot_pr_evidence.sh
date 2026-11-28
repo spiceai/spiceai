@@ -108,7 +108,7 @@ case "${1:-}" in
       write_section
     done
     rm -f "${file}"
-    if has_entry; then exit 0; fi
+    if has_entry && is_head; then exit 0; fi
     echo "The evidence entry could not be kept in ${pr}'s description; add it by hand: ${first_line}" >&2
     exit 1
     ;;

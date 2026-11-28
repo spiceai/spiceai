@@ -37,13 +37,13 @@ const ELSEWHERE = '9'.repeat(40);
 const RUN = 'https://github.com/o/r/actions/runs/42';
 const done = (headSha) => ({ head_sha: headSha, status: 'completed', conclusion: 'success' });
 const RUN_AT = {
-  42: done(HEAD), 7: done(FIRST), 9: done(BASE),
+  42: done(HEAD), 7: done(FIRST), 9: done(BASE), 3: done(HEAD),
   5: { head_sha: HEAD, status: 'queued', conclusion: null },
   8: { head_sha: HEAD, status: 'completed', conclusion: 'action_required' },
   6: { head_sha: HEAD, status: 'completed', conclusion: 'failure' },
 };
 // Jobs per run: a run that executed has a job whose steps ran; held and closed-while-held runs have none.
-const JOBS = { 6: [], 8: [] };
+const JOBS = { 6: [], 8: [], 3: [...Array.from({ length: 100 }, () => ({ steps: [{ conclusion: 'skipped' }] })), { steps: [{ conclusion: 'success' }] }] };
 const executedJob = [{ steps: [{ conclusion: 'success' }] }];
 
 const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n## Not a heading\n-->';
@@ -97,7 +97,9 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
           reads.push(`run ${runId}`);
           return { data: runs[runId] };
         },
-        listJobsForWorkflowRun: async ({ run_id: runId }) => ({ data: { jobs: JOBS[runId] ?? executedJob } }),
+        listJobsForWorkflowRun: async ({ run_id: runId, per_page: perPage, page }) => ({
+          data: { jobs: (JOBS[runId] ?? executedJob).slice((page - 1) * perPage, page * perPage) },
+        }),
       },
     },
   };
@@ -258,6 +260,11 @@ test('a run at another commit, a queued or held run, one closed without a job, a
     assert.equal(result.problems.length, 1, link);
     assert.match(result.problems[0], /carries no output/, link);
   }
+});
+
+test('a run counts when the only job that ran is past the first page of jobs', async () => {
+  const result = await check({ body: describe(`Green at ${HEAD.slice(0, 12)}: https://github.com/o/r/actions/runs/3`) });
+  assert.deepEqual(result.problems, []);
 });
 
 test('a check marked not run needs a reason', async () => {
@@ -543,7 +550,7 @@ test('the section bot_pr_evidence.sh writes passes the check, on its fenced outp
  * a file. `overwrites` edits are undone right after they land, as a concurrent
  * writer working from an older read would. Returns { body, status, stderr }.
  */
-function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha, headAfterEdit } = {}) {
+function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha, headAfterEdit, headMovesOnEdit = 1 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
     writeFileSync(join(dir, 'body.md'), body);
@@ -557,7 +564,8 @@ function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha, 
         'if [ "$1 $2" = "pr edit" ]; then\n' +
         '  while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "$d/body.md"; shift; done\n' +
         '  n=$(cat "$d/overwrites"); if [ "$n" -gt 0 ]; then cp "$d/original.md" "$d/body.md"; echo $((n - 1)) > "$d/overwrites"; fi\n' +
-        (headAfterEdit ? `  echo ${headAfterEdit} > "$d/head"\n` : '') +
+        '  e=$(( $(cat "$d/edits" 2>/dev/null || echo 0) + 1 )); echo $e > "$d/edits"\n' +
+        (headAfterEdit ? `  if [ "$e" -ge ${headMovesOnEdit} ]; then echo ${headAfterEdit} > "$d/head"; fi\n` : '') +
         'fi\n'
     );
     writeFileSync(join(dir, 'git'), `#!/usr/bin/env bash\necho ${sha}\n`);
@@ -634,6 +642,13 @@ test('bot_pr_evidence.sh update fails its run when the head moves while it write
   assert.match(stderr, /head moved off [0-9a-f]{12} while its evidence was written; not releasing its runs\./);
 });
 
+test('bot_pr_evidence.sh update checks the head on its last try too', () => {
+  // Three writes are undone, the fourth lands, and the head moves with it.
+  const { status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml', { overwrites: 3, headAfterEdit: SECOND, headMovesOnEdit: 4 });
+  assert.equal(status, 1);
+  assert.match(stderr, /could not be kept in 7's description/);
+});
+
 test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
   const { body, status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml', { overwrites: 99 });
   assert.equal(status, 1);
@@ -659,8 +674,12 @@ test('snapshot workflows key each branch, and its evidence, on one workload', ()
   assert.match(bench, /^ {4}concurrency:\n {6}group: testoperator-bench-\$\{\{ github\.event\.inputs\.spiced_commit \|\| github\.run_id \}\}-\$\{\{ github\.event\.inputs\.query_set \}\}-sf\$\{\{ github\.event\.inputs\.scale_factor \}\}-\$\{\{ github\.event\.inputs\.spicepod_path \}\}-\$\{\{ github\.event\.inputs\.layout \}\}-\$\{\{ github\.event\.inputs\.scenario_query_file \}\}-\$\{\{ github\.event\.inputs\.query_overrides \}\}\n {6}cancel-in-progress: false$/m);
   assert.match(cluster, /^ {4}concurrency:\n {6}group: testoperator-cluster-bench-\$\{\{ github\.event\.inputs\.custom_image_tag \|\| github\.run_id \}\}-.*scenario_query_file \}\}\n {6}cancel-in-progress: false$/m);
   const schema = read('testoperator_run_schema.yml');
-  assert.match(schema, /^ {4}concurrency:\n {6}group: testoperator-schema-\$\{\{ github\.ref_name \}\}-\$\{\{ github\.event\.inputs\.spicepod_path \}\}\n {6}cancel-in-progress: false$/m);
-  assert.match(schema, /^\s*BRANCH_NAME="testoperator-snapshot-update\/\$\{SLUG\}"$/m);
+  assert.match(schema, /^\s*BRANCH_NAME="testoperator-snapshot-update\/\$\{SLUG\}-\$\{SNAPSHOT_KEY\}"$/m);
+  assert.match(schema, /SNAPSHOT_KEY="\$\(printf '%s' "\$\{SNAPSHOT_INPUTS\}" \| git hash-object --stdin/);
+  const schemaInputs = /^ {10}SNAPSHOT_INPUTS: (.+)$/m.exec(schema);
+  assert.ok(schemaInputs, 'the schema upload step names its branch-key inputs');
+  assert.ok(schema.includes(`    concurrency:\n      group: testoperator-schema-${schemaInputs[1]}\n      cancel-in-progress: false\n`),
+    'the schema concurrency group is the same string the branch key hashes');
   assert.equal((schema.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator run schema \$\{\{ github\.event\.inputs\.spicepod_path \}\}"/g) ?? []).length, 2);
 });
 

@@ -134,7 +134,9 @@ jobs:
     # Runs of one workload pinned to one spiced commit share a snapshot branch and
     # its PR ("Upload benchmark snapshots to branch"), so they run one at a time: two
     # at once could publish the PR's evidence out of order. The group names the
-    # same inputs as the branch key; an unpinned run is keyed by its own run id.
+    # same inputs as the branch key; an unpinned run is keyed by its own run id. So
+    # only duplicates share a group, and a pending duplicate GitHub replaces loses
+    # nothing.
     concurrency:
       group: testoperator-bench-${{ github.event.inputs.spiced_commit || github.run_id }}-${{ github.event.inputs.query_set }}-sf${{ github.event.inputs.scale_factor }}-${{ github.event.inputs.spicepod_path }}-${{ github.event.inputs.layout }}-${{ github.event.inputs.scenario_query_file }}-${{ github.event.inputs.query_overrides }}
       cancel-in-progress: false
