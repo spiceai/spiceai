@@ -1624,7 +1624,6 @@ fn holder_deadline_boot_ns(started_boot_ns: u64, duration: std::time::Duration) 
     started_boot_ns.saturating_add(held_ns).min(u64::MAX - 1)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::super::LeaseSettings;
