@@ -778,6 +778,14 @@ pub enum MetricCondition {
         amount: f64,
         since: Option<String>,
     },
+    /// At most `amount` higher than at `mark-metrics: since`, read once: a
+    /// counter does not come back down, so waiting cannot change the answer.
+    /// An absent series counts as 0 at either end, since a counter is
+    /// published only once it first moves.
+    IncreasedAtMost {
+        amount: f64,
+        since: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1745,7 +1753,7 @@ const UPSTREAM_ONLY: &[&str] = &[
 ];
 
 /// What a load's `faults:` may run: steps that start, stop or wait on
-/// processes.
+/// processes, `spiced`'s or a source's.
 const FAULT_ACTIONS: &[&str] = &[
     "start",
     "stop",
@@ -1757,6 +1765,10 @@ const FAULT_ACTIONS: &[&str] = &[
     "kill-executor",
     "start-executors",
     "add-executor",
+    "start-source",
+    "stop-source",
+    "pause-source",
+    "unpause-source",
 ];
 
 /// Replaces `source-exec: { <source>: { file: <path> } }` with the file's
@@ -2606,10 +2618,19 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             if inner.bool("increases")? {
                 conditions.push(MetricCondition::Increases);
             }
+            let since = inner.string("since")?;
             if let Some(v) = inner.take("increased-by") {
                 conditions.push(MetricCondition::IncreasedBy {
                     amount: number(v, "increased-by")?,
-                    since: inner.string("since")?,
+                    since: since.clone(),
+                });
+            }
+            if let Some(v) = inner.take("increased-at-most") {
+                conditions.push(MetricCondition::IncreasedAtMost {
+                    amount: number(v, "increased-at-most")?,
+                    since: since.clone().context(
+                        "`increased-at-most` needs `since: <mark>`: without a mark it would compare the series with itself",
+                    )?,
                 });
             }
             let timeout = inner.duration("timeout")?.unwrap_or(Duration::from_mins(5));
@@ -2644,8 +2665,21 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             };
             inner.finish()?;
             let [condition] = conditions.try_into().map_err(|_| {
-                anyhow!("`wait-metric` takes exactly one of `above`, `below`, `increases`, `increased-by`")
+                anyhow!("`wait-metric` takes exactly one of `above`, `below`, `increases`, `increased-by`, `increased-at-most`")
             })?;
+            ensure!(
+                since.is_none()
+                    || matches!(
+                        condition,
+                        MetricCondition::IncreasedBy { .. }
+                            | MetricCondition::IncreasedAtMost { .. }
+                    ),
+                "`since` applies to `increased-by` and `increased-at-most`"
+            );
+            ensure!(
+                drive.is_none() || !matches!(condition, MetricCondition::IncreasedAtMost { .. }),
+                "`increased-at-most` is read once, so it takes no `drive`"
+            );
             Action::WaitMetric(MetricWait {
                 name: metric,
                 labels,
@@ -3883,6 +3917,96 @@ steps:
     }
 
     #[test]
+    fn a_load_fault_stops_starts_or_pauses_a_source() {
+        let script = Script::parse(
+            r"
+name: l
+spicepod: {}
+steps:
+  - load:
+      queries: [SELECT 1]
+      duration: 30s
+      recover-within: 10s
+      faults:
+        - { at: 5s, pause-source: lake }
+        - { at: 10s, unpause-source: lake }
+        - { at: 15s, stop-source: lake }
+        - { at: 20s, start-source: lake }
+",
+        )
+        .expect("script parses");
+        let Action::Load(load) = &script.steps[0].action else {
+            panic!("expected a load, got {:?}", script.steps[0].action);
+        };
+        let faults: Vec<(u64, String)> = load
+            .faults
+            .iter()
+            .map(|f| (f.at.as_secs(), format!("{:?}", f.step.action)))
+            .collect();
+        assert_eq!(
+            faults,
+            [
+                (5, r#"PauseSource("lake")"#.to_string()),
+                (10, r#"UnpauseSource("lake")"#.to_string()),
+                (15, r#"StopSource("lake")"#.to_string()),
+                (20, r#"StartSource("lake")"#.to_string()),
+            ]
+        );
+        // A source step reaches no `spiced`, in a load as anywhere.
+        let err = Script::parse(
+            "name: l\nspicepod: {}\nsidecar: { spicepod: {} }\nsteps: [{ load: { queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, stop-source: lake, on: sidecar }] } }]",
+        )
+        .expect_err("`on` on a source fault");
+        assert!(format!("{err:#}").contains("`on`"), "{err:#}");
+    }
+
+    #[test]
+    fn wait_metric_bounds_a_rise_since_a_mark() {
+        let script = Script::parse(
+            "name: m\nspicepod: {}\nsteps:\n  - mark-metrics: before\n  - wait-metric: { name: reads, labels: { op: get }, increased-at-most: 3, since: before }\n  - wait-metric: { name: reads, increased-by: 2, since: before }\n",
+        )
+        .expect("script parses");
+        let Action::WaitMetric(at_most) = &script.steps[1].action else {
+            panic!("expected a wait-metric, got {:?}", script.steps[1].action);
+        };
+        assert_eq!(
+            format!("{:?}", at_most.condition),
+            r#"IncreasedAtMost { amount: 3.0, since: "before" }"#
+        );
+        let Action::WaitMetric(by) = &script.steps[2].action else {
+            panic!("expected a wait-metric, got {:?}", script.steps[2].action);
+        };
+        assert_eq!(
+            format!("{:?}", by.condition),
+            r#"IncreasedBy { amount: 2.0, since: Some("before") }"#
+        );
+        for (step, message) in [
+            (
+                "{ name: reads, increased-at-most: 3 }",
+                "`increased-at-most` needs `since: <mark>`",
+            ),
+            (
+                "{ name: reads, increased-at-most: 3, since: m, drive: { src: SELECT 1 } }",
+                "`increased-at-most` is read once, so it takes no `drive`",
+            ),
+            (
+                "{ name: reads, above: 3, since: m }",
+                "`since` applies to `increased-by` and `increased-at-most`",
+            ),
+            (
+                "{ name: reads, increased-by: 1, increased-at-most: 3, since: m }",
+                "`wait-metric` takes exactly one of `above`, `below`, `increases`, `increased-by`, `increased-at-most`",
+            ),
+        ] {
+            let err = Script::parse(&format!(
+                "name: m\nspicepod: {{}}\nsteps: [{{ wait-metric: {step} }}]"
+            ))
+            .expect_err("an invalid wait-metric is refused");
+            assert!(format!("{err:#}").contains(message), "{step}: {err:#}");
+        }
+    }
+
+    #[test]
     fn a_load_refuses_what_it_cannot_check_or_time() {
         for (load, message) in [
             (
@@ -3923,7 +4047,7 @@ steps:
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
-                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, start-source, stop-source, pause-source, unpause-source, not `query`",
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",

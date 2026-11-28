@@ -33,7 +33,11 @@ limitations under the License.
 //! namespace takes no network from Docker's address pools, which concurrent
 //! runs exhaust. The image has no shell, so it is configured through its HTTP
 //! API, not `source-exec`. The harness's own requests go to the store
-//! directly.
+//! directly. `stop-source` stops the proxy with the store, and `start-source`
+//! starts it again in the store's new namespace and configures it afresh,
+//! since a stopped store's namespace goes with it and the proxy keeps its
+//! configuration only in memory; `pause-source` freezes the store alone,
+//! which leaves the proxy accepting connections that get no answer.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -84,10 +88,17 @@ const TOXIPROXY_API: u16 = 8474;
 /// The port the proxy listens on for the store, beside the store's own 9000.
 const TOXIPROXY_LISTEN: u16 = 9100;
 
+/// The toxiproxy `spiced` reaches the store through, with `latency:`.
+struct Proxy {
+    container: Container,
+    latency: Duration,
+    /// The source's name, for errors.
+    source: String,
+}
+
 pub struct ObjectStore {
     container: Container,
-    /// The toxiproxy `spiced` reaches the store through, with `latency:`.
-    proxy: Option<Container>,
+    proxy: Option<Proxy>,
     /// Where part files are written before they are uploaded.
     staging: PathBuf,
     /// The secret key of [`USER`], this store's own (see [`store_secret`]).
@@ -129,17 +140,33 @@ impl ObjectStore {
             alias: None,
         })
         .await?;
-        configure_proxy(container.host_port(TOXIPROXY_API)?, latency)
-            .await
-            .with_context(|| {
-                format!("Failed to put {latency:?} of latency in front of '{name}'")
-            })?;
-        Ok(Self {
+        let store = Self {
             container,
-            proxy: Some(proxy),
+            proxy: Some(Proxy {
+                container: proxy,
+                latency,
+                source: name.to_string(),
+            }),
             staging,
             secret,
-        })
+        };
+        store.configure_proxy().await?;
+        Ok(store)
+    }
+
+    /// Puts the proxy's latency in front of the store, when it has one.
+    async fn configure_proxy(&self) -> Result<()> {
+        let Some(proxy) = &self.proxy else {
+            return Ok(());
+        };
+        configure_proxy(self.container.host_port(TOXIPROXY_API)?, proxy.latency)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to put {:?} of latency in front of '{}'",
+                    proxy.latency, proxy.source
+                )
+            })
     }
 
     /// The store itself, for the harness's own requests.
@@ -356,7 +383,7 @@ impl Source for ObjectStore {
 
     fn containers(&self) -> Vec<&Container> {
         std::iter::once(&self.container)
-            .chain(self.proxy.as_ref())
+            .chain(self.proxy.as_ref().map(|p| &p.container))
             .collect()
     }
 
@@ -365,10 +392,30 @@ impl Source for ObjectStore {
             return self.container.remove().await;
         };
         // The proxy first: it lives in the store's network namespace.
-        let proxy_removed = proxy.remove().await;
+        let proxy_removed = proxy.container.remove().await;
         let store_removed = self.container.remove().await;
         proxy_removed?;
         store_removed
+    }
+
+    /// The proxy stops first: it lives in the store's network namespace,
+    /// which goes away with the store.
+    async fn stop_server(&self) -> Result<()> {
+        if let Some(proxy) = &self.proxy {
+            proxy.container.stop().await?;
+        }
+        self.container.stop().await
+    }
+
+    /// The store starts with a new network namespace, so the proxy starts
+    /// after it, joining that one, and is configured again: it holds its
+    /// configuration in memory only.
+    async fn start_server(&self) -> Result<()> {
+        self.container.start_stopped().await?;
+        if let Some(proxy) = &self.proxy {
+            proxy.container.start_stopped().await?;
+        }
+        self.configure_proxy().await
     }
 
     async fn create_namespace(&self, namespace: &str) -> Result<super::Namespace> {
