@@ -457,18 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn only_cayenne_registers_a_sink_from_its_acceleration() {
-        let source = SinkConnector::with_known_schema(stored_schema());
-
-        for engine in [Engine::Arrow, Engine::PartitionedArrow] {
-            assert!(
-                !registers_from_acceleration(Some(&acceleration(engine)), &source),
-                "{engine} keeps the wait-for-first-write behavior"
-            );
-        }
-    }
-
-    #[test]
     fn an_unaccelerated_sink_has_no_acceleration_to_register_from() {
         let source = SinkConnector::with_known_schema(stored_schema());
 

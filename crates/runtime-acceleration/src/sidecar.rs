@@ -37,8 +37,7 @@ limitations under the License.
 //!
 //! # Not every engine hosts every store
 //!
-//! The in-memory engines (`arrow`, `partitioned_arrow`) host nothing at all. A store an engine cannot provide is
-//! reported as [`CheckpointError::Store`] rather than skipped, so a connector that
+//! A store an engine cannot provide is reported as [`CheckpointError::Store`] rather than skipped, so a connector that
 //! needs one fails loudly at registration instead of silently running stateless and
 //! re-bootstrapping on every restart.
 

@@ -31,7 +31,6 @@ mod cayenne_memory;
 mod cayenne_on_conflict_batches;
 mod cron;
 mod file_watcher;
-mod hash_index;
 mod localpod_sync;
 mod pk_insert_semantics;
 
@@ -40,7 +39,6 @@ mod on_conflict_cayenne;
 mod on_conflict_options;
 mod on_zero_results_retention;
 mod on_zero_results_subqueries;
-mod partition_by_arrow;
 mod partition_by_cayenne;
 mod refresh;
 mod reload_file_accelerated;

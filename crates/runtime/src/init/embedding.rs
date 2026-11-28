@@ -600,7 +600,7 @@ pub(crate) mod tests {
                             "from": format!("file:{}", csv.display()),
                             "name": "docs",
                             "columns": [{"name": "body", "embeddings": [{"from": "e"}]}],
-                            "acceleration": {"enabled": true, "engine": "arrow"},
+                            "acceleration": {"enabled": true, "engine": "cayenne", "mode": "memory"},
                         }))
                         .expect("a valid dataset"),
                     )

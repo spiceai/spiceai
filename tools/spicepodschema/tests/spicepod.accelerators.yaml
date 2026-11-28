@@ -13,25 +13,6 @@ runtime:
 
 datasets:
   # ===========================================================================
-  # Arrow Accelerator
-  # Runtime params: file_watcher
-  # ===========================================================================
-  - name: accel_arrow
-    from: postgres:public.small_table
-    params:
-      pg_host: localhost
-      pg_port: "5432"
-      pg_db: testdb
-      pg_user: postgres
-      pg_pass: secret
-    acceleration:
-      enabled: true
-      engine: arrow
-      refresh_mode: full
-      params:
-        file_watcher: "true"
-
-  # ===========================================================================
   # Cayenne Accelerator (if enabled)
   # Runtime params: file_watcher
   # ===========================================================================

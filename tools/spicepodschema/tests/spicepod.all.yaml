@@ -475,25 +475,6 @@ datasets:
       duckdb_open: data/test.db
 
   # ---------------------------------------------------------------------------
-  # Arrow accelerator test
-  # ---------------------------------------------------------------------------
-  - name: arrow_accel
-    from: postgres:public.small
-    params:
-      pg_host: localhost
-      pg_port: '5432'
-      pg_db: db
-      pg_user: user
-      pg_pass: pass
-    acceleration:
-      enabled: true
-      engine: arrow
-      params:
-        file_watcher: 'true'
-        arrow_sort_columns: id,created_at
-
-
-  # ---------------------------------------------------------------------------
   # Cayenne accelerator test
   # ---------------------------------------------------------------------------
   - name: cayenne_accel

@@ -43,7 +43,6 @@ use crate::component::dataset::{
 use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
-use crate::datafusion::engine_to_acceleration_engine;
 use crate::init::dataset_loads::DatasetLoad;
 use crate::{Runtime, UnableToBuildDatasetSnafu, status};
 
@@ -357,7 +356,6 @@ impl Runtime {
     /// `engine`, as a snapshot records it, if this build can load snapshots into it.
     async fn snapshot_engine(&self, engine: &str) -> Option<Engine> {
         let engine = Engine::try_from(engine).ok()?;
-        engine_to_acceleration_engine(engine)?;
         self.accelerator_engine_registry()
             .get_accelerator_engine(engine)
             .await?;

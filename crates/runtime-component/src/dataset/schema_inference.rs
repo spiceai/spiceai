@@ -70,7 +70,7 @@ pub fn apply_inferred_schema(
 
     let has_column = |name: &str| effective_schema.field_with_name(name).is_ok();
     let is_changes = resolved_refresh_mode == RefreshMode::Changes;
-    let engine = acceleration.engine.to_unpartitioned();
+    let engine = acceleration.engine;
 
     // Whether inferred physical constraints (primary key, secondary indexes) can be
     // applied for this engine + refresh mode:
@@ -157,7 +157,7 @@ pub fn apply_inferred_schema(
             // An index the engine would refuse at registration is dropped here
             // instead: the user never declared it, so it must not become a
             // configuration error that keeps the whole dataset from loading.
-            if let Some(field) = unindexable_column(engine, effective_schema, &index.columns) {
+            if let Some(field) = unindexable_column(effective_schema, &index.columns) {
                 let warning =
                     inferred_index_skip_warning(dataset_name, engine, &index.columns, field);
                 tracing::warn!("{warning}");
@@ -184,7 +184,7 @@ pub fn apply_inferred_schema(
     // `cayenne_sort_columns` sorts the background COMPACTION rewrite, not the
     // change stream, so it applies even in changes mode and is what keeps
     // per-file zone maps tight for listing-time pruning on heavy CDC tables.
-    let applied_sort = apply_inferred_sort(acceleration, inferred, effective_schema, is_changes);
+    let applied_sort = apply_inferred_sort(acceleration, inferred, effective_schema);
 
     // 4) Shard key — Cayenne only: route the source's declared distribution key
     // (Postgres partition key / MongoDB shard key) to `cayenne_shard_key_columns`
@@ -201,25 +201,18 @@ pub fn apply_inferred_schema(
     );
 }
 
-/// The first column of an inferred index that `engine` cannot key, or `None` when
-/// the engine accepts every column of the index.
+/// The first column of an inferred index that Cayenne cannot key, or `None` when
+/// it accepts every column of the index.
 ///
 /// Cayenne keys a column by its value with `key_index`, and refuses a column
 /// type that cannot be encoded, such as a list or a struct, at registration. A
 /// *declared* index still reaches Cayenne and fails with that actionable error;
 /// an *inferred* one is skipped by the caller, because the user never asked for
-/// it. The other engines index any column type.
+/// it.
 ///
 /// Columns absent from `schema` are ignored here; the caller has already skipped
 /// an index naming one.
-fn unindexable_column<'a>(
-    engine: Engine,
-    schema: &'a SchemaRef,
-    columns: &[String],
-) -> Option<&'a Field> {
-    if engine != Engine::Cayenne {
-        return None;
-    }
+fn unindexable_column<'a>(schema: &'a SchemaRef, columns: &[String]) -> Option<&'a Field> {
     columns
         .iter()
         .filter_map(|column| schema.field_with_name(column).ok())
@@ -249,7 +242,6 @@ fn apply_inferred_sort(
     acceleration: &mut Acceleration,
     inferred: &InferredSchema,
     effective_schema: &SchemaRef,
-    is_changes: bool,
 ) -> bool {
     if inferred.sort_columns.is_empty() {
         return false;
@@ -265,65 +257,31 @@ fn apply_inferred_sort(
         return false;
     }
 
-    // Each key is the *external* spelling the engine's parameter validation
-    // accepts: a `ParameterSpec::component` param must carry the engine prefix
-    // (`arrow_sort_columns`, `cayenne_sort_columns`). An unprefixed component key
-    // is dropped by `runtime_parameters` with a user-facing warning about a
-    // parameter the user never wrote (#14023).
-    let engine = acceleration.engine.to_unpartitioned();
-    let key = match engine {
-        Engine::Arrow => "arrow_sort_columns",
-        Engine::Cayenne => "cayenne_sort_columns",
-        // `to_unpartitioned` folds `PartitionedArrow` into `Arrow`.
-        Engine::PartitionedArrow => return false,
-    };
+    // The key is the *external* spelling the engine's parameter validation
+    // accepts: a `ParameterSpec::component` param must carry the engine prefix.
+    // An unprefixed component key is dropped by `runtime_parameters` with a
+    // user-facing warning about a parameter the user never wrote (#14023).
+    //
+    // It applies for `refresh_mode: changes` too: `cayenne_sort_columns` sorts the
+    // background compaction rewrite, not the change stream (which stays unsorted
+    // by design), so it keeps per-file zone maps tight for listing-time pruning
+    // on the heavy update tables.
+    let key = "cayenne_sort_columns";
 
-    // For `refresh_mode: changes`, skip engines whose sort param drives the
-    // refresh itself (Arrow `arrow_sort_columns`): a
-    // refresh-time sort is a no-op for a change stream and risks perturbing the
-    // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
-    // the background compaction rewrite, not the change stream (which stays
-    // unsorted by design), so it applies and keeps per-file zone maps tight for
-    // listing-time pruning on the heavy update tables.
-    if is_changes && engine != Engine::Cayenne {
+    // Respect any user-configured sort param. Cayenne also reads the unprefixed
+    // `sort_columns` straight from the acceleration params, so a user who wrote
+    // that spelling has configured a sort even though validation warns about the
+    // missing prefix.
+    if acceleration.params.contains_key(key) || acceleration.params.contains_key("sort_columns") {
         return false;
     }
 
-    // Respect any user-configured sort param. Cayenne and Arrow also read the
-    // unprefixed `sort_columns` straight from the acceleration params, so a user
-    // who wrote that spelling has configured a sort even though validation warns
-    // about the missing prefix.
-    let user_configured = acceleration.params.contains_key(key)
-        || (matches!(engine, Engine::Cayenne | Engine::Arrow)
-            && acceleration.params.contains_key("sort_columns"));
-    if user_configured {
-        return false;
-    }
-
-    let value = if engine == Engine::Cayenne {
-        // Cayenne sorts by bare column names and ignores direction.
-        present
-            .iter()
-            .map(|sc| sc.column.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        present
-            .iter()
-            .map(|sc| {
-                let mut spec = format!("{} {}", sc.column, if sc.desc { "DESC" } else { "ASC" });
-                // Carry the source's declared NULLS placement; when unknown the
-                // engine default applies.
-                match sc.nulls_first {
-                    Some(true) => spec.push_str(" NULLS FIRST"),
-                    Some(false) => spec.push_str(" NULLS LAST"),
-                    None => {}
-                }
-                spec
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    // Cayenne sorts by bare column names and ignores direction.
+    let value = present
+        .iter()
+        .map(|sc| sc.column.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     acceleration.params.insert(key.to_string(), value);
     // Mark the value as inference-derived so Cayenne can rank it correctly.
@@ -338,12 +296,10 @@ fn apply_inferred_sort(
     // disabled that feature on every deployment where inference can read the
     // catalog. Tagging the provenance lets the engine keep this as the
     // pre-observation fallback while letting measured filters win.
-    if engine == Engine::Cayenne {
-        acceleration.params.insert(
-            "cayenne_sort_columns_origin".to_string(),
-            "inferred".to_string(),
-        );
-    }
+    acceleration.params.insert(
+        "cayenne_sort_columns_origin".to_string(),
+        "inferred".to_string(),
+    );
     true
 }
 
@@ -365,9 +321,6 @@ fn apply_inferred_shard_key(
     effective_schema: &SchemaRef,
 ) -> bool {
     if inferred.shard_key.is_empty() {
-        return false;
-    }
-    if acceleration.engine.to_unpartitioned() != Engine::Cayenne {
         return false;
     }
     // Respect a user-configured shard key (Cayenne also accepts `shard_key_columns`).
@@ -788,10 +741,6 @@ mod tests {
             acc.indexes.contains_key(&col_ref(&["status"])),
             "a dictionary column is keyed by its values"
         );
-
-        let mut acc = accel(Engine::Arrow);
-        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
-        assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
     }
 
     #[test]
@@ -821,35 +770,12 @@ mod tests {
     }
 
     #[test]
-    fn arrow_sort_param_carries_direction() {
-        let mut acc = accel(Engine::Arrow);
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true), sort("id", false)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at", "id"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert_eq!(
-            acc.params.get("arrow_sort_columns").map(String::as_str),
-            Some("created_at DESC, id ASC")
-        );
-        // The unprefixed spelling is what Arrow's parameter validation rejects
-        // with a warning; inference must never write it (#14023).
-        assert!(!acc.params.contains_key("sort_columns"));
-    }
-
-    #[test]
-    fn arrow_respects_user_sort_param_in_either_spelling() {
-        // `arrow_sort_columns` is the validated spelling; the Arrow accelerator
+    fn respects_user_sort_param_in_either_spelling() {
+        // `cayenne_sort_columns` is the validated spelling; the Cayenne accelerator
         // also reads a bare `sort_columns` from the acceleration params, so both
         // count as user-configured and neither is overridden by inference.
-        for user_key in ["arrow_sort_columns", "sort_columns"] {
-            let mut acc = accel(Engine::Arrow);
+        for user_key in ["cayenne_sort_columns", "sort_columns"] {
+            let mut acc = accel(Engine::Cayenne);
             acc.params
                 .insert(user_key.to_string(), "custom".to_string());
             let inferred = InferredSchema {
@@ -893,30 +819,8 @@ mod tests {
     }
 
     #[test]
-    fn respects_user_sort_param() {
-        let mut acc = accel(Engine::Arrow);
-        acc.params
-            .insert("arrow_sort_columns".to_string(), "custom".to_string());
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert_eq!(
-            acc.params.get("arrow_sort_columns").map(String::as_str),
-            Some("custom")
-        );
-    }
-
-    #[test]
     fn filters_missing_sort_columns() {
-        let mut acc = accel(Engine::Arrow);
+        let mut acc = accel(Engine::Cayenne);
         let inferred = InferredSchema {
             sort_columns: vec![sort("created_at", true), sort("absent", false)],
             ..InferredSchema::default()
@@ -929,30 +833,9 @@ mod tests {
             RefreshMode::Full,
         );
         assert_eq!(
-            acc.params.get("arrow_sort_columns").map(String::as_str),
-            Some("created_at DESC")
+            acc.params.get("cayenne_sort_columns").map(String::as_str),
+            Some("created_at")
         );
-    }
-
-    #[test]
-    fn does_not_apply_sort_for_changes_refresh_mode_on_refresh_time_engines() {
-        // Arrow applies the inferred sort as a *refresh-time* sort, which is
-        // a no-op for a change stream and risks perturbing its initial snapshot —
-        // so it stays disabled in changes mode. (Cayenne is the exception; see
-        // `applies_sort_for_changes_refresh_mode_on_cayenne`.)
-        let mut acc = accel(Engine::Arrow);
-        let inferred = InferredSchema {
-            sort_columns: vec![sort("created_at", true)],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at"]),
-            "ds",
-            RefreshMode::Changes,
-        );
-        assert!(acc.params.is_empty());
     }
 
     #[test]
@@ -1055,7 +938,7 @@ mod tests {
 
     #[test]
     fn empty_inferred_is_noop() {
-        let mut acc = accel(Engine::Arrow);
+        let mut acc = accel(Engine::Cayenne);
         apply_inferred_schema(
             &mut acc,
             &InferredSchema::default(),
@@ -1066,37 +949,6 @@ mod tests {
         assert!(acc.primary_key.is_none());
         assert!(acc.indexes.is_empty());
         assert!(acc.params.is_empty());
-    }
-
-    #[test]
-    fn arrow_sort_param_carries_nulls_placement() {
-        let mut acc = accel(Engine::Arrow);
-        let inferred = InferredSchema {
-            sort_columns: vec![
-                InferredSortColumn {
-                    column: "created_at".to_string(),
-                    desc: true,
-                    nulls_first: Some(true),
-                },
-                InferredSortColumn {
-                    column: "id".to_string(),
-                    desc: false,
-                    nulls_first: Some(false),
-                },
-            ],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["created_at", "id"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert_eq!(
-            acc.params.get("arrow_sort_columns").map(String::as_str),
-            Some("created_at DESC NULLS FIRST, id ASC NULLS LAST")
-        );
     }
 
     #[test]
@@ -1184,23 +1036,6 @@ mod tests {
             RefreshMode::Full,
         );
         assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
-    }
-
-    #[test]
-    fn skips_shard_key_on_non_cayenne_engines() {
-        let mut acc = accel(Engine::Arrow);
-        let inferred = InferredSchema {
-            shard_key: vec!["tenant_id".to_string()],
-            ..InferredSchema::default()
-        };
-        apply_inferred_schema(
-            &mut acc,
-            &inferred,
-            &schema(&["tenant_id"]),
-            "ds",
-            RefreshMode::Full,
-        );
-        assert!(acc.params.is_empty());
     }
 
     #[test]
