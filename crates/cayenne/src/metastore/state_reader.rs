@@ -27,8 +27,8 @@ use crate::{
     catalog::{CatalogError, CatalogResult},
     metadata::{
         ColdTierFile, DeleteFile, DeletionType, IndexRunRecord, InlinedData, InlinedDataStats,
-        InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
-        TableStatistics, TableStorageStats,
+        InlinedDelete, PartitionMetadata, RecordedFileStatistics, SnapshotFile,
+        SnapshotFileStatistics, TableMetadata, TableStatistics, TableStorageStats,
     },
 };
 use cayenne_metastore_actions::{DatasetState, ObjRef, TableState};
@@ -348,6 +348,11 @@ impl DatasetStateReader {
                 min_sequence: f.min_seq,
                 max_sequence: f.max_seq,
                 digest: f.digest.clone(),
+                recorded_statistics: f.stats.as_ref().map(|recorded| RecordedFileStatistics {
+                    rows: f.rows,
+                    blob: recorded.blob.clone(),
+                    schema: recorded.schema,
+                }),
             })
             .collect()
     }

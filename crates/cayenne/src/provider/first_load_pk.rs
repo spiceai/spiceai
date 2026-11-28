@@ -296,7 +296,13 @@ fn exact_keyset_may_fit(keys: u64, shortest_key: usize, budget: usize) -> bool {
 }
 
 impl VortexWriteObserver for FirstLoadPkObserver {
-    fn file_written(&self, _file_path: &object_store::path::Path, _size: u64) {}
+    fn file_written(
+        &self,
+        _file_path: &object_store::path::Path,
+        _size: u64,
+        _footer: &vortex::file::Footer,
+    ) {
+    }
 
     fn batch_written(
         &self,

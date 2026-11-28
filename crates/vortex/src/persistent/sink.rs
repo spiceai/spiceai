@@ -667,7 +667,7 @@ impl DataSink for VortexSink {
             // listings carrying real store mtimes miss and read the footer as
             // before.
             if let Some(observer) = self.write_observer.as_ref() {
-                observer.file_written(&path, summary.size());
+                observer.file_written(&path, summary.size(), summary.footer());
             }
             cache_footer(
                 &file_metadata_cache,

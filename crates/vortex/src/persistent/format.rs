@@ -66,6 +66,7 @@ use vortex::expr::stats;
 use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
 use vortex::file::FileStatistics;
+use vortex::file::Footer;
 use vortex::file::MAX_POSTSCRIPT_SIZE;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VORTEX_FILE_EXTENSION;
@@ -667,6 +668,22 @@ impl VortexFormat {
         }
     }
 
+    /// The session this format reads and writes files with.
+    #[must_use]
+    pub fn session(&self) -> &VortexSession {
+        &self.session
+    }
+
+    /// `statistics` of the file `object`, adjusted by this format's access plan
+    /// provider for the rows it hides, as `infer_stats` adjusts a footer's.
+    #[must_use]
+    pub fn adjust_statistics(&self, object: &ObjectMeta, statistics: Statistics) -> Statistics {
+        match self.access_plan_provider.as_ref() {
+            Some(provider) => provider.adjust_statistics(object, statistics),
+            None => statistics,
+        }
+    }
+
     /// Returns a format whose writes report the file and file-local row position
     /// of every batch they emit, so a caller can build a row-address index during
     /// the write rather than by reading the finished files back.
@@ -978,8 +995,8 @@ impl FileFormat for VortexFormat {
         let file_metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
 
         let statistics = SpawnedTask::spawn(async move {
-            // Try to get cached metadata first
-            let cached_metadata = file_metadata_cache
+            // The cached footer, if any; otherwise open the file and cache it.
+            let cached = file_metadata_cache
                 .get(&object.location)
                 .filter(|entry| entry.is_valid_for(&object))
                 .and_then(|entry| {
@@ -988,177 +1005,41 @@ impl FileFormat for VortexFormat {
                         .as_any()
                         .downcast_ref::<CachedVortexMetadata>()
                         .map(|m| {
-                            (
-                                m.footer().dtype().clone(),
-                                m.footer().statistics().cloned(),
-                                m.footer().row_count(),
-                            )
+                            footer_statistics(&session, &object.location, m.footer(), &table_schema)
                         })
                 });
-
-            let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
-                metadata
-            } else {
-                // Not cached - open the file
-                let reader = Arc::new(ObjectStoreReadAt::new(
-                    store,
-                    object.location.clone(),
-                    session.handle(),
-                ));
-
-                let vxf = session
-                    .open_options()
-                    .with_initial_read_size(opts.footer_initial_read_size_bytes)
-                    .with_file_size(object.size)
-                    .open_read(reader)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to open Vortex file {}: {e}",
-                            object.location
-                        ))
-                    })?;
-
-                // Cache the metadata
-                let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
-
-                (
-                    vxf.dtype().clone(),
-                    vxf.file_stats().cloned(),
-                    vxf.row_count(),
-                )
-            };
-
-            if dtype.as_struct_fields_opt().is_none() {
-                return Err(DataFusionError::Execution(format!(
-                    "Failed to infer statistics for Vortex file {}: file dtype is not a struct",
-                    object.location
-                )));
+            if let Some(statistics) = cached {
+                return statistics;
             }
-
-            let num_rows = usize::try_from(row_count).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "Failed to infer statistics for Vortex file {}: row count {row_count} cannot be represented as usize",
-                    object.location
-                ))
-            })?;
-
-            // Evaluate the statistics for each column that we are able to return to DataFusion.
-            let Some(file_stats) = file_stats else {
-                // If the file has no column stats, the best we can do is return a row count.
-                return Ok::<Statistics, DataFusionError>(Statistics {
-                    num_rows: Precision::Exact(num_rows),
-                    total_byte_size: Precision::Absent,
-                    column_statistics: vec![
-                        ColumnStatistics::default();
-                        table_schema.fields().len()
-                    ],
-                });
-            };
-
-            let mut sum_of_column_byte_sizes = stats::Precision::exact(0_usize);
-            let mut column_statistics = Vec::with_capacity(table_schema.fields().len());
-
-            for field in table_schema.fields() {
-                // If the column does not exist, continue. This can happen if the schema has evolved
-                // but we have not yet updated the Vortex file.
-                let Some((stats_set, stats_dtype)) = column_stats(&file_stats, field.name()) else {
-                    // The default sets all statistics to `Precision<Absent>`.
-                    column_statistics.push(ColumnStatistics::default());
-                    continue;
-                };
-                let (stats_set, stats_dtype) = (&stats_set, &stats_dtype);
-
-                // Update the total size in bytes.
-                let column_size =
-                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
-                sum_of_column_byte_sizes = sum_of_column_byte_sizes
-                    .zip(column_size)
-                    .map(|(acc, size)| acc + size);
-
-                let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+            let reader = Arc::new(ObjectStoreReadAt::new(
+                store,
+                object.location.clone(),
+                session.handle(),
+            ));
+            let vxf = session
+                .open_options()
+                .with_initial_read_size(opts.footer_initial_read_size_bytes)
+                .with_file_size(object.size)
+                .open_read(reader)
+                .await
+                .map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "Failed to infer statistics for Vortex file {}: column '{}' has no Vortex type: {e}",
-                        object.location,
-                        field.name()
+                        "Failed to open Vortex file {}: {e}",
+                        object.location
                     ))
                 })?;
-                // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
-                let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
-                let bound = |stat: Stat| {
-                    if bounds_usable {
-                        stat_bound_to_df(
-                            stat,
-                            stats_set.get(stat),
-                            stats_dtype,
-                            &target_dtype,
-                            field.data_type(),
-                        )
-                    } else {
-                        stats::Precision::Absent
-                    }
-                };
-                let min = bound(Stat::Min);
-                let max = bound(Stat::Max);
-
-                let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
-
-                // Surface the column sum from the Vortex footer (`Stat::Sum`) so
-                // whole-table `SUM`/`AVG` can be answered from metadata without a
-                // scan. We deliberately keep the sum in its *own* widened dtype
-                // (`Stat::Sum.dtype`) rather than casting down to the column's
-                // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
-                // DataFusion, and narrowing here would lose width or overflow.
-                let sum = match Stat::Sum.dtype(stats_dtype) {
-                    Some(sum_dtype) if bounds_usable => scalar_stat_to_df(
-                        Stat::Sum,
-                        stats_set.get(Stat::Sum),
-                        stats_dtype,
-                        &sum_dtype,
-                    ),
-                    _ => stats::Precision::Absent,
-                };
-
-                let null_count = null_count.to_df();
-                let min_value = min.to_df();
-                let max_value = max.to_df();
-                let distinct_count = singleton_distinct_count(&min_value, &max_value, &null_count)
-                    .unwrap_or_else(|| {
-                        distinct_count_from_is_constant(stats_set.get_as::<bool>(
-                            Stat::IsConstant,
-                            &DType::Bool(Nullability::NonNullable),
-                        ))
-                    });
-                column_statistics.push(ColumnStatistics {
-                    null_count,
-                    min_value,
-                    max_value,
-                    sum_value: sum.to_df(),
-                    distinct_count,
-                    // TODO(connor): Is this correct?
-                    byte_size: column_size.to_df(),
-                });
-            }
-
-            let total_byte_size = sum_of_column_byte_sizes.to_df();
-
-            Ok::<Statistics, DataFusionError>(Statistics {
-                num_rows: Precision::Exact(num_rows),
-                total_byte_size,
-                column_statistics,
-            })
+            let cached = Arc::new(CachedVortexMetadata::new(&vxf));
+            let statistics =
+                footer_statistics(&session, &object.location, cached.footer(), &table_schema);
+            cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
+            statistics
         })
         .await
         .map_err(|e| {
             DataFusionError::Execution(format!("Failed to join Vortex infer_stats task: {e}"))
         })??;
 
-        if let Some(provider) = self.access_plan_provider.as_ref() {
-            Ok(provider.adjust_statistics(&object_for_adjustment, statistics))
-        } else {
-            Ok(statistics)
-        }
+        Ok(self.adjust_statistics(&object_for_adjustment, statistics))
     }
 
     async fn create_physical_plan(
@@ -1413,6 +1294,134 @@ fn scalar_stat_to_df(
         })
         .transpose()
         .unwrap_or(stats::Precision::Absent)
+}
+
+/// The statistics [`VortexFormat`]'s `infer_stats` reports for the file at
+/// `location` whose footer is `footer`, laid out as `table_schema`, before an
+/// access plan provider adjusts them for deleted rows. A writer that has just
+/// written the file can record them without reading it back.
+///
+/// # Errors
+///
+/// The footer's type is not a struct, its row count does not fit in `usize`,
+/// or a column of `table_schema` has no Vortex type.
+pub fn footer_statistics(
+    session: &VortexSession,
+    location: &Path,
+    footer: &Footer,
+    table_schema: &Schema,
+) -> DFResult<Statistics> {
+    let dtype = footer.dtype();
+    let row_count = footer.row_count();
+    if dtype.as_struct_fields_opt().is_none() {
+        return Err(DataFusionError::Execution(format!(
+            "Failed to infer statistics for Vortex file {location}: file dtype is not a struct"
+        )));
+    }
+
+    let num_rows = usize::try_from(row_count).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "Failed to infer statistics for Vortex file {location}: row count {row_count} cannot be represented as usize"
+        ))
+    })?;
+
+    // Evaluate the statistics for each column that we are able to return to DataFusion.
+    let Some(file_stats) = footer.statistics() else {
+        // If the file has no column stats, the best we can do is return a row count.
+        return Ok(Statistics {
+            num_rows: Precision::Exact(num_rows),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::default(); table_schema.fields().len()],
+        });
+    };
+
+    let mut sum_of_column_byte_sizes = stats::Precision::exact(0_usize);
+    let mut column_statistics = Vec::with_capacity(table_schema.fields().len());
+
+    for field in table_schema.fields() {
+        // If the column does not exist, continue. This can happen if the schema has evolved
+        // but we have not yet updated the Vortex file.
+        let Some((stats_set, stats_dtype)) = column_stats(file_stats, field.name()) else {
+            // The default sets all statistics to `Precision<Absent>`.
+            column_statistics.push(ColumnStatistics::default());
+            continue;
+        };
+        let (stats_set, stats_dtype) = (&stats_set, &stats_dtype);
+
+        // Update the total size in bytes.
+        let column_size =
+            stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
+        sum_of_column_byte_sizes = sum_of_column_byte_sizes
+            .zip(column_size)
+            .map(|(acc, size)| acc + size);
+
+        let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to infer statistics for Vortex file {location}: column '{}' has no Vortex type: {e}",
+                field.name()
+            ))
+        })?;
+        // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+        let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
+        let bound = |stat: Stat| {
+            if bounds_usable {
+                stat_bound_to_df(
+                    stat,
+                    stats_set.get(stat),
+                    stats_dtype,
+                    &target_dtype,
+                    field.data_type(),
+                )
+            } else {
+                stats::Precision::Absent
+            }
+        };
+        let min = bound(Stat::Min);
+        let max = bound(Stat::Max);
+
+        let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
+
+        // Surface the column sum from the Vortex footer (`Stat::Sum`) so
+        // whole-table `SUM`/`AVG` can be answered from metadata without a
+        // scan. We deliberately keep the sum in its *own* widened dtype
+        // (`Stat::Sum.dtype`) rather than casting down to the column's
+        // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
+        // DataFusion, and narrowing here would lose width or overflow.
+        let sum = match Stat::Sum.dtype(stats_dtype) {
+            Some(sum_dtype) if bounds_usable => {
+                scalar_stat_to_df(Stat::Sum, stats_set.get(Stat::Sum), stats_dtype, &sum_dtype)
+            }
+            _ => stats::Precision::Absent,
+        };
+
+        let null_count = null_count.to_df();
+        let min_value = min.to_df();
+        let max_value = max.to_df();
+        let distinct_count = singleton_distinct_count(&min_value, &max_value, &null_count)
+            .unwrap_or_else(|| {
+                distinct_count_from_is_constant(
+                    stats_set
+                        .get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable)),
+                )
+            });
+        column_statistics.push(ColumnStatistics {
+            null_count,
+            min_value,
+            max_value,
+            sum_value: sum.to_df(),
+            distinct_count,
+            // TODO(connor): Is this correct?
+            byte_size: column_size.to_df(),
+        });
+    }
+
+    let total_byte_size = sum_of_column_byte_sizes.to_df();
+
+    Ok(Statistics {
+        num_rows: Precision::Exact(num_rows),
+        total_byte_size,
+        column_statistics,
+    })
 }
 
 /// The statistics a file records for its top-level column `name`, with the column's Vortex type,

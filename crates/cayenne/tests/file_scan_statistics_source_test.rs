@@ -45,7 +45,10 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const TABLE: &str = "file_stats_source";
 
 test_on_data_store!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
-test_on_data_store!(compaction_persists_no_statistics_for_the_files_it_replaces);
+// The object-native metastore records statistics with each file instead.
+test_with_backends!(compaction_persists_no_statistics_for_the_files_it_replaces);
+test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
+test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -243,8 +246,6 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     Ok(())
 }
 
-test_on_data_store!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
-
 /// Build a blob shaped like one written before per-column byte sizes were
 /// persisted: every column's `byte_size` absent, so the restored total is too.
 fn legacy_blob(num_rows: i64) -> Vec<u8> {
@@ -409,8 +410,6 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
 
     Ok(())
 }
-
-test_on_data_store!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
@@ -584,32 +583,37 @@ const ROWS_PER_FILE: i64 = 256;
 const CONCURRENT_SCANS: usize = 6;
 
 /// A primary-key-less table whose current snapshot holds `SINGLE_FLIGHT_FILES`
-/// Vortex files, with no persisted statistics rows. Returns the table id.
-async fn write_multi_file_table(fixture: &common::TestFixture) -> TestResult<String> {
+/// Vortex files, with no persisted statistics rows. Returns the table id, and
+/// the provider that wrote it with its session.
+async fn write_multi_file_table(
+    fixture: &common::TestFixture,
+) -> TestResult<(String, Arc<CayenneTableProvider>, SessionContext)> {
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
-            CreateTableOptions {
-                table_name: SINGLE_FLIGHT_TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    // One Vortex file per insert, and nothing to merge them.
-                    inline_max_rows: 0,
-                    inline_max_bytes: 0,
-                    inline_max_buffer_bytes: 0,
-                    compaction_trigger_files: 64,
-                    compaction_background_interval_ms: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: SINGLE_FLIGHT_TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(SINGLE_FLIGHT_TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        // One Vortex file per insert, and nothing to merge them.
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        compaction_trigger_files: 64,
+                        compaction_background_interval_ms: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     for file in 0..SINGLE_FLIGHT_FILES {
         let start = i64::try_from(file)? * ROWS_PER_FILE;
@@ -631,7 +635,7 @@ async fn write_multi_file_table(fixture: &common::TestFixture) -> TestResult<Str
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Ok(table_id)
+    Ok((table_id, table, ctx))
 }
 
 /// Counts the reads of each Vortex file, so a test can see how many times a
@@ -841,7 +845,7 @@ impl StatisticsWriteLog {
 async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let table_id = write_multi_file_table(&fixture).await?;
+    let (table_id, _, _) = write_multi_file_table(&fixture).await?;
     let write_log = StatisticsWriteLog::install(&fixture).await?;
     let expected_rows = usize::try_from(i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE)?;
 
@@ -966,12 +970,58 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
     Ok(())
 }
 
+/// Ids below this are deleted by position, from the first file only.
+const DELETED_IDS: i64 = 10;
+
+/// Delete the ids below [`DELETED_IDS`] by position.
+async fn delete_first_ids(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+) -> TestResult<()> {
+    let delete = table
+        .delete_from(&ctx.state(), vec![col("id").lt(lit(DELETED_IDS))])
+        .await?;
+    datafusion::physical_plan::collect(delete, ctx.task_ctx()).await?;
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
+/// A scan's statistics after [`delete_first_ids`], as a footer read reports
+/// them: the row count leaves out the deleted rows (inexact, as a scan marks
+/// every count while a delete is pending), the first file's bounds still cover
+/// them and so are no longer exact, and no sum survives it.
+fn assert_deletes_adjusted(statistics: &Statistics) -> TestResult<()> {
+    let rows = i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE;
+    assert_eq!(
+        statistics.num_rows,
+        Precision::Inexact(usize::try_from(rows - DELETED_IDS)?),
+        "the row count leaves out the deleted rows: {statistics:?}"
+    );
+    let id = &statistics.column_statistics[0];
+    assert_eq!(
+        (&id.min_value, &id.max_value),
+        (
+            &Precision::Inexact(datafusion_common::ScalarValue::Int64(Some(0))),
+            &Precision::Inexact(datafusion_common::ScalarValue::Int64(Some(rows - 1)))
+        ),
+        "the bounds still cover the deleted rows, and are inexact: {statistics:?}"
+    );
+    for column in &statistics.column_statistics {
+        assert_eq!(
+            column.sum_value,
+            Precision::Absent,
+            "no sum survives a delete: {statistics:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The provider's own accounting agrees with what the store and the metastore
 /// observed.
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
-    let table_id = write_multi_file_table(&fixture).await?;
+    let (table_id, _, _) = write_multi_file_table(&fixture).await?;
     fixture
         .catalog
         .clear_snapshot_file_statistics(&table_id)
@@ -1012,6 +1062,92 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
         "no footer is read when every row is persisted: {:?}",
         store.reads()
     );
+    Ok(())
+}
+
+/// [`scan_file_statistics_counters_match_the_store_and_the_metastore`] on the
+/// object-native metastore, where each file's writer records its footer
+/// statistics in the commit that adds it. The first cold scan after a restart
+/// is served from those for every file: it writes nothing to the store, the
+/// dataset's log gains no commit, and the scan plans with the statistics a
+/// footer read gives after the position delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_file_statistics_counters_match_the_store_and_the_metastore_object_native()
+-> TestResult<()> {
+    let mut faults = None;
+    let (fixture, _) = common::TestFixture::object_native_through(|store| {
+        let store = Arc::new(object_store_sim::fault::FaultStore::new(store));
+        faults = Some(Arc::clone(&store));
+        store as Arc<dyn object_store::ObjectStore>
+    })
+    .await?;
+    let faults = faults.expect("the fixture wraps its store");
+    let (table_id, writer, writer_ctx) = write_multi_file_table(&fixture).await?;
+    delete_first_ids(&writer, &writer_ctx).await?;
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
+    catalog.init().await?;
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_metadata_cache_limit(0)
+        .build_arc()?;
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                SINGLE_FLIGHT_TABLE,
+            )
+            .await?,
+    );
+    let commits_before = fixture
+        .object_native_head_commit(SINGLE_FLIGHT_TABLE)
+        .await?;
+    let logged_before = faults.log().len();
+    let cold =
+        futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
+            .await?;
+    table.wait_for_scan_file_statistics_persistence().await;
+    let counters = table.scan_file_statistics_counters();
+    let commits_after = fixture
+        .object_native_head_commit(SINGLE_FLIGHT_TABLE)
+        .await?;
+    let store_writes: Vec<String> = faults.log()[logged_before..]
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.op,
+                object_store_sim::Op::Create
+                    | object_store_sim::Op::Cas
+                    | object_store_sim::Op::Put
+                    | object_store_sim::Op::MultipartBegin
+            )
+        })
+        .map(|op| format!("{:?} {}", op.op, op.path))
+        .collect();
+    assert_eq!(
+        counters.footer_reads, 0,
+        "every file is served from the statistics its writer recorded"
+    );
+    assert_eq!(counters.persisted_hits, u64::try_from(SINGLE_FLIGHT_FILES)?);
+    assert_eq!(counters.persisted_upserts, 0, "a scan persists nothing");
+    assert!(
+        store_writes.is_empty(),
+        "a scan writes no object to the store: {store_writes:?}"
+    );
+    assert_eq!(
+        commits_after, commits_before,
+        "a scan commits nothing to the dataset's log"
+    );
+
+    for statistics in &cold {
+        assert_deletes_adjusted(statistics)?;
+    }
     Ok(())
 }
 

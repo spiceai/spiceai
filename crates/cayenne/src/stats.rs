@@ -734,6 +734,28 @@ pub(crate) fn restore_persisted_statistics(
     })
 }
 
+/// The identity of `schema` that recorded file statistics carry: the first
+/// eight bytes of the BLAKE3 digest of its fields' Arrow IPC serialization, the
+/// serialization and digest the metastore stores a table schema under. The
+/// columns' metadata is cleared first: it cannot change statistics, and its
+/// map order is not stable. `None` when the schema does not serialize.
+#[must_use]
+pub(crate) fn schema_identity(schema: &Schema) -> Option<u64> {
+    let fields: Vec<arrow_schema::Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            field
+                .as_ref()
+                .clone()
+                .with_metadata(std::collections::HashMap::new())
+        })
+        .collect();
+    let ipc = crate::cayenne_catalog::serialize_schema_ipc_base64(&Schema::new(fields)).ok()?;
+    let digest = cayenne_metastore_actions::ObjRef::of(ipc.as_bytes()).digest;
+    Some(u64::from_le_bytes(digest.get(..8)?.try_into().ok()?))
+}
+
 /// Whether a restored blob was written by a build that persists per-column byte
 /// sizes.
 ///
