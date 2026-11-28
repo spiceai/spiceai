@@ -26,6 +26,7 @@ use crate::{
     model::provider_models::get_available_models_hint, status,
 };
 use app::App;
+use futures::future::join_all;
 use llms::chat::DistributedBackendSetting;
 use llms::evaluate::Evaluate;
 use model_capabilities::{Capability, DecisionsBackend, ModelCapabilities};
@@ -358,6 +359,16 @@ impl Runtime {
         );
     }
 
+    /// Stops the model loads in progress, takes every model, embedding model and reranker out
+    /// of the runtime, and returns once each is dropped.
+    pub(crate) async fn unload_all_models(&self) {
+        self.model_loads.stop_all().await;
+        let mut unloaded = self.llm_runtime_stores.take_all().await;
+        unloaded.extend(std::mem::take(&mut *self.embeds.write().await).into_values());
+        unloaded.extend(std::mem::take(&mut *self.rerankers.write().await).into_values());
+        unloaded.free().await;
+    }
+
     async fn update_model(self: &Arc<Self>, m: &SpicepodModel) {
         // First, so a load of the old configuration cannot register after it is removed.
         self.model_loads.stop(&m.name).await;
@@ -521,6 +532,16 @@ impl LoadTasks {
             // Waits until an attempt in progress is dropped.
             let _ = task.await;
         }
+    }
+
+    /// Stops every load in progress. When this returns, no attempt to load is running and
+    /// none will start.
+    pub(crate) async fn stop_all(&self) {
+        let tasks: Vec<_> = self.tasks.lock().drain().map(|(_, task)| task).collect();
+        for task in &tasks {
+            task.abort();
+        }
+        join_all(tasks).await;
     }
 
     /// Runs `attempt` as the load of `name`, replacing any load of it in progress, and retries
