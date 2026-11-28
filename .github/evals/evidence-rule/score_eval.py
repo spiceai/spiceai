@@ -329,8 +329,8 @@ def _sha(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-# "Not run — reason", "not run: reason", "not run - reason", "not run because ...",
-# as the PR evidence check (.github/scripts/pr_evidence.mjs) accepts them.
+# A check marked not run with its reason: "Not run — reason", "not run: reason",
+# "not run - reason", "not run because ...".
 NOT_RUN_WITH_REASON = re.compile(r"\bnot run\b\s*(?:[—–:-]+|because\b)\s*\S", re.I)
 
 

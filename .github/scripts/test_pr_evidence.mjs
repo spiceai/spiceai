@@ -97,11 +97,11 @@ test('the parse finds SHA tokens, output, and not-run lines that lack a reason',
   const parsed = parseEvidence(
     `Ran at ${HEAD.slice(0, 7).toUpperCase()}: https://github.com/o/r/actions/runs/1\n` +
       'Not run — needs an S3 bucket\nnot run: no GPU here\nThe TPC-DS bench was not run because it needs SF100\n' +
-      'Integration tests: not run\n- [ ] Not run —'
+      'Integration tests: not run\n- [ ] Not run —\nFuzzing: **not run**'
   );
   assert.deepEqual(parsed.tokens, [HEAD.slice(0, 7)]);
   assert.equal(parsed.hasOutput, true);
-  assert.deepEqual(parsed.notRunWithoutReason, ['Integration tests: not run', '- [ ] Not run —']);
+  assert.deepEqual(parsed.notRunWithoutReason, ['Integration tests: not run', '- [ ] Not run —', 'Fuzzing: **not run**']);
 });
 
 // --- Verdicts ----------------------------------------------------------------
@@ -138,6 +138,22 @@ test('a check marked not run needs a reason', async () => {
   const result = await check({ body: describe(`${ran(HEAD)}\n\nIntegration tests: not run\nBenchmarks: Not run — no change to a shipped binary`) });
   assert.deepEqual(result.problems, [
     'A check is marked not run without a reason: "Integration tests: not run". Write `Not run — <reason>`.',
+  ]);
+});
+
+test('"not run" inside pasted output is output, not a claim', async () => {
+  const output = '```\n$ ./run-checks\nunit           12 passed\nintegration    not run\n```';
+  const result = await check({ body: describe(`${ran(HEAD)}\n\n${output}\n\nIntegration tests: not run`) });
+  assert.deepEqual(result.problems, [
+    'A check is marked not run without a reason: "Integration tests: not run". Write `Not run — <reason>`.',
+  ]);
+});
+
+test('a sentence that mentions "not run" is not a check marked not run', async () => {
+  const prose = 'Queries that do not run on DuckDB are skipped by the oracle, as before.\n**Benchmarks**: not run.';
+  const result = await check({ body: describe(`${ran(HEAD)}\n\n${prose}`) });
+  assert.deepEqual(result.problems, [
+    'A check is marked not run without a reason: "**Benchmarks**: not run.". Write `Not run — <reason>`.',
   ]);
 });
 

@@ -41,9 +41,12 @@ const COMMENT = /<!--[\s\S]*?-->/g;
 const SHA_TOKEN = /\b[0-9a-f]{7,40}\b/gi;
 const URL = /\bhttps?:\/\/\S+/;
 const FENCE = /^\s*(```|~~~)/m;
-const NOT_RUN = /\bnot run\b/i;
-// "Not run — reason", "not run: reason", "not run - reason", "not run because ...".
-const NOT_RUN_WITH_REASON = /\bnot run\b\s*(?:[—–:-]+|because\b)\s*\S/i;
+// A check marked not run with nothing after the mark: "Tests: not run", "- Not run —",
+// "Not run:". A reason after it ("Not run — needs a bucket", "not run because ...")
+// passes, and so does prose that merely contains the words ("queries that do not run
+// on DuckDB"). Markdown emphasis is ignored.
+const NOT_RUN_WITHOUT_REASON = /\bnot run\b[\s—–:.-]*$/i;
+const EMPHASIS = /[*_`]+/g;
 
 /**
  * The text of the description's Evidence section with HTML comments removed,
@@ -69,12 +72,24 @@ export function evidenceSection(body) {
   return start === -1 ? null : lines.slice(start).join('\n').replace(COMMENT, '').trim();
 }
 
+/** The section's lines outside fenced code blocks: what the author wrote, not pasted output. */
+function proseLines(section) {
+  let fenced = false;
+  return section.split('\n').filter((line) => {
+    if (FENCE.test(line)) {
+      fenced = !fenced;
+      return false;
+    }
+    return !fenced;
+  });
+}
+
 /** What the section offers, before any of it is matched against the PR. */
 export function parseEvidence(section) {
   const tokens = [...new Set((section.match(SHA_TOKEN) ?? []).map((token) => token.toLowerCase()))];
-  const notRunWithoutReason = section
-    .split('\n')
-    .filter((line) => NOT_RUN.test(line) && !NOT_RUN_WITH_REASON.test(line))
+  // Pasted output can say anything; only the author's own lines claim a check was not run.
+  const notRunWithoutReason = proseLines(section)
+    .filter((line) => NOT_RUN_WITHOUT_REASON.test(line.replace(EMPHASIS, '')))
     .map((line) => line.trim());
   return {
     tokens,
