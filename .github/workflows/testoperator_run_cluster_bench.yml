@@ -692,6 +692,8 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
+            # Before the held runs are released, so Attestation reads the new evidence.
+            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" 'the cluster benchmark run in this workflow run'
             # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
@@ -779,6 +781,9 @@ jobs:
             printf -- '- **Updated snapshots**: indicate planner or execution drift. Inspect the diff and cross-reference recent trunk commits touching the runtime / federation / acceleration layer to confirm the change is intentional.\n'
             printf -- '- The cluster-bench harness only opens this PR when `update_snapshots=always` (the default for non-`release/*` branches). To gate snapshot drift in CI, set `update_snapshots=no` on the dispatch.\n'
           } > "${body_file}"
+          # Attestation checks the description's Evidence section (.github/scripts/pr_evidence.mjs).
+          printf '\n' >> "${body_file}"
+          bash .github/scripts/bot_pr_evidence.sh section 'the cluster benchmark run in this workflow run' >> "${body_file}"
 
           # Title carries the same summary that's in the commit message — short
           # but specifies cluster-bench, file counts, spicepod, and query set

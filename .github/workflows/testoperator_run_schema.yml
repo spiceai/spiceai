@@ -452,13 +452,15 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
             echo "Updated the open PR -> ${PR_URL}"
+            # Before the held runs are released below, so Attestation reads the new evidence.
+            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" 'the schema snapshot run in this workflow run'
           else
             # Target the branch the run was dispatched on: a release branch's
             # snapshots describe that branch, not trunk. enforce-pull-with-spice, a
             # required check, fails a PR without both a kind/ and an area/ label.
             gh pr create \
               --title "fix: Update schema snapshots for ${{ github.event.inputs.spicepod_path }}" \
-              --body "Updates the schema snapshots for \`${{ github.event.inputs.spicepod_path }}\` on \`${{ github.ref_name }}\`." \
+              --body "$(printf 'Updates the schema snapshots for `%s` on `%s`.\n\n%s' "${{ github.event.inputs.spicepod_path }}" "${{ github.ref_name }}" "$(bash .github/scripts/bot_pr_evidence.sh section 'the schema snapshot run in this workflow run')")" \
               --base "${{ github.ref_name }}" \
               --head "${BRANCH_NAME}" \
               --label kind/bug \

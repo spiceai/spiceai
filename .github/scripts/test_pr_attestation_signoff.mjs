@@ -494,7 +494,7 @@ test('editing the description re-runs Attestation', () => {
  * `module`: whether that base carries pr_evidence.mjs; `checkout`: whether the
  * checkout happened at all.
  */
-async function runEvidence({ body, createdAt = '2026-12-02T00:00:00Z', module = true, checkout = true }) {
+async function runEvidence({ body, createdAt = '2026-12-08T00:00:00Z', module = true, checkout = true }) {
   const workspace = mkdtempSync(join(tmpdir(), 'evidence-'));
   if (checkout) {
     mkdirSync(join(workspace, 'trusted/.github/scripts'), { recursive: true });
@@ -515,7 +515,6 @@ async function runEvidence({ body, createdAt = '2026-12-02T00:00:00Z', module = 
         listCommits: async () => ({ data: [{ sha: HEAD, parents: [{ sha: BASE }] }] }),
       },
       repos: {
-        listCommits: async () => ({ data: [{ commit: { committer: { date: '2026-12-01T00:00:00Z' } } }] }),
         getCommit: async () => ({ data: { files: [] } }),
       },
     },

@@ -153,21 +153,34 @@ status is not a verdict and does not block inheritance.
 Every PR that needs a sign-off also needs evidence in its description, in the
 `🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
 (the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). **Attestation**
-checks, with `.github/scripts/pr_evidence.mjs` read from the base commit, that
-the section:
+checks it with `.github/scripts/pr_evidence.mjs`, read from the base commit:
 
-- exists and says more than the template comment;
-- names a commit from this PR that the evidence ran at;
-- carries output, as a fenced code block or a link to the run;
-- gives a reason for every check marked not run (`Not run — <reason>`);
-- is current: no commit after the newest one it names changes a file the
-  sign-off covers (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked)).
-  Merges of the base don't count, as for sign-off inheritance.
+- The section exists and says more than the template comment. A heading that
+  is just "Evidence" is used; heading-shaped lines inside pasted output don't
+  count.
+- Each entry names a commit from this PR, on a line outside its output, and
+  carries that output: a non-empty fenced block under it, or a link to a
+  workflow run, a PR's checks, or an uploaded file. Other links are not output.
+- Every check marked not run gives a real reason (`Not run — <reason>`, not the
+  placeholder and not "TODO").
+- The newest entry is current: no later commit changes a file the sign-off
+  covers (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
+  checked by old and new path). A merge of the base counts only for covered
+  files it changes against both parents: files both sides touched, or edited
+  while merging. Any other merge counts for everything it brings in. Evidence at
+  the head is current by definition, however many commits the PR has.
 
 It checks form, not truth: whether the output shows what the PR claims is for
 review. Editing the description re-runs **Attestation**. The fast-tracks skip
-the check for the same reason they skip the sign-off. A PR opened before the
-check reached its base branch gets a warning instead of a failure.
+the check for the same reason they skip the sign-off. PRs opened before
+`ENFORCED_FROM` (2026-12-07T00:00Z, in the module) get a warning instead of a
+failure.
+
+Workflows that open PRs with generated commits (snapshot and schema updates)
+write the section with `.github/scripts/bot_pr_evidence.sh`: the generated
+commit and the run that produced it. When a maintainer adds commits to such a
+PR, or to a Dependabot bump that has left its fast-track, they add an entry for
+their own run, as for any other PR.
 
 ### Reverts are fast-tracked
 

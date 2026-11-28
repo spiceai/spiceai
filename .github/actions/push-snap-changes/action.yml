@@ -69,6 +69,8 @@ runs:
         if [[ -z "${BODY}" ]]; then
           BODY="$(printf 'Automated snapshot update from workflow run [#%s](%s/%s/actions/runs/%s).\n\n<!-- spice-snapshot-update -->' "${GITHUB_RUN_ID}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")"
         fi
+        # Attestation checks the description's Evidence section (.github/scripts/pr_evidence.mjs).
+        BODY="$(printf '%s\n\n%s' "${BODY}" "$(bash .github/scripts/bot_pr_evidence.sh section 'the snapshot update in this workflow run')")"
         # enforce-pull-with-spice, a required check, fails a PR without both a kind/ and an
         # area/ label.
         PR_URL="$(gh pr create --title "${PR_TITLE}" --body "${BODY}" --base "${BASE_BRANCH}" --head "${BRANCH_NAME}" --label kind/bug --label area/tests)"

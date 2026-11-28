@@ -26,6 +26,7 @@ on:
       - '.github/scripts/test_trunk_health.mjs'
       - '.github/scripts/pr_evidence.mjs'
       - '.github/scripts/test_pr_evidence.mjs'
+      - '.github/scripts/bot_pr_evidence.sh'
   push:
     branches:
       - trunk
@@ -41,6 +42,7 @@ on:
       - '.github/scripts/test_trunk_health.mjs'
       - '.github/scripts/pr_evidence.mjs'
       - '.github/scripts/test_pr_evidence.mjs'
+      - '.github/scripts/bot_pr_evidence.sh'
   workflow_dispatch:
 
 concurrency:

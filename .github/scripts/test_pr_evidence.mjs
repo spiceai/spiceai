@@ -1,18 +1,24 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 //
 // Unit tests for pr_evidence.mjs, the evidence rule Attestation (pr.yml) applies to
-// a pull request's description. Run: node .github/scripts/test_pr_evidence.mjs
+// a pull request's description, and for bot_pr_evidence.sh, which writes the
+// section for PRs a workflow opens. Run: node .github/scripts/test_pr_evidence.mjs
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ENFORCED_FROM,
   RUST_AFFECTING,
   checkEvidence,
   describeProblems,
+  evidenceEntries,
   evidenceSection,
-  parseEvidence,
+  notRunWithoutReason,
 } from './pr_evidence.mjs';
 import { testRunner } from './fake_github.mjs';
 
@@ -23,9 +29,12 @@ const SECOND = '2b'.repeat(20);
 const MERGE = '3c'.repeat(20);
 const HEAD = '4d'.repeat(20);
 const BASE = 'f'.repeat(40);
-const INTRODUCED = '2026-12-01T00:00:00Z';
+const ON_BASE = 'e'.repeat(40);
+const ELSEWHERE = '9'.repeat(40);
+const AFTER_CUTOFF = '2026-12-08T00:00:00Z';
+const RUN = 'https://github.com/o/r/actions/runs/42';
 
-const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n-->';
+const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n## Not a heading\n-->';
 
 /** A description with the given Evidence section text between Summary and Docs. */
 const describe = (evidence) =>
@@ -33,15 +42,14 @@ const describe = (evidence) =>
 
 const ran = (sha) => `Ran at ${sha.slice(0, 12)}:\n\n\`\`\`\n$ make test\n12 passed\n\`\`\``;
 
+const files = (...names) => names.map((filename) => ({ filename }));
+
 /**
  * A stub of the Octokit calls checkEvidence makes. `commits` are listed oldest
- * first as { sha, merge? }; `files` maps a commit SHA to the paths it changes;
- * `history` is the module's commit dates on the base, newest first.
+ * first as { sha, parents? }; `changes` maps a commit SHA to the files it changes
+ * against its first parent; `compares` maps "base...head" to { status, files }.
  */
-function stubGithub({
-  body, commits = [{ sha: HEAD }], files = {}, createdAt = '2026-12-02T00:00:00Z',
-  history = [INTRODUCED], fail,
-}) {
+function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = {}, createdAt = AFTER_CUTOFF, fail }) {
   const reads = [];
   const github = {
     paginate: async (method, params) => (await method(params)).data,
@@ -52,21 +60,20 @@ function stubGithub({
           return { data: { body, created_at: createdAt, head: { sha: commits.at(-1).sha }, base: { sha: BASE } } };
         },
         listCommits: async () => ({
-          data: commits.map(({ sha, merge }) => ({
-            sha,
-            parents: merge ? [{ sha: BASE }, { sha: FIRST }] : [{ sha: BASE }],
-          })),
+          data: commits.map(({ sha, parents = [BASE] }) => ({ sha, parents: parents.map((parent) => ({ sha: parent })) })),
         }),
       },
       repos: {
-        listCommits: async ({ path, sha }) => {
-          assert.equal(path, '.github/scripts/pr_evidence.mjs');
-          assert.equal(sha, BASE, 'the check took effect on the base branch, not on the PR');
-          return { data: history.map((date) => ({ commit: { committer: { date } } })) };
+        getCommit: async ({ ref, per_page: perPage, page }) => {
+          reads.push(`commit ${ref} page ${page}`);
+          const all = changes[ref] ?? [];
+          return { data: { files: all.slice((page - 1) * perPage, page * perPage) } };
         },
-        getCommit: async ({ ref }) => {
-          reads.push(ref);
-          return { data: { files: (files[ref] ?? []).map((filename) => ({ filename })) } };
+        compareCommitsWithBasehead: async ({ basehead }) => {
+          reads.push(`compare ${basehead}`);
+          const found = compares[basehead];
+          assert.ok(found, `the test did not define the comparison ${basehead}`);
+          return { data: found };
         },
       },
     },
@@ -93,15 +100,58 @@ test('a description without the section has none, and an untouched template is e
   assert.equal(evidenceSection(describe('')), '');
 });
 
-test('the parse finds SHA tokens, output, and not-run lines that lack a reason', () => {
-  const parsed = parseEvidence(
-    `Ran at ${HEAD.slice(0, 7).toUpperCase()}: https://github.com/o/r/actions/runs/1\n` +
-      'Not run — needs an S3 bucket\nnot run: no GPU here\nThe TPC-DS bench was not run because it needs SF100\n' +
-      'Integration tests: not run\n- [ ] Not run —\nFuzzing: **not run**'
+test('heading-shaped lines in pasted output do not end the section', () => {
+  const output = '```\n# run the suite\n## Results\n12 passed\n```';
+  assert.equal(evidenceSection(describe(`${output}\nRan at abcdef123456.`)), `${output}\nRan at abcdef123456.`);
+});
+
+test('a heading that is just "Evidence" wins over one that mentions the word', () => {
+  const body = `## Summary\n\n### Why evidence is out of scope\n\nfoo\n\n## 🧪 Evidence\n\n${ran(HEAD)}\n\n## Docs`;
+  assert.equal(evidenceSection(body), ran(HEAD));
+});
+
+// --- Entries and not-run marks -------------------------------------------------
+
+test('an entry needs its own output: a non-empty fenced block or a link to a run', () => {
+  const resolve = (token) => [FIRST, SECOND, HEAD].find((sha) => sha.startsWith(token)) ?? null;
+  const entries = evidenceEntries(
+    `Before, at ${FIRST.slice(0, 9)}:\n\n\`\`\`\nFAIL\n\`\`\`\n\n` +
+      `At ${SECOND.slice(0, 9)}: see https://spiceai.org/docs\n\n` +
+      `At ${HEAD.slice(0, 9)}: ${RUN}\n\n\`\`\`\ncommit ${SECOND} printed by git log\n\`\`\`\n\n` +
+      `Empty block at ${FIRST.slice(0, 9)}:\n\n\`\`\`\n\n\`\`\``,
+    resolve
   );
-  assert.deepEqual(parsed.tokens, [HEAD.slice(0, 7)]);
-  assert.equal(parsed.hasOutput, true);
-  assert.deepEqual(parsed.notRunWithoutReason, ['Integration tests: not run', '- [ ] Not run —', 'Fuzzing: **not run**']);
+  assert.deepEqual(
+    entries.map(({ shas, hasOutput }) => [shas, hasOutput]),
+    [[[FIRST], true], [[SECOND], false], [[HEAD], true], [[FIRST], false]],
+    'a SHA inside output starts no entry, and an empty block is no output'
+  );
+});
+
+test('output before the first entry belongs to it', () => {
+  const entries = evidenceEntries(`\`\`\`\n12 passed\n\`\`\`\n\nAll of the above ran at ${HEAD.slice(0, 12)}.`, (token) =>
+    HEAD.startsWith(token) ? HEAD : null
+  );
+  assert.deepEqual(entries.map(({ hasOutput }) => hasOutput), [true]);
+});
+
+test('not-run marks need a real reason; prose and pasted output are not marks', () => {
+  assert.deepEqual(
+    notRunWithoutReason(
+      'Not run — needs an S3 bucket\nnot run: no GPU here\nThe TPC-DS bench was not run because it needs SF100\n' +
+        'Queries that do not run on DuckDB are skipped.\n| Bench | not run | needs SF100 |\n' +
+        'Integration tests: not run\n- [ ] Not run —\nFuzzing: **not run**\n| S3 integration | not run |\n' +
+        '- S3: Not run — <reason>\n- Docs build: not run: TODO\n```\nintegration    not run\n```'
+    ),
+    [
+      'Integration tests: not run',
+      '- [ ] Not run —',
+      'Fuzzing: **not run**',
+      '| S3 integration | not run |',
+      '- S3: Not run — <reason>',
+      '- Docs build: not run: TODO',
+    ]
+  );
 });
 
 // --- Verdicts ----------------------------------------------------------------
@@ -122,15 +172,17 @@ test('an untouched template fails as empty', async () => {
   assert.deepEqual(result.problems, ['The Evidence section is empty (its template comment does not count).']);
 });
 
-test('a claim without output or a link fails', async () => {
-  const result = await check({ body: describe(`Tests pass at ${HEAD.slice(0, 12)}.`) });
+test('a bare SHA with an unrelated link is not evidence', async () => {
+  const result = await check({ body: describe(`Tests pass at ${HEAD.slice(0, 12)}. Docs: https://spiceai.org/docs`) });
   assert.deepEqual(result.problems, [
-    'The Evidence section has no output: paste it in a fenced code block, or link the CI run.',
+    `"Tests pass at ${HEAD.slice(0, 12)}. Docs: https://spiceai.org/docs" names ${HEAD.slice(0, 12)} but carries no output: ` +
+      'put the output in a fenced block under it, or link the run.',
   ]);
+  assert.equal(result.cited, null);
 });
 
 test('a link to the run counts as output', async () => {
-  const result = await check({ body: describe(`Green at ${HEAD.slice(0, 12)}: https://github.com/o/r/actions/runs/42`) });
+  const result = await check({ body: describe(`Green at ${HEAD.slice(0, 12)}: ${RUN}`) });
   assert.deepEqual(result.problems, []);
 });
 
@@ -141,78 +193,128 @@ test('a check marked not run needs a reason', async () => {
   ]);
 });
 
-test('"not run" inside pasted output is output, not a claim', async () => {
-  const output = '```\n$ ./run-checks\nunit           12 passed\nintegration    not run\n```';
-  const result = await check({ body: describe(`${ran(HEAD)}\n\n${output}\n\nIntegration tests: not run`) });
-  assert.deepEqual(result.problems, [
-    'A check is marked not run without a reason: "Integration tests: not run". Write `Not run — <reason>`.',
-  ]);
-});
-
-test('a sentence that mentions "not run" is not a check marked not run', async () => {
-  const prose = 'Queries that do not run on DuckDB are skipped by the oracle, as before.\n**Benchmarks**: not run.';
-  const result = await check({ body: describe(`${ran(HEAD)}\n\n${prose}`) });
-  assert.deepEqual(result.problems, [
-    'A check is marked not run without a reason: "**Benchmarks**: not run.". Write `Not run — <reason>`.',
-  ]);
-});
-
 test('citing only a commit outside the PR fails, naming the head', async () => {
   const result = await check({ body: describe(ran(BASE)) });
   assert.deepEqual(result.problems, [
-    `The Evidence section names no commit from this PR. Name the commit each result ran at (the head is ${HEAD.slice(0, 12)}).`,
+    `The Evidence section names no commit from this PR outside its output. Name the commit each result ran at (the head is ${HEAD.slice(0, 12)}).`,
   ]);
-  assert.equal(result.cited, null);
+});
+
+test('naming the head without output does not refresh an older run', async () => {
+  const result = await check({
+    body: describe(`${ran(FIRST)}\n\nThe head is ${HEAD.slice(0, 12)}.`),
+    commits: [{ sha: FIRST }, { sha: HEAD }],
+    changes: { [HEAD]: files('crates/runtime/src/lib.rs') },
+  });
+  assert.deepEqual(result.problems, [
+    `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, or link the run.`,
+    `The evidence ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). ` +
+      'Re-run it at the new head and update the SHA.',
+  ]);
+  assert.equal(result.cited, FIRST);
 });
 
 test('a later commit that changes shipped code makes the evidence stale', async () => {
   const result = await check({
     body: describe(ran(FIRST)),
     commits: [{ sha: FIRST }, { sha: SECOND }, { sha: HEAD }],
-    files: { [SECOND]: ['docs/dev/testing.md'], [HEAD]: ['crates/cayenne/src/lib.rs', 'Cargo.lock'] },
+    changes: { [SECOND]: files('docs/dev/testing.md'), [HEAD]: files('crates/cayenne/src/lib.rs', 'Cargo.lock') },
   });
   assert.deepEqual(result.problems, [
     `The evidence ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
       `${HEAD.slice(0, 12)} (crates/cayenne/src/lib.rs, Cargo.lock). Re-run it at the new head and update the SHA.`,
   ]);
-  assert.equal(result.cited, FIRST);
 });
 
-test('later commits that change no shipped code, and base merges, keep the evidence current', async () => {
+test('a rename out of shipped code counts as a change to it', async () => {
+  const result = await check({
+    body: describe(ran(FIRST)),
+    commits: [{ sha: FIRST }, { sha: HEAD }],
+    changes: { [HEAD]: [{ filename: 'notes.txt', previous_filename: 'crates/runtime/src/old.rs' }] },
+  });
+  assert.equal(result.problems.length, 1);
+  assert.match(result.problems[0], /later commits change shipped code: 4d4d4d4d4d4d \(notes\.txt\)/);
+});
+
+test('every page of a large commit is read', async () => {
+  const many = Array.from({ length: 150 }, (_, index) => ({ filename: `docs/page-${index}.md` }));
+  many.push({ filename: 'crates/runtime/src/lib.rs' });
+  const { github, reads } = stubGithub({ body: describe(ran(FIRST)), commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: many } });
+  const result = await checkEvidence({ github, owner: 'o', repo: 'r', pullNumber: 7 });
+  assert.match(result.problems[0], /\(crates\/runtime\/src\/lib\.rs\)/);
+  assert.deepEqual(reads, [`commit ${HEAD} page 1`, `commit ${HEAD} page 2`]);
+});
+
+test('a commit past the listed-file limit cannot be shown current', async () => {
+  const many = Array.from({ length: 3000 }, (_, index) => ({ filename: `docs/page-${index}.md` }));
+  const result = await check({ body: describe(ran(FIRST)), commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: many } });
+  assert.match(result.problems[0], /4d4d4d4d4d4d \(more files than GitHub lists, so it cannot be checked\)/);
+});
+
+test('a clean merge of the base keeps the evidence current', async () => {
   const { github, reads } = stubGithub({
     body: describe(ran(FIRST)),
-    commits: [{ sha: FIRST }, { sha: SECOND }, { sha: MERGE, merge: true }],
-    files: { [SECOND]: ['docs/dev/testing.md'], [MERGE]: ['crates/runtime/src/lib.rs'] },
+    commits: [{ sha: FIRST }, { sha: MERGE, parents: [FIRST, ON_BASE] }],
+    compares: {
+      [`${FIRST}...${MERGE}`]: { status: 'ahead', files: files('crates/runtime/src/from_base.rs') },
+      [`${ON_BASE}...${BASE}`]: { status: 'ahead', files: [] },
+      [`${ON_BASE}...${MERGE}`]: { status: 'ahead', files: files('docs/dev/testing.md') },
+    },
   });
   const result = await checkEvidence({ github, owner: 'o', repo: 'r', pullNumber: 7 });
   assert.deepEqual(result.problems, []);
-  assert.deepEqual(reads, [SECOND], 'a merge commit is not read: it brings in the base, not new work');
+  assert.deepEqual(reads, [`compare ${FIRST}...${MERGE}`, `compare ${ON_BASE}...${BASE}`, `compare ${ON_BASE}...${MERGE}`]);
+});
+
+test('a base merge that changes a shipped file against both parents makes the evidence stale', async () => {
+  const result = await check({
+    body: describe(ran(FIRST)),
+    commits: [{ sha: FIRST }, { sha: MERGE, parents: [FIRST, ON_BASE] }],
+    compares: {
+      [`${FIRST}...${MERGE}`]: { status: 'ahead', files: files('crates/runtime/src/conflict.rs', 'crates/runtime/src/from_base.rs') },
+      [`${ON_BASE}...${BASE}`]: { status: 'identical', files: [] },
+      [`${ON_BASE}...${MERGE}`]: { status: 'ahead', files: files('crates/runtime/src/conflict.rs') },
+    },
+  });
+  assert.equal(result.problems.length, 1);
+  assert.match(result.problems[0], /later commits change shipped code: 3c3c3c3c3c3c \(crates\/runtime\/src\/conflict\.rs\)/);
+});
+
+test('a merge of a branch other than the base counts everything it brings in', async () => {
+  const result = await check({
+    body: describe(ran(FIRST)),
+    commits: [{ sha: FIRST }, { sha: MERGE, parents: [FIRST, ELSEWHERE] }],
+    compares: {
+      [`${FIRST}...${MERGE}`]: { status: 'ahead', files: files('crates/runtime/src/feature.rs') },
+      [`${ELSEWHERE}...${BASE}`]: { status: 'diverged', files: [] },
+    },
+  });
+  assert.match(result.problems[0], /3c3c3c3c3c3c \(crates\/runtime\/src\/feature\.rs\)/);
 });
 
 test('the newest cited commit decides what is later', async () => {
   const result = await check({
-    body: describe(`${ran(FIRST)}\n\nRe-ran at ${SECOND.slice(0, 12)}, same output.`),
+    body: describe(`${ran(FIRST)}\n\nRe-ran at ${SECOND.slice(0, 12)}: ${RUN}`),
     commits: [{ sha: FIRST }, { sha: SECOND }],
-    files: { [SECOND]: ['crates/runtime/src/lib.rs'] },
+    changes: { [SECOND]: files('crates/runtime/src/lib.rs') },
   });
   assert.deepEqual(result.problems, []);
   assert.equal(result.cited, SECOND);
 });
 
-test('a PR opened before the check took effect is not enforced', async () => {
-  const before = await check({ body: describe(''), createdAt: '2026-11-30T23:59:59Z' });
-  assert.equal(before.enforced, false);
-  assert.equal(before.problems.length, 1);
-  // Newest first: the oldest entry is when the module reached the base.
-  const after = await check({ body: describe(''), createdAt: '2026-12-01T00:00:00Z', history: ['2027-01-05T00:00:00Z', INTRODUCED] });
-  assert.equal(after.enforced, true);
+test('a PR opened before ENFORCED_FROM is not enforced', async () => {
+  assert.equal(ENFORCED_FROM, '2026-12-07T00:00:00Z');
+  assert.equal((await check({ body: describe(''), createdAt: '2026-12-06T23:59:59Z' })).enforced, false);
+  assert.equal((await check({ body: describe(''), createdAt: ENFORCED_FROM })).enforced, true);
 });
 
-test('a PR past the listed-commit limit fails rather than guess', async () => {
+test('past the listed-commit limit, evidence at the head still passes', async () => {
   const commits = Array.from({ length: 250 }, (_, index) => ({ sha: index.toString(16).padStart(40, '0') }));
-  const result = await check({ body: describe(ran(HEAD)), commits });
-  assert.deepEqual(result.problems, [
-    'The PR has 250 or more commits, past what GitHub lists, so the evidence cannot be matched to them.',
+  commits[249] = { sha: HEAD };
+  assert.deepEqual((await check({ body: describe(ran(HEAD)), commits })).problems, []);
+  const older = await check({ body: describe(ran(commits[10].sha)), commits });
+  assert.deepEqual(older.problems, [
+    `The PR has 250 or more commits, past what GitHub lists, so only evidence at the head (${HEAD.slice(0, 12)}) can be shown current.`,
   ]);
 });
 
@@ -240,6 +342,62 @@ test('shipped code means what the no-Rust fast-track in pr.yml says it means', (
     match[1],
     'RUST_AFFECTING in pr_evidence.mjs differs from rustAffecting in pr.yml; copy the pattern across'
   );
+});
+
+// --- The section bots write ----------------------------------------------------
+
+const HELPER = fileURLToPath(new URL('./bot_pr_evidence.sh', import.meta.url));
+const repoHead = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const actionsEnv = {
+  ...process.env,
+  GITHUB_SERVER_URL: 'https://github.com',
+  GITHUB_REPOSITORY: 'spiceai/spiceai',
+  GITHUB_RUN_ID: '123',
+};
+
+test('the section bot_pr_evidence.sh writes passes the check', async () => {
+  const section = execFileSync('bash', [HELPER, 'section', 'the snapshot update in this workflow run'], {
+    encoding: 'utf8',
+    env: actionsEnv,
+  });
+  assert.equal(
+    section,
+    `## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by the snapshot update in this workflow run: ` +
+      'https://github.com/spiceai/spiceai/actions/runs/123\n'
+  );
+  const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }] });
+  assert.deepEqual(result.problems, []);
+});
+
+test('bot_pr_evidence.sh update replaces the section in an open PR and keeps the rest', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
+  try {
+    writeFileSync(
+      join(dir, 'body.md'),
+      `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${'0'.repeat(12)} by an older run: https://github.com/spiceai/spiceai/actions/runs/1\n\n## Notes\n\nKeep me.`
+    );
+    // A fake `gh` that serves the body and records the edit.
+    writeFileSync(
+      join(dir, 'gh'),
+      `#!/usr/bin/env bash\nif [ "$1 $2" = "pr view" ]; then cat "${join(dir, 'body.md')}"; fi\n` +
+        `if [ "$1 $2" = "pr edit" ]; then while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "${join(dir, 'edited.md')}"; shift; done; fi\n`
+    );
+    chmodSync(join(dir, 'gh'), 0o755);
+    execFileSync('bash', [HELPER, 'update', '7', 'the schema snapshot run in this workflow run'], {
+      env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}` },
+    });
+    const edited = readFileSync(join(dir, 'edited.md'), 'utf8');
+    assert.equal(
+      edited,
+      'Automated update.\n\n## Notes\n\nKeep me.\n\n## 🧪 Evidence\n\n' +
+        `Generated at ${repoHead.slice(0, 12)} by the schema snapshot run in this workflow run: ` +
+        'https://github.com/spiceai/spiceai/actions/runs/123\n'
+    );
+    const result = await check({ body: edited, commits: [{ sha: repoHead }] });
+    assert.deepEqual(result.problems, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 await runAll();
