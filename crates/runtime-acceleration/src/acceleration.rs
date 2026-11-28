@@ -159,6 +159,44 @@ pub fn unset_refresh_mode_for_connector(connector: &str) -> RefreshMode {
     }
 }
 
+/// The change-source consumer `dataset` reads through when other datasets may
+/// share it, named so every instance running the same Spicepod computes the
+/// same name: a PostgreSQL replication slot named by `pg_replication_slot`,
+/// which every dataset naming it on one connection reads through one
+/// replication connection. `None` for a dataset that reads through a consumer
+/// of its own, or none.
+///
+/// Datasets on one consumer must be written by one instance. The name is the
+/// slot alone, whatever the connection: two datasets naming one slot on
+/// different databases are then written together too, which is coarser than
+/// needed but never splits a consumer.
+///
+/// Only a dataset the object-native Cayenne metastore holds is named: a
+/// `cayenne` acceleration in a file mode without `partition_by`. A dataset
+/// accelerated elsewhere never opens in that metastore, so a write unit
+/// waiting for it would never open its writes.
+#[must_use]
+pub fn shared_change_consumer(dataset: &spicepod::component::dataset::Dataset) -> Option<String> {
+    let in_object_native_metastore = dataset.acceleration.as_ref().is_some_and(|acceleration| {
+        acceleration.enabled
+            && matches!(
+                Engine::try_from(acceleration.engine_name()),
+                Ok(Engine::Cayenne)
+            )
+            && !matches!(acceleration.mode, spicepod_acceleration::Mode::Memory)
+            && acceleration.partition_by.is_empty()
+    });
+    if !in_object_native_metastore
+        || dataset.from.split_once(':').map(|(connector, _)| connector) != Some("postgres")
+    {
+        return None;
+    }
+    let slot = dataset.params.as_ref()?.data.get("pg_replication_slot")?;
+    let slot = slot.as_string();
+    let slot = slot.trim();
+    (!slot.is_empty()).then(|| format!("postgres slot {slot}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
     #[default]
@@ -1477,6 +1515,53 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use spicepod::param::ParamValue;
     use std::sync::Arc;
+
+    fn slot_dataset(acceleration: &serde_json::Value) -> spicepod::component::dataset::Dataset {
+        serde_json::from_value(serde_json::json!({
+            "from": "postgres:public.orders",
+            "name": "orders",
+            "params": { "pg_replication_slot": "orders_slot" },
+            "acceleration": acceleration,
+        }))
+        .expect("parse the dataset")
+    }
+
+    /// Only a dataset the object-native Cayenne metastore holds is grouped
+    /// on its replication slot: a unit waiting for any other would never open.
+    #[test]
+    fn only_an_object_native_cayenne_dataset_shares_its_slot_consumer() {
+        let cases = [
+            (serde_json::json!({ "enabled": true, "mode": "file" }), true),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "file_create" }),
+                true,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "memory" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "arrow", "mode": "file" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": false, "engine": "cayenne", "mode": "file" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "file", "partition_by": ["bucket(4, id)"] }),
+                false,
+            ),
+        ];
+        for (acceleration, grouped) in cases {
+            let expected = grouped.then(|| "postgres slot orders_slot".to_string());
+            assert_eq!(
+                shared_change_consumer(&slot_dataset(&acceleration)),
+                expected,
+                "{acceleration}"
+            );
+        }
+    }
 
     #[test]
     fn only_a_cayenne_acceleration_with_a_datalake_location_uses_the_datalake() {

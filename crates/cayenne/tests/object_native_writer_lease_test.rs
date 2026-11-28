@@ -610,9 +610,11 @@ async fn a_writer_whose_clock_stood_still_deletes_nothing_its_successor_commits(
     b.insert(201, 300).await.expect("B writes again");
     assert_eq!(b.count_and_sum().await, expected(1..=300), "B took over");
 
-    // A resumes: on its own clock its lease's deadline is still ahead.
+    // A resumes: on its own clock its lease's deadline is still ahead, and
+    // the task that suspends its writes at that deadline has not fired.
     let gate = a.catalog.data_write_gate(&table_id);
     gate.hold_until(Instant::now() + Duration::from_hours(3));
+    gate.set(true);
     assert!(gate.allows(), "A's write gate is open, as its clock says");
 
     let swept = a_table
@@ -1562,4 +1564,262 @@ async fn a_rewritten_run_file_is_read_again() {
         1,
         "the rewritten file is read again and retired: {swept:?}"
     );
+}
+
+/// One instance that loads several datasets, for the tests of write units.
+struct Node {
+    store: Arc<dyn ObjectStore>,
+    catalog: Arc<ObjectNativeCatalog>,
+    ctx: SessionContext,
+}
+
+impl Node {
+    async fn start(
+        objects: &Arc<dyn ObjectStore>,
+        identity: &'static str,
+        units: cayenne::metastore::object_native::WriteUnits,
+    ) -> Self {
+        let store = Arc::clone(objects);
+        let catalog = ObjectNativeCatalog::open_or_create_at_with_units(
+            Arc::clone(&store),
+            Path::from(crate::common::LOCATION_CATALOG),
+            LOCATION,
+            NativeCatalogConfig {
+                access: Access::Leased(LeaseSettings {
+                    duration: LEASE,
+                    identity: Some(identity),
+                }),
+                ..NativeCatalogConfig::default()
+            },
+            units,
+        )
+        .await
+        .expect("open the object-native catalog");
+        catalog.init().await.expect("init");
+        Self {
+            store,
+            catalog: Arc::new(catalog),
+            ctx: SessionContext::new(),
+        }
+    }
+
+    fn builder(&self, name: &str) -> CayenneTableProviderBuilder {
+        let url = crate::common::location_data_url(&self.catalog, name);
+        crate::common::table_builder_on_store(
+            Arc::clone(&self.catalog) as Arc<dyn MetadataCatalog>,
+            self.ctx.runtime_env(),
+            ObjectStoreConfig {
+                url: url::Url::parse(&url).expect("data url"),
+                store: Arc::clone(&self.store),
+            },
+        )
+    }
+
+    /// Open dataset `name`, creating it when the location has none.
+    async fn load(&self, name: &str) {
+        let table = if self.catalog.get_table(name).await.is_ok() {
+            self.builder(name).open(name).await.expect("open")
+        } else {
+            let url = crate::common::location_data_url(&self.catalog, name);
+            self.builder(name)
+                .create(CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema: schema(),
+                    primary_key: Vec::new(),
+                    on_conflict: None,
+                    base_path: url,
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        ..VortexConfig::default()
+                    },
+                })
+                .await
+                .expect("create")
+        };
+        let _ = self.ctx.deregister_table(name);
+        self.ctx
+            .register_table(name, Arc::new(table))
+            .expect("register");
+    }
+
+    fn writes(&self, name: &str) -> bool {
+        self.catalog
+            .writer_watch(name)
+            .is_some_and(|watch| *watch.borrow())
+    }
+
+    async fn insert(&self, name: &str, first: i64, last: i64) -> datafusion::error::Result<()> {
+        self.ctx
+            .sql(&format!(
+                "INSERT INTO {name} SELECT value AS id, value * 10 AS v FROM generate_series({first}, {last})"
+            ))
+            .await?
+            .collect()
+            .await
+            .map(|_| ())
+    }
+
+    async fn count(&self, name: &str) -> i64 {
+        let batches = self
+            .ctx
+            .sql(&format!("SELECT count(*) FROM {name}"))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("execute");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    }
+}
+
+/// Wait up to `limit` for `condition`, then report `what` and the last state.
+async fn wait_for(limit: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what} within {limit:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The generation in the lease object at `path`, and in the head of the log
+/// at `log`, both read straight from storage.
+async fn lease_and_head_generation(
+    store: &Arc<dyn ObjectStore>,
+    lease: &Path,
+    log: &Path,
+) -> (u64, u64) {
+    let bytes = store
+        .get(lease)
+        .await
+        .expect("lease stored")
+        .bytes()
+        .await
+        .expect("read lease");
+    let record = object_store_occ::lease::LeaseRecord::parse(&bytes).expect("a lease record");
+    let head = object_store_occ::headlog::head_generation(store.as_ref(), log)
+        .await
+        .expect("read head")
+        .expect("a head");
+    (record.generation, head)
+}
+
+/// Two datasets that share a change source's consumer are one write unit:
+/// one instance writes both, and when it stops, another takes both over, at
+/// the generation its lease grants, never one of them alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn datasets_on_one_consumer_are_written_by_one_instance() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let units = || {
+        cayenne::metastore::object_native::WriteUnits::default()
+            .with_consumer("postgres slot shared", &["orders", "audit"])
+    };
+    let a = Node::start(&objects, "a", units()).await;
+    a.load("orders").await;
+    a.load("audit").await;
+    let b = Node::start(&objects, "b", units()).await;
+    b.load("orders").await;
+    b.load("audit").await;
+    wait_for(LEASE, "A writes both datasets", || {
+        a.writes("orders") && a.writes("audit")
+    })
+    .await;
+    assert!(
+        !b.writes("orders") && !b.writes("audit"),
+        "B writes neither"
+    );
+    // `orders` opened before its unit was complete, so it reopens before
+    // writing, as the runtime reloads a dataset when writing starts.
+    a.load("orders").await;
+    a.load("audit").await;
+    a.insert("orders", 1, 10).await.expect("A writes orders");
+    a.insert("audit", 1, 20).await.expect("A writes audit");
+
+    // One lease for the pair, beside the registry.
+    let leases: Vec<Path> = objects
+        .list(Some(&Path::from("state/cayenne/v1/leases")))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list leases")
+        .into_iter()
+        .map(|meta| meta.location)
+        .filter(|path| path.extension() == Some("json"))
+        .collect();
+    assert_eq!(leases.len(), 1, "{leases:?}");
+    let lease = leases[0].clone();
+    for dataset in ["orders", "audit"] {
+        let log = a.catalog.dataset_log(dataset).expect("a log");
+        assert_eq!(
+            lease_and_head_generation(&objects, &lease, &log).await,
+            (1, 1),
+            "{dataset}: the head is taken over at the lease's generation"
+        );
+    }
+
+    // A stops; B takes over both, together, at the next generation.
+    drop(a);
+    wait_for(LEASE * 4, "B writes both datasets", || {
+        b.writes("orders") && b.writes("audit")
+    })
+    .await;
+    for dataset in ["orders", "audit"] {
+        let log = b.catalog.dataset_log(dataset).expect("a log");
+        let (lease_generation, head) = lease_and_head_generation(&objects, &lease, &log).await;
+        assert_eq!(lease_generation, head, "{dataset}");
+        assert!(head >= 2, "{dataset}: the takeover fences A");
+    }
+    b.load("orders").await;
+    b.load("audit").await;
+    assert_eq!((b.count("orders").await, b.count("audit").await), (10, 20));
+    b.insert("orders", 11, 15).await.expect("B writes orders");
+    b.insert("audit", 21, 25).await.expect("B writes audit");
+}
+
+/// An instance that writes fewer datasets than its share asks the instance
+/// writing the most for one, through the location; that instance hands it
+/// over at a commit boundary, and the two settle at one each, with every row
+/// either committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joining_instance_is_handed_its_share() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let none = cayenne::metastore::object_native::WriteUnits::default;
+    let a = Node::start(&objects, "a", none()).await;
+    a.load("orders").await;
+    a.load("audit").await;
+    a.insert("orders", 1, 10).await.expect("A writes orders");
+    a.insert("audit", 1, 20).await.expect("A writes audit");
+    assert!(a.writes("orders") && a.writes("audit"));
+
+    let b = Node::start(&objects, "b", none()).await;
+    b.load("orders").await;
+    b.load("audit").await;
+    // B asks once a lease duration; A answers at its next renewal.
+    wait_for(LEASE * 8, "each instance writes one dataset", || {
+        let a_writes = usize::from(a.writes("orders")) + usize::from(a.writes("audit"));
+        let b_writes = usize::from(b.writes("orders")) + usize::from(b.writes("audit"));
+        a_writes == 1 && b_writes == 1
+    })
+    .await;
+    // Stays there: neither asks again.
+    tokio::time::sleep(LEASE * 3).await;
+    let moved = if b.writes("orders") {
+        "orders"
+    } else {
+        "audit"
+    };
+    assert!(b.writes(moved) && !a.writes(moved), "{moved} stayed with B");
+    // B serves every row A committed, and writes on.
+    b.load(moved).await;
+    let before = b.count(moved).await;
+    assert_eq!(before, if moved == "orders" { 10 } else { 20 });
+    b.insert(moved, 1_000, 1_004)
+        .await
+        .expect("B writes what it was handed");
+    assert_eq!(b.count(moved).await, before + 5);
 }

@@ -862,6 +862,18 @@ pub struct BackgroundStep {
     /// invariant that a concurrent change could break is checked on every
     /// iteration.
     pub expect: Option<BTreeMap<String, Option<String>>>,
+    /// For a query: a numeric column of its one row to sample on every
+    /// iteration; `stop-background` prints the samples' count, P99, P99.9 and
+    /// maximum, and fails when one reached `below`.
+    pub measure: Option<Measure>,
+}
+
+/// A numeric column a background query samples.
+#[derive(Debug, Clone)]
+pub struct Measure {
+    pub column: String,
+    /// Every sample must be under this.
+    pub below: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2288,6 +2300,29 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 expect.is_none() || matches!(work, BackgroundWork::Query(_)),
                 "background `expect` applies to a `query`"
             );
+            let measure = match inner.take("measure") {
+                None => None,
+                Some(Value::String(column)) => Some(Measure {
+                    column,
+                    below: None,
+                }),
+                Some(Value::Object(m)) => {
+                    let mut m = Opts(m);
+                    let column = m
+                        .string("column")?
+                        .context("background `measure` needs a `column`")?;
+                    let below = m.parse("below", "`below` must be a number")?;
+                    m.finish()?;
+                    Some(Measure { column, below })
+                }
+                Some(_) => bail!(
+                    "background `measure` takes a column name, or a mapping with `column` and `below`"
+                ),
+            };
+            ensure!(
+                measure.is_none() || matches!(work, BackgroundWork::Query(_)),
+                "background `measure` applies to a `query`"
+            );
             inner.finish()?;
             Action::Background(BackgroundStep {
                 id,
@@ -2295,6 +2330,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 concurrency,
                 every,
                 expect,
+                measure,
             })
         }
         "stop-background" => {

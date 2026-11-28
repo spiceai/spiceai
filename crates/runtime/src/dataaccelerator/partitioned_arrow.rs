@@ -152,6 +152,9 @@ impl DataAccelerator for PartitionedArrowAccelerator {
         Ok(None)
     }
 
+    // No other instance writes these accelerations.
+    async fn release_writer_leases(&self) {}
+
     fn as_any(&self) -> &dyn Any {
         self
     }

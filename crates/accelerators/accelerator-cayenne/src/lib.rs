@@ -3822,6 +3822,12 @@ impl DataAccelerator for CayenneAccelerator {
             .and_then(|catalog| catalog.writer_watch(&source.name().to_string()))
     }
 
+    async fn release_writer_leases(&self) {
+        if let Some(catalog) = self.native_catalog.get() {
+            catalog.release_writer_leases().await;
+        }
+    }
+
     async fn shared_location_id(
         &self,
         source: &dyn AccelerationSource,

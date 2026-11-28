@@ -223,6 +223,7 @@ impl Replay {
                 false,
                 None,
                 "",
+                None,
             )
             .await
             .expect("create a participant's log");
@@ -474,6 +475,7 @@ impl Replay {
                     false,
                     None,
                     "",
+                    None,
                 )
                 .await
                 .expect("take a participant's log over");

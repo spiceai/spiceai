@@ -82,6 +82,9 @@ impl MetadataCatalog for ObjectNativeCatalog {
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
+        // Hand every writer lease back first, each at a commit boundary, so
+        // another instance takes over at once.
+        self.release_writer_leases().await;
         self.on_every_log(|domain| async move { domain.shutdown().await })
             .await
             .map(|_| ())

@@ -531,8 +531,8 @@ const SNAPSHOTTING: u8 = 0b010;
 const STREAMING: u8 = 0b100;
 
 /// Per-member LSN accounting — one cache-line-isolated slot per member. The
-/// consumer commit path (the hot ~5.5M/run write) is a single lock-free atomic
-/// advance on the member's own `committed`, never a shared mutex; the pump
+/// consumer commit path (the hot ~5.5M/run write) uses lock-free atomic
+/// advances on the member's own horizons, never a shared mutex; the pump
 /// advances `delivered` (and, for idle members, both — see
 /// [`AckTable::credit_idle`]). During streaming both fields advance monotonically,
 /// so a torn pair-read across a concurrent writer can only under-observe, never
@@ -547,8 +547,14 @@ const STREAMING: u8 = 0b100;
 /// not "clean up".
 #[repr(align(64))]
 struct AckSlot {
-    /// Highest commit LSN durably applied by this member's sink.
+    /// Highest commit LSN durably applied by this member's sink, including idle
+    /// intervals that the pump proved contained no changes for it.
     committed: AtomicU64,
+    /// Acknowledgement horizon established by a durable change commit or a
+    /// successful applied-position writer save. Idle credit alone never moves it.
+    /// A saved snapshot boundary may lead `committed`; [`Self::flush_lsn`] caps
+    /// the acknowledgement at the pump's coverage until it catches up.
+    flush: AtomicU64,
     /// Highest commit LSN staged for this member, either in the pump-local eager
     /// coalescer or its mailbox.
     delivered: AtomicU64,
@@ -568,8 +574,8 @@ struct AckSlot {
     /// the premise [`flush_idle_watermarks`] needs before it may carry the position
     /// forward over an interval that contained nothing to apply.
     ///
-    /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
-    /// used), so it adds no false sharing.
+    /// All fields still fit within the one 64-byte line this type is aligned to,
+    /// so they add no false sharing.
     recorded: AtomicU64,
     /// Whether a mid-stream rebuild request is outstanding for this member.
     ///
@@ -600,6 +606,7 @@ impl AckSlot {
     fn new(at: u64, snapshotting: bool) -> Self {
         Self {
             committed: AtomicU64::new(at),
+            flush: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
@@ -615,6 +622,7 @@ impl AckSlot {
     fn reserved(at: u64) -> Self {
         Self {
             committed: AtomicU64::new(at),
+            flush: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
@@ -625,6 +633,12 @@ impl AckSlot {
 
     fn committed(&self) -> u64 {
         self.committed.load(Ordering::Acquire)
+    }
+
+    /// The member's source acknowledgement cannot exceed either the pump's
+    /// coverage or the position established by a durable commit or store save.
+    fn flush_lsn(&self) -> u64 {
+        self.committed().min(self.flush.load(Ordering::Acquire))
     }
 
     fn delivered(&self) -> u64 {
@@ -678,6 +692,7 @@ impl AckSlot {
         self.note_recorded(lsn);
         self.note_pending(lsn);
         advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.flush, lsn);
         advance_monotonic(&self.delivered, lsn);
     }
 
@@ -685,6 +700,7 @@ impl AckSlot {
     /// the consumer commit path via [`SharedLsnCommitter`].
     fn commit(&self, lsn: u64) {
         advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.flush, lsn);
     }
 
     /// Record an envelope staged for this member (monotonic). The pump is the
@@ -706,7 +722,7 @@ impl AckSlot {
 }
 
 /// Per-member LSN accounting for a shared slot. The slot-level acknowledgment
-/// (`shared_flush`) is the minimum `committed` over **all** members — live or
+/// (`shared_flush`) is the minimum [`AckSlot::flush_lsn`] over **all** members — live or
 /// held — advanced monotonically and recomputed *lazily on read*
 /// ([`Self::flush_lsn`]), not eagerly on every commit.
 ///
@@ -818,7 +834,7 @@ impl AckTable {
     }
 
     /// Called by the pump immediately after a successful connect, whose
-    /// `start_lsn` was the floor (min over all `committed`, held members
+    /// `start_lsn` was the floor (min over all member acknowledgements, held members
     /// included): every held, snapshot-complete member's gap is covered by
     /// this connection's replay, so they become routable and creditable.
     fn promote_ready_members(&self) {
@@ -856,6 +872,8 @@ impl AckTable {
                 // keepalive), never credit past an in-flight envelope. This is
                 // the one memory-ordering subtlety here; any future edit MUST
                 // preserve the order.
+                // Routing may carry this interval forward immediately, but the
+                // acknowledgement waits for `write_one` to save its position.
                 advance_monotonic(&slot.committed, upto);
                 advance_monotonic(&slot.delivered, upto);
             }
@@ -900,6 +918,7 @@ impl AckTable {
             // `committed` before `delivered`, per [`AckSlot`]: a torn read must
             // never be able to show `delivered > committed`.
             advance_monotonic(&slot.committed, at);
+            advance_monotonic(&slot.flush, at);
             advance_monotonic(&slot.delivered, at);
         }
     }
@@ -909,12 +928,12 @@ impl AckTable {
         advance_monotonic(&self.shared_flush, lsn);
     }
 
-    /// Read-time slot-level floor: the minimum `committed` over all members
+    /// Read-time slot-level floor: the minimum [`AckSlot::flush_lsn`] over all members
     /// (held members included — their frozen floor pins WAL by design), advanced
     /// monotonically into `shared_flush`. Recomputed on read, so nobody should
     /// cache the result expecting eager freshness. The monotonic CAS preserves
     /// the never-regress guarantee even if a `register` seeds a slot below the
-    /// last reported floor mid-sweep. The sweep is one atomic load per entry
+    /// last reported floor mid-sweep. The sweep reads each member's two horizons
     /// under an uncontended read lock — typically ≤ 8 members, transiently more
     /// on a resuming slot that is still holding floors for tables whose
     /// datasets have not joined ([`Self::reserve`]) — and it replaces the old
@@ -922,7 +941,7 @@ impl AckTable {
     fn flush_lsn(&self) -> u64 {
         let floor = read_lock(&self.members)
             .values()
-            .map(|slot| slot.committed())
+            .map(|slot| slot.flush_lsn())
             .min();
         if let Some(floor) = floor {
             advance_monotonic(&self.shared_flush, floor);
@@ -979,8 +998,8 @@ fn advance_monotonic(flush: &AtomicU64, to: u64) {
 }
 
 /// `CommitChange` impl for shared-slot envelopes: advances this member's
-/// committed LSN via its own cache-line-isolated [`AckSlot`] — a single
-/// lock-free atomic, no shared mutex and no floor recompute (the floor is read
+/// committed LSN via its own cache-line-isolated [`AckSlot`] — lock-free
+/// atomic advances, no shared mutex and no floor recompute (the floor is read
 /// lazily at the next boundary by [`AckTable::flush_lsn`]).
 struct SharedLsnCommitter {
     slot: Arc<AckSlot>,
@@ -2026,6 +2045,12 @@ impl SharedSource {
     /// re-subscription, which re-attaches immediately — only WARN).
     fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
+        // A dataset another instance writes now left on purpose: the new
+        // writer resumes the slot at once, so nothing is stalled.
+        let released = removed
+            .as_ref()
+            .is_some_and(|member| crate::cdc::take_released_dataset(&member.dataset_name));
+        let stalls_slot = stalls_slot && !released;
         // The writer sweeps members, so anything this one published but had not yet
         // had written would be dropped on the floor by the removal above. Hand it
         // over rather than writing it here, which would make a second writer.
@@ -2048,7 +2073,12 @@ impl SharedSource {
             // observable, not only logged (#11644). A superseding re-subscription
             // re-attaches (back to 1) via `mark_member_attached` on rejoin.
             member.metrics.mark_member_detached();
-            if stalls_slot {
+            if released {
+                tracing::info!(
+                    "{}",
+                    released_member_message(&member.dataset_name, &self.key.slot_name)
+                );
+            } else if stalls_slot {
                 tracing::error!(
                     dataset = %member.dataset_name,
                     table = %format_member(key),
@@ -2296,6 +2326,14 @@ impl SharedSource {
             self.detach_member(&key, "changes stream receiver dropped", true);
         }
     }
+}
+
+/// Logged when a dataset stops consuming its replication slot because another
+/// Spice instance writes it now ([`crate::cdc::release_dataset`]).
+fn released_member_message(dataset: &str, slot: &str) -> String {
+    format!(
+        "Dataset '{dataset}' stopped consuming PostgreSQL replication slot '{slot}', because another Spice instance writes it now; that instance resumes the slot from the last saved change."
+    )
 }
 
 fn format_member(key: &MemberKey) -> String {
@@ -2696,6 +2734,7 @@ async fn attach_member(
     // join and an in-process rejoin (both reach here); the paired `mark_member_detached`
     // in `detach_member` flips it to 0 when the member leaves (#11644).
     metrics.mark_member_attached();
+    crate::cdc::clear_released_dataset(&dataset_name);
 
     tracing::info!(
         dataset = %dataset_name,
@@ -3233,15 +3272,13 @@ async fn run_applied_lsn_writer(source: Arc<SharedSource>, interval: std::time::
     }
 }
 
-/// Carry each idle member's position forward to what the slot has acknowledged on
-/// its behalf, by publishing it like any other producer.
+/// Publish each idle member's carried-forward position for recording before
+/// the slot may acknowledge it.
 ///
-/// The slot's acknowledgement advances for a member that had nothing to apply, via
-/// [`AckTable::credit_idle`], which routes no envelope and so runs no committer.
-/// Left alone the recorded position and the acknowledgement drift apart for any
-/// quiet table, and the next start reads a position behind the slot's
-/// `confirmed_flush_lsn` — indistinguishable from changes acknowledged but never
-/// applied, so a healthy acceleration is rebuilt on every restart.
+/// [`AckTable::credit_idle`] advances the coverage of a member that had nothing
+/// to apply, routing no envelope and running no committer. The writer saves that
+/// position before advancing its acknowledgement horizon, so a failed save leaves
+/// the source retaining the interval after the member's recorded position.
 ///
 /// Publishing here claims nothing new: crediting requires `delivered == committed`,
 /// so everything routed to the member has been committed (durability-gated), and the
@@ -3323,6 +3360,11 @@ async fn write_one(
     match store.save(AppliedLsn { lsn: pending }).await {
         Ok(()) => {
             slot.note_recorded(pending);
+            // Only the captured position was saved: a concurrent idle credit may
+            // already have carried `committed` farther. Keep this separate from
+            // `note_recorded`, which the change committer can call inside a
+            // catalog transaction before that transaction commits.
+            advance_monotonic(&slot.flush, pending);
             // The durable applied floor for this member has advanced to `pending`.
             // Any registered write-back whose echo committed at or below it is now
             // durably consumed and can never be replayed, so drop it — the only
@@ -4757,6 +4799,34 @@ async fn deliver_commit(
 
 #[cfg(test)]
 mod tests {
+    /// A dataset that leaves its slot on purpose says so, naming the dataset,
+    /// the slot and what happens next, and a member that leaves without being
+    /// released still counts as a stall.
+    #[test]
+    fn a_released_member_departs_without_a_stall() {
+        assert_eq!(
+            super::released_member_message("orders", "spice_orders_ab12"),
+            "Dataset 'orders' stopped consuming PostgreSQL replication slot 'spice_orders_ab12', because another Spice instance writes it now; that instance resumes the slot from the last saved change."
+        );
+        let dataset = "released_member_departs_without_a_stall";
+        assert!(
+            !crate::cdc::take_released_dataset(dataset),
+            "nothing released yet"
+        );
+        crate::cdc::release_dataset(dataset);
+        assert!(
+            crate::cdc::take_released_dataset(dataset),
+            "the mark is seen once"
+        );
+        assert!(!crate::cdc::take_released_dataset(dataset), "and consumed");
+        crate::cdc::release_dataset(dataset);
+        crate::cdc::clear_released_dataset(dataset);
+        assert!(
+            !crate::cdc::take_released_dataset(dataset),
+            "rejoining clears a mark, so a later stall is reported"
+        );
+    }
+
     use super::*;
 
     fn key(s: &str) -> MemberKey {
@@ -6260,6 +6330,17 @@ mod tests {
         ));
     }
 
+    /// Complete a successful writer pass for the positions in a pure ack test.
+    fn record_ack_positions(ack: &AckTable) {
+        let slots: Vec<_> = read_lock(&ack.members).values().cloned().collect();
+        let store: Arc<dyn AppliedLsnStore> =
+            Arc::new(crate::postgres_replication::NoopAppliedLsnStore);
+        for slot in slots {
+            slot.note_pending(slot.committed());
+            futures::executor::block_on(write_one("test", &store, &slot, None));
+        }
+    }
+
     #[test]
     fn ack_floor_is_min_across_members() {
         let ack = AckTable::default();
@@ -6289,12 +6370,17 @@ mod tests {
         ack.deliver(&key("a"), 300);
         ack.credit_idle(500);
 
-        // b (idle) was credited to 500; a holds the floor at its committed 100.
+        // b (idle) was credited to 500; its acknowledgement waits for a save.
+        assert_eq!(ack.flush_lsn(), 100);
+        record_ack_positions(&ack);
+        // a still holds the floor at its committed 100.
         assert_eq!(ack.flush_lsn(), 100);
         ack.commit(&key("a"), 300);
         assert_eq!(ack.flush_lsn(), 300);
-        // Now a is idle again — a later credit advances everyone.
+        // Now a is idle again; a later credit advances everyone after a save.
         ack.credit_idle(600);
+        assert_eq!(ack.flush_lsn(), 300);
+        record_ack_positions(&ack);
         assert_eq!(ack.flush_lsn(), 600);
     }
 
@@ -6329,6 +6415,8 @@ mod tests {
         ack.promote_ready_members();
         assert!(ack.is_streaming(&key("a")));
         ack.credit_idle(400);
+        assert_eq!(ack.flush_lsn(), 100);
+        record_ack_positions(&ack);
         assert_eq!(ack.flush_lsn(), 400);
     }
 
@@ -6354,6 +6442,8 @@ mod tests {
         ack.register(&key("b"), false);
         ack.promote_ready_members();
         ack.credit_idle(200);
+        assert_eq!(ack.flush_lsn(), 100);
+        record_ack_positions(&ack);
         assert_eq!(ack.flush_lsn(), 200);
 
         ack.detach(&key("a"));
@@ -6368,6 +6458,8 @@ mod tests {
         ack.deliver(&key("a"), 900);
         ack.commit(&key("a"), 900);
         ack.credit_idle(900);
+        assert_eq!(ack.flush_lsn(), 200);
+        record_ack_positions(&ack);
         assert_eq!(ack.flush_lsn(), 900);
     }
 
@@ -6756,6 +6848,8 @@ mod tests {
         assert_eq!(ack.flush_lsn(), 500);
         // And the member still counts as idle for crediting.
         ack.credit_idle(700);
+        assert_eq!(ack.flush_lsn(), 500);
+        record_ack_positions(&ack);
         assert_eq!(ack.flush_lsn(), 700);
     }
 
@@ -6939,11 +7033,8 @@ mod tests {
         }
     }
 
-    /// Reference model: a direct, deliberately naive reimplementation of the
-    /// *pre-`AckSlot`* semantics (mutex-`HashMap` + eager `recompute` on every
-    /// commit/credit, `flush_lsn` = the eagerly-maintained floor). The
-    /// differential test (below) asserts the new lock-free `AckTable` is
-    /// byte-identical to this on every operation.
+    /// Sequential reference model with eager floor recomputation. Idle coverage
+    /// and permission to acknowledge it advance in separate operations.
     #[derive(Default)]
     struct Model {
         entries: HashMap<MemberKey, ModelEntry>,
@@ -6952,6 +7043,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct ModelEntry {
         committed: u64,
+        flush: u64,
         delivered: u64,
         live: bool,
         snapshotting: bool,
@@ -6973,6 +7065,7 @@ mod tests {
                 })
                 .or_insert(ModelEntry {
                     committed: at,
+                    flush: at,
                     delivered: at,
                     live: true,
                     snapshotting,
@@ -6999,6 +7092,7 @@ mod tests {
         fn commit(&mut self, key: &MemberKey, lsn: u64) {
             if let Some(e) = self.entries.get_mut(key) {
                 e.committed = e.committed.max(lsn);
+                e.flush = e.flush.max(lsn);
             }
             self.recompute();
         }
@@ -7018,8 +7112,14 @@ mod tests {
                 e.streaming = false;
             }
         }
+        fn record_positions(&mut self) {
+            for e in self.entries.values_mut() {
+                e.flush = e.committed;
+            }
+            self.recompute();
+        }
         fn recompute(&mut self) {
-            if let Some(floor) = self.entries.values().map(|e| e.committed).min() {
+            if let Some(floor) = self.entries.values().map(|e| e.flush).min() {
                 self.shared_flush = self.shared_flush.max(floor);
             }
         }
@@ -7053,7 +7153,7 @@ mod tests {
             for _ in 0..800 {
                 let m = usize::try_from(rng.below(MEMBERS)).expect("member index fits usize");
                 let k = &members[m];
-                match rng.below(7) {
+                match rng.below(8) {
                     0 => {
                         let snap = rng.below(2) == 0;
                         ack.register(k, snap);
@@ -7089,9 +7189,13 @@ mod tests {
                         ack.snapshot_finished(k);
                         model.snapshot_finished(k);
                     }
-                    _ => {
+                    6 => {
                         ack.detach(k);
                         model.detach(k);
+                    }
+                    _ => {
+                        record_ack_positions(&ack);
+                        model.record_positions();
                     }
                 }
 
@@ -7196,8 +7300,8 @@ mod tests {
 
         // Quiescence: `credit_idle` may legitimately have advanced an idle
         // member up to its `upto` (N+1000), so `committed` lands somewhere in
-        // [N, N+1000]. What must hold is convergence: the floor equals the
-        // member's committed (single member ⇒ the floor *is* its committed).
+        // [N, N+1000]. Only the actual commits may be acknowledged until the
+        // writer saves the idle credit.
         let final_committed = slot.committed();
         assert!(
             (N..=N + 1000).contains(&final_committed),
@@ -7205,8 +7309,14 @@ mod tests {
         );
         assert_eq!(
             ack.flush_lsn(),
+            N,
+            "unrecorded idle credit cannot be acknowledged"
+        );
+        record_ack_positions(&ack);
+        assert_eq!(
+            ack.flush_lsn(),
             final_committed,
-            "floor converged to the member's committed"
+            "floor converged to the saved idle position"
         );
     }
 
@@ -8461,6 +8571,118 @@ mod tests {
         );
     }
 
+    /// Inject a position-store failure without timing or a live source dependency.
+    struct FallibleLsnStore {
+        stored: ParkingMutex<u64>,
+        attempts: ParkingMutex<Vec<u64>>,
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AppliedLsnStore for FallibleLsnStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<
+            crate::postgres_replication::RecordedPosition,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(crate::postgres_replication::RecordedPosition::At(
+                AppliedLsn {
+                    lsn: *self.stored.lock(),
+                },
+            ))
+        }
+
+        async fn save(
+            &self,
+            applied: AppliedLsn,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.attempts.lock().push(applied.lsn);
+            if self.fail.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("injected position save failure").into());
+            }
+            *self.stored.lock() = applied.lsn;
+            Ok(())
+        }
+
+        async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.stored.lock() = 0;
+            Ok(())
+        }
+    }
+
+    fn idle_member_with_store(store: Arc<dyn AppliedLsnStore>) -> Arc<SharedSource> {
+        let (source, _probes) = test_source_with_members(1);
+        Arc::get_mut(lock(&source.members).get_mut(&key("t0")).expect("member"))
+            .expect("sole member owner")
+            .applied_lsn_store = store;
+        source.ack.seed(100);
+        source.ack.register(&key("t0"), false);
+        source
+            .ack
+            .slot(&key("t0"))
+            .expect("slot")
+            .seat_recorded(100);
+        source.ack.promote_ready_members();
+        source
+    }
+
+    fn idle_member_with_fallible_store() -> (Arc<SharedSource>, Arc<FallibleLsnStore>) {
+        let store = Arc::new(FallibleLsnStore {
+            stored: ParkingMutex::new(100),
+            attempts: ParkingMutex::new(Vec::new()),
+            fail: AtomicBool::new(true),
+        });
+        let source = idle_member_with_store(Arc::clone(&store) as Arc<dyn AppliedLsnStore>);
+        (source, store)
+    }
+
+    /// Exercise the pump credit and writer pass with a refused store write.
+    /// The injected failure is an in-process state a Spicepod cannot force.
+    #[tokio::test]
+    async fn idle_ack_stays_at_recorded_position_when_save_fails() {
+        let (source, store) = idle_member_with_fallible_store();
+        for (upto, attempts) in [(200, vec![200]), (300, vec![200, 300])] {
+            source.ack.credit_idle(upto);
+            publish_idle_positions(&source);
+            write_published_positions(&source).await;
+            assert_eq!(*store.attempts.lock(), attempts);
+            assert_eq!(*store.stored.lock(), 100);
+            assert_eq!(source.ack.slot(&key("t0")).expect("slot").recorded(), 100);
+            assert_eq!(
+                source.ack.flush_lsn(),
+                100,
+                "idle acknowledgement must wait for the position save"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_ack_advances_after_position_save_succeeds() {
+        let (source, store) = idle_member_with_fallible_store();
+        source.ack.credit_idle(200);
+        publish_idle_positions(&source);
+        write_published_positions(&source).await;
+        assert_eq!(*store.attempts.lock(), vec![200]);
+        assert_eq!(*store.stored.lock(), 100);
+        assert_eq!(
+            source.ack.flush_lsn(),
+            100,
+            "a refused save cannot advance the floor"
+        );
+
+        store.fail.store(false, Ordering::Release);
+        write_published_positions(&source).await;
+        assert_eq!(*store.attempts.lock(), vec![200, 200]);
+        assert_eq!(*store.stored.lock(), 200);
+        assert_eq!(source.ack.slot(&key("t0")).expect("slot").recorded(), 200);
+        assert_eq!(
+            source.ack.flush_lsn(),
+            200,
+            "a successful retry releases the idle floor"
+        );
+    }
+
     /// An [`AppliedLsnStore`] whose first `save` parks until released, so a test can
     /// hold the background writer mid-write while another write runs.
     #[derive(Default)]
@@ -8497,6 +8719,68 @@ mod tests {
         async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn idle_ack_only_advances_to_the_position_saved_by_an_in_flight_writer() {
+        let store = Arc::new(GatedLsnStore {
+            stored: ParkingMutex::new(Some(100)),
+            ..GatedLsnStore::default()
+        });
+        let source = idle_member_with_store(Arc::clone(&store) as Arc<dyn AppliedLsnStore>);
+        let slot = source.ack.slot(&key("t0")).expect("slot");
+        source.ack.credit_idle(200);
+        publish_idle_positions(&source);
+        let writer = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.notified())
+            .await
+            .expect("writer entered the save");
+        source.ack.credit_idle(300);
+        publish_idle_positions(&source);
+        assert_eq!(slot.pending(), 300);
+        assert_eq!(
+            source.ack.flush_lsn(),
+            100,
+            "the in-flight save has not succeeded"
+        );
+        store.release.notify_one();
+        writer.await.expect("writer completed");
+        assert_eq!(*store.stored.lock(), Some(200));
+        assert_eq!(slot.recorded(), 200);
+        assert_eq!(
+            source.ack.flush_lsn(),
+            200,
+            "only the captured position was saved"
+        );
+        write_published_positions(&source).await;
+        assert_eq!(*store.stored.lock(), Some(300));
+        assert_eq!(slot.recorded(), 300);
+        assert_eq!(source.ack.flush_lsn(), 300);
+    }
+
+    #[tokio::test]
+    async fn idle_ack_uses_a_saved_boundary_when_coverage_catches_up() {
+        let (source, store) = idle_member_with_fallible_store();
+        store.fail.store(false, Ordering::Release);
+        let slot = source.ack.slot(&key("t0")).expect("slot");
+        // A snapshot boundary can be saved before the pump credits its interval.
+        slot.note_pending(200);
+        write_published_positions(&source).await;
+        assert_eq!(slot.recorded(), 200);
+        assert_eq!(*store.stored.lock(), 200);
+        assert_eq!(source.ack.flush_lsn(), 100);
+        source.ack.credit_idle(200);
+        publish_idle_positions(&source);
+        write_published_positions(&source).await;
+        assert_eq!(
+            *store.attempts.lock(),
+            vec![200],
+            "no duplicate save is needed"
+        );
+        assert_eq!(source.ack.flush_lsn(), 200);
     }
 
     /// The pump's final write at shutdown must not be overtaken by a writer pass

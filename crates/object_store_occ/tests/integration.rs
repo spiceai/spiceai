@@ -23,6 +23,7 @@ mod data_file_replay;
 mod fault;
 mod headlog;
 mod headlog_replay;
+mod lease_replay;
 mod local_cancellation;
 mod local_root_overlap;
 mod prefix_listing;

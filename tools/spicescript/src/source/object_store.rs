@@ -29,7 +29,11 @@ limitations under the License.
 //!
 //! With `latency:`, a toxiproxy sharing the store's network namespace delays
 //! every response by that long, and `.endpoint` and `.params` reach the store
-//! through it, so `spiced` sees a remote store's round trip. Sharing the
+//! through it, so `spiced` sees a remote store's round trip, while
+//! `.direct_endpoint` reaches the store itself. `proxy-disable` and
+//! `proxy-enable` (in `source-exec`) cut every connection through the proxy
+//! and refuse new ones, then allow them again: an instance given `.endpoint`
+//! loses the store while one given `.direct_endpoint` keeps it. Sharing the
 //! namespace takes no network from Docker's address pools, which concurrent
 //! runs exhaust. The image has no shell, so it is configured through its HTTP
 //! API, not `source-exec`. The harness's own requests go to the store
@@ -208,6 +212,59 @@ impl ObjectStore {
 }
 
 impl ObjectStore {
+    /// How many writer leases each instance holds in the Cayenne state
+    /// location at `prefix` of the shared bucket: every lease object (a JSON
+    /// file in a `leases/` folder, not a handoff request) except the name
+    /// registry's (under `catalog/`), by its `holder-identity`, or by its
+    /// `handoff-to` while a handoff is under way. One row per holder, the
+    /// largest count first, as `writes`. Read straight from the bucket, so it
+    /// shares no code with Spice.
+    async fn lease_holders(&self, prefix: &str) -> Result<TextResult> {
+        let prefix = prefix.trim_end_matches('/');
+        let registry = format!("{prefix}/catalog/");
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for key in self.keys(SHARED_BUCKET, prefix).await? {
+            let in_leases = key.split('/').rev().nth(1) == Some("leases");
+            if !in_leases
+                || !std::path::Path::new(&key)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                || key.ends_with("-request.json")
+                || key.starts_with(&registry)
+            {
+                continue;
+            }
+            let local = self.staging.join("lease.json");
+            let local_text = local.display().to_string();
+            self.aws(&[
+                "s3",
+                "cp",
+                "--quiet",
+                &format!("s3://{SHARED_BUCKET}/{key}"),
+                &local_text,
+            ])
+            .await
+            .with_context(|| format!("Failed to download lease '{key}'"))?;
+            let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&local)?)
+                .with_context(|| format!("Lease '{key}' is not JSON"))?;
+            let holder = record
+                .get("handoff-to")
+                .or_else(|| record.get("holder-identity"))
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("Lease '{key}' names no holder"))?;
+            *counts.entry(holder.to_string()).or_default() += 1;
+        }
+        let mut counts: Vec<usize> = counts.into_values().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(TextResult {
+            columns: vec!["writes".into()],
+            rows: counts
+                .into_iter()
+                .map(|count| vec![Some(count.to_string())])
+                .collect(),
+        })
+    }
+
     /// The first key, in key order, under `prefix` that contains `contains`.
     async fn first_key(&self, bucket: &str, prefix: &str, contains: &str) -> Result<String> {
         let mut keys = self.keys(bucket, prefix).await?;
@@ -230,10 +287,25 @@ impl ObjectStore {
 /// - `delete-prefix <prefix>` deletes every object under a prefix.
 #[derive(Debug, PartialEq, Eq)]
 enum ObjectCommand {
-    DeleteFirst { prefix: String, contains: String },
-    TruncateFirst { prefix: String, contains: String },
-    Copy { from: String, to: String },
-    DeletePrefix { prefix: String },
+    DeleteFirst {
+        prefix: String,
+        contains: String,
+    },
+    TruncateFirst {
+        prefix: String,
+        contains: String,
+    },
+    Copy {
+        from: String,
+        to: String,
+    },
+    DeletePrefix {
+        prefix: String,
+    },
+    /// Enable or disable the `latency:` proxy in front of the store.
+    Proxy {
+        enabled: bool,
+    },
 }
 
 impl ObjectCommand {
@@ -255,8 +327,10 @@ impl ObjectCommand {
             ["delete-prefix", prefix] => Self::DeletePrefix {
                 prefix: (*prefix).to_string(),
             },
+            ["proxy-disable"] => Self::Proxy { enabled: false },
+            ["proxy-enable"] => Self::Proxy { enabled: true },
             _ => bail!(
-                "an object store runs `delete-first <prefix> <contains>`, `truncate-first <prefix> <contains>`, `copy <from-prefix> <to-prefix>` or `delete-prefix <prefix>`, not `{line}`"
+                "an object store runs `delete-first <prefix> <contains>`, `truncate-first <prefix> <contains>`, `copy <from-prefix> <to-prefix>`, `delete-prefix <prefix>`, `proxy-disable` or `proxy-enable`, not `{line}`"
             ),
         })
     }
@@ -339,6 +413,24 @@ async fn configure_proxy(api_port: u16, latency: Duration) -> Result<()> {
     .await
 }
 
+/// Enables or disables the proxy `configure_proxy` created. Disabled, it
+/// closes every connection it relays and refuses new ones.
+async fn set_proxy_enabled(api_port: u16, enabled: bool) -> Result<()> {
+    let path = format!("http://127.0.0.1:{api_port}/proxies/store");
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .post(&path)
+        .json(&json!({ "enabled": enabled }))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("POST {path}: {status}: {}", response.text().await?);
+    }
+    Ok(())
+}
+
 /// The bucket shared by every instance; no namespace bucket has this name,
 /// since those begin with the instance's index.
 const SHARED_BUCKET: &str = "shared";
@@ -407,6 +499,7 @@ impl Source for ObjectStore {
         extra.insert("bucket".into(), json!(bucket));
         extra.insert("shared_bucket".into(), json!(SHARED_BUCKET));
         extra.insert("endpoint".into(), json!(endpoint));
+        extra.insert("direct_endpoint".into(), json!(self.endpoint()?));
         extra.insert("key".into(), json!(USER));
         extra.insert("secret".into(), json!(self.secret));
         Ok(super::Namespace {
@@ -470,6 +563,21 @@ impl Source for ObjectStore {
                     .await
                     .with_context(|| format!("Failed to delete '{prefix}'"))?;
                 }
+                ObjectCommand::Proxy { enabled } => {
+                    if self.proxy.is_none() {
+                        bail!(
+                            "`proxy-disable` and `proxy-enable` need a store with `latency:`, which puts a proxy in front of it"
+                        );
+                    }
+                    set_proxy_enabled(self.container.host_port(TOXIPROXY_API)?, enabled)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to {} the proxy in front of the store",
+                                if enabled { "enable" } else { "disable" }
+                            )
+                        })?;
+                }
                 ObjectCommand::Copy { from, to } => {
                     self.aws(&[
                         "s3",
@@ -488,7 +596,12 @@ impl Source for ObjectStore {
     }
 
     async fn query(&self, _namespace: &str, sql: &str) -> Result<TextResult> {
-        bail!("an object store answers no queries (`{sql}`); mirror its rows into a database")
+        match sql.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["lease-holders", prefix] => self.lease_holders(prefix).await,
+            _ => bail!(
+                "an object store answers only `lease-holders <prefix>`, not `{sql}`; mirror its rows into a database"
+            ),
+        }
     }
 
     fn dialect(&self) -> Dialect {

@@ -279,3 +279,59 @@ Not covered: the engine's records and the catalog that answers the retired set
 are not driven (they live in the Cayenne crates); a scan's start tick is the replay's
 own bookkeeping; deletes go one key per
 request rather than in batches.
+
+## Writer-lease traces
+
+`standby-retake.jsonl` holds the 6 witnesses of `standby-retake`,
+`standby-retake-walk.jsonl` 20 walks of it (seed 42, 40 steps), and
+`standby-split-generations.jsonl` the counterexample of the control
+`standby-retake-split-generations` for "a head takeover carries its lease's
+generation". Generated from the repository root (`TRACE_JSON` appends, so
+delete the files first; the control file is then filtered to its `FAIL` line):
+
+    cargo build --release -p cayenne-metastore-model
+    B=target/release/cayenne-metastore-model; T=crates/object_store_occ/tests/traces
+    EXHAUST=1 TRACE_JSON=$T/standby-retake.jsonl $B run standby-retake
+    EXHAUST=1 WALK=42:20:40 TRACE_JSON=$T/standby-retake-walk.jsonl $B run standby-retake
+    EXHAUST=1 TRACE_JSON=$T/standby-split-generations.jsonl $B run standby-retake-split-generations
+
+`standby-handoff.jsonl` holds the witnesses of `standby-handoff` and
+`standby-handoff-three`, and `standby-handoff-walk.jsonl` 20 walks of each
+(seed 42, 40 steps):
+
+    for r in standby-handoff standby-handoff-three; do
+      EXHAUST=1 TRACE_JSON=$T/standby-handoff.jsonl $B run $r
+      EXHAUST=1 WALK=42:20:40 TRACE_JSON=$T/standby-handoff-walk.jsonl $B run $r
+    done
+
+A `Handoff` writes the holder's lease with `Lease::release_to` naming the
+target; every other instance, the holder included, must then stand by, and the
+target's next `Acquire` must take the lease over on its first read, with no
+clock advance. A `DataWrite` touches no storage; it checks that the instance
+writing holds the head's current generation and the stored lease. The two
+handoff controls (`standby-handoff-release-first`, `standby-handoff-unnamed`)
+are checked in the model only: the order they break is inside the Cayenne
+handover (data writes stop before the lease is written), which this crate does
+not drive.
+
+`../lease_replay.rs` replays each through a real `lease::Lease` per process
+(a new one, with a new process id, at each restart) and a real head-log
+`Writer`, on InMemory and LocalConditionalPut::new_durable, under tokio's
+paused clock: `Tick` advances it ten seconds, a third of the thirty-second
+lease. A takeover takes the head over at the generation of the lease its
+taker holds; a retake first advances the taker's own lease
+(`Lease::advance`); an acquisition that finds the lease held under its own
+identity by an earlier run advances it too. After every action the replay
+checks the implementation against `cayenne_metastore_model::standby_steps`
+(the lease generation of each acquisition and retake, whether a takeover is
+accepted, and whether a commit is accepted, rebased or fenced) and against
+two invariants of its own: every head takeover carries the generation of the
+lease its taker holds, both read back from storage; and a fresh reader's
+records are exactly the accepted commits, the source changes 1..=n each once.
+A process that started after the lease was last written must watch it for a
+whole lease before taking it over, which the model does not distinguish; the
+replay then advances the clock by one lease and counts the wait.
+
+For the control's counterexample the replay runs the implementation's rule
+(the invariant holds) and then a takeover at the head's next generation with
+the lease left as is (the invariant fails).

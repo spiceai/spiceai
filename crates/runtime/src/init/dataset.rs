@@ -1972,6 +1972,11 @@ impl Runtime {
             let Some(this) = runtime.upgrade() else {
                 return;
             };
+            // A shutdown hands writing over first; the datasets it stops are
+            // not reloaded on the way out.
+            if this.status.is_shutdown() {
+                return;
+            }
             let Some(app) = this.read_app().await else {
                 continue;
             };
@@ -1985,7 +1990,14 @@ impl Runtime {
             // A reload that unregistered the dataset and then failed to load it
             // again is retried as an added dataset's load is, rather than wait
             // for another change of writer that may never come.
-            if let Some(bootstrap) = Arc::clone(&this).update_dataset(Arc::clone(&dataset)).await {
+            if let Some(bootstrap) = Arc::clone(&this)
+                .update_dataset_with_reload(
+                    Arc::clone(&dataset),
+                    BootstrapStatus::None.into(),
+                    ReloadCause::WriterChanged,
+                )
+                .await
+            {
                 let runtime = Arc::clone(&this);
                 let load_semaphore = Arc::clone(&this.dataset_load_semaphore);
                 let load = this.dataset_loads.begin(&dataset.name);
@@ -2007,8 +2019,12 @@ impl Runtime {
         }
     }
 
-    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) -> Option<AcceleratorBootstrap> {
-        self.update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
+    async fn update_dataset_with_bootstrap(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap: AcceleratorBootstrap,
+    ) -> Option<AcceleratorBootstrap> {
+        self.update_dataset_with_reload(ds, bootstrap, ReloadCause::Configuration)
             .await
     }
 
@@ -2016,10 +2032,11 @@ impl Runtime {
     /// reload unregistered the dataset and then failed to load its new
     /// configuration. An acceleration that cannot be initialized is not retried,
     /// as for an added dataset.
-    async fn update_dataset_with_bootstrap(
+    async fn update_dataset_with_reload(
         self: Arc<Self>,
         ds: Arc<Dataset>,
         bootstrap: AcceleratorBootstrap,
+        cause: ReloadCause,
     ) -> Option<AcceleratorBootstrap> {
         // Defense in depth. Today the only caller is `apply_dataset_diff`, which
         // preflights through `initialize_datasets_accelerators` and skips a
@@ -2057,8 +2074,13 @@ impl Runtime {
                 // File accelerated datasets don't support hot reload. A hot reload keeps the
                 // registered table serving until its replacement has loaded, so a dataset with
                 // no registered table loads in place instead, and its views find it registered.
+                // A change of writer reopens the same committed state of an
+                // acceleration shared through one location, which the table it
+                // replaces has stopped writing: the replacement is built while
+                // that table keeps serving queries, so none fails meanwhile.
                 if self.df.table_exists(&ds.name)
-                    && Self::accelerated_dataset_supports_hot_reload(&ds, &*connector)
+                    && (cause == ReloadCause::WriterChanged
+                        || Self::accelerated_dataset_supports_hot_reload(&ds, &*connector))
                 {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     match Arc::clone(&self)
@@ -2066,6 +2088,7 @@ impl Runtime {
                             Arc::clone(&ds),
                             Arc::clone(&connector),
                             bootstrap.clone(),
+                            cause,
                         )
                         .await
                     {
@@ -2280,6 +2303,7 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
         bootstrap: AcceleratorBootstrap,
+        cause: ReloadCause,
     ) -> Result<()> {
         let read_table = connector
             .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
@@ -2338,8 +2362,13 @@ impl Runtime {
 
         let refresher = accelerated_table.table().refresher();
 
-        // wait for accelerated table to be ready
-        if let Some(completion) = refresher.refresh_completion() {
+        // Wait for the accelerated table to be ready. A change of writer opens
+        // the committed state the location already holds, so its replacement
+        // serves at once: a new writer resumes from the last commit, and a
+        // dataset refreshed in full refreshes on its own schedule.
+        if cause == ReloadCause::Configuration
+            && let Some(completion) = refresher.refresh_completion()
+        {
             await_hot_reload_initial_refresh(
                 &ds.name,
                 &|| refresher.initial_load_completed(),
@@ -4154,6 +4183,17 @@ fn with_localpod_dependents(
     };
     reloading.sort_by_cached_key(depth);
     reloading
+}
+
+/// Why a dataset reloads, which decides whether its replacement can be built
+/// while the table it replaces keeps serving queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadCause {
+    /// Its configuration changed.
+    Configuration,
+    /// Another instance took writing its shared acceleration over, or this one
+    /// did: the same committed state, opened in the other role.
+    WriterChanged,
 }
 
 #[cfg(test)]
@@ -6499,6 +6539,9 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             Ok(None)
         }
 
+        // No other instance writes these accelerations.
+        async fn release_writer_leases(&self) {}
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -6642,7 +6685,9 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let ds = write_back_dataset_on_mode(&runtime, spicepod::acceleration::Mode::FileCreate);
         let registered_before = runtime.df.get_table(&ds.name).await.is_some();
 
-        Arc::clone(&runtime).update_dataset(Arc::clone(&ds)).await;
+        Arc::clone(&runtime)
+            .update_dataset_with_bootstrap(Arc::clone(&ds), BootstrapStatus::None.into())
+            .await;
 
         // The reload's own refusal, not a later failure: `update_dataset` sets
         // `Refreshing` and starts building a connector as its first act, so the
@@ -6696,7 +6741,9 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         // This dataset's connector cannot be built, so the reload fails after the
         // point that must invalidate: what the assertion below pins is that the
         // invalidation happens before the reload touches the registration at all.
-        Arc::clone(&runtime).update_dataset(Arc::clone(&ds)).await;
+        Arc::clone(&runtime)
+            .update_dataset_with_bootstrap(Arc::clone(&ds), BootstrapStatus::None.into())
+            .await;
 
         assert!(
             provider.tables_changed_since(&tables, read_started_at),
@@ -6786,7 +6833,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         let reload = tokio::spawn({
             let runtime = Arc::clone(&runtime);
             let ds = Arc::clone(&ds);
-            async move { runtime.update_dataset(ds).await }
+            async move {
+                runtime
+                    .update_dataset_with_bootstrap(ds, BootstrapStatus::None.into())
+                    .await
+            }
         });
 
         // The reload is now parked in connector construction, with its first mark

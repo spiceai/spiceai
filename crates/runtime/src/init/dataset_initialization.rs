@@ -1040,6 +1040,10 @@ mod tests {
         ) -> std::result::Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             self.inner.shared_location_id(source).await
         }
+
+        async fn release_writer_leases(&self) {
+            self.inner.release_writer_leases().await;
+        }
     }
 
     /// Serves `other_schema`, and fails accelerator setup until `fail_setup` is used up

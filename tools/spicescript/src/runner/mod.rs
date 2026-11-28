@@ -575,6 +575,7 @@ struct Background {
     stop: Arc<std::sync::atomic::AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     stats: Arc<parking_lot::Mutex<BackgroundStats>>,
+    measure: Option<crate::script::Measure>,
 }
 
 #[derive(Default)]
@@ -583,6 +584,8 @@ struct BackgroundStats {
     latencies: Vec<Duration>,
     /// Every failure's time and message, in order.
     errors: Vec<(chrono::DateTime<chrono::Utc>, String)>,
+    /// The `measure` column's value in each answer.
+    measured: Vec<f64>,
 }
 
 impl Instance {

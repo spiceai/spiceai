@@ -5187,14 +5187,22 @@ impl DataFusion {
             None => None,
         };
         let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
-        if writer_role.is_some() {
+        if let Some(role) = &writer_role {
             // The writer records its completed initial load in the location;
             // a replica is ready from then on.
             let initial_load = shared_initial_load_record(dataset).await?;
             accelerated_table_builder.shared(if replica {
                 runtime_table::accelerated::SharedAcceleration::Replica { initial_load }
             } else {
-                runtime_table::accelerated::SharedAcceleration::Writer { initial_load }
+                let reloads = self.writer_role_changes.clone();
+                let name = dataset.name.clone();
+                runtime_table::accelerated::SharedAcceleration::Writer {
+                    initial_load,
+                    writes: role.clone(),
+                    reload: Arc::new(move || {
+                        let _ = reloads.send(name.clone());
+                    }),
+                }
             });
         }
         if replica {

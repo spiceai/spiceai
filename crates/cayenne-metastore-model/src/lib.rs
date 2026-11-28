@@ -28,6 +28,7 @@ mod standby;
 mod state_rules;
 mod transactions;
 mod window;
+mod write_units;
 
 /// A finite checker invocation with an explicit expected downstream failure.
 #[derive(Clone, Copy, Debug)]
@@ -112,7 +113,7 @@ const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
 /// (including the data-file replay),
 /// and the runs `crates/cayenne`'s mem-tier replay names directly. A test keeps
 /// this list equal to the runs those files name.
-const REPLAYED_AGAINST_CODE: [&str; 38] = [
+const REPLAYED_AGAINST_CODE: [&str; 42] = [
     "commits-restart-no-persist-before-send",
     "commits-restart-turnover",
     "data-files",
@@ -140,6 +141,10 @@ const REPLAYED_AGAINST_CODE: [&str; 38] = [
     "source-no-redelivery-skip",
     "source-position-before-data",
     "source-positions",
+    "standby-handoff",
+    "standby-handoff-three",
+    "standby-retake",
+    "standby-retake-split-generations",
     "transactions-txn-1-exhaust",
     "transactions-txn-no-coordinator-wait-0-exhaust",
     "transactions-txn-no-create-once-0-exhaust",
@@ -517,6 +522,54 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "healthy holder keeps its lease",
+        },
+        Run {
+            name: "standby-handoff",
+            family: "standby",
+            mode: "standby-handoff",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-handoff-three",
+            family: "standby",
+            mode: "standby-handoff-three",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-handoff-release-first",
+            family: "standby",
+            mode: "standby-handoff-release-first",
+            bound: 0,
+            seed: None,
+            failure: "no data write below the head's generation",
+        },
+        Run {
+            name: "standby-handoff-unnamed",
+            family: "standby",
+            mode: "standby-handoff-unnamed",
+            bound: 0,
+            seed: None,
+            failure: "a handed-over lease is taken without a lapse",
+        },
+        Run {
+            name: "standby-retake",
+            family: "standby",
+            mode: "standby-retake",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-retake-split-generations",
+            family: "standby",
+            mode: "standby-retake-split",
+            bound: 0,
+            seed: None,
+            failure: "a head takeover carries its lease's generation",
         },
         Run {
             name: "commits-restart-turnover",
@@ -2721,6 +2774,48 @@ fn additional_runs() -> Vec<Run> {
             failure,
         });
     }
+    // Datasets that share a change source's consumer, leased as one unit.
+    for (name, failure) in [
+        ("write-units", ""),
+        (
+            "write-units-per-dataset",
+            "the slot never stalls on a change its consumer cannot apply",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "write-units",
+            mode: name,
+            bound: 0,
+            seed: None,
+            failure,
+        });
+    }
+    // Instances that may disagree on a write unit's members.
+    for (name, failure) in [
+        ("write-units-grouping", ""),
+        (
+            "write-units-grouping-groups-unopened",
+            "every dataset that opens is written once the leases settle",
+        ),
+        (
+            "write-units-grouping-no-own-lease",
+            "at most one instance has data writes open on each dataset",
+        ),
+        (
+            "write-units-grouping-partial-own-lease",
+            "every dataset that opens is written once the leases settle",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "write-units-grouping",
+            mode: name,
+            bound: 0,
+            seed: None,
+            failure,
+        });
+    }
     // Persisted lookup-index runs, named for the data files they cover.
     for (name, failure) in [
         ("index-runs", ""),
@@ -3512,6 +3607,8 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
+        "write-units" => v.visit(write_units::Protocol::new(r.mode), r, None),
+        "write-units-grouping" => v.visit(write_units::grouping::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
         "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
@@ -3678,6 +3775,24 @@ pub fn data_file_steps(run: &str, actions: &[String]) -> Option<Vec<DataFileStep
         .into_iter()
         .find(|r| r.name == run && r.family == "data-files")?;
     data_files::steps(run.mode, run.bound, actions)
+}
+
+pub use standby::{
+    CommitOutcome as StandbyCommitOutcome, Step as StandbyStep, StepKind as StandbyStepKind,
+};
+
+/// The steps of the `standby` run `run` through `actions`, as a trace prints
+/// them: what each action did (a lease acquired or advanced, a head taken over
+/// or refused, a commit accepted, rebased or fenced) and the lease generation,
+/// head generation and committed changes after it, for a replay to compare
+/// with the implementation. `None` for an unknown run or an action that is not
+/// enabled.
+#[must_use]
+pub fn standby_steps(run: &str, actions: &[String]) -> Option<Vec<StandbyStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "standby")?;
+    standby::steps(run.mode, actions)
 }
 
 /// Problems with the model citations in design documents: a cited run that does
@@ -3941,7 +4056,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 26, "{:?}", render.families);
+        assert_eq!(render.families.len(), 28, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

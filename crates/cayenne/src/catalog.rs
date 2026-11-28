@@ -330,6 +330,9 @@ pub struct DataWriteGate {
 #[derive(Debug)]
 struct GateState {
     allowed: std::sync::atomic::AtomicBool,
+    /// Writes were refused by [`DataWriteGate::suspend`], not by a change of
+    /// writer: allowing them again keeps the generation.
+    suspended: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicU64,
     /// Writes are refused from this instant on, as nanoseconds since
     /// [`gate_clock_epoch`]; `u64::MAX` for no deadline.
@@ -343,6 +346,7 @@ impl DataWriteGate {
         Self {
             state: std::sync::Arc::new(GateState {
                 allowed: std::sync::atomic::AtomicBool::new(allowed),
+                suspended: std::sync::atomic::AtomicBool::new(false),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 valid_until_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
                 changes: tokio::sync::watch::Sender::new(allowed),
@@ -418,11 +422,12 @@ impl DataWriteGate {
     }
 
     /// Allow or refuse writes from now on. Allowing them again after a refusal
-    /// starts a new generation.
+    /// starts a new generation, unless the refusal was a [`Self::suspend`].
     pub fn set(&self, allows: bool) {
         use std::sync::atomic::Ordering;
         if allows {
-            if !self.state.allowed.load(Ordering::Acquire) {
+            let suspended = self.state.suspended.swap(false, Ordering::AcqRel);
+            if !self.state.allowed.load(Ordering::Acquire) && !suspended {
                 self.state.generation.fetch_add(1, Ordering::AcqRel);
             }
             self.state.allowed.store(true, Ordering::Release);
@@ -430,11 +435,29 @@ impl DataWriteGate {
                 .changes
                 .send_if_modified(|allowed| !std::mem::replace(allowed, true));
         } else {
+            self.state.suspended.store(false, Ordering::Release);
             self.state.allowed.store(false, Ordering::Release);
             self.state
                 .changes
                 .send_if_modified(|allowed| std::mem::replace(allowed, false));
         }
+    }
+
+    /// Refuse writes until [`Self::set`] allows them again, without ending
+    /// the current writer's generation: for a writer whose lease could have
+    /// lapsed but that may yet renew it, which proves no other instance wrote
+    /// meanwhile, so the tables it opened may write on. A refusal that ends
+    /// the writer's generation ([`Self::set`]`(false)`) overrides it.
+    pub fn suspend(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.state.allowed.load(Ordering::Acquire) {
+            return;
+        }
+        self.state.suspended.store(true, Ordering::Release);
+        self.state.allowed.store(false, Ordering::Release);
+        self.state
+            .changes
+            .send_if_modified(|allowed| std::mem::replace(allowed, false));
     }
 }
 
