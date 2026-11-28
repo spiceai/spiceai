@@ -16,7 +16,7 @@ For each claim the PR makes (fixed, passes, faster, no regression):
 - for performance, both arms' commits, the sample count, and P99/P99.9;
 - the local reviews you ran before pushing (`/code-review`, an adversarial review by a model other than the implementer) and what you did about their findings.
 List every check in scope you did not run as `Not run — <reason>`.
-Re-run and update the SHA after a later commit changes shipped code; older evidence is stale.
+After a later commit changes shipped code, re-run each entry's command at the new head; an older entry with no newer run of the same command is stale.
 -->
 
 ## 🚨 Breaking Changes

@@ -153,7 +153,8 @@ status is not a verdict and does not block inheritance.
 Every PR that needs a sign-off also needs evidence in its description, in the
 `🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
 (the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). **Attestation**
-checks it with `.github/scripts/pr_evidence.mjs`, read from the base commit:
+checks it with `.github/scripts/pr_evidence.mjs`, from a checkout of the base
+commit it verifies before importing it:
 
 - The section exists and says more than the template comment. A heading that
   is just "Evidence" is used; heading-shaped lines inside pasted output don't
@@ -163,22 +164,28 @@ checks it with `.github/scripts/pr_evidence.mjs`, read from the base commit:
   workflow run, a PR's checks, or an uploaded file. Other links are not output.
 - Every check marked not run gives a real reason (`Not run — <reason>`, not the
   placeholder and not "TODO").
-- The newest entry is current: no later commit changes a file the sign-off
-  covers (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
-  checked by old and new path). A merge of the base counts only for covered
-  files it changes against both parents: files both sides touched, or edited
-  while merging. Any other merge counts for everything it brings in. Evidence at
-  the head is current by definition, however many commits the PR has.
+- Every entry is current: no later commit changes a file the sign-off covers
+  (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
+  checked by old and new path), unless a newer entry re-runs the same command.
+  An entry's commands are the `$ ` lines in its output and the code spans on its
+  line. That is the before-and-after pattern: the failing run at an older
+  commit, the same command passing at the head. A newer run of a different check
+  refreshes nothing. A merge of the base counts only for covered files it
+  changes against both parents: files both sides touched, or edited while
+  merging. Any other merge counts for everything it brings in. Evidence at the
+  head is current by definition, however many commits the PR has.
 
 It checks form, not truth: whether the output shows what the PR claims is for
 review. Editing the description re-runs **Attestation**. The fast-tracks skip
-the check for the same reason they skip the sign-off. PRs opened before
-`ENFORCED_FROM` (2026-12-07T00:00Z, in the module) get a warning instead of a
-failure.
+the check for the same reason they skip the sign-off. Until `ENFORCED_FROM`
+(2026-12-07T00:00Z, in the module) the check only warns; from then on it fails
+every PR it finds a problem with, whenever the PR was opened.
 
 Workflows that open PRs with generated commits (snapshot and schema updates)
-write the section with `.github/scripts/bot_pr_evidence.sh`: the generated
-commit and the run that produced it. When a maintainer adds commits to such a
+write the section with `.github/scripts/bot_pr_evidence.sh`: an entry naming
+the generated commit and the run that produced it. A later run adds an entry
+and keeps the earlier ones; because it names the same generation, it keeps
+them current. When a maintainer adds commits to such a
 PR, or to a Dependabot bump that has left its fast-track, they add an entry for
 their own run, as for any other PR.
 

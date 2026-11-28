@@ -49,7 +49,7 @@ const files = (...names) => names.map((filename) => ({ filename }));
  * first as { sha, parents? }; `changes` maps a commit SHA to the files it changes
  * against its first parent; `compares` maps "base...head" to { status, files }.
  */
-function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = {}, createdAt = AFTER_CUTOFF, fail }) {
+function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = {}, createdAt = '2026-11-01T00:00:00Z', fail }) {
   const reads = [];
   const github = {
     paginate: async (method, params) => (await method(params)).data,
@@ -81,7 +81,8 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
   return { github, reads };
 }
 
-const check = (state) => checkEvidence({ github: stubGithub(state).github, owner: 'o', repo: 'r', pullNumber: 7 });
+const check = (state) =>
+  checkEvidence({ github: stubGithub(state).github, owner: 'o', repo: 'r', pullNumber: 7, now: new Date(state.now ?? AFTER_CUTOFF) });
 
 // --- Finding the section -----------------------------------------------------
 
@@ -208,8 +209,8 @@ test('naming the head without output does not refresh an older run', async () =>
   });
   assert.deepEqual(result.problems, [
     `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, or link the run.`,
-    `The evidence ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). ` +
-      'Re-run it at the new head and update the SHA.',
+    `"Ran at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
+      `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`,
   ]);
   assert.equal(result.cited, FIRST);
 });
@@ -221,8 +222,8 @@ test('a later commit that changes shipped code makes the evidence stale', async 
     changes: { [SECOND]: files('docs/dev/testing.md'), [HEAD]: files('crates/cayenne/src/lib.rs', 'Cargo.lock') },
   });
   assert.deepEqual(result.problems, [
-    `The evidence ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
-      `${HEAD.slice(0, 12)} (crates/cayenne/src/lib.rs, Cargo.lock). Re-run it at the new head and update the SHA.`,
+    `"Ran at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
+      `${HEAD.slice(0, 12)} (crates/cayenne/src/lib.rs, Cargo.lock). Re-run the same command at the head and add its output, or remove the entry.`,
   ]);
 });
 
@@ -292,9 +293,9 @@ test('a merge of a branch other than the base counts everything it brings in', a
   assert.match(result.problems[0], /3c3c3c3c3c3c \(crates\/runtime\/src\/feature\.rs\)/);
 });
 
-test('the newest cited commit decides what is later', async () => {
+test('a newer run of the same command keeps an older entry current: before and after', async () => {
   const result = await check({
-    body: describe(`${ran(FIRST)}\n\nRe-ran at ${SECOND.slice(0, 12)}: ${RUN}`),
+    body: describe(`Before the fix, at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make  test\n1 failed\n\`\`\`\n\nRe-ran \`make test\` at ${SECOND.slice(0, 12)}: ${RUN}`),
     commits: [{ sha: FIRST }, { sha: SECOND }],
     changes: { [SECOND]: files('crates/runtime/src/lib.rs') },
   });
@@ -302,10 +303,27 @@ test('the newest cited commit decides what is later', async () => {
   assert.equal(result.cited, SECOND);
 });
 
-test('a PR opened before ENFORCED_FROM is not enforced', async () => {
+test('a newer run of a different check does not refresh an older entry', async () => {
+  const result = await check({
+    body: describe(
+      `Engine regression at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ cargo test -p runtime\n1 passed\n\`\`\`\n\n` +
+        `Formatting at ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ cargo fmt --check\nok\n\`\`\``
+    ),
+    commits: [{ sha: FIRST }, { sha: HEAD }],
+    changes: { [HEAD]: files('crates/runtime/src/lib.rs') },
+  });
+  assert.deepEqual(result.problems, [
+    `"Engine regression at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
+      `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`,
+  ]);
+  assert.equal(result.cited, HEAD);
+});
+
+test('the check warns until ENFORCED_FROM and then fails every PR, however old', async () => {
   assert.equal(ENFORCED_FROM, '2026-12-07T00:00:00Z');
-  assert.equal((await check({ body: describe(''), createdAt: '2026-12-06T23:59:59Z' })).enforced, false);
-  assert.equal((await check({ body: describe(''), createdAt: ENFORCED_FROM })).enforced, true);
+  assert.equal((await check({ body: describe(''), now: '2026-12-06T23:59:59Z' })).enforced, false);
+  // A PR opened long before the cutoff is enforced once the cutoff has passed.
+  assert.equal((await check({ body: describe(''), createdAt: '2026-01-01T00:00:00Z', now: ENFORCED_FROM })).enforced, true);
 });
 
 test('past the listed-commit limit, evidence at the head still passes', async () => {
@@ -314,7 +332,8 @@ test('past the listed-commit limit, evidence at the head still passes', async ()
   assert.deepEqual((await check({ body: describe(ran(HEAD)), commits })).problems, []);
   const older = await check({ body: describe(ran(commits[10].sha)), commits });
   assert.deepEqual(older.problems, [
-    `The PR has 250 or more commits, past what GitHub lists, so only evidence at the head (${HEAD.slice(0, 12)}) can be shown current.`,
+    `"Ran at ${commits[10].sha.slice(0, 12)}:" ran at ${commits[10].sha.slice(0, 12)}, but the PR has 250 or more commits, ` +
+      `past what GitHub lists, so only evidence at the head (${HEAD.slice(0, 12)}) can be shown current.`,
   ]);
 });
 
@@ -362,42 +381,62 @@ test('the section bot_pr_evidence.sh writes passes the check', async () => {
   });
   assert.equal(
     section,
-    `## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by the snapshot update in this workflow run: ` +
+    `## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by \`the snapshot update in this workflow run\`: ` +
       'https://github.com/spiceai/spiceai/actions/runs/123\n'
   );
   const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }] });
   assert.deepEqual(result.problems, []);
 });
 
-test('bot_pr_evidence.sh update replaces the section in an open PR and keeps the rest', async () => {
+/** Run `bot_pr_evidence.sh update` against a fake `gh` serving `body`; returns the edited body. */
+function updateBody(body, what, sha = repoHead) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
-    writeFileSync(
-      join(dir, 'body.md'),
-      `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${'0'.repeat(12)} by an older run: https://github.com/spiceai/spiceai/actions/runs/1\n\n## Notes\n\nKeep me.`
-    );
-    // A fake `gh` that serves the body and records the edit.
+    writeFileSync(join(dir, 'body.md'), body);
+    // A fake `gh` that serves the body and records the edit, and a fake `git` for the generated commit.
     writeFileSync(
       join(dir, 'gh'),
       `#!/usr/bin/env bash\nif [ "$1 $2" = "pr view" ]; then cat "${join(dir, 'body.md')}"; fi\n` +
         `if [ "$1 $2" = "pr edit" ]; then while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "${join(dir, 'edited.md')}"; shift; done; fi\n`
     );
+    writeFileSync(join(dir, 'git'), `#!/usr/bin/env bash\necho ${sha}\n`);
     chmodSync(join(dir, 'gh'), 0o755);
-    execFileSync('bash', [HELPER, 'update', '7', 'the schema snapshot run in this workflow run'], {
-      env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}` },
-    });
-    const edited = readFileSync(join(dir, 'edited.md'), 'utf8');
-    assert.equal(
-      edited,
-      'Automated update.\n\n## Notes\n\nKeep me.\n\n## 🧪 Evidence\n\n' +
-        `Generated at ${repoHead.slice(0, 12)} by the schema snapshot run in this workflow run: ` +
-        'https://github.com/spiceai/spiceai/actions/runs/123\n'
-    );
-    const result = await check({ body: edited, commits: [{ sha: repoHead }] });
-    assert.deepEqual(result.problems, []);
+    chmodSync(join(dir, 'git'), 0o755);
+    execFileSync('bash', [HELPER, 'update', '7', what], { env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}` } });
+    return readFileSync(join(dir, 'edited.md'), 'utf8');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test('bot_pr_evidence.sh update adds an entry and keeps every earlier entry and section', async () => {
+  const run1 = 'https://github.com/spiceai/spiceai/actions/runs/1';
+  const body =
+    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${FIRST.slice(0, 12)} by \`the schema snapshot run\`: ${run1}\n\n` +
+    '```\n## printed by the run, not a heading\n```\n\n# Release notes\n\nKeep me.';
+  const edited = updateBody(body, 'the schema snapshot run', SECOND);
+  assert.equal(
+    edited,
+    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${FIRST.slice(0, 12)} by \`the schema snapshot run\`: ${run1}\n\n` +
+      '```\n## printed by the run, not a heading\n```\n\n' +
+      `Generated at ${SECOND.slice(0, 12)} by \`the schema snapshot run\`: https://github.com/spiceai/spiceai/actions/runs/123\n\n` +
+      '# Release notes\n\nKeep me.\n'
+  );
+  // The older entry ran the same generation, so the newer one keeps it current.
+  const result = await check({
+    body: edited,
+    commits: [{ sha: FIRST }, { sha: SECOND }],
+    changes: { [SECOND]: files('crates/runtime/tests/snapshots/plan.snap') },
+  });
+  assert.deepEqual(result.problems, []);
+});
+
+test('bot_pr_evidence.sh update adds the section to a description without one', () => {
+  assert.equal(
+    updateBody('Automated update.', 'the benchmark run'),
+    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by \`the benchmark run\`: ` +
+      'https://github.com/spiceai/spiceai/actions/runs/123\n'
+  );
 });
 
 await runAll();

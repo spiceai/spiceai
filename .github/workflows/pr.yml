@@ -316,9 +316,8 @@ jobs:
       # it. Only `.github/scripts` is checked out, without credentials.
       - name: Check out the base commit's scripts
         if: ${{ github.event_name == 'pull_request' }}
-        # The revert fast-track and the evidence check use these. If the
-        # checkout fails, the revert import fails and the PR takes the normal
-        # sign-off path, and the evidence check fails rather than pass unchecked.
+        # Only the revert fast-track needs these. If the checkout fails, the
+        # import below fails too and the PR takes the normal sign-off path.
         continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -549,35 +548,55 @@ jobs:
             );
 
       # Every claim a PR makes needs evidence in its description (AGENTS.md,
-      # Evidence): a commit from the PR it ran at, the output or a link to the run,
-      # a reason on each check not run, and no later commit to shipped code since.
-      # The rule lives in .github/scripts/pr_evidence.mjs and is read from the base
-      # commit, like the revert rule, so a PR cannot rewrite the check that judges
-      # it. The fast-tracks skip it for the reason they skip the sign-off: those
-      # PRs change no shipped code. `!cancelled()` so a failed sign-off and missing
-      # evidence are reported in one run. A base that predates the module skips
-      # with a notice; anything else that stops the check reaching a verdict fails
-      # Attestation, because a check that passes when it cannot run checks nothing.
+      # Evidence): entries that name a PR commit and carry its output, a reason on
+      # each check not run, and no later change to shipped code an entry has not
+      # been re-run after. The rule lives in .github/scripts/pr_evidence.mjs and is
+      # read from the base commit, so a PR cannot rewrite the check that judges it.
+      # It gets a checkout of its own, made here, after `Check out pull request
+      # history`: that step checks the PR out over the workspace root, and the
+      # checkout action empties a destination that is not a repository, so the
+      # `trusted` checkout above is gone by now and the PR could have put files at
+      # its path. The fast-tracks skip the check for the reason they skip the
+      # sign-off: those PRs change no shipped code. `!cancelled()` so a failed
+      # sign-off and missing evidence are reported in one run.
+      - name: Check out the base commit's evidence rule
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: evidence-rule
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # The checker is imported only from a checkout whose HEAD is the base commit,
+      # and the check is skipped only when that commit's tree lacks the module (a
+      # base branch older than the check). Anything else that stops the check
+      # reaching a verdict fails Attestation: a check that passes when it cannot run
+      # checks nothing.
       - name: Check the pull request's evidence
         if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const { existsSync } = await import('node:fs');
-            const trusted = `${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts`;
-            if (!existsSync(trusted)) {
+            const checkout = `${process.env.GITHUB_WORKSPACE}/evidence-rule`;
+            const baseSha = context.payload.pull_request.base.sha;
+            const git = (...args) => exec.getExecOutput('git', ['-C', checkout, ...args], { ignoreReturnCode: true, silent: true });
+
+            const head = await git('rev-parse', 'HEAD');
+            if (head.exitCode !== 0 || head.stdout.trim() !== baseSha) {
               core.setFailed(
-                "The base commit's scripts were not checked out, so the evidence check " +
-                'could not run. Re-run the job.'
+                `The evidence rule was not checked out at the base commit ${baseSha}, so the ` +
+                'evidence check could not run. Re-run the job.'
               );
               return;
             }
-            if (!existsSync(`${trusted}/pr_evidence.mjs`)) {
-              core.notice('The base commit predates the evidence check (.github/scripts/pr_evidence.mjs), so it was skipped.');
+            const module = '.github/scripts/pr_evidence.mjs';
+            if ((await git('cat-file', '-e', `HEAD:${module}`)).exitCode !== 0) {
+              core.notice(`The base commit predates the evidence check (${module}), so it was skipped.`);
               return;
             }
 
-            const { checkEvidence, describeProblems } = await import(`${trusted}/pr_evidence.mjs`);
+            const { ENFORCED_FROM, checkEvidence, describeProblems } = await import(`${checkout}/${module}`);
             let result;
             try {
               result = await checkEvidence({
@@ -599,7 +618,7 @@ jobs:
             if (result.enforced) {
               core.setFailed(message);
             } else {
-              core.warning(`${message}\nThis PR was opened before the evidence check took effect, so this is a warning.`);
+              core.warning(`${message}\nThe evidence check warns until ${ENFORCED_FROM}, and fails from then on.`);
             }
 
       - name: Dependabot fast-track passthrough

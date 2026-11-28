@@ -17,7 +17,8 @@
 // copied here — a change to the workflow changes what is under test.
 
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +29,7 @@ const INSPECT_STEP = 'Inspect developer sign-off';
 const QUEUE_PASSTHROUGH_STEP = 'Merge queue passthrough';
 const DISPATCH_REJECT_STEP = 'Reject an attestation asserted by dispatch';
 const EVIDENCE_STEP = "Check the pull request's evidence";
+const EVIDENCE_CHECKOUT_STEP = "Check out the base commit's evidence rule";
 const EVIDENCE_MODULE = fileURLToPath(new URL('./pr_evidence.mjs', import.meta.url));
 
 const HEAD = 'a'.repeat(40);
@@ -468,37 +470,63 @@ test('a test input no Rust source names can still fast-track', async () => {
 
 // The evidence step must run for exactly the PRs that need a sign-off, and must
 // run even when the sign-off steps failed, so one run reports both problems.
+const EVIDENCE_GATE =
+  "!cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && " +
+  "steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true'";
+
 test('the evidence check runs for every PR the fast-tracks do not cover', () => {
-  assert.equal(
-    stepIf(job, EVIDENCE_STEP),
-    "!cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && " +
-      "steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true'"
-  );
+  assert.equal(stepIf(job, EVIDENCE_STEP), EVIDENCE_GATE);
+  assert.equal(stepIf(job, EVIDENCE_CHECKOUT_STEP), EVIDENCE_GATE);
   assert.doesNotMatch(
     stepLines(job, EVIDENCE_STEP).join('\n'),
     /continue-on-error/,
     'an evidence check that cannot fail the job is not a check'
   );
-  assert.ok(
-    stepIndex(job, 'Check out the base commit\'s scripts') < stepIndex(job, EVIDENCE_STEP),
-    'the evidence check imports from the base checkout, so it must run after it'
-  );
+});
+
+// `Check out pull request history` checks the PR out over the workspace root, and
+// the checkout action empties a destination that is not a repository. A checker
+// checked out before it would be deleted, and the PR could put its own at that path.
+test('the evidence rule is checked out at the base commit after the PR, right before it runs', () => {
+  const checkout = stepIndex(job, EVIDENCE_CHECKOUT_STEP);
+  assert.ok(stepIndex(job, 'Check out pull request history') < checkout, 'the checker must be checked out after the PR checkout');
+  const names = jobStepNames(job);
+  assert.equal(names[names.indexOf(EVIDENCE_CHECKOUT_STEP) + 1], EVIDENCE_STEP, 'nothing may run between the checkout and the check');
+  const declaration = stepLines(job, EVIDENCE_CHECKOUT_STEP).join('\n');
+  assert.match(declaration, /ref: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(declaration, /path: evidence-rule\n/);
+  assert.match(declaration, /persist-credentials: false/);
 });
 
 test('editing the description re-runs Attestation', () => {
   assert.match(workflow, /^ {2}pull_request:\n(?: {4}#.*\n)* {4}types: \[opened, synchronize, reopened, edited\]$/m);
 });
 
+const git = (cwd, ...args) => {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
+  return result.stdout.trim();
+};
+
 /**
- * Run the evidence step's real script against a temporary base checkout.
- * `module`: whether that base carries pr_evidence.mjs; `checkout`: whether the
- * checkout happened at all.
+ * Run the evidence step's real script against a real repository standing in for
+ * the base checkout. `module`: whether the base commit carries pr_evidence.mjs;
+ * `checkout`: whether the checkout happened; `atBase`: whether its HEAD is the
+ * PR's base commit; `now`: the time the check runs.
  */
-async function runEvidence({ body, createdAt = '2026-12-08T00:00:00Z', module = true, checkout = true }) {
+async function runEvidence({ body, module = true, checkout = true, atBase = true, now = '2026-12-08T00:00:00Z' }) {
   const workspace = mkdtempSync(join(tmpdir(), 'evidence-'));
+  let baseSha = BASE;
   if (checkout) {
-    mkdirSync(join(workspace, 'trusted/.github/scripts'), { recursive: true });
-    if (module) copyFileSync(EVIDENCE_MODULE, join(workspace, 'trusted/.github/scripts/pr_evidence.mjs'));
+    const repo = join(workspace, 'evidence-rule');
+    mkdirSync(join(repo, '.github/scripts'), { recursive: true });
+    git(repo, 'init', '-q');
+    if (module) copyFileSync(EVIDENCE_MODULE, join(repo, '.github/scripts/pr_evidence.mjs'));
+    writeFileSync(join(repo, '.github/scripts/README'), 'base scripts\n');
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'base');
+    const head = git(repo, 'rev-parse', 'HEAD');
+    if (atBase) baseSha = head;
   }
   const calls = { failed: [], notices: [], infos: [], warnings: [] };
   const core = {
@@ -507,26 +535,40 @@ async function runEvidence({ body, createdAt = '2026-12-08T00:00:00Z', module = 
     info: (message) => calls.infos.push(message),
     warning: (message) => calls.warnings.push(message),
   };
+  const exec = {
+    getExecOutput: async (command, args) => {
+      const result = spawnSync(command, args, { encoding: 'utf8' });
+      return { exitCode: result.status, stdout: result.stdout, stderr: result.stderr };
+    },
+  };
   const github = {
     paginate: async (method, params) => (await method(params)).data,
     rest: {
       pulls: {
-        get: async () => ({ data: { body, created_at: createdAt, head: { sha: HEAD }, base: { sha: BASE } } }),
-        listCommits: async () => ({ data: [{ sha: HEAD, parents: [{ sha: BASE }] }] }),
-      },
-      repos: {
-        getCommit: async () => ({ data: { files: [] } }),
+        get: async () => ({ data: { body, created_at: '2026-11-01T00:00:00Z', head: { sha: HEAD }, base: { sha: baseSha } } }),
+        listCommits: async () => ({ data: [{ sha: HEAD, parents: [{ sha: baseSha }] }] }),
       },
     },
   };
-  const context = { repo: { owner: 'spiceai', repo: 'spiceai' }, payload: { pull_request: { number: 1 } } };
-  const previous = process.env.GITHUB_WORKSPACE;
+  const context = {
+    repo: { owner: 'spiceai', repo: 'spiceai' },
+    payload: { pull_request: { number: 1, base: { sha: baseSha } } },
+  };
+  const previous = { workspace: process.env.GITHUB_WORKSPACE, Date: globalThis.Date };
   process.env.GITHUB_WORKSPACE = workspace;
+  // The check reads the clock; pin it.
+  const RealDate = globalThis.Date;
+  globalThis.Date = class extends RealDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [now] : args));
+    }
+  };
   try {
     const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
-    await new AsyncFunction('github', 'context', 'core', stepScript(job, EVIDENCE_STEP))(github, context, core);
+    await new AsyncFunction('github', 'context', 'core', 'exec', stepScript(job, EVIDENCE_STEP))(github, context, core, exec);
   } finally {
-    process.env.GITHUB_WORKSPACE = previous;
+    process.env.GITHUB_WORKSPACE = previous.workspace;
+    globalThis.Date = previous.Date;
     rmSync(workspace, { recursive: true, force: true });
   }
   return calls;
@@ -546,14 +588,14 @@ test('missing evidence fails the step', async () => {
   assert.match(calls.failed[0], /^The PR description's Evidence section is incomplete:\n- The description has no Evidence section\./);
 });
 
-test('a PR opened before the check took effect gets a warning, not a failure', async () => {
-  const calls = await runEvidence({ body: '## Summary', createdAt: '2026-11-01T00:00:00Z' });
+test('before ENFORCED_FROM the step warns instead of failing', async () => {
+  const calls = await runEvidence({ body: '## Summary', now: '2026-12-01T00:00:00Z' });
   assert.deepEqual(calls.failed, []);
   assert.equal(calls.warnings.length, 1);
-  assert.match(calls.warnings[0], /opened before the evidence check took effect, so this is a warning\.$/);
+  assert.match(calls.warnings[0], /\nThe evidence check warns until 2026-12-07T00:00:00Z, and fails from then on\.$/);
 });
 
-test('a base that predates the module skips the check with a notice', async () => {
+test('a base commit without the module skips the check with a notice', async () => {
   const calls = await runEvidence({ body: '## Summary', module: false });
   assert.deepEqual(calls.failed, []);
   assert.deepEqual(calls.notices, [
@@ -561,11 +603,18 @@ test('a base that predates the module skips the check with a notice', async () =
   ]);
 });
 
-test('a failed base checkout fails the step instead of skipping it', async () => {
+test('a missing checkout fails the step instead of skipping it', async () => {
   const calls = await runEvidence({ body: EVIDENCE, checkout: false });
-  assert.deepEqual(calls.failed, [
-    "The base commit's scripts were not checked out, so the evidence check could not run. Re-run the job.",
-  ]);
+  assert.equal(calls.failed.length, 1);
+  assert.equal(calls.failed[0], `The evidence rule was not checked out at the base commit ${BASE}, so the evidence check could not run. Re-run the job.`);
+});
+
+test('a checker not at the base commit is never imported', async () => {
+  // As if the PR had put its own directory where the checkout should be.
+  const calls = await runEvidence({ body: '## Summary', atBase: false });
+  assert.equal(calls.failed.length, 1);
+  assert.equal(calls.failed[0], `The evidence rule was not checked out at the base commit ${BASE}, so the evidence check could not run. Re-run the job.`);
+  assert.deepEqual(calls.notices, []);
 });
 
 let failures = 0;

@@ -15,16 +15,18 @@
 // The evidence a pull request's description must carry before Attestation
 // passes it (AGENTS.md, *Evidence*). Each entry names a commit from the PR and
 // carries its output, as a fenced block or a link to the run; every check marked
-// not run gives a reason; and the newest entry is current: no later commit
-// changes shipped code, except a clean merge of the base branch.
+// not run gives a reason; and every entry is current: no later commit changes
+// shipped code (a clean merge of the base aside), unless a newer entry re-runs
+// the same command.
 //
 // Attestation (`.github/workflows/pr.yml`) imports this from a checkout of the
 // *base* commit, never the PR's, so a PR cannot change the rule that judges it.
 // It checks that evidence is present, current, and complete in form. It cannot
 // check that the evidence is true; review does that.
 
-// PRs opened before this time get the check's findings as a warning, so open PRs
-// and the bots that open PRs have time to adopt the Evidence section.
+// Until this time the check reports its findings as a warning, so open PRs and the
+// bots that open PRs have time to adopt the Evidence section. From then on it
+// fails every PR it finds a problem with, whenever the PR was opened.
 export const ENFORCED_FROM = '2026-12-07T00:00:00Z';
 
 // GitHub lists at most this many commits for a PR.
@@ -56,6 +58,11 @@ const RUN_LINK =
 const NOT_RUN_WITHOUT_REASON = /\bnot run\b[\s—–:.-]*$/i;
 const NOT_RUN_PLACEHOLDER = /\bnot run\b\s*(?:[—–:-]+|because\b)\s*(?:<[^>]*>|todo|tbd|n\/a)?[\s.]*$/i;
 const DECORATION = /[*_`]+/g;
+// A command in pasted output ("$ make test") or a code span on the entry's line
+// that is not a SHA: what identifies a re-run of the same check.
+const PROMPT = /^\s*\$\s+(.+?)\s*$/;
+const CODE_SPAN = /`([^`]+)`/g;
+const normalize = (command) => command.replace(/\s+/g, ' ').trim();
 const TABLE_EDGE = /\s*\|\s*$/;
 
 /** Each line of a body with HTML comments removed, marked as inside a fenced block or not. */
@@ -103,13 +110,15 @@ export function evidenceSection(body) {
 /**
  * The section's evidence entries. An entry starts at a line, outside a fenced
  * block, naming a commit `resolve` recognizes, and runs to the next such line.
- * It has output when it holds a fenced block with content or a run link. Output
- * before the first entry belongs to the first entry.
+ * It has output when it holds a fenced block with content or a run link. Its
+ * commands are the `$ ` lines in its output and the code spans on its line that
+ * are not SHAs. Output before the first entry belongs to the first entry.
  */
 export function evidenceEntries(section, resolve) {
   const entries = [];
   let current = null;
   let pendingOutput = false;
+  const pendingCommands = new Set();
   let blockHasContent = false;
   const credit = () => {
     if (current) current.hasOutput = true;
@@ -124,12 +133,21 @@ export function evidenceEntries(section, resolve) {
     }
     if (fenced) {
       if (line.trim()) blockHasContent = true;
+      const prompt = PROMPT.exec(line);
+      if (prompt) (current ? current.commands : pendingCommands).add(normalize(prompt[1]));
       continue;
     }
     const shas = [...new Set((line.match(SHA_TOKEN) ?? []).map((token) => resolve(token.toLowerCase())).filter(Boolean))];
     if (shas.length > 0) {
-      current = { shas, line: line.trim(), hasOutput: pendingOutput || RUN_LINK.test(line) };
+      const spans = [...line.matchAll(CODE_SPAN)].map((match) => normalize(match[1])).filter((span) => !/^[0-9a-f]{7,40}$/i.test(span));
+      current = {
+        shas,
+        line: line.trim(),
+        hasOutput: pendingOutput || RUN_LINK.test(line),
+        commands: new Set([...pendingCommands, ...spans]),
+      };
       pendingOutput = false;
+      pendingCommands.clear();
       entries.push(current);
     } else if (RUN_LINK.test(line)) {
       credit();
@@ -206,13 +224,13 @@ async function laterChanges(github, owner, repo, commit, baseSha) {
  * changes after the newest commit the evidence cites.
  *
  * Returns { problems: [string], enforced: bool, cited: sha | null }. `enforced`
- * is false for a PR opened before ENFORCED_FROM, whose problems are reported as a
- * warning. API errors propagate: a check that cannot read the PR has reached no
- * verdict, and the caller must not pass it.
+ * is false before ENFORCED_FROM, when problems are reported as a warning. API
+ * errors propagate: a check that cannot read the PR has reached no verdict, and
+ * the caller must not pass it.
  */
-export async function checkEvidence({ github, owner, repo, pullNumber }) {
+export async function checkEvidence({ github, owner, repo, pullNumber, now = new Date() }) {
   const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-  const enforced = new Date(pull.created_at) >= new Date(ENFORCED_FROM);
+  const enforced = now >= new Date(ENFORCED_FROM);
   const head = pull.head.sha.toLowerCase();
 
   const problems = [];
@@ -249,36 +267,58 @@ export async function checkEvidence({ github, owner, repo, pullNumber }) {
     );
   }
 
-  // The newest commit an entry with output names decides what counts as later.
+  // Every entry with output must describe the current code: nothing after its
+  // commit changes shipped code, or a newer entry re-runs the same command (the
+  // "after" of a before-and-after pair). A newer run of a different check proves
+  // nothing about this one.
   const position = (sha) => (sha === head ? Number.MAX_SAFE_INTEGER : listed.indexOf(sha));
-  const cited = entries
-    .filter((entry) => entry.hasOutput)
-    .flatMap((entry) => entry.shas)
-    .reduce((newest, sha) => (newest === null || position(sha) > position(newest) ? sha : newest), null);
-  if (cited === null || cited === head) return { problems, enforced, cited };
+  const newestOf = (entry) => entry.shas.reduce((newest, sha) => (position(sha) > position(newest) ? sha : newest));
+  const withOutput = entries.filter((entry) => entry.hasOutput);
+  const cited = withOutput.map(newestOf).reduce((newest, sha) => (newest === null || position(sha) > position(newest) ? sha : newest), null);
 
-  if (truncated) {
-    problems.push(
-      `The PR has ${commits.length} or more commits, past what GitHub lists, so only evidence at the head (${short(head)}) can be shown current.`
-    );
-    return { problems, enforced, cited };
-  }
-
-  const stale = [];
-  for (const commit of commits.slice(position(cited) + 1)) {
-    // eslint-disable-next-line no-await-in-loop
-    const change = await laterChanges(github, owner, repo, commit, pull.base.sha);
-    if (change.unknown) {
-      stale.push(`${short(commit.sha)} (${change.unknown}, so it cannot be checked)`);
-    } else if (change.paths.length > 0) {
-      stale.push(`${short(commit.sha)} (${change.paths.slice(0, 3).join(', ')}${change.paths.length > 3 ? ', …' : ''})`);
+  const changes = new Map();
+  const changedAfter = async (sha) => {
+    const described = [];
+    for (const commit of commits.slice(position(sha) + 1)) {
+      if (!changes.has(commit.sha)) {
+        // eslint-disable-next-line no-await-in-loop
+        const change = await laterChanges(github, owner, repo, commit, pull.base.sha);
+        changes.set(
+          commit.sha,
+          change.unknown
+            ? `${short(commit.sha)} (${change.unknown}, so it cannot be checked)`
+            : change.paths.length > 0
+              ? `${short(commit.sha)} (${change.paths.slice(0, 3).join(', ')}${change.paths.length > 3 ? ', …' : ''})`
+              : null
+        );
+      }
+      if (changes.get(commit.sha)) described.push(changes.get(commit.sha));
     }
-  }
-  if (stale.length > 0) {
-    problems.push(
-      `The evidence ran at ${short(cited)}, but later commits change shipped code: ${stale.join('; ')}. ` +
-        'Re-run it at the new head and update the SHA.'
+    return described;
+  };
+
+  for (const entry of withOutput) {
+    const at = newestOf(entry);
+    if (at === head) continue;
+    const rerun = withOutput.some(
+      (other) => position(newestOf(other)) > position(at) && [...entry.commands].some((command) => other.commands.has(command))
     );
+    if (rerun) continue;
+    if (truncated) {
+      problems.push(
+        `"${entry.line}" ran at ${short(at)}, but the PR has ${commits.length} or more commits, past what GitHub lists, ` +
+          `so only evidence at the head (${short(head)}) can be shown current.`
+      );
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const stale = await changedAfter(at);
+    if (stale.length > 0) {
+      problems.push(
+        `"${entry.line}" ran at ${short(at)}, but later commits change shipped code: ${stale.join('; ')}. ` +
+          'Re-run the same command at the head and add its output, or remove the entry.'
+      );
+    }
   }
   return { problems, enforced, cited };
 }
