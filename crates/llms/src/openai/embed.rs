@@ -19,11 +19,12 @@ use async_openai::error::OpenAIError;
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+use llm_resilience::{CircuitBreaker, CircuitBreakerError};
 use reqwest::StatusCode;
 use runtime_rate_control::RateController;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
@@ -54,6 +55,12 @@ fn default_retry_strategy() -> FibonacciBackoff {
     FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
 }
 
+/// Shared across every request of one embedding model: after 5 consecutive
+/// retriable failures the provider gets no more calls for 30s.
+fn default_circuit_breaker() -> CircuitBreaker {
+    CircuitBreaker::new(5, 1.0, Duration::from_secs(30))
+}
+
 /// Embedding implementation for `OpenAI` compatible embedding models.
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
@@ -63,6 +70,9 @@ pub struct OpenaiEmbed<C: Config + Clone> {
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
     // Retry strategy for transient or throttling errors
     retry_strategy: FibonacciBackoff,
+
+    // Stops retries against a provider that keeps failing
+    breaker: CircuitBreaker,
 
     // Rate limiter for requests
     rate_controller: Arc<RateController>,
@@ -86,6 +96,7 @@ impl<C: Config + Clone> OpenaiEmbed<C> {
             inner,
             chunk_sizer: None,
             retry_strategy: default_retry_strategy(),
+            breaker: default_circuit_breaker(),
             rate_controller: rate_controller.unwrap_or_else(default_rate_controller),
             cache: None,
         }
@@ -190,6 +201,7 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                 let retry_strategy = self.retry_strategy.clone();
                 let client = Arc::clone(&client_ref);
                 let rate_controller = Arc::clone(&self.rate_controller);
+                let breaker = self.breaker.clone();
                 async move {
                     retry(retry_strategy, async || {
                         if let Some(cached) = self.get_cached_embed((&req).into()).await
@@ -197,10 +209,23 @@ impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
                                 return Ok(std::sync::Arc::clone(vectors));
                             }
 
+                        let Some(call) = breaker.try_acquire() else {
+                            return Err(RetryError::permanent(EmbedError::RateLimited {
+                                source: Box::new(CircuitBreakerError::<std::convert::Infallible>::Open),
+                            }));
+                        };
+
                         let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
                         let start = Instant::now();
 
-                        let embeddings: Vec<Vec<f32>> = client.embeddings().create_float(req.clone()).await
+                        let result = client.embeddings().create_float(req.clone()).await;
+                        match &result {
+                            Ok(_) => call.success(),
+                            Err(err) if is_retriable_error(err) => call.failure(),
+                            Err(_) => drop(call),
+                        }
+
+                        let embeddings: Vec<Vec<f32>> = result
                             .map(|resp| {
                                 let end = Instant::now();
                                 drop(permit);
@@ -490,5 +515,53 @@ mod tests {
         // Single string should remain as-is
         assert_eq!(batches.len(), 1);
         assert!(matches!(batches[0], EmbeddingInput::String(_)));
+    }
+
+    #[tokio::test]
+    async fn test_open_circuit_stops_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Provider that drops every connection: always a retriable error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let base = format!("http://{addr}/v1");
+        let inner = crate::openai::new_openai_client(
+            TEXT_EMBED_3_SMALL.to_string(),
+            Some(base.as_str()),
+            Some("test-key"),
+            None,
+            None,
+            None,
+        );
+        let mut embed = OpenaiEmbed::new(inner, None);
+        embed.breaker = CircuitBreaker::new(2, 1.0, Duration::from_secs(60));
+
+        // Without the breaker this request makes 11 attempts over ~4 minutes.
+        let err = embed
+            .embed(EmbeddingInput::String("hello".to_string()))
+            .await
+            .expect_err("provider is down");
+        assert!(matches!(err, EmbedError::RateLimited { .. }), "{err}");
+        let after_first = hits.load(Ordering::SeqCst);
+        assert!(after_first < 11, "{after_first} attempts");
+
+        // The open circuit fails the next request without calling the provider.
+        let start = Instant::now();
+        let err = embed
+            .embed(EmbeddingInput::String("again".to_string()))
+            .await
+            .expect_err("circuit is open");
+        assert!(matches!(err, EmbedError::RateLimited { .. }), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(hits.load(Ordering::SeqCst), after_first);
     }
 }
