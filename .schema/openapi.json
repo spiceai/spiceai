@@ -446,6 +446,19 @@
               }
             }
           },
+          "409": {
+            "description": "The dataset is deferred and no query has initialized it yet: none has referenced it, or its initialization failed. Query the dataset to initialize it, or to see the error that prevents it, then refresh",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset eth_recent_blocks is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error occurred while processing refresh",
             "content": {
@@ -2369,7 +2382,7 @@
           "SQL"
         ],
         "summary": "SQL Query",
-        "description": "Execute a SQL query and return the results.\n\nThis endpoint allows users to execute SQL queries directly from an HTTP request. The SQL query is sent as plain text in the request body.",
+        "description": "Execute a SQL query and return the results.\n\nThis endpoint allows users to execute SQL queries directly from an HTTP request. Send the SQL as `text/plain`, or as JSON `{\"sql\": \"...\"}` with optional `parameters`.",
         "operationId": "post_sql",
         "parameters": [
           {
@@ -2383,14 +2396,32 @@
           }
         ],
         "requestBody": {
-          "description": "SQL query to execute",
+          "description": "SQL query to execute. For `application/json`, `parameters` is optional: omit it or send `null` when the SQL has no placeholders.",
           "content": {
             "application/json": {
               "schema": {},
-              "example": {
-                "sql": "SELECT :foo + 1 AS the_answer",
-                "parameters": {
-                  "foo": 41
+              "examples": {
+                "Named parameters": {
+                  "value": {
+                    "sql": "SELECT :foo + 1 AS the_answer",
+                    "parameters": {
+                      "foo": 41
+                    }
+                  }
+                },
+                "Positional parameters": {
+                  "value": {
+                    "sql": "SELECT avg(total_amount), avg(tip_amount), count($1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $2",
+                    "parameters": [
+                      1,
+                      3
+                    ]
+                  }
+                },
+                "SQL only": {
+                  "value": {
+                    "sql": "SELECT * FROM my_table LIMIT 10"
+                  }
                 }
               }
             },
