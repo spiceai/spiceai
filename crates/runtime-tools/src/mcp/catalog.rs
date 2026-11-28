@@ -20,13 +20,15 @@ use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
-    ClientLifecycleMode, ClientServiceExt, RoleClient,
+    ClientLifecycleMode, ClientServiceExt, ErrorData, Peer, RoleClient, Service,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientRequest,
-        Implementation, InitializeRequestParams, ListToolsRequest, ListToolsResult,
-        PaginatedRequestParams, PingRequest, ProtocolVersion, ServerResult,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        CancelledNotification, CancelledNotificationParam, ClientCapabilities, ClientRequest,
+        DEFAULT_MRTR_MAX_ROUNDS, Implementation, InitializeRequestParams, InputRequest,
+        InputResponses, ListToolsRequest, ListToolsResult, NumberOrString, PaginatedRequestParams,
+        PingRequest, ProtocolVersion, RequestId, ServerRequest, ServerResult,
     },
-    service::{RunningService, ServiceError},
+    service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
     transport::{
         ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -55,8 +57,8 @@ use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
 use super::{
-    Error, MAX_TOOL_RESULT_SIZE, MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT,
-    MCPConfig, Result, UnderlyingTransportSnafu,
+    Error, MAX_TOOL_RESULT_SIZE, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT, MCPConfig,
+    McpCallTimeout, Result, UnderlyingTransportSnafu,
     http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
@@ -122,6 +124,7 @@ pub(crate) struct McpToolCatalog {
     /// `ttlMs` is 0 and every `all`/`get` refetches.
     refresh: Arc<ListRefresh>,
     reconnector: Arc<Reconnector>,
+    call_timeout: McpCallTimeout,
 }
 
 /// Replaces a dead client and republishes its tool list. Shared by the
@@ -376,7 +379,12 @@ impl Drop for McpToolCatalog {
 }
 
 impl McpToolCatalog {
-    pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
+    pub async fn try_new(
+        cfg: MCPConfig,
+        call_timeout: McpCallTimeout,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<Self> {
         let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
 
@@ -461,6 +469,7 @@ impl McpToolCatalog {
             schemas,
             refresh,
             reconnector,
+            call_timeout,
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
@@ -740,6 +749,7 @@ impl McpToolCatalog {
                 schemas,
                 refresh,
             }),
+            call_timeout: McpCallTimeout::default(),
         }
     }
 }
@@ -965,6 +975,178 @@ async fn bounded<T>(
         .unwrap_or(Err(ServiceError::Timeout { timeout }))
 }
 
+/// `reason` of the `notifications/cancelled` for a `tools/call` that timed out.
+const CALL_TIMEOUT_REASON: &str = "request timeout";
+/// `reason` of the `notifications/cancelled` for a `tools/call` whose caller stopped waiting.
+const CALLER_GONE_REASON: &str = "the caller stopped waiting for the result";
+
+/// One upstream `tools/call` request: one round of a multi-round (MRTR) call.
+///
+/// Sent as a cancellable request, so that the MCP server stops the tool when Spice stops
+/// waiting for it: on `timeout`, and when the caller drops this future (a `/v1/mcp` client
+/// cancels or disconnects, or a chat request ends). rmcp's `call_tool` / `call_tool_once` give
+/// no handle to cancel with.
+async fn call_tool_round(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    timeout: McpCallTimeout,
+) -> Result<CallToolResponse, ServiceError> {
+    let handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+    let in_flight = InFlightCall::new(peer.clone(), handle.id.clone());
+    // Spice applies the timeout here, not through `PeerRequestOptions`: rmcp's own timeout
+    // awaits the cancel notification, which a stalled server can hold forever.
+    let Ok(response) = tokio::time::timeout(timeout.duration(), handle.await_response()).await
+    else {
+        in_flight.cancel(CALL_TIMEOUT_REASON);
+        return Err(ServiceError::Timeout {
+            timeout: timeout.duration(),
+        });
+    };
+    in_flight.finished();
+    let response = response?;
+    match response {
+        ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+        ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
+        ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// A `tools/call` request the MCP server may still be running.
+///
+/// Dropped before [`Self::finished`], it sends `notifications/cancelled` for the request.
+/// rmcp's `RequestHandle` has no drop hook, so without this a dropped call keeps running on the
+/// server.
+struct InFlightCall {
+    pending: Option<(Peer<RoleClient>, RequestId)>,
+}
+
+impl InFlightCall {
+    fn new(peer: Peer<RoleClient>, id: RequestId) -> Self {
+        Self {
+            pending: Some((peer, id)),
+        }
+    }
+
+    /// The server answered, so there is nothing to cancel.
+    fn finished(mut self) {
+        self.pending = None;
+    }
+
+    fn cancel(mut self, reason: &'static str) {
+        if let Some((peer, id)) = self.pending.take() {
+            send_cancel(peer, id, reason);
+        }
+    }
+}
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        if let Some((peer, id)) = self.pending.take() {
+            send_cancel(peer, id, CALLER_GONE_REASON);
+        }
+    }
+}
+
+/// Best-effort `notifications/cancelled` for request `id`, sent from a new task so that it never
+/// blocks the caller (which may be in `Drop`). Without a runtime there is no transport to send on.
+fn send_cancel(peer: Peer<RoleClient>, id: RequestId, reason: &'static str) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        let notification = CancelledNotification::new(CancelledNotificationParam::new(
+            Some(id.clone()),
+            Some(reason.to_string()),
+        ));
+        match tokio::time::timeout(
+            MCP_REQUEST_TIMEOUT,
+            peer.send_notification(notification.into()),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::debug!(%id, reason, "Cancelled MCP tool call on the server"),
+            Ok(Err(e)) => tracing::debug!(%id, "Could not cancel MCP tool call on the server: {e}"),
+            Err(_) => tracing::debug!(%id, "Timed out cancelling MCP tool call on the server"),
+        }
+    });
+}
+
+/// `tools/call` that fulfils SEP-2322 `input_required` rounds with the client's own handler,
+/// as rmcp's `call_tool` does, but sends each round through [`call_tool_round`] so that each
+/// round can be cancelled on the server.
+async fn call_tool_with_input_rounds<S: Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    mut params: CallToolRequestParams,
+    timeout: McpCallTimeout,
+) -> Result<CallToolResult, ServiceError> {
+    let mut state_only_rounds = 0_u32;
+    for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
+        let input_required = match call_tool_round(client.peer(), params.clone(), timeout).await? {
+            CallToolResponse::Complete(result) => return Ok(result),
+            CallToolResponse::InputRequired(result) => result,
+            // A task needs `tasks/get` polling, which rmcp's `call_tool` does not do either.
+            _ => return Err(ServiceError::UnexpectedResponse),
+        };
+        let requests = input_required.input_requests.unwrap_or_default();
+        if requests.is_empty() {
+            if input_required.request_state.is_none() {
+                return Err(ServiceError::UnexpectedResponse);
+            }
+            // Back off like rmcp so a server that only returns state is not polled hot.
+            let millis = (50_u64 << state_only_rounds.min(3)).min(250);
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            state_only_rounds += 1;
+        } else {
+            state_only_rounds = 0;
+        }
+        let mut responses = InputResponses::new();
+        for (key, request) in requests {
+            let response = fulfill_input_request(client, &key, request).await?;
+            responses.insert(key, response);
+        }
+        params.input_responses = (!responses.is_empty()).then_some(responses);
+        params.request_state = input_required.request_state;
+    }
+    Err(ServiceError::InputRequiredRoundsExceeded {
+        max_rounds: DEFAULT_MRTR_MAX_ROUNDS,
+    })
+}
+
+/// Answers one MRTR input request with the client's handler, keyed like rmcp's `call_tool`.
+async fn fulfill_input_request<S: Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    key: &str,
+    request: InputRequest,
+) -> Result<serde_json::Value, ServiceError> {
+    let request = match request {
+        InputRequest::CreateMessage(request) => ServerRequest::CreateMessageRequest(request),
+        InputRequest::Elicitation(request) => ServerRequest::ElicitRequest(request),
+        InputRequest::ListRoots(request) => ServerRequest::ListRootsRequest(request),
+        _ => return Err(ServiceError::UnexpectedResponse),
+    };
+    let context = RequestContext::new(
+        NumberOrString::String(Arc::from(key)),
+        client.peer().clone(),
+    );
+    let result = client
+        .service()
+        .handle_request(request, context)
+        .await
+        .map_err(ServiceError::McpError)?;
+    serde_json::to_value(result).map_err(|e| {
+        ServiceError::McpError(ErrorData::internal_error(
+            format!("failed to serialize MRTR input response: {e}"),
+            None,
+        ))
+    })
+}
+
 /// Waits at most [`MCP_HANDSHAKE_TIMEOUT`] for an MCP client to start. Dropping the start
 /// future on timeout drops its transport, which stops a stdio server's child process.
 async fn handshake<T>(tool_name: &str, start: impl Future<Output = T>) -> Result<T> {
@@ -1015,13 +1197,28 @@ impl McpClient {
             }
         }
     }
+    /// `tools/call` that fulfils `input_required` rounds locally. `timeout` bounds the whole
+    /// call; a round still running when Spice stops waiting is cancelled on the server.
     pub async fn call_tool(
         &self,
         params: CallToolRequestParams,
+        timeout: McpCallTimeout,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
-            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
+            McpClient::Stdio(s) => {
+                bounded(
+                    timeout.duration(),
+                    call_tool_with_input_rounds(s, params, timeout),
+                )
+                .await
+            }
+            McpClient::Http(s) => {
+                bounded(
+                    timeout.duration(),
+                    call_tool_with_input_rounds(s, params, timeout),
+                )
+                .await
+            }
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1035,10 +1232,11 @@ impl McpClient {
     pub async fn call_tool_once(
         &self,
         params: CallToolRequestParams,
+        timeout: McpCallTimeout,
     ) -> Result<CallToolResponse, ServiceError> {
         match self {
-            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
-            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
+            McpClient::Stdio(s) => call_tool_round(s.peer(), params, timeout).await,
+            McpClient::Http(s) => call_tool_round(s.peer(), params, timeout).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1155,6 +1353,7 @@ impl SpiceToolCatalog for McpToolCatalog {
                     self.with_spicepod_description(t),
                     self.name.clone(),
                     Arc::clone(&self.reconnector),
+                    self.call_timeout,
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()
@@ -1194,6 +1393,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             self.with_spicepod_description(tool),
             self.name.clone(),
             Arc::clone(&self.reconnector),
+            self.call_timeout,
         )))
     }
 
@@ -1212,6 +1412,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             self.with_spicepod_description(spec),
             self.name.clone(),
             Arc::clone(&self.reconnector),
+            self.call_timeout,
         )))
     }
 
@@ -1228,6 +1429,7 @@ impl SpiceToolCatalog for McpToolCatalog {
                     self.with_spicepod_description(spec.clone()),
                     self.name.clone(),
                     Arc::clone(&self.reconnector),
+                    self.call_timeout,
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()
@@ -1237,7 +1439,243 @@ impl SpiceToolCatalog for McpToolCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::{
+        RoleServer, ServerHandler, ServiceExt,
+        model::{ContentBlock, InputRequiredResult, ServerCapabilities, ServerConfig, Tool},
+        service::NotificationContext,
+    };
     use serde_json::{Value, json};
+
+    /// An in-process MCP server that records what a client cancels. `hang` never answers;
+    /// `fast` answers at once; `two_rounds` answers `input_required` and then, on the retry,
+    /// behaves like `hang`.
+    #[derive(Clone, Default)]
+    struct CancelRecordingServer {
+        /// Request id of each `hang`-like `tools/call` the server started, in order.
+        hang_ids: Arc<StdMutex<Vec<RequestId>>>,
+        hang_started: Arc<tokio::sync::Notify>,
+        /// `requestId` of each `notifications/cancelled` the server received, in order.
+        cancelled_ids: Arc<StdMutex<Vec<RequestId>>>,
+        cancel_received: Arc<tokio::sync::Notify>,
+    }
+
+    impl CancelRecordingServer {
+        fn last_hang_id(&self) -> RequestId {
+            self.hang_ids
+                .lock()
+                .expect("hang ids lock")
+                .last()
+                .cloned()
+                .expect("the server started a `hang` call")
+        }
+
+        fn cancelled_ids(&self) -> Vec<RequestId> {
+            self.cancelled_ids
+                .lock()
+                .expect("cancelled ids lock")
+                .clone()
+        }
+
+        async fn wait_for_hang(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.hang_started.notified())
+                .await
+                .expect("the server did not start the call within 10 s");
+        }
+
+        async fn wait_for_cancel_of(&self, id: &RequestId, what: &str) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !self.cancelled_ids().contains(id) {
+                    self.cancel_received.notified().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}: the server did not receive `notifications/cancelled` for request {id} within 10 s; it received {:?}",
+                    self.cancelled_ids()
+                )
+            });
+        }
+    }
+
+    impl ServerHandler for CancelRecordingServer {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = std::result::Result<ListToolsResult, ErrorData>> + Send + '_
+        {
+            let schema = Arc::new(serde_json::Map::new());
+            std::future::ready(Ok(ListToolsResult {
+                tools: ["hang", "fast", "two_rounds"]
+                    .into_iter()
+                    .map(|name| Tool::new(name, name, Arc::clone(&schema)))
+                    .collect(),
+                ..ListToolsResult::default()
+            }))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> std::result::Result<CallToolResponse, ErrorData> {
+            let hangs = request.name == "hang"
+                || (request.name == "two_rounds"
+                    && request.request_state.as_deref() == Some("round-2"));
+            if request.name == "two_rounds" && !hangs {
+                return Ok(CallToolResponse::InputRequired(
+                    InputRequiredResult::from_request_state("round-2"),
+                ));
+            }
+            if !hangs {
+                return Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into());
+            }
+            self.hang_ids
+                .lock()
+                .expect("hang ids lock")
+                .push(context.id.clone());
+            self.hang_started.notify_one();
+            // rmcp cancels `ct` when `notifications/cancelled` for this request arrives.
+            context.ct.cancelled().await;
+            Err(ErrorData::internal_error("cancelled", None))
+        }
+
+        fn on_cancelled(
+            &self,
+            notification: CancelledNotificationParam,
+            _context: NotificationContext<RoleServer>,
+        ) -> impl Future<Output = ()> + Send + '_ {
+            if let Some(id) = notification.request_id {
+                self.cancelled_ids
+                    .lock()
+                    .expect("cancelled ids lock")
+                    .push(id);
+            }
+            self.cancel_received.notify_one();
+            std::future::ready(())
+        }
+    }
+
+    /// Connects an MCP client to `server` over an in-memory pipe. Like stdio, this transport
+    /// writes `notifications/cancelled` to the server.
+    async fn connect_in_process(server: CancelRecordingServer) -> McpClient {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let running = server.serve(server_io).await.expect("the server starts");
+            let _ = running.waiting().await;
+        });
+        McpClient::Stdio(
+            ().serve_with_lifecycle(client_io, client_lifecycle())
+                .await
+                .expect("the client connects"),
+        )
+    }
+
+    const SHORT_CALL_TIMEOUT: McpCallTimeout = McpCallTimeout(Duration::from_millis(300));
+
+    /// regression test: a `tools/call` that timed out failed in Spice, but the MCP server was
+    /// not told and kept running it. Covers the model path (`call_tool`, which drives MRTR
+    /// rounds, including a later round) and the gateway path (`call_tool_once`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timed_out_tool_call_sends_cancelled_for_its_request_id() {
+        let server = CancelRecordingServer::default();
+        let client = connect_in_process(server.clone()).await;
+
+        for tool in ["hang", "two_rounds"] {
+            let error = client
+                .call_tool(CallToolRequestParams::new(tool), SHORT_CALL_TIMEOUT)
+                .await
+                .expect_err("a call that is never answered must time out");
+            assert!(
+                matches!(error, ServiceError::Timeout { .. }),
+                "call_tool({tool}): unexpected error: {error}"
+            );
+            server
+                .wait_for_cancel_of(&server.last_hang_id(), &format!("call_tool({tool})"))
+                .await;
+        }
+
+        let error = client
+            .call_tool_once(CallToolRequestParams::new("hang"), SHORT_CALL_TIMEOUT)
+            .await
+            .expect_err("a call that is never answered must time out");
+        assert!(
+            matches!(error, ServiceError::Timeout { .. }),
+            "call_tool_once: unexpected error: {error}"
+        );
+        server
+            .wait_for_cancel_of(&server.last_hang_id(), "call_tool_once")
+            .await;
+    }
+
+    /// regression test: dropping a call future (a chat request or a `/v1/mcp` request that
+    /// ends) left the call running on the MCP server. The default 10-minute timeout cannot fire
+    /// here, so the cancel can only come from the drop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_tool_call_sends_cancelled_for_its_request_id() {
+        let server = CancelRecordingServer::default();
+        let client = Arc::new(connect_in_process(server.clone()).await);
+
+        for gateway in [false, true] {
+            let call = tokio::spawn({
+                let client = Arc::clone(&client);
+                async move {
+                    let params = CallToolRequestParams::new("hang");
+                    if gateway {
+                        client
+                            .call_tool_once(params, McpCallTimeout::default())
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .call_tool(params, McpCallTimeout::default())
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            });
+            server.wait_for_hang().await;
+            call.abort();
+            assert!(
+                call.await.is_err_and(|e| e.is_cancelled()),
+                "gateway={gateway}: the call must still be running when it is dropped"
+            );
+            server
+                .wait_for_cancel_of(&server.last_hang_id(), &format!("gateway={gateway}"))
+                .await;
+        }
+    }
+
+    /// A call that completes is never cancelled afterwards, on either path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_tool_call_sends_no_cancelled() {
+        let server = CancelRecordingServer::default();
+        let client = connect_in_process(server.clone()).await;
+
+        let result = client
+            .call_tool(CallToolRequestParams::new("fast"), SHORT_CALL_TIMEOUT)
+            .await
+            .expect("call_tool completes");
+        assert_eq!(result.is_error, Some(false));
+        let response = client
+            .call_tool_once(CallToolRequestParams::new("fast"), SHORT_CALL_TIMEOUT)
+            .await
+            .expect("call_tool_once completes");
+        assert!(matches!(response, CallToolResponse::Complete(_)));
+
+        // Past the call timeout, so a late timeout-driven cancel would also have arrived.
+        tokio::time::sleep(3 * SHORT_CALL_TIMEOUT.duration()).await;
+        assert_eq!(
+            server.cancelled_ids(),
+            Vec::<RequestId>::new(),
+            "a completed call must not be cancelled"
+        );
+    }
 
     /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
     /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way, once its first
