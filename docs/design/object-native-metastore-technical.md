@@ -812,6 +812,18 @@ record as the state it covers (decision 1.9):
   changes already buffered at recovery or any head refresh;
 - in Milestone 3, each source partition's position lives in its writer's records.
 
+**Generated PostgreSQL slots across the SQLite rollback copy.** Default
+(generated) slots are named for the acceleration's state location. The SQLite
+copy kept for rollback used an instance-scoped name, so acknowledging the
+object-native copy does not advance that leftover. It stays inactive and retains
+WAL on the source until it is dropped. Startup inspects it, logs a WARN, and
+exposes retained WAL bytes ([#16917](https://github.com/spiceai/spiceai/pull/16917));
+the drop command and `max_slot_wal_keep_size` guidance are in
+[PostgreSQL logical replication](../features/postgres-replication.md#leftover-slots-after-upgrading-to-object-native-cayenne).
+An explicitly configured `pg_replication_slot` is shared by both copies, so a
+rollback after the object-native copy has acknowledged past it rebuilds with
+`rebuild_cause=acknowledged_past`.
+
 **Backfill versus live CDC.** A backfill (an initial snapshot, a re-bootstrap
 after slot loss, a repair) reflects the source as of its snapshot position P.
 With one writer it commits before streaming resumes, so commit order is correct;

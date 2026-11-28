@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
 pub mod retention;
+pub mod rollback_slot;
 pub mod schema_evolution;
 pub mod shared;
 pub mod slot;
@@ -46,6 +47,10 @@ pub use config::{ReplicationParams, SchemaEvolutionPolicy};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
+pub use rollback_slot::{
+    RollbackSlotLookup, generated_rollback_slot_name, inspect_inactive_rollback_slot,
+    rollback_slot_warning,
+};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 pub use xid_registry::{EchoKeys, EchoReadGuard, XactStatus, XidEntry, XidRegistry};
 
@@ -637,7 +642,8 @@ pub fn creation_cause(inputs: CreationInputs) -> Option<CreationCause> {
 /// The connector page an operator is sent to when the source is read into an
 /// acceleration. One constant, so the created and rebuilt lines cannot drift
 /// onto different pages.
-const CONNECTOR_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
+pub(crate) const CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
 
 /// The line an operator reads when an acceleration is about to be created by
 /// reading the source.

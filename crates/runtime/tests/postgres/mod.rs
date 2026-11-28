@@ -52,6 +52,8 @@ pub mod replication_tpch;
 #[cfg(feature = "postgres")]
 pub mod replication_type_change;
 #[cfg(feature = "postgres")]
+pub mod rollback_slot;
+#[cfg(feature = "postgres")]
 pub mod schema_inference;
 #[cfg(feature = "postgres")]
 pub mod write_back;

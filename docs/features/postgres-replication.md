@@ -302,6 +302,8 @@ Spice emits OpenTelemetry observables for every replicated Postgres dataset. Met
 | -------------------------------------------------- | ----- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `dataset_postgres_replication_lag_ms`              | Gauge | ms    | `now() − commit_time(latest ingested txn)`. Primary CDC freshness signal. Alert when this crosses your SLO (e.g. `> 5000`).                  |
 | `dataset_postgres_replication_lag_bytes`           | Gauge | bytes | `server_wal_end_lsn − confirmed_flush_lsn`. Indicates unacknowledged WAL still held by Spice's slot. Track alongside Postgres disk headroom. |
+| `dataset_postgres_replication_inactive_rollback_slots` | Gauge | — | `1` when this dataset left an inactive generated slot from the SQLite rollback copy after an object-native upgrade. Absent when there is no distinct leftover. Labeled `name` and `slot`. |
+| `dataset_postgres_replication_rollback_slot_retained_wal_bytes` | Gauge | bytes | WAL bytes that leftover still retains (`pg_current_wal_lsn() − restart_lsn`). Absent when there is no leftover or the role cannot compute the difference. Labeled `name` and `slot`. |
 | `dataset_postgres_replication_confirmed_flush_lsn` | Gauge | —     | Most recent LSN Spice has acknowledged. Matches `pg_replication_slots.confirmed_flush_lsn` for the dataset's slot.                           |
 | `dataset_postgres_replication_server_wal_end_lsn`  | Gauge | —     | Latest WAL end LSN reported by the server via keepalive. Diff against `confirmed_flush_lsn` to reproduce `lag_bytes`.                        |
 
@@ -370,6 +372,8 @@ To keep the default metric cardinality reasonable, only operationally critical m
 | `replication_schema_mismatch_errors_total`                      | ✅                 |
 | `replication_recv_errors_total`                                 | ✅                 |
 | `replication_reconnects_total`                                  | ✅                 |
+| `replication_inactive_rollback_slots`                           | ✅                 |
+| `replication_rollback_slot_retained_wal_bytes`                  | ✅                 |
 | `replication_confirmed_flush_lsn`                               | — enable manually |
 | `replication_server_wal_end_lsn`                                | — enable manually |
 | `replication_truncates_total`                                   | — enable manually |
@@ -426,6 +430,33 @@ SELECT slot_name
 
 On PostgreSQL 13 or older, `pg_replication_slots` has no inactivity timestamp — use `pg_stat_replication` or your monitoring system instead.
 
+### Leftover slots after upgrading to object-native Cayenne
+
+When a dataset uses a **generated** slot (no `pg_replication_slot`) and the acceleration moves to a location-scoped object-native Cayenne metastore, the live slot is named for the new location. The SQLite copy kept for rollback still holds an instance-scoped generated slot. That leftover stays **inactive** and retains WAL on the source until it is dropped.
+
+At startup Spice inspects that leftover. If it exists and is inactive, it logs a WARN with the slot name, how long it has been inactive (PostgreSQL 14+, from `inactive_since`), and how many bytes of WAL it retains (`pg_current_wal_lsn() - restart_lsn`) when the role can read them. The gauges `dataset_postgres_replication_inactive_rollback_slots` and `dataset_postgres_replication_rollback_slot_retained_wal_bytes` report the same snapshot, labeled `name` (dataset) and `slot` (leftover slot). If the role cannot read `pg_replication_slots` or execute `pg_current_wal_lsn`, Spice still warns and continues loading the dataset.
+
+Drop the leftover only after the upgrade is committed and you will **not** roll back to the SQLite copy:
+
+```sql
+SELECT pg_drop_replication_slot('<slot_name>');
+```
+
+Do **not** drop the slot while `pg_replication_slots.active` is `true` — another consumer still needs it. Do **not** drop it if you still plan to roll the acceleration back to the SQLite copy: that copy resumes from this slot.
+
+**Explicit `pg_replication_slot`:** both copies share that slot. Spice does not treat it as a leftover. Rolling back to the SQLite copy after the object-native copy has acknowledged past it forces a full re-read of the source (`rebuild_cause=acknowledged_past`).
+
+### Cap source WAL retained by idle slots
+
+Set `max_slot_wal_keep_size` on the source so an abandoned slot cannot fill the disk. When retained WAL exceeds the cap, PostgreSQL invalidates the slot (`wal_status = lost`) instead of growing WAL forever. Spice then rebuilds the acceleration from a fresh source snapshot. Size the cap for the largest catch-up you can tolerate; `-1` (the default) means no cap.
+
+```
+# postgresql.conf
+max_slot_wal_keep_size = 4GB
+```
+
+This is a safety net, not a substitute for dropping a leftover rollback slot once the upgrade is committed.
+
 ### Rebooting a replica
 
 Nothing special required. Spice rejoins its existing slot and resumes from the last acknowledged LSN. The accelerator catches up automatically.
@@ -471,7 +502,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |
 | `pg_replication_slots.active` is `true` but the accelerator isn't updating | Check the Spice logs for schema-mismatch errors. The replication task will still hold the slot even after a failure — restart Spice after fixing the schema to advance. |
-| `wal` on the source disk growing forever                                   | An abandoned slot — drop it with `pg_drop_replication_slot`. On a shared slot, also check the logs for a "shared replication member detached" WARN: one failed/removed dataset holds the slot's `confirmed_flush_lsn` until spiced restarts.             |
+| `wal` on the source disk growing forever                                   | An abandoned slot — drop it with `pg_drop_replication_slot`. After an object-native Cayenne upgrade, check the logs for an inactive SQLite-rollback slot WARN and the `dataset_postgres_replication_rollback_slot_retained_wal_bytes` gauge; drop that leftover only once the upgrade is committed. Set `max_slot_wal_keep_size` so an unnoticed leftover cannot fill the disk. On a shared slot, also check the logs for a "shared replication member detached" WARN: one failed/removed dataset holds the slot's `confirmed_flush_lsn` until spiced restarts. |
 | `UPDATE`s on Arrow-engine dataset don't replace rows                       | Configure a `primary_key` so Arrow can use its hash index for upserts, or switch to `cayenne`, `sqlite`, or `postgres`.                                       |
 | Error: *`received Value::Unchanged (TOASTed column omitted) during Update`* | The table has a large (TOASTed) column that an `UPDATE` didn't modify, and the old tuple isn't available to recover its value. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` on the source — Spice then fills unchanged TOASTed columns from the old tuple on every update.                              |
 | Logged *`TRUNCATE from postgres replication queued for accelerator`*       | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied.                                                                            |

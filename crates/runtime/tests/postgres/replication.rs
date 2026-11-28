@@ -84,6 +84,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         watermark_flush_interval:
             data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
         ready_lag: Duration::from_secs(2),
+        rollback_slot_name: None,
     }
 }
 
@@ -141,7 +142,7 @@ fn num_rows(envelope: &ChangeEnvelope) -> usize {
 }
 
 /// Pull the next envelope, erroring with `context` if the stream stalls.
-async fn next_envelope(
+pub(super) async fn next_envelope(
     stream: &mut ChangesStream,
     context: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {
@@ -181,7 +182,7 @@ async fn next_change_envelope(
 /// everything seen along the way. On a caught-up, quiet source this is the
 /// source-attested idle heartbeat; on a busy source it is the first live commit
 /// whose source-commit time is within `ready_lag` of now.
-async fn wait_for_ready(
+pub(super) async fn wait_for_ready(
     stream: &mut ChangesStream,
     context: &str,
 ) -> Result<ChangeEnvelope, anyhow::Error> {

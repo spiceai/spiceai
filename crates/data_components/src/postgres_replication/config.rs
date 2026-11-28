@@ -188,6 +188,17 @@ pub struct ReplicationParams {
     /// that depends on the hold lapsing is otherwise unreachable in under five
     /// minutes. Read from the params of whichever member opened the slot.
     pub unclaimed_reservation_grace: Duration,
+
+    /// Instance-scoped generated slot the `SQLite` rollback copy still holds after
+    /// an upgrade onto a location-scoped (object-native) generated slot. `None`
+    /// when there is no distinct leftover: the dataset names its slot explicitly
+    /// (both copies share that name), the acceleration is not shared through a
+    /// location, or the two generated names collide.
+    ///
+    /// Internal, not a spicepod parameter. The connector sets it from
+    /// [`super::generated_rollback_slot_name`]. Startup inspects that slot and
+    /// warns when it is inactive so the leftover cannot retain WAL unnoticed.
+    pub rollback_slot_name: Option<String>,
 }
 
 impl ReplicationParams {
@@ -885,6 +896,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             pg_output_format: PgOutputFormat::Binary,
             unclaimed_reservation_grace:
                 crate::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+            rollback_slot_name: None,
         }
     }
 
