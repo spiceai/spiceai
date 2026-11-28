@@ -670,7 +670,11 @@ impl ObjectStore for FTPObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
     use chrono::Utc;
+    use object_store::{GetOptions, GetRange, GetResult, ObjectStore};
 
     #[test]
     fn test_ftp_object_store_display() {
@@ -917,5 +921,335 @@ mod tests {
             commands,
             ["USER", "PASS", "TYPE", "PASV", "REST", "RETR", "ABOR"]
         );
+    }
+
+    /// Same bound SMB uses for a buffered object read (`MAX_BUFFERED_READ`).
+    const BUFFERED_READ_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+    fn size_refusal(reported: u64) -> String {
+        format!(
+            "Generic FTP error: FTP read of {reported} bytes exceeds {BUFFERED_READ_CAP}-byte cap; reduce range or stream"
+        )
+    }
+
+    /// Bytes the scripted peer actually sends. The `SIZE` reply is independent of this.
+    fn payload() -> Vec<u8> {
+        b"abcdefghij".to_vec()
+    }
+
+    struct SizeScript {
+        pending: VecDeque<u64>,
+        repeat: u64,
+    }
+
+    impl SizeScript {
+        fn from_replies(replies: &[u64]) -> Self {
+            let repeat = *replies.last().expect("at least one SIZE reply");
+            Self {
+                pending: VecDeque::from(replies.to_vec()),
+                repeat,
+            }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.pending.pop_front().unwrap_or(self.repeat)
+        }
+    }
+
+    /// Control-connection commands, in the order each connection received them.
+    type CommandLog = Arc<Mutex<Vec<String>>>;
+
+    /// One cleartext FTP peer. Every `SIZE` answer comes from `replies`, and once
+    /// that list is exhausted the last answer is repeated, so a second lookup
+    /// cannot observe a smaller length than the script's last reply.
+    ///
+    /// `RETR` sends `payload` and closes the data connection. It does not send
+    /// `reported` bytes.
+    async fn scripted_peer(replies: Vec<u64>, file_payload: Vec<u8>) -> (String, CommandLog) {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the control listener");
+        let port = listener
+            .local_addr()
+            .expect("control listener address")
+            .port()
+            .to_string();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let sizes = Arc::new(Mutex::new(SizeScript::from_replies(&replies)));
+        let file_payload = Arc::new(file_payload);
+        let accept_log = Arc::clone(&commands);
+        let accept_sizes = Arc::clone(&sizes);
+        let accept_payload = Arc::clone(&file_payload);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let commands = Arc::clone(&accept_log);
+                let sizes = Arc::clone(&accept_sizes);
+                let file_payload = Arc::clone(&accept_payload);
+                tokio::spawn(async move {
+                    serve_control(socket, commands, sizes, file_payload).await;
+                });
+            }
+        });
+
+        (port, commands)
+    }
+
+    async fn serve_control(
+        socket: tokio::net::TcpStream,
+        commands: CommandLog,
+        sizes: Arc<Mutex<SizeScript>>,
+        file_payload: Arc<Vec<u8>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let (read, mut write) = socket.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let mut offset = 0_usize;
+        let mut data_listener: Option<TcpListener> = None;
+        write
+            .write_all(b"220 ready\r\n")
+            .await
+            .expect("send the greeting");
+        while let Ok(Some(line)) = lines.next_line().await {
+            let verb = line
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            {
+                let mut log = commands.lock().expect("command log");
+                log.push(verb.clone());
+            }
+            let reply = match verb.as_str() {
+                "USER" => "331 password required".to_string(),
+                "PASS" => "230 logged in".to_string(),
+                "NOOP" | "TYPE" => "200 ok".to_string(),
+                "REST" => {
+                    offset = line[5..].trim().parse().expect("REST offset");
+                    "350 restarting".to_string()
+                }
+                "SIZE" => {
+                    let reported = sizes.lock().expect("SIZE script").next();
+                    format!("213 {reported}")
+                }
+                "MDTM" => "213 20200101120000".to_string(),
+                "PASV" => {
+                    let data = TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind the data listener");
+                    let data_port = data.local_addr().expect("data listener address").port();
+                    data_listener = Some(data);
+                    format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})",
+                        data_port >> 8,
+                        data_port & 0xff
+                    )
+                }
+                "RETR" => {
+                    write.write_all(b"150 sending\r\n").await.expect("send 150");
+                    let listener = data_listener.take().expect("PASV before RETR");
+                    let (mut data, _) =
+                        listener.accept().await.expect("accept the data connection");
+                    let start = offset.min(file_payload.len());
+                    data.write_all(&file_payload[start..])
+                        .await
+                        .expect("send the file");
+                    let _ = data.shutdown().await;
+                    drop(data);
+                    "226 transfer complete".to_string()
+                }
+                "ABOR" => "226 abort done".to_string(),
+                "QUIT" => "221 bye".to_string(),
+                _ => "502 not implemented".to_string(),
+            };
+            write
+                .write_all(format!("{reply}\r\n").as_bytes())
+                .await
+                .expect("send the reply");
+        }
+    }
+
+    fn store_for(port: &str) -> FTPObjectStore {
+        FTPObjectStore::new(
+            "user".to_string(),
+            "pass".to_string(),
+            "127.0.0.1".to_string(),
+            port.to_string(),
+            Some(Duration::from_secs(5)),
+        )
+    }
+
+    fn command_log(commands: &CommandLog) -> Vec<String> {
+        commands.lock().expect("command log").clone()
+    }
+
+    /// Virtual size of this process, used only to show a refused read did not
+    /// reserve the reported length. `None` where `/proc` is unavailable.
+    fn virtual_size_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            let Some(rest) = line.strip_prefix("VmSize:") else {
+                continue;
+            };
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kib.saturating_mul(1024));
+        }
+        None
+    }
+
+    async fn read_with(
+        reported: &[u64],
+        options: GetOptions,
+    ) -> (object_store::Result<GetResult>, Vec<String>, Option<u64>) {
+        let (port, commands) = scripted_peer(reported.to_vec(), payload()).await;
+        let store = store_for(&port);
+        let before = virtual_size_bytes();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.get_opts(&object_store::path::Path::from("file.bin"), options),
+        )
+        .await
+        .expect("the read returns; it must not wait for the reported length to arrive");
+        let after = virtual_size_bytes();
+        let grown = match (before, after) {
+            (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+            _ => None,
+        };
+        (result, command_log(&commands), grown)
+    }
+
+    fn refusal_failure(
+        result: object_store::Result<GetResult>,
+        commands: &[String],
+        grown: Option<u64>,
+        reported: u64,
+    ) -> Option<String> {
+        let Err(error) = result else {
+            return Some(format!(
+                "SIZE {reported} was reserved and the object was returned (virtual size grew by {grown:?} bytes; the peer sent {} bytes). Commands: {commands:?}",
+                payload().len()
+            ));
+        };
+        if error.to_string() != size_refusal(reported) {
+            return Some(format!("expected {}, got {error}", size_refusal(reported)));
+        }
+        if commands
+            .iter()
+            .any(|command| command == "PASV" || command == "RETR")
+        {
+            return Some(format!(
+                "the data connection was opened before the SIZE was refused, commands: {commands:?}"
+            ));
+        }
+        if !commands.iter().any(|command| command == "SIZE") {
+            return Some(format!(
+                "the read never asked for SIZE, commands: {commands:?}"
+            ));
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn object_reads_reject_a_size_one_byte_over_the_buffered_read_cap() {
+        let reported = BUFFERED_READ_CAP + 1;
+        let cases = [
+            ("full object", GetOptions::default()),
+            (
+                "offset to end of file",
+                GetOptions::default().with_range(Some(GetRange::Offset(0))),
+            ),
+            (
+                "suffix of the whole reported length",
+                GetOptions::default().with_range(Some(GetRange::Suffix(u64::MAX))),
+            ),
+            (
+                "bounded range of the reported length",
+                GetOptions::default().with_range(Some(GetRange::Bounded(0..reported))),
+            ),
+            (
+                "bounded range shorter than the cap",
+                GetOptions::default().with_range(Some(GetRange::Bounded(0..4))),
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, options) in cases {
+            let (result, commands, grown) = read_with(&[reported], options).await;
+            if let Some(failure) = refusal_failure(result, &commands, grown, reported) {
+                failures.push(format!("{name}: {failure}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "a SIZE one byte over the buffered-read cap must be refused before the file is downloaded:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_inside_the_cap_returns_only_the_bytes_the_peer_sent() {
+        let reported = u64::try_from(payload().len()).expect("payload length fits in u64");
+        let (result, commands, _) = read_with(&[reported], GetOptions::default()).await;
+        let body = result
+            .expect("a SIZE inside the cap is readable")
+            .bytes()
+            .await
+            .expect("the object body");
+        assert_eq!(body.as_ref(), payload().as_slice());
+        assert!(
+            commands.iter().any(|command| command == "RETR"),
+            "the file is read from the data connection, commands: {commands:?}"
+        );
+        assert_eq!(
+            commands.iter().filter(|command| *command == "SIZE").count(),
+            1,
+            "the length that is reserved is the SIZE reply already read, commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_size_reply_cannot_choose_the_reserved_length() {
+        let reported = u64::try_from(payload().len()).expect("payload length fits in u64");
+        // The first reply is inside the cap. A second `SIZE`, if the read asks
+        // again after checking the first, is past `isize::MAX` and cannot be
+        // reserved. The read must keep the first reply.
+        let (result, commands, _) = read_with(
+            &[
+                reported,
+                u64::try_from(isize::MAX).expect("isize::MAX fits in u64") + 1,
+            ],
+            GetOptions::default(),
+        )
+        .await;
+        let body = result
+            .expect("the first SIZE is inside the cap, so the object is readable")
+            .bytes()
+            .await
+            .expect("the object body");
+        assert_eq!(body.as_ref(), payload().as_slice());
+        assert_eq!(
+            commands.iter().filter(|command| *command == "SIZE").count(),
+            1,
+            "the reserved length is the SIZE that was read, not a later reply, commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn size_past_isize_max_is_refused_instead_of_panicking() {
+        // A `u8` buffer longer than `isize::MAX` makes `Vec::with_capacity` panic
+        // ("capacity overflow") before the allocator runs. That SIZE must be
+        // refused instead.
+        let reported = u64::try_from(isize::MAX).expect("isize::MAX fits in u64") + 1;
+        let (result, commands, grown) = read_with(&[reported], GetOptions::default()).await;
+        if let Some(failure) = refusal_failure(result, &commands, grown, reported) {
+            panic!("{failure}");
+        }
     }
 }
