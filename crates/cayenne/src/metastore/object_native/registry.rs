@@ -797,7 +797,7 @@ impl ObjectNativeCatalog {
             if self.registry.data_writes.allows() {
                 return Ok(());
             }
-            self.registry.follow_commits("").await?;
+            self.registry.follow_commits("", 0).await?;
             self.open_new_dataset_logs().await?;
             if self.routes.read().by_name.contains_key(name) {
                 return Ok(());
@@ -856,6 +856,23 @@ impl ObjectNativeCatalog {
             .datasets
             .get(name)
             .map(|domain| domain.data_writes.watch())
+    }
+    /// Follow which instance writes dataset `name`, by the identity its writer
+    /// lease names: this instance's own while it writes the dataset. `None`
+    /// for a dataset that is not open, or whose log has no writer lease; the
+    /// value is `None` until the lease has been read, or while it names no
+    /// holder.
+    #[must_use]
+    pub fn writer_identity(
+        &self,
+        name: &str,
+    ) -> Option<tokio::sync::watch::Receiver<Option<Arc<str>>>> {
+        self.routes
+            .read()
+            .datasets
+            .get(name)
+            .filter(|domain| domain.lease.is_some())
+            .map(|domain| domain.writer.subscribe())
     }
     /// The prefix of the dataset folders (`…/cayenne/v1/datasets`) in [`Self::store`].
     #[must_use]

@@ -10,7 +10,7 @@ use prost::Message;
 
 use super::{
     Batch, Head, HeadState, Result, decode_head, decode_record, invalid, load_checkpoint, numbered,
-    read_head, spilled_path,
+    read_head_at, spilled_path,
 };
 
 /// Default bound on a reader's concurrent GETs (batches and spilled payloads).
@@ -46,6 +46,9 @@ pub struct Reader {
     prefix: Path,
     state: HeadState,
     concurrency: usize,
+    /// When the head this reader is at was written, as Unix milliseconds on
+    /// the store's clock (its `LastModified`).
+    published_ms: u64,
 }
 
 impl Reader {
@@ -69,7 +72,7 @@ impl Reader {
         if concurrency == 0 {
             return invalid("read concurrency must be at least 1");
         }
-        let mut state = read_head(store.as_ref(), &prefix).await?;
+        let (mut state, mut published_ms) = read_head_at(store.as_ref(), &prefix).await?;
         let mut retries = 0;
         loop {
             match load(store.as_ref(), &prefix, &state, concurrency).await {
@@ -80,6 +83,7 @@ impl Reader {
                             prefix,
                             state,
                             concurrency,
+                            published_ms,
                         },
                         opened,
                     ));
@@ -88,13 +92,15 @@ impl Reader {
                 // since, a collector deleted it below the newer floor: open
                 // from the newer head. Otherwise it is missing, an error.
                 Err(error) if retries < OPEN_RETRIES && is_not_found(&error) => {
-                    let latest = read_head(store.as_ref(), &prefix).await?;
+                    let (latest, latest_published_ms) =
+                        read_head_at(store.as_ref(), &prefix).await?;
                     if latest.head.incarnation != state.head.incarnation
                         || latest.head.floor <= state.head.floor
                     {
                         return Err(error);
                     }
                     state = latest;
+                    published_ms = latest_published_ms;
                     retries += 1;
                 }
                 Err(error) => return Err(error),
@@ -105,6 +111,13 @@ impl Reader {
     #[must_use]
     pub fn state(&self) -> &HeadState {
         &self.state
+    }
+
+    /// When the head this reader is at was written, as Unix milliseconds on
+    /// the store's clock: the publication time of the newest commit it has read.
+    #[must_use]
+    pub fn published_ms(&self) -> u64 {
+        self.published_ms
     }
 
     /// Conditional GET; fetch batches only if the cursor is behind the window.
@@ -124,6 +137,8 @@ impl Reader {
             Err(object_store::Error::NotModified { .. }) => return Ok(Poll::Unchanged),
             Err(error) => return Err(error.into()),
         };
+        let published_ms =
+            u64::try_from(result.meta.last_modified.timestamp_millis()).unwrap_or_default();
         let state = decode_head(result).await?;
         if state.head.incarnation != self.state.head.incarnation
             || state.head.commit < self.state.head.commit
@@ -145,6 +160,7 @@ impl Reader {
         let records =
             resolve_spilled(self.store.as_ref(), &self.prefix, records, self.concurrency).await?;
         self.state = state;
+        self.published_ms = published_ms;
         Ok(Poll::Records(records))
     }
 }

@@ -572,8 +572,16 @@ impl AcceleratorEngineRegistry {
     }
 }
 
-/// Whether this instance writes an acceleration; see [`DataAccelerator::writer_role`].
-pub type WriterRole = tokio::sync::watch::Receiver<bool>;
+/// Which instance writes an acceleration shared with other instances; see
+/// [`DataAccelerator::writer_role`].
+#[derive(Clone, Debug)]
+pub struct WriterRole {
+    /// `true` while this instance writes the acceleration.
+    pub writes: tokio::sync::watch::Receiver<bool>,
+    /// The instance that writes it, by its instance ID (`SPICE_INSTANCE_ID`):
+    /// this instance's own while it writes. `None` while it is not known.
+    pub writer: tokio::sync::watch::Receiver<Option<Arc<str>>>,
+}
 
 /// A `DataAccelerator` knows how to read, write and create new tables.
 #[async_trait]

@@ -305,6 +305,11 @@ fn dataset_infos(
             } else {
                 (None, None)
             };
+            let writer = if include_status {
+                dataset_writer(df, d)
+            } else {
+                None
+            };
             DatasetResponseItem {
                 from: redact_source_credentials(&d.from),
                 name: d.name.to_quoted_string(),
@@ -316,9 +321,24 @@ fn dataset_infos(
                 error_message,
                 last_refresh,
                 next_refresh,
+                writer,
             }
         })
         .collect()
+}
+
+/// The instance that writes `ds`'s acceleration, by instance ID: the one the
+/// shared location names for an acceleration several instances share, and
+/// this instance for any other. `None` for a dataset that is not accelerated,
+/// or whose shared writer is not known yet.
+fn dataset_writer(df: &DataFusion, ds: &Dataset) -> Option<String> {
+    ds.acceleration.as_ref().filter(|a| a.enabled)?;
+    match df.runtime_status().dataset_writer(&ds.name) {
+        runtime_status::WriterKnown::Shared(writer) => writer,
+        runtime_status::WriterKnown::NotShared => {
+            Some(util::instance_id::instance_id().to_string())
+        }
+    }
 }
 
 /// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
@@ -716,6 +736,7 @@ mod tests {
             error_message: error_message.map(ToString::to_string),
             last_refresh: None,
             next_refresh: None,
+            writer: None,
         }
     }
 
@@ -813,6 +834,7 @@ mod tests {
                 error_message: None,
                 last_refresh: None,
                 next_refresh: None,
+                writer: None,
             },
             DatasetResponseItem {
                 from: "databricks:hive_metastore.default.messages".to_string(),
@@ -833,6 +855,7 @@ mod tests {
                 ),
                 last_refresh: None,
                 next_refresh: None,
+                writer: None,
             },
             DatasetResponseItem {
                 from: "postgres:aidemo_messages".to_string(),
@@ -845,6 +868,7 @@ mod tests {
                 error_message: None,
                 last_refresh: None,
                 next_refresh: None,
+                writer: None,
             },
         ])
         .expect("csv");

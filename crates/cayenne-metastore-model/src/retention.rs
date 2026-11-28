@@ -22,6 +22,8 @@
 //! pending set from the root and the records after the floor.
 use stateright::{Model, Property};
 
+pub(crate) mod deadline;
+
 const N: usize = 2;
 /// Reader retention.
 const T: u8 = 3;

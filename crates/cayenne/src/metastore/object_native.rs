@@ -46,6 +46,10 @@ struct Domain {
     /// The writer lease that decides whether this instance writes the log,
     /// under [`Access::Leased`].
     lease: Option<WriterLease>,
+    /// The instance that writes the log, by the identity its lease names, as
+    /// this instance last read the lease; `None` until it has, or while the
+    /// lease names no holder. Only for a log with a lease.
+    writer: tokio::sync::watch::Sender<Option<Arc<str>>>,
 }
 
 /// A log's writer lease, as this instance holds or watches it.
@@ -135,6 +139,11 @@ struct Inner {
     /// what it caches from the catalog when the revision differs from the one
     /// it last loaded at (see [`crate::catalog::MetadataCatalog::follow_commits`]).
     revision: u64,
+    /// For the latest revisions a replica reached by following the writer,
+    /// oldest first: the revision, and when the writer prepared the oldest
+    /// commit that revision added (Unix milliseconds on its clock). Bounded by
+    /// [`FOLLOWED_REVISIONS_KEPT`].
+    followed_revisions: std::collections::VecDeque<(u64, u64)>,
     /// A batch of followed records failed to apply, and the reader's cursor
     /// already covers it: the next follow reads the log again rather than
     /// resume from there.
@@ -256,9 +265,27 @@ fn position(source: &str, partition: &str, value: Option<Vec<u8>>) -> Action {
         position: value.unwrap_or_default(),
     }))
 }
+/// How many followed revisions a log remembers the commit times of (see
+/// `Inner::followed_revisions`). A table more revisions behind than this reports
+/// the oldest one remembered.
+const FOLLOWED_REVISIONS_KEPT: usize = 256;
+
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: error.to_string(),
+    }
+}
+/// A failed read of a log: [`CatalogError::LocationUnreachable`] when the
+/// store did not answer (a transport failure or a server error, after the
+/// store's own retries), any other error when its answer cannot be used.
+fn read_failure(error: object_store_occ::headlog::Error) -> CatalogError {
+    match &error {
+        object_store_occ::headlog::Error::Storage {
+            source: object_store::Error::Generic { .. } | object_store::Error::JoinError { .. },
+        } => CatalogError::LocationUnreachable {
+            message: error.to_string(),
+        },
+        _ => invalid(error),
     }
 }
 fn validate_uuid(name: &str, value: &str) -> CatalogResult<()> {

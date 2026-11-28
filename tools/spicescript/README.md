@@ -293,7 +293,7 @@ mapping's own keys winning: `params: { $merge: '${sources.lake.params}',
 file_format: parquet }`.
 
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
-`${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
+`${variant.name}`, `${instance.name}`, `${instance.id}` (its `SPICE_INSTANCE_ID`; `${instances.<name>.id}` names another instance's), `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
 `spiced` serves HTTP on, for a container that posts to it),
 `${instance.flight_port}` (the port it serves Flight on, for a
@@ -329,7 +329,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice: [args…]` | Run the `spice` CLI against the instance, in the instance's directory (so `spice dataset configure` edits its `spicepod.yaml`); `input` is written to its standard input, for an interactive command's prompts; `output-contains`, `expect-error`. A spicepod the command changes becomes that of the tier the step reaches (the upstream's, or the sidecar's on `on: sidecar`), so a later `start` or `restart` keeps the change. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
-| `assert-status: { dataset, status, message-contains, ready, has, lacks }` | Check a dataset's status from `/v1/datasets`. |
+| `assert-status: { dataset, status, message-contains, ready, has, lacks, fields }` | Check a dataset's status from `/v1/datasets`; `fields: { writer: '${instances.a.id}' }` requires fields to equal these strings. |
 | `assert-log: { contains, lacks, count, clean, allow }` | Check the instance's `spiced.log` with regular expressions; `count: { <pattern>: N \| '>=N' }`. |
 | `assert-files: { contains, lacks, lacks-dirs, unchanged-since }` | Check files under the instance's directory, by path relative to it (files only, not empty directories); `lacks-dirs` checks directories, empty ones included, as `<path>/`; `unchanged-since: <id>` requires every file a `mark-files: <id>` recorded to still be there with the same contents (files added since are allowed). |
 | `wipe-instance-dir: { keep }` | Delete everything `spiced` wrote in the instance's directory (`.spice/`, data and metastore files), as if the instance had lost its disk, keeping the spicepod, `spiced.log` and the `keep` paths (relative to the directory, such as a local state location). Refused while `spiced` or an executor runs; put `stop` or `kill-spiced` before it. |
@@ -337,7 +337,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `sample-objects: { source, prefix, contains, every, for, max-objects, max-bytes }` | Sample the count and total bytes of the objects under a prefix every `every` for `for` (at least six samples), as a series printed with the step. Fails when a sample is over `max-objects` or `max-bytes`, or when the series trends upward: the peak of its last third is more than a quarter (and at least one) above the peak of its middle third. Pair it with a `background` writer for a fixed-rate run. |
 | `mark-metrics: <id>` | Keep a `/metrics` scrape for a later `wait-metric … since:`. |
 | `mark-files: <id>` or `{ id, matching }` | Record the size and contents of every file under the instance's directory (but `spicepod.yaml` and `spiced.log`), or of those whose relative path matches a `matching` pattern, for a later `assert-files: { unchanged-since: <id> }`. Fails when it records nothing. |
-| `wait-metric: { name, labels, above \| below \| increases \| increased-by, since, timeout, drive }` | Wait for a series to meet a condition. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
+| `wait-metric: { name, labels, above \| below \| increases \| increased-by \| absent, since, timeout, drive }` | Wait for a series to meet a condition; `absent: true` waits until no series with that name and labels is published. `drive` writes new data each round while waiting, for conditions (such as a compaction) that need new data rather than time. |
 | `background: { id, query \| source-exec, concurrency, every, expect }` | Loop a query or a source write until `stop-background: <id>`. `expect: { column: value }` is an invariant every answer must keep. `${round}` counts iterations. |
 | `stop-background: { id, allow }` | Stop it; fails on any error not matching `allow`. Prints the iteration count, the P99 latency and the commonest allowed errors. |
 | `load: { queries \| corpus, clients, duration \| count, expect, faults, recover-within, … }` | Queries from many clients at once, every answer checked, with faults applied while they run (see [Load](#load)). |

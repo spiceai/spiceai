@@ -101,7 +101,10 @@ const RULE_NOT_REQUIRED: [&str; 14] = [
 ];
 
 /// Runs that check a property stronger than the design guarantees, and fail it.
-const STRONGER_PROPERTIES: [&str; 1] = ["replicas-readers-adoption-all-present"];
+const STRONGER_PROPERTIES: [&str; 2] = [
+    "replicas-readers-adoption-all-present",
+    "retention-deadline-all-present",
+];
 
 /// Runs that model the current code and reproduce a known defect in it.
 const CURRENT_DEFECTS: [&str; 1] = ["mem-tier-current-3-exhaust"];
@@ -516,6 +519,94 @@ pub fn runs() -> Vec<Run> {
             failure: "healthy holder keeps its lease",
         },
         Run {
+            name: "standby-reads",
+            family: "standby",
+            mode: "standby-reads",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-reads-response-time",
+            family: "standby",
+            mode: "standby-reads-response-time",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-no-gate",
+            family: "standby",
+            mode: "standby-reads-no-gate",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-from-written",
+            family: "standby",
+            mode: "standby-reads-from-written",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-clock-rate",
+            family: "standby",
+            mode: "standby-reads-clock-rate",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-reclaim",
+            family: "standby",
+            mode: "standby-reads-reclaim",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-reads-reclaim-missing-as-empty",
+            family: "standby",
+            mode: "standby-reads-reclaim-missing-as-empty",
+            bound: 0,
+            seed: None,
+            failure: "rows or an error",
+        },
+        Run {
+            name: "standby-reads-boot-clock",
+            family: "standby",
+            mode: "standby-reads-boot-clock",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-reads-boot-clock-suspend-monotonic",
+            family: "standby",
+            mode: "standby-reads-boot-clock-suspend-monotonic",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-boot-clock-no-rate-margin",
+            family: "standby",
+            mode: "standby-reads-boot-clock-no-rate-margin",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
+            name: "standby-reads-boot-clock-short-rate-margin",
+            family: "standby",
+            mode: "standby-reads-boot-clock-short-rate-margin",
+            bound: 0,
+            seed: None,
+            failure: "a query sees every commit acknowledged before it started",
+        },
+        Run {
             name: "commits-restart-turnover",
             family: "commits",
             mode: "commit-restart",
@@ -762,6 +853,62 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-deadline",
+            family: "retention",
+            mode: "retention-deadline",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-deadline-no-margin",
+            family: "retention",
+            mode: "retention-deadline-no-margin",
+            bound: 0,
+            seed: None,
+            failure: "a query fails only past confirm_sent + T, as outlived",
+        },
+        Run {
+            name: "retention-deadline-from-start",
+            family: "retention",
+            mode: "retention-deadline-from-start",
+            bound: 0,
+            seed: None,
+            failure: "a query fails only past confirm_sent + T, as outlived",
+        },
+        Run {
+            name: "retention-deadline-response-time",
+            family: "retention",
+            mode: "retention-deadline-response-time",
+            bound: 0,
+            seed: None,
+            failure: "a query fails only past confirm_sent + T, as outlived",
+        },
+        Run {
+            name: "retention-deadline-ignores-deadline",
+            family: "retention",
+            mode: "retention-deadline-ignores-deadline",
+            bound: 0,
+            seed: None,
+            failure: "a query fails only past confirm_sent + T, as outlived",
+        },
+        Run {
+            name: "retention-deadline-missing-as-empty",
+            family: "retention",
+            mode: "retention-deadline-missing-as-empty",
+            bound: 0,
+            seed: None,
+            failure: "rows or an error",
+        },
+        Run {
+            name: "retention-deadline-all-present",
+            family: "retention",
+            mode: "retention-deadline-all-present",
+            bound: 0,
+            seed: None,
+            failure: "a replica read never finds a deleted object",
         },
         Run {
             name: "naming",
@@ -3101,7 +3248,9 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
     // including the lost GC commit, the stale delete and the root rebuild.
     let remote_retention_required = run.family == "retention"
         && run.failure.is_empty()
-        && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
+        && (run.mode.contains("remote-gc")
+            || run.mode.contains("checkpoint")
+            || run.mode.contains("deadline"))
         && *expectation == Expectation::Sometimes;
     let standby_required = matches!(
         run.family,
@@ -3461,11 +3610,17 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         ),
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
+        "standby" if r.mode.contains("reads") => {
+            v.visit(standby::reads::Protocol::new(r.mode), r, None)
+        }
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
         "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
         "action-compatibility" => v.visit(action_compatibility::Protocol::new(r.mode), r, None),
+        "retention" if r.mode.contains("deadline") => {
+            v.visit(retention::deadline::Protocol::new(r.mode), r, None)
+        }
         "retention" => v.visit(retention::Protocol::new(r.mode), r, None),
         "replicas" => v.visit(replicas::Protocol::new(r.mode), r, None),
         "commits" => v.visit(commits::Protocol::new(r.mode, r.bound), r, None),

@@ -2229,6 +2229,12 @@ struct ScanView {
     /// [`ScanViewCache::try_serve_latest`]). Errs towards `false`, which only
     /// keeps the ordinary lag reuse.
     captured_nothing: bool,
+    /// When the state this view holds was last known current: for a table
+    /// that serves another instance's writes, when the read of the dataset
+    /// head was sent; otherwise when the capture started. A scan of such a
+    /// table reads its files until this plus the data-file retention (see
+    /// [`crate::provider::scan::ReadDeadline`]).
+    captured_at: Instant,
 }
 
 /// A completed, cached scan view plus its identity and ordering metadata. Held by
@@ -2270,6 +2276,45 @@ impl CompletedScanView {
 fn scan_view_clock_epoch() -> Instant {
     static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
     *EPOCH
+}
+
+/// Every open table whose data is in the object-native location, oldest first,
+/// for [`replica_lags`]. Entries of dropped tables are removed when a table
+/// registers.
+static OBJECT_NATIVE_TABLES: std::sync::LazyLock<
+    parking_lot::Mutex<Vec<std::sync::Weak<CayenneTableProvider>>>,
+> = std::sync::LazyLock::new(parking_lot::Mutex::default);
+
+/// Each dataset this instance serves as a replica, with its lag (see
+/// [`CayenneTableProvider::replica_lag`]), for
+/// `dataset_acceleration_replica_lag_ms`. A dataset this instance writes is
+/// not listed. When a dataset's table was replaced and the previous one is
+/// still open, the newest table answers.
+#[must_use]
+pub fn replica_lags() -> Vec<(String, Duration)> {
+    let tables: Vec<Arc<CayenneTableProvider>> = OBJECT_NATIVE_TABLES
+        .lock()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    let mut lags: std::collections::BTreeMap<String, Option<Duration>> =
+        std::collections::BTreeMap::new();
+    for table in tables {
+        lags.insert(table.table_metadata.table_name.clone(), table.replica_lag());
+    }
+    lags.into_iter()
+        .filter_map(|(dataset, lag)| lag.map(|lag| (dataset, lag)))
+        .collect()
+}
+
+/// The current time as Unix milliseconds, for comparison with the location's
+/// clock.
+fn unix_time_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn scan_view_instant_as_ns(now: Instant) -> u64 {
@@ -3035,6 +3080,11 @@ pub struct CayenneTableProvider {
     /// (strict) unless set ([`Self::set_replica_view_lag`]). Shared across all
     /// clones for the same table.
     replica_view_lag_ns: Arc<AtomicU64>,
+    /// When the writer prepared the oldest commit this table has read but does
+    /// not serve yet, as Unix milliseconds on the writer's clock; `u64::MAX`
+    /// while it serves every commit it has read (see [`Self::replica_lag`]).
+    /// Shared across all clones for the same table.
+    oldest_unserved_commit_ms: Arc<AtomicU64>,
     /// The dataset's store, for a table whose data path is an object-store URL:
     /// `url` is `cayenne://<table id>/` and `store` is [`Self::dataset_storage`]'s
     /// store, registered under that URL in each `RuntimeEnv` the table uses.
@@ -3859,7 +3909,7 @@ pub struct CayenneTableProvider {
     /// For a table whose catalog keeps the durable retirement record, its
     /// retention timers in place of `retired_snapshot_dirs`: retired file key
     /// → when this process's sweep first observed it retired. The sweep deletes
-    /// a file once [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed.
+    /// a file once [`crate::metastore_layout::data_file_reclaim_after`] has passed.
     /// In memory: a restart or a takeover observes every file again, which only
     /// delays its deletion.
     retired_file_timers: Arc<ParkingMutex<HashMap<String, Instant>>>,
@@ -10560,7 +10610,7 @@ impl CayenneTableProvider {
 
     /// Whether this table reclaims the files its catalog's durable retirement
     /// record names, by file and after
-    /// [`crate::metastore_layout::DATA_FILE_RETENTION`], instead of whole
+    /// [`crate::metastore_layout::data_file_reclaim_after`], instead of whole
     /// snapshot directories after [`Self::SNAPSHOT_CLEANUP_GRACE`].
     pub(super) fn reclaims_retired_files(&self) -> bool {
         self.data_in_store() && self.catalog.keeps_retirement_record()
@@ -10605,8 +10655,9 @@ impl CayenneTableProvider {
     /// The retired set is read from committed state only
     /// ([`MetadataCatalog::retired_files`]); the pass does nothing while it is
     /// not settled. A file is due once
-    /// [`crate::metastore_layout::DATA_FILE_RETENTION`] has passed since this
-    /// process first observed it retired. A write of this
+    /// [`crate::metastore_layout::data_file_reclaim_after`] has passed since
+    /// this process first observed it retired: a query stops reading at the
+    /// retention itself (see [`crate::provider::scan::ReadDeadline`]). A write of this
     /// process still building files in the file's snapshot keeps it too. A
     /// crash between the deletes and the forget leaves the files retired: the
     /// next pass deletes what is left (an object already gone counts as
@@ -10667,9 +10718,9 @@ impl CayenneTableProvider {
                         return false;
                     };
                     let waited = now.duration_since(observed);
-                    if waited < crate::metastore_layout::DATA_FILE_RETENTION {
-                        let left =
-                            crate::metastore_layout::DATA_FILE_RETENTION.saturating_sub(waited);
+                    let reclaim_after = crate::metastore_layout::data_file_reclaim_after();
+                    if waited < reclaim_after {
+                        let left = reclaim_after.saturating_sub(waited);
                         next_due = Some(next_due.map_or(left, |due| due.min(left)));
                         return false;
                     }
@@ -10794,12 +10845,12 @@ impl CayenneTableProvider {
     }
 
     /// Test-only: end the retention of every retired file this process has
-    /// observed, as if [`crate::metastore_layout::DATA_FILE_RETENTION`] had
+    /// observed, as if [`crate::metastore_layout::data_file_reclaim_after`] had
     /// passed.
     #[doc(hidden)]
     pub fn elapse_data_file_retention(&self) {
         let Some(past) =
-            Instant::now().checked_sub(crate::metastore_layout::DATA_FILE_RETENTION * 2)
+            Instant::now().checked_sub(crate::metastore_layout::data_file_reclaim_after() * 2)
         else {
             return;
         };
@@ -12815,6 +12866,7 @@ impl CayenneTableProvider {
             last_query_ns: Arc::new(AtomicU64::new(u64::MAX)),
             loaded_revision: Arc::new(AtomicU64::new(u64::MAX)),
             replica_view_lag_ns: Arc::new(AtomicU64::new(0)),
+            oldest_unserved_commit_ms: Arc::new(AtomicU64::new(u64::MAX)),
             object_store_config,
             dataset_storage,
             data_root,
@@ -15313,6 +15365,7 @@ impl CayenneTableProvider {
             last_query_ns: Arc::clone(&self.last_query_ns),
             loaded_revision: Arc::clone(&self.loaded_revision),
             replica_view_lag_ns: Arc::clone(&self.replica_view_lag_ns),
+            oldest_unserved_commit_ms: Arc::clone(&self.oldest_unserved_commit_ms),
             object_store_config: self.object_store_config.clone(),
             dataset_storage: self.dataset_storage.clone(),
             data_root: Arc::clone(&self.data_root),
@@ -36380,17 +36433,81 @@ impl CayenneTableProvider {
     /// The caller holds `write_lock`, taken before the scan view's build
     /// admission: a rewrite takes them in that order too.
     async fn confirm_head(&self) -> Result<()> {
-        let revision = self
-            .catalog
-            .follow_commits(&self.table_metadata.table_id)
-            .await
-            .map_err(|source| Error::Catalog { source })?;
-        if self.loaded_revision.load(Ordering::Acquire) != revision {
+        let loaded = self.loaded_revision.load(Ordering::Acquire);
+        let followed = self.follow_head_within_deadline(loaded).await?;
+        let revision = followed.revision;
+        if loaded != revision {
+            // Not served until the reload below completes; a reload that
+            // fails leaves it unserved, and the replica's lag grows from the
+            // oldest commit it has not served.
+            let prepared_ms = followed
+                .oldest_unserved_ms
+                .unwrap_or_else(unix_time_ms_now)
+                .min(u64::MAX - 1);
+            self.oldest_unserved_commit_ms
+                .fetch_min(prepared_ms, Ordering::AcqRel);
             self.reload_from_catalog().await?;
             self.reload_cached_statistics_and_inline_state().await?;
             self.loaded_revision.store(revision, Ordering::Release);
         }
+        self.oldest_unserved_commit_ms
+            .store(u64::MAX, Ordering::Release);
         Ok(())
+    }
+
+    /// [`MetadataCatalog::follow_commits`] for this table, bounded by
+    /// [`crate::metastore_layout::HEAD_CONFIRM_DEADLINE`] from when the read is
+    /// sent. A read the location does not answer in time, or answers with a
+    /// transport failure, is *Location unreachable*. The read runs as a task of
+    /// its own, so abandoning it never cuts a follow short: the next one waits
+    /// for it, and is bounded the same way.
+    async fn follow_head_within_deadline(
+        &self,
+        served_revision: u64,
+    ) -> Result<crate::catalog::FollowedCommits> {
+        let unreachable = |cause: String| Error::QueryRead {
+            source: crate::dataset_storage::QueryReadError::LocationUnreachable {
+                dataset: self.table_metadata.table_name.clone(),
+                location: crate::metastore_layout::state_location_of(&self.table_metadata.path)
+                    .unwrap_or_else(|| self.table_metadata.path.clone()),
+                cause,
+            },
+        };
+        let catalog = Arc::clone(&self.catalog);
+        let table_id = self.table_metadata.table_id.clone();
+        let follow =
+            task::spawn(async move { catalog.follow_commits(&table_id, served_revision).await });
+        let deadline = crate::metastore_layout::HEAD_CONFIRM_DEADLINE;
+        match tokio::time::timeout(deadline, follow).await {
+            Err(_) => Err(unreachable(format!(
+                "no answer within {}",
+                crate::metastore_layout::describe_duration(deadline)
+            ))),
+            Ok(Err(join_error)) => Err(Error::Catalog {
+                source: CatalogError::TaskJoin { source: join_error },
+            }),
+            Ok(Ok(Err(CatalogError::LocationUnreachable { message }))) => Err(unreachable(message)),
+            Ok(Ok(Err(source))) => Err(Error::Catalog { source }),
+            Ok(Ok(Ok(followed))) => Ok(followed),
+        }
+    }
+
+    /// How long ago the writer published the oldest commit this table does
+    /// not serve yet, or zero when it serves every commit it has read; `None`
+    /// for a table that writes its dataset, or whose data is not in the
+    /// object-native location. Reported as `dataset_acceleration_replica_lag_ms`.
+    #[must_use]
+    pub fn replica_lag(&self) -> Option<Duration> {
+        if !self.serves_from_writer() {
+            return None;
+        }
+        let prepared_ms = self.oldest_unserved_commit_ms.load(Ordering::Acquire);
+        if prepared_ms == u64::MAX {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_millis(
+            unix_time_ms_now().saturating_sub(prepared_ms),
+        ))
     }
 
     /// The table statistics and inline-corpus counters, read again from the
@@ -39433,6 +39550,7 @@ impl CayenneTableProvider {
         &self,
         raw: RawScanInput,
         structural_version: u64,
+        captured_at: Instant,
     ) -> datafusion_common::Result<ScanView> {
         #[cfg(test)]
         {
@@ -39463,6 +39581,7 @@ impl CayenneTableProvider {
             union_tombstones,
             structural_version,
             captured_nothing,
+            captured_at,
         })
     }
 
@@ -39482,6 +39601,8 @@ impl CayenneTableProvider {
     /// while queries use it, so a query's own read of the head usually finds
     /// it unchanged and the view already built.
     const REPLICA_STRICT_REFRESH_PERIOD: Duration = Duration::from_secs(1);
+    /// How often a replica follows the head of a table no query uses.
+    const REPLICA_IDLE_REFRESH_PERIOD: Duration = Duration::from_secs(10);
     /// How often the background view refresh of a table that writes its
     /// dataset wakes to notice the table's teardown, while it waits for the
     /// table to stop writing.
@@ -39503,6 +39624,9 @@ impl CayenneTableProvider {
             task::spawn(Self::run_scan_view_evictor(Arc::downgrade(self)));
             if self.data_in_object_native_location() {
                 task::spawn(Self::run_replica_view_refresh(Arc::downgrade(self)));
+                let mut tables = OBJECT_NATIVE_TABLES.lock();
+                tables.retain(|table| table.strong_count() > 0);
+                tables.push(Arc::downgrade(self));
             }
         }
     }
@@ -39513,11 +39637,13 @@ impl CayenneTableProvider {
     /// replica's queries then find a view within their lag and read nothing
     /// themselves; a strict replica's queries still confirm the head, but
     /// usually find it unchanged and the view already built. A table no query
-    /// has used within the idle window sends no request. Holds only a
+    /// has used within the idle window follows the head every
+    /// [`Self::REPLICA_IDLE_REFRESH_PERIOD`] instead. Holds only a
     /// `Weak<Self>` and exits after the table is torn down; a table that
     /// writes the dataset skips each round, and refreshes again once it
     /// serves another writer.
     async fn run_replica_view_refresh(weak: std::sync::Weak<Self>) {
+        let mut last_idle_confirm: Option<Instant> = None;
         loop {
             let (period, writes) = {
                 let Some(provider) = weak.upgrade() else {
@@ -39545,7 +39671,29 @@ impl CayenneTableProvider {
             let Some(provider) = weak.upgrade() else {
                 return;
             };
-            if !provider.serves_from_writer() || !provider.queried_recently(Instant::now()) {
+            if !provider.serves_from_writer() {
+                continue;
+            }
+            let now = Instant::now();
+            if !provider.queried_recently(now) {
+                // A table no query uses still follows the head now and then, so
+                // what it reports (`dataset_acceleration_replica_lag_ms`) stays
+                // current, and the next query usually finds the head unchanged.
+                let due = last_idle_confirm.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= Self::REPLICA_IDLE_REFRESH_PERIOD
+                });
+                if !due {
+                    continue;
+                }
+                last_idle_confirm = Some(now);
+                let _reload_guard = provider.write_lock.lock().await;
+                if let Err(error) = provider.confirm_head().await {
+                    tracing::debug!(
+                        table = %provider.table_metadata.table_name,
+                        %error,
+                        "Did not follow the dataset head of an idle replica table; the next round retries"
+                    );
+                }
                 continue;
             }
             let refreshed = if provider.replica_view_lag().is_zero() {
@@ -39652,7 +39800,7 @@ impl CayenneTableProvider {
             // unit-test path): build inline and wrap the ready result, publishing
             // it before `build_permit` drops at the end of this scope.
             let result = self
-                .build_scan_view(raw, structural_version)
+                .build_scan_view(raw, structural_version, captured_at)
                 .map(Arc::new)
                 .map_err(Arc::new);
             if let Ok(view) = &result {
@@ -39663,15 +39811,17 @@ impl CayenneTableProvider {
             return futures::future::ready(result).boxed().shared();
         };
         let build = async move {
-            task::spawn_blocking(move || provider.build_scan_view(raw, structural_version))
-                .await
-                .map_err(|join_error| {
-                    Arc::new(datafusion_common::DataFusionError::Execution(format!(
-                        "scan-view build task failed to join: {join_error}"
-                    )))
-                })?
-                .map(Arc::new)
-                .map_err(Arc::new)
+            task::spawn_blocking(move || {
+                provider.build_scan_view(raw, structural_version, captured_at)
+            })
+            .await
+            .map_err(|join_error| {
+                Arc::new(datafusion_common::DataFusionError::Execution(format!(
+                    "scan-view build task failed to join: {join_error}"
+                )))
+            })?
+            .map(Arc::new)
+            .map_err(Arc::new)
         }
         .boxed()
         .shared();
@@ -49053,6 +49203,21 @@ impl TableProvider for CayenneTableProvider {
                 .store(scan_view_instant_as_ns(Instant::now()), Ordering::Relaxed);
         }
         let scan_view = self.scan_view_confirming_head(reuse, confirm_head).await?;
+        // A table that serves another instance's writes reads files that
+        // instance reclaims on its own schedule, so its scans stop at the
+        // retention counted from when the view's head read was sent. The
+        // writer's own scans are not limited: its views are reused until a
+        // write replaces them, and its sweep is its own.
+        if self.serves_from_writer() {
+            scan_view
+                .raw
+                .scan_guard
+                .limit_reads(crate::provider::scan::ReadDeadline::new(
+                    scan_view.captured_at,
+                    crate::metastore_layout::data_file_retention(),
+                    Arc::from(self.table_metadata.table_name.as_str()),
+                ));
+        }
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
@@ -78724,7 +78889,9 @@ mod tests {
         upsert(11).await;
         provider.checkpoint_mem_tier().await.expect("checkpoint");
 
-        let view = provider.build_scan_view(build, 0).expect("build");
+        let view = provider
+            .build_scan_view(build, 0, Instant::now())
+            .expect("build");
         let mut rows: Vec<(i64, i64)> = view
             .visible_segments
             .iter()
@@ -82646,7 +82813,11 @@ mod tests {
         // rest of the test (as an in-flight scan's plan would).
         let held: Arc<ScanView> = {
             let raw = provider.capture_raw_scan_input().await.expect("capture");
-            Arc::new(provider.build_scan_view(raw, 0).expect("build"))
+            Arc::new(
+                provider
+                    .build_scan_view(raw, 0, Instant::now())
+                    .expect("build"),
+            )
         };
         assert_eq!(
             collect_segment_pairs(&held.visible_segments),

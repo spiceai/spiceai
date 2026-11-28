@@ -106,10 +106,14 @@ impl MetadataCatalog for Domain {
     fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
         self.data_writes.clone()
     }
-    async fn follow_commits(&self, _table_id: &str) -> CatalogResult<u64> {
+    async fn follow_commits(
+        &self,
+        _table_id: &str,
+        served_revision: u64,
+    ) -> CatalogResult<crate::catalog::FollowedCommits> {
         // Only a table that may not write asks: a replica's, or one opened
         // before this instance last became the writer.
-        self.inner.take().await.follow().await
+        self.inner.take().await.follow(served_revision).await
     }
     async fn init(&self) -> CatalogResult<()> {
         self.read().await?;

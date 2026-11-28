@@ -104,6 +104,9 @@ pub struct RuntimeStatus {
     dataset_freshness: Arc<RwLock<HashMap<String, DatasetFreshness>>>,
     /// The parent refresher that schedules each synchronized dataset.
     dataset_refresh_sources: Arc<RwLock<HashMap<TableReference, TableReference>>>,
+    /// For each dataset whose acceleration is shared with other instances
+    /// through one location, the instance that writes it, by instance ID.
+    dataset_writers: Arc<RwLock<HashMap<TableReference, DatasetWriter>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
     /// Controls how runtime readiness is computed.
@@ -126,6 +129,20 @@ pub struct RuntimeStatus {
     changes_decode_degraded: Arc<RwLock<HashSet<String>>>,
 }
 
+/// Which instance writes a shared acceleration, by instance ID; `None` while
+/// it is not known.
+pub type DatasetWriter = tokio::sync::watch::Receiver<Option<Arc<str>>>;
+
+/// What [`RuntimeStatus::dataset_writer`] knows about a dataset's writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriterKnown {
+    /// The acceleration is shared through a location; the writer's instance
+    /// ID when it is known.
+    Shared(Option<String>),
+    /// This instance alone writes the dataset.
+    NotShared,
+}
+
 /// Status of the outbound Spice Cloud management connection.
 ///
 /// Recorded for diagnostics and tests. Not part of [`RuntimeStatus::is_ready`]:
@@ -143,6 +160,7 @@ impl Default for RuntimeStatus {
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             dataset_freshness: Arc::new(RwLock::new(HashMap::new())),
             dataset_refresh_sources: Arc::new(RwLock::new(HashMap::new())),
+            dataset_writers: Arc::new(RwLock::new(HashMap::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
@@ -299,9 +317,40 @@ impl RuntimeStatus {
         None
     }
 
+    /// Follow which instance writes `dataset`'s acceleration, shared with other
+    /// instances through one location: `writer` holds its instance ID, `None`
+    /// while it is not known.
+    pub fn set_dataset_writer(&self, dataset: &TableReference, writer: DatasetWriter) {
+        self.dataset_writers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dataset.clone(), writer);
+    }
+
+    /// Which instance writes `dataset`'s acceleration: [`WriterKnown::Shared`]
+    /// for one shared through a location, with the writer when it is known,
+    /// and [`WriterKnown::NotShared`] for any other dataset, which this
+    /// instance alone writes.
+    #[must_use]
+    pub fn dataset_writer(&self, dataset: &TableReference) -> WriterKnown {
+        match self
+            .dataset_writers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(dataset)
+        {
+            Some(writer) => WriterKnown::Shared(writer.borrow().as_deref().map(str::to_string)),
+            None => WriterKnown::NotShared,
+        }
+    }
+
     /// Forgets `dataset`'s refresh times, when it is unloaded, so a dataset later
     /// registered under the same name starts from its own.
     pub fn remove_dataset_freshness(&self, dataset: &TableReference) {
+        self.dataset_writers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dataset);
         self.dataset_refresh_sources
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

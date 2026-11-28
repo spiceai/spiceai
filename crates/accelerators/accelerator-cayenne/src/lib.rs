@@ -604,6 +604,25 @@ pub fn register_cayenne_telemetry() {
     // well before the real meter provider replaces the startup noop one.
     vortex_datafusion::register_segment_cache_metrics();
 
+    // --- Replicas: how far each dataset served from another instance's
+    // writes is behind them. Only a replica reports a dataset, so the series
+    // is absent on the instance that writes it.
+    let _ = meter
+        .u64_observable_gauge("dataset_acceleration_replica_lag_ms")
+        .with_description(
+            "On an instance that serves a dataset another instance writes: how long ago that instance published the oldest commit this one does not serve yet, or 0 when it serves every commit it has read. Absent on the writer.",
+        )
+        .with_unit("ms")
+        .with_callback(|obs| {
+            for (dataset, lag) in cayenne::replica_lags() {
+                obs.observe(
+                    u64::try_from(lag.as_millis()).unwrap_or(u64::MAX),
+                    &[opentelemetry::KeyValue::new("dataset", dataset)],
+                );
+            }
+        })
+        .build();
+
     // --- Process-global encode-concurrency budget ---
     let _ = meter
         .u64_observable_gauge("cayenne_encode_permits_available")
@@ -3817,9 +3836,12 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Option<data_accelerator_api::WriterRole> {
         // Only an acceleration in the object-native location is shared with
         // other instances; any other is written by this instance alone.
-        self.native_catalog
-            .get()
-            .and_then(|catalog| catalog.writer_watch(&source.name().to_string()))
+        let catalog = self.native_catalog.get()?;
+        let name = source.name().to_string();
+        Some(data_accelerator_api::WriterRole {
+            writes: catalog.writer_watch(&name)?,
+            writer: catalog.writer_identity(&name)?,
+        })
     }
 
     async fn shared_location_id(

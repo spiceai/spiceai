@@ -35,6 +35,14 @@ use std::sync::Arc;
 #[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum CatalogError {
+    /// The state location did not answer a read: a transport failure or a
+    /// server error, as opposed to an answer that cannot be applied.
+    #[snafu(display("{message}"))]
+    LocationUnreachable {
+        /// What the store reported.
+        message: String,
+    },
+
     /// Database error
     #[snafu(display("Database error: {message}"))]
     Database {
@@ -310,9 +318,10 @@ pub struct SnapshotSequenceCommit {
 /// the metastore log that decides it, so the table sees a change of writer at
 /// once. See [`MetadataCatalog::data_write_gate`].
 ///
-/// Under a writer lease the gate also closes by itself at the lease's
-/// deadline ([`Self::hold_until`]): an instance that cannot renew its lease
-/// sends no data write once another instance could judge the lease lapsed and
+/// Under a writer lease the gate closes a twelfth of the lease early on a
+/// clock that counts through host suspend ([`Self::hold_until_boot_ns`]): an
+/// instance that cannot renew its lease sends no data write once another
+/// instance could judge the lease lapsed and
 /// take over, even if it never learns it was replaced.
 ///
 /// Each time the instance becomes the writer again the gate's generation
@@ -331,8 +340,9 @@ pub struct DataWriteGate {
 struct GateState {
     allowed: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicU64,
-    /// Writes are refused from this instant on, as nanoseconds since
-    /// [`gate_clock_epoch`]; `u64::MAX` for no deadline.
+    /// Writes are refused from this boot-clock deadline on, a twelfth of the
+    /// lease early; the clock counts through host suspend on Linux and macOS.
+    /// `u64::MAX` means no deadline.
     valid_until_ns: std::sync::atomic::AtomicU64,
     /// Whether writes are allowed, for whoever waits for a change of writer.
     changes: tokio::sync::watch::Sender<bool>,
@@ -384,7 +394,7 @@ impl DataWriteGate {
         self.state.changes.subscribe()
     }
 
-    /// Whether a write may be sent now.
+    /// Whether a write may be sent now. Fails closed if the boot clock cannot be read.
     #[must_use]
     pub fn allows(&self) -> bool {
         // The generation is read after `allowed`, which `set` publishes after
@@ -401,20 +411,22 @@ impl DataWriteGate {
                         .generation
                         .load(std::sync::atomic::Ordering::Acquire)
             })
-            && gate_clock_ns(std::time::Instant::now())
-                < self
+            && crate::boot_clock::now_ns().is_some_and(|now| {
+                now < self
                     .state
                     .valid_until_ns
                     .load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
-    /// Refuse writes from `deadline` on, until a later call moves it: the
-    /// instant a writer lease could lapse unless renewed.
-    pub fn hold_until(&self, deadline: std::time::Instant) {
-        self.state.valid_until_ns.store(
-            gate_clock_ns(deadline),
-            std::sync::atomic::Ordering::Release,
-        );
+    /// Refuse writes from `deadline` on, in [`crate::boot_clock::now_ns`]
+    /// nanoseconds, until a later call moves it. A writer lease closes the gate
+    /// a twelfth early to cover clock rate differences, counting host suspend.
+    /// `u64::MAX` means no deadline.
+    pub fn hold_until_boot_ns(&self, deadline: u64) {
+        self.state
+            .valid_until_ns
+            .store(deadline, std::sync::atomic::Ordering::Release);
     }
 
     /// Allow or refuse writes from now on. Allowing them again after a refusal
@@ -436,20 +448,6 @@ impl DataWriteGate {
                 .send_if_modified(|allowed| std::mem::replace(allowed, false));
         }
     }
-}
-
-/// Process-local origin of [`GateState::valid_until_ns`].
-fn gate_clock_epoch() -> std::time::Instant {
-    static EPOCH: std::sync::LazyLock<std::time::Instant> =
-        std::sync::LazyLock::new(std::time::Instant::now);
-    *EPOCH
-}
-
-/// `at` as nanoseconds since [`gate_clock_epoch`]; an instant before the epoch
-/// counts as the epoch.
-fn gate_clock_ns(at: std::time::Instant) -> u64 {
-    u64::try_from(at.saturating_duration_since(gate_clock_epoch()).as_nanos())
-        .unwrap_or(u64::MAX - 1)
 }
 
 /// The durable effects of one mem-tier seal or checkpoint.
@@ -777,6 +775,18 @@ pub async fn commit_at_acknowledgement_for(
     catalog.commit_pending_for(table_id).await
 }
 
+/// What [`MetadataCatalog::follow_commits`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FollowedCommits {
+    /// The revision of the committed state, which changes whenever it does.
+    pub revision: u64,
+    /// When the writer prepared the oldest commit after the caller's
+    /// `served_revision`, as Unix milliseconds on the writer's clock; `None`
+    /// when the caller serves every commit read (or this instance alone
+    /// writes the metastore).
+    pub oldest_unserved_ms: Option<u64>,
+}
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Cayenne catalog,
@@ -848,7 +858,16 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// No default: a wrapper must forward it, or its replica never sees new
     /// commits.
-    async fn follow_commits(&self, table_id: &str) -> CatalogResult<u64>;
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::LocationUnreachable`] when the location did not answer
+    /// the read; any other error when what it answered cannot be applied.
+    async fn follow_commits(
+        &self,
+        table_id: &str,
+        served_revision: u64,
+    ) -> CatalogResult<FollowedCommits>;
 
     /// Whether this instance may write `table_id`'s data to its location: open
     /// while it writes the table, closed while another instance does. Every

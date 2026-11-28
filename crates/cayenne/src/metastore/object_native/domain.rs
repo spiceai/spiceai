@@ -41,12 +41,13 @@ use tokio::sync::Notify;
 
 /// What [`WriterLease::acquire`] found this instance may do with a log.
 pub(super) enum LeaseRole {
-    /// It holds the writer lease until `valid_until` unless it renews it.
+    /// Its gate closes at `valid_until_boot_ns` on the suspend-inclusive boot
+    /// clock, a twelfth of the lease early, unless it renews the lease.
     /// `continuous` when this process renewed a lease it already held; a
     /// lease it created or took over may have lapsed, and been held by
     /// another instance, since this process last wrote the log.
     Holder {
-        valid_until: std::time::Instant,
+        valid_until_boot_ns: u64,
         continuous: bool,
     },
     /// Another instance, `holder` when the lease names it, holds a live one.
@@ -82,8 +83,10 @@ impl WriterLease {
         let dataset = self.dataset.as_ref();
         // Another instance judges the lease lapsed only once the version this
         // call writes has stayed unchanged for the lease's duration since it
-        // received it, which is after this call started.
-        let started = std::time::Instant::now();
+        // received it, which is after this call started. The holder closes its
+        // gate early on a suspend-inclusive clock to cover clock rate differences.
+        // A failed clock read closes the gate until the next renewal retries.
+        let started_boot_ns = crate::boot_clock::now_ns();
         let role = self
             .lease
             .acquire(
@@ -105,7 +108,9 @@ impl WriterLease {
             })?;
         Ok(match role {
             object_store_occ::lease::Role::Holder { acquired, .. } => LeaseRole::Holder {
-                valid_until: started + self.lease.duration(),
+                valid_until_boot_ns: started_boot_ns.map_or(0, |started| {
+                    holder_deadline_boot_ns(started, self.lease.duration())
+                }),
                 continuous: acquired
                     == object_store_occ::lease::Acquired::Renewed {
                         by_other_process: false,
@@ -132,6 +137,11 @@ impl WriterLease {
     fn renew_every(&self) -> std::time::Duration {
         self.lease.duration() / 3
     }
+
+    /// The identity this instance's lease names when it holds it.
+    fn identity(&self) -> Arc<str> {
+        Arc::from(self.lease.holder().identity())
+    }
 }
 
 impl Domain {
@@ -155,9 +165,18 @@ impl Domain {
             }
         };
         let dataset = &lease.dataset;
+        let writer = match &role {
+            LeaseRole::Holder { .. } => Some(lease.identity()),
+            LeaseRole::Standby { holder } => holder.as_deref().map(Arc::from),
+        };
+        self.writer.send_if_modified(|current| {
+            let changed = *current != writer;
+            *current = writer;
+            changed
+        });
         match role {
             LeaseRole::Holder {
-                valid_until,
+                valid_until_boot_ns,
                 continuous,
             } => {
                 // A lease this process did not hold throughout may have been
@@ -167,7 +186,7 @@ impl Domain {
                 if !continuous {
                     self.data_writes.set(false);
                 }
-                self.data_writes.hold_until(valid_until);
+                self.data_writes.hold_until_boot_ns(valid_until_boot_ns);
                 if continuous && self.data_writes.allows() {
                     return true;
                 }
@@ -266,7 +285,11 @@ impl Domain {
             .commit_now(Action::new(Kind::Prepare(proto::Prepare {
                 txn: txn.to_string(),
                 footprint: footprint.clone(),
-                actions: Record { actions: batch }.encode_to_vec(),
+                actions: Record {
+                    committed_unix_ms: 0,
+                    actions: batch,
+                }
+                .encode_to_vec(),
             })))
             .await?;
         Ok(footprint)
@@ -399,7 +422,8 @@ impl Domain {
         {
             return Err(inner.stopped(stop));
         }
-        inner.follow().await?;
+        let served = inner.revision;
+        inner.follow(served).await?;
         Ok(inner)
     }
 
@@ -440,24 +464,30 @@ impl Domain {
             Access::Writer | Access::Replica => None,
         };
         let mut config = config;
-        let mut valid_until = None;
+        let mut valid_until_boot_ns = None;
+        let writer = tokio::sync::watch::Sender::new(None);
         if let Some(lease) = &lease {
             config.access = match lease.acquire().await? {
                 LeaseRole::Holder {
-                    valid_until: until, ..
+                    valid_until_boot_ns: until,
+                    ..
                 } => {
-                    valid_until = Some(until);
+                    valid_until_boot_ns = Some(until);
+                    writer.send_replace(Some(lease.identity()));
                     Access::Writer
                 }
-                LeaseRole::Standby { .. } => Access::Replica,
+                LeaseRole::Standby { holder } => {
+                    writer.send_replace(holder.map(Arc::from));
+                    Access::Replica
+                }
             };
         }
         let data_writes = match config.access {
             Access::Writer => crate::catalog::DataWriteGate::open(),
             Access::Replica | Access::Leased(_) => crate::catalog::DataWriteGate::closed(),
         };
-        if let Some(until) = valid_until {
-            data_writes.hold_until(until);
+        if let Some(until) = valid_until_boot_ns {
+            data_writes.hold_until_boot_ns(until);
         }
         let (inner, opened) = Inner::open(
             store,
@@ -476,6 +506,7 @@ impl Domain {
             folder: String::new(),
             data_writes,
             lease,
+            writer,
             inner: Arc::new(StateSlot {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
@@ -659,7 +690,10 @@ impl Inner {
         self.ensure_accepting()?;
         let mut actions = actions;
         self.stamp(&mut actions);
-        let record = Record { actions };
+        let record = Record {
+            committed_unix_ms: 0,
+            actions,
+        };
         // Applied without a copy of the state. A refused record is a guard this
         // catalog's own checks should have caught, and leaves the state partly
         // changed, so the log stops until the process restarts.
@@ -1399,6 +1433,7 @@ impl Inner {
                 ),
                 head,
                 revision: 0,
+                followed_revisions: std::collections::VecDeque::new(),
                 reread: false,
                 data_writes: crate::catalog::DataWriteGate::closed(),
                 stop,
@@ -1440,23 +1475,34 @@ impl Inner {
 
     /// On a replica, apply the commits the writer made since this log last
     /// read its head: one conditional GET when nothing changed. Returns the
-    /// log's revision afterwards. The writer's own state is always current.
-    pub(super) async fn follow(&mut self) -> CatalogResult<u64> {
+    /// log's revision afterwards, and when the writer built the oldest record
+    /// after revision `served` to commit it. The writer's own state is always
+    /// current.
+    pub(super) async fn follow(
+        &mut self,
+        served: u64,
+    ) -> CatalogResult<crate::catalog::FollowedCommits> {
         let Head::Replica(reader) = &mut self.head else {
-            return Ok(self.revision);
+            return Ok(crate::catalog::FollowedCommits {
+                revision: self.revision,
+                oldest_unserved_ms: None,
+            });
         };
         let poll = if self.reread {
             Poll::Reopen
         } else {
-            reader.poll().await.map_err(invalid)?
+            reader.poll().await.map_err(super::read_failure)?
         };
         match poll {
             Poll::Unchanged => {}
             Poll::Records(entries) => {
                 if entries.is_empty() {
-                    return Ok(self.revision);
+                    return Ok(self.followed(served));
                 }
+                let oldest =
+                    Self::oldest_committed(&entries).unwrap_or_else(|| reader.published_ms());
                 self.revision += 1;
+                self.note_followed_revision(oldest);
                 // Applied to a copy, so the state published for reads holds
                 // either none of the batch or all of it.
                 let mut state = self.reader.state.clone();
@@ -1474,7 +1520,52 @@ impl Inner {
                 self.reread = false;
             }
         }
-        Ok(self.revision)
+        Ok(self.followed(served))
+    }
+
+    /// When the writer built the oldest of `entries` to commit it, among records
+    /// whose writers recorded that time.
+    fn oldest_committed(entries: &[object_store_occ::headlog::RecordWithCommit]) -> Option<u64> {
+        let mut oldest = None;
+        for entry in entries {
+            for payload in Group::decode(entry.record.payload.clone()).ok()?.payloads {
+                let record = Record::decode(payload).ok()?;
+                if record.committed_unix_ms > 0 {
+                    oldest = Some(oldest.map_or(record.committed_unix_ms, |ms: u64| {
+                        ms.min(record.committed_unix_ms)
+                    }));
+                }
+            }
+        }
+        oldest
+    }
+
+    /// Remember when the writer built the current revision's oldest record to
+    /// commit it, at `oldest_ms`.
+    fn note_followed_revision(&mut self, oldest_ms: u64) {
+        if self.followed_revisions.len() >= super::FOLLOWED_REVISIONS_KEPT {
+            self.followed_revisions.pop_front();
+        }
+        self.followed_revisions
+            .push_back((self.revision, oldest_ms));
+    }
+
+    /// The revision, and when the writer built the oldest unserved record to
+    /// commit it, for a table serving revision `served`.
+    fn followed(&self, served: u64) -> crate::catalog::FollowedCommits {
+        let oldest_unserved_ms = if served == self.revision {
+            None
+        } else {
+            self.followed_revisions
+                .iter()
+                .find(|(revision, _)| *revision > served)
+                .or_else(|| self.followed_revisions.back())
+                .map(|(_, ms)| *ms)
+        };
+        crate::catalog::FollowedCommits {
+            revision: self.revision,
+            oldest_unserved_ms,
+        }
     }
 
     /// Read the committed log again from its head and follow it from there as
@@ -1483,10 +1574,16 @@ impl Inner {
         let (reader, opened) =
             Reader::open(Arc::clone(&self.reader.store), self.reader.prefix.clone())
                 .await
-                .map_err(invalid)?;
+                .map_err(super::read_failure)?;
+        // The records after the floor carry their commit times. Commits folded
+        // into the checkpoint are older, so a lag measured from these is a
+        // lower bound.
+        let oldest =
+            Self::oldest_committed(&opened.records).unwrap_or_else(|| reader.published_ms());
         let replayed = replay_state(opened)?;
         self.replace_state(replayed.state);
         self.revision += 1;
+        self.note_followed_revision(oldest);
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
         self.head = Head::Replica(Box::new(reader));
@@ -1515,6 +1612,16 @@ fn replica_error(dataset: &str) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: replica_change_message(dataset),
     }
+}
+
+/// Close a twelfth of the lease early to cover a clock rate difference of up to
+/// a twelfth between this instance and a standby over one lease. This is the
+/// rule in `standby-reads-boot-clock`; `-suspend-monotonic` and `-no-rate-margin`
+/// model runs demonstrate why both suspend-inclusive time and the margin matter.
+fn holder_deadline_boot_ns(started_boot_ns: u64, duration: std::time::Duration) -> u64 {
+    let duration_ns = duration.as_nanos();
+    let held_ns = u64::try_from(duration_ns - duration_ns / 12).unwrap_or(u64::MAX);
+    started_boot_ns.saturating_add(held_ns).min(u64::MAX - 1)
 }
 
 #[cfg(test)]
@@ -1628,6 +1735,18 @@ mod tests {
         assert_eq!(
             value(&replica.read().await.expect("read published writer state")),
             Some(LATEST_VALUE.to_vec())
+        );
+    }
+
+    #[test]
+    fn lease_holder_deadline_includes_rate_margin() {
+        assert_eq!(
+            super::holder_deadline_boot_ns(123, std::time::Duration::from_secs(30)),
+            123 + 27_500_000_000,
+        );
+        assert_eq!(
+            super::holder_deadline_boot_ns(u64::MAX - 2, std::time::Duration::from_secs(30)),
+            u64::MAX - 1,
         );
     }
 }

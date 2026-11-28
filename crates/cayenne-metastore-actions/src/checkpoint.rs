@@ -143,7 +143,10 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
             size: part.size,
         })));
     }
-    Record { actions }
+    Record {
+        committed_unix_ms: 0,
+        actions,
+    }
 }
 
 /// Actions that rebuild a whole catalog, every table and every source position,
@@ -171,7 +174,10 @@ pub fn state_as_root(state: &crate::DatasetState) -> Record {
             actions: prepared.actions.clone(),
         })));
     }
-    Record { actions }
+    Record {
+        committed_unix_ms: 0,
+        actions,
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,8 @@
 //! generation in the head fences writers; lease timing decides availability.
 use stateright::{Model, Property};
 
+pub(crate) mod reads;
+
 /// Ticks a lease lasts after acquisition or renewal.
 const DURATION: usize = 3;
 /// Source changes available to ingest.

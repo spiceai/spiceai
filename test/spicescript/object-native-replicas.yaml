@@ -1,43 +1,49 @@
 name: object-native-replicas
-duration: 83s
+duration: 167s
 description: >
   Two instances run the same Spicepod against one state location and one
-  Postgres source. The first to start writes the dataset; the second serves its
-  rows from the location as a replica, and adding it adds no replication slot.
-  The replica follows the writer's changes. When the writer is killed, the
-  replica takes over once its lease lapses and resumes the same slot from the
-  last commit, with no change missing or applied twice; the killed instance,
-  started again, follows the new writer, and takes the dataset over again
-  while the source is down, ingesting once it is back. A dataset the writer has not loaded
-  yet is not served from the replica's empty acceleration: the replica serves it
-  from the source until the writer records its load. Every answer is checked
-  against the source.
+  Postgres source, on a local directory and on an S3-compatible store. The first
+  to start writes the dataset; the second serves its rows from the location as
+  a replica, and adding it adds no replication slot. Each instance reports which
+  instance writes the dataset, and the replica reports how far behind the
+  writer it is. The replica follows the writer's changes. A replica query that
+  runs longer than the data-file retention while the writer compacts and
+  reclaims the files it captured stops with an error rather than read them, and
+  a replica query whose read of the dataset head the location does not answer
+  fails rather than answer from an unconfirmed state. When the writer is
+  killed, the replica takes over once its lease lapses and resumes the same slot
+  from the last commit, with no change missing or applied twice; the killed
+  instance, started again, follows the new writer, and takes the dataset over
+  again while the source is down, ingesting once it is back. A dataset the
+  writer has not loaded yet is not served from the replica's empty
+  acceleration: the replica serves it from the source until the writer records
+  its load. Every answer is checked against the source.
 
 sources:
   # One database for both instances: they share its replication slot.
   src: { kind: postgres, shared: true }
-  # Its shared bucket holds the state location both instances use.
+  # Its shared bucket holds the state location of the `rustfs` runs.
   lake: { kind: rustfs }
+  # One directory both instances share: the state location of the `local` runs.
+  state: { kind: files, shared: true }
+
+matrix:
+  location: [local, rustfs]
 
 variants:
-  a: {}
-  b: {}
+  # Files a commit removes stay for 20 seconds rather than an hour, so a
+  # replica query can outlive them within the run. Both instances on one
+  # location must agree on it.
+  a: { env: { SPICE_TEST_CAYENNE_DATA_FILE_RETENTION_SECS: '20' } }
+  b: { env: { SPICE_TEST_CAYENNE_DATA_FILE_RETENTION_SECS: '20' } }
 
 spicepod:
   version: v1
   kind: Spicepod
   name: object-native-replicas
+  # `runtime.state` is set by each instance's first `start`, for its location.
   runtime:
     params: { cayenne_vnext: enabled }
-    state:
-      location: s3://${sources.lake.shared_bucket}/state/
-      params:
-        s3_endpoint: ${sources.lake.endpoint}
-        s3_region: us-east-1
-        s3_auth: key
-        s3_key: ${sources.lake.key}
-        s3_secret: ${sources.lake.secret}
-        allow_http: 'true'
   datasets:
     - from: postgres:public.orders
       name: orders
@@ -64,6 +70,11 @@ spicepod:
         mode: file
         refresh_mode: full
         refresh_sql: SELECT * FROM unloaded WHERE u_id / (u_id - u_id) = 1
+    # A federated view that answers after a minute: a scalar subquery over it
+    # holds a scan of `orders` open until then.
+    - from: postgres:public.slow
+      name: slow
+      params: ${sources.src.params}
 
 defaults:
   # The instances work together, so they run side by side; each answers from
@@ -79,19 +90,55 @@ steps:
         INSERT INTO orders SELECT i, 'O', i * 1.25 FROM generate_series(1, 1000) AS i;
         CREATE TABLE unloaded (u_id bigint PRIMARY KEY, u_v bigint);
         INSERT INTO unloaded SELECT i, i * 10 FROM generate_series(1, 300) AS i;
+        CREATE FUNCTION slow_k() RETURNS integer LANGUAGE sql AS 'SELECT pg_sleep(60); SELECT 1';
+        CREATE VIEW slow AS SELECT slow_k() AS k;
     only: a
 
   # A starts first and writes the dataset.
-  - start: {}
+  - start:
+      patch: { spicepod: { runtime: { state: { location: 'file://${sources.state.path}/' } } } }
     only: a
+    when: { location: local }
+  - start:
+      patch:
+        spicepod:
+          runtime:
+            state:
+              location: s3://${sources.lake.shared_bucket}/state/
+              params:
+                s3_endpoint: ${sources.lake.endpoint}
+                s3_region: us-east-1
+                s3_auth: key
+                s3_key: ${sources.lake.key}
+                s3_secret: ${sources.lake.secret}
+                allow_http: 'true'
+    only: a
+    when: { location: rustfs }
   - query: SELECT count(*) AS n, sum(o_total) AS total FROM orders
     eventually: 60s
     only: a
 
   # B serves A's rows from the location, consuming nothing: the source still
   # has exactly one slot.
-  - start: {}
+  - start:
+      patch: { spicepod: { runtime: { state: { location: 'file://${sources.state.path}/' } } } }
     only: b
+    when: { location: local }
+  - start:
+      patch:
+        spicepod:
+          runtime:
+            state:
+              location: s3://${sources.lake.shared_bucket}/state/
+              params:
+                s3_endpoint: ${sources.lake.endpoint}
+                s3_region: us-east-1
+                s3_auth: key
+                s3_key: ${sources.lake.key}
+                s3_secret: ${sources.lake.secret}
+                allow_http: 'true'
+    only: b
+    when: { location: rustfs }
   - query: SELECT count(*) AS n, sum(o_total) AS total FROM orders
     eventually: 60s
     only: b
@@ -103,6 +150,19 @@ steps:
   - query: SELECT count(*) AS n, sum(u_v) AS total FROM unloaded
     only: b
 
+  # Both instances name A as the writer. B reports its lag behind A, zero once
+  # it serves every commit it has read; A, the writer, reports none.
+  - assert-status: { dataset: orders, fields: { writer: '${instances.a.id}' } }
+    eventually: 30s
+    only: a
+  - assert-status: { dataset: orders, fields: { writer: '${instances.a.id}' } }
+    eventually: 30s
+    only: b
+  - wait-metric: { name: dataset_acceleration_replica_lag_ms, labels: { dataset: orders }, below: 1, timeout: 30s }
+    only: b
+  - wait-metric: { name: dataset_acceleration_replica_lag_ms, labels: { dataset: orders }, absent: true, timeout: 30s }
+    only: a
+
   # Changes A applies reach B.
   - source-exec:
       src: |
@@ -113,6 +173,45 @@ steps:
   - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
     eventually: 60s
     only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: b
+
+  # A query on B plans its scan of `orders` from a head confirmed when it
+  # starts, then waits a minute for `slow` before it reads a file. Meanwhile A
+  # applies a change every second, compacts the files B's scan captured and,
+  # 20 seconds later, deletes them. B's scan stops at the retention with an
+  # error naming it, rather than read a deleted file.
+  - background:
+      id: churn
+      source-exec: { src: "INSERT INTO orders SELECT 100000 + ${round} * 10 + i, 'C', i FROM generate_series(1, 10) AS i" }
+      every: 1s
+    only: a
+  - query: SELECT count(*) AS n FROM orders WHERE o_id > (SELECT max(k) - 1 FROM slow)
+    expect-error: "the query ran longer than 20 seconds, the time files are kept after compaction, so it stopped rather than return partial results. Rerun the query."
+    only: b
+  - stop-background: { id: churn }
+    only: a
+  # A reclaimed files while B's scan was held.
+  - wait-metric: { name: cayenne_maintenance_reclaimed_files_total, labels: { table: orders, op: retired_dir_sweep }, above: 0, timeout: 60s }
+    only: a
+  - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
+    eventually: 60s
+    only: b
+
+  # While the location does not answer, a query on B fails rather than answer
+  # from a state it cannot confirm, and answers again once the location is
+  # back. A local directory always answers, so only the store is paused.
+  - pause-source: lake
+    only: b
+    when: { location: rustfs }
+  - query: SELECT count(*) AS n FROM orders
+    expect-error: "did not respond, so the query fails rather than return results that may miss acknowledged writes. Retry once the location responds."
+    only: b
+    when: { location: rustfs }
+  - unpause-source: lake
+    only: b
+    when: { location: rustfs }
   - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
     eventually: 60s
     only: b
@@ -139,8 +238,14 @@ steps:
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
     expect: { rows: [['1']] }
     only: b
+  # B names itself the writer and reports no lag.
+  - assert-status: { dataset: orders, fields: { writer: '${instances.b.id}' } }
+    eventually: 30s
+    only: b
+  - wait-metric: { name: dataset_acceleration_replica_lag_ms, labels: { dataset: orders }, absent: true, timeout: 30s }
+    only: b
 
-  # A, started again, follows B.
+  # A, started again, follows B, names B the writer and reports its lag.
   - start: {}
     only: a
   - source-exec:
@@ -154,6 +259,11 @@ steps:
     only: a
   - source-query: { src: "SELECT count(*) AS slots FROM pg_replication_slots WHERE database = current_database()" }
     expect: { rows: [['1']] }
+    only: a
+  - assert-status: { dataset: orders, fields: { writer: '${instances.b.id}' } }
+    eventually: 30s
+    only: a
+  - wait-metric: { name: dataset_acceleration_replica_lag_ms, labels: { dataset: orders }, below: 1, timeout: 30s }
     only: a
 
   # B dies while the source is down. A takes the dataset over but cannot reach
@@ -173,4 +283,9 @@ steps:
     only: a
   - query: SELECT o_status, count(*) AS n, sum(o_total) AS total FROM orders GROUP BY o_status ORDER BY o_status
     eventually: 180s
+    only: a
+  - assert-status: { dataset: orders, fields: { writer: '${instances.a.id}' } }
+    eventually: 30s
+    only: a
+  - wait-metric: { name: dataset_acceleration_replica_lag_ms, labels: { dataset: orders }, absent: true, timeout: 30s }
     only: a
