@@ -34,7 +34,7 @@ mod sampler;
 
 use std::sync::OnceLock;
 
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 pub use context::{Batch, Context, ContextParams, Truncation};
 pub use devices::gpu_free_memory;
@@ -143,6 +143,32 @@ pub fn json_schema_to_grammar(schema: &str) -> Result<String> {
     };
     let reason = take(error);
     take(grammar).ok_or_else(|| Error::JsonSchema {
+        reason: reason.unwrap_or_else(|| "llama.cpp gave no reason".to_string()),
+    })
+}
+
+/// Checks that llama.cpp parses the GBNF `grammar` without a vocabulary, so a grammar that
+/// names a token by its text (`<think>`) fails; one by its id (`<[42]>`) parses. A repetition whose maximum is below its
+/// minimum (`"x"{3,1}`) fails rather than parsing without end.
+pub fn check_grammar(grammar: &str) -> Result<()> {
+    let c_grammar = std::ffi::CString::new(grammar).context(GrammarNulSnafu)?;
+    let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
+    // SAFETY: `c_grammar` is NUL-terminated for the call, and `error` takes an owned string.
+    let parsed = unsafe { sys::spice_grammar_check(c_grammar.as_ptr(), &raw mut error) };
+    let reason = if error.is_null() {
+        None
+    } else {
+        // SAFETY: a non-null `error` is a string the shim allocated, read once, then freed.
+        let owned = unsafe { std::ffi::CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { sys::spice_string_free(error) };
+        Some(owned)
+    };
+    if parsed == 1 {
+        return Ok(());
+    }
+    Err(Error::Grammar {
         reason: reason.unwrap_or_else(|| "llama.cpp gave no reason".to_string()),
     })
 }

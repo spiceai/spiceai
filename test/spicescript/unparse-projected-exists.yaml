@@ -1,4 +1,5 @@
 name: unparse-projected-exists
+duration: 9s
 description: Projected EXISTS inputs retain computed names and scalar correlations; repeated probes see one volatile build result.
 sources:
   src: { kind: postgres }

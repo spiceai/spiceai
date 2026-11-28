@@ -110,7 +110,7 @@ impl DatabricksDelta {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let table = self.get_uc_table(&table_reference).await?;
         // Checked before vending, because a table that cannot be vended falls back to
-        // `DeltaTable::from`, which would open any location.
+        // `DeltaTable::open`, which would open any location.
         let table_uri = object_storage_location(&table, table_reference)?;
 
         if let Some(client) = &self.credential_vending_client {
@@ -142,7 +142,9 @@ impl DatabricksDelta {
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options, &self.io_runtime).boxed()?;
+        let delta_table = DeltaTable::open(table_uri, storage_options, &self.io_runtime)
+            .await
+            .boxed()?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }

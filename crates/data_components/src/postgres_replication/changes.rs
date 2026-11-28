@@ -43,7 +43,7 @@ use super::xid_registry::EchoKeys;
 use super::{PgOutputDecodeSnafu, Result, XidRegistry};
 use crate::cdc::{
     ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
-    changes_schema,
+    RedactedValue, changes_schema,
 };
 
 /// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
@@ -1221,37 +1221,37 @@ impl FieldBuilder {
             Self::Bool(b) => b.append_value(matches!(s, "t" | "true" | "TRUE")),
             Self::Int8(b) => {
                 b.append_value(s.parse::<i8>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int8 parse '{s}': {e}"),
+                    message: format!("int8 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int16(b) => {
                 b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int16 parse '{s}': {e}"),
+                    message: format!("int16 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int32(b) => {
                 b.append_value(s.parse::<i32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int32 parse '{s}': {e}"),
+                    message: format!("int32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int64(b) => {
                 b.append_value(s.parse::<i64>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int64 parse '{s}': {e}"),
+                    message: format!("int64 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::UInt32(b) => {
                 b.append_value(s.parse::<u32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("uint32 parse '{s}': {e}"),
+                    message: format!("uint32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Float32(b) => {
                 b.append_value(s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("float32 parse '{s}': {e}"),
+                    message: format!("float32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Float64(b) => {
                 b.append_value(s.parse::<f64>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("float64 parse '{s}': {e}"),
+                    message: format!("float64 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Date32(b) => {
@@ -1263,7 +1263,7 @@ impl FieldBuilder {
                 use chrono::Timelike;
                 let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f").map_err(|e| {
                     super::Error::PgOutputDecode {
-                        message: format!("time parse '{s}': {e}"),
+                        message: format!("time parse {:?}: {e}", RedactedValue(s.len())),
                     }
                 })?;
                 let nanos_since_midnight = i64::from(t.num_seconds_from_midnight()) * 1_000_000_000
@@ -1284,17 +1284,17 @@ impl FieldBuilder {
             }
             Self::DictUtf8Int8(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::DictUtf8Int16(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::DictUtf8Int32(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::List {
@@ -1729,7 +1729,10 @@ impl FieldBuilder {
 /// Arrow side only supports single-level lists.
 fn parse_pg_array_literal(s: &str) -> Result<Vec<Option<String>>> {
     let err = |reason: &str| super::Error::PgOutputDecode {
-        message: format!("postgres array literal parse '{s}': {reason}"),
+        message: format!(
+            "postgres array literal parse {:?}: {reason}",
+            RedactedValue(s.len())
+        ),
     };
 
     // Arrays with non-default lower bounds are prefixed: `[0:1]={a,b}`.
@@ -1801,7 +1804,7 @@ fn parse_pg_array_literal(s: &str) -> Result<Vec<Option<String>>> {
 fn parse_pg_date_days_since_epoch(s: &str) -> Result<i32> {
     let parsed = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
         super::Error::PgOutputDecode {
-            message: format!("date parse '{s}': {e}"),
+            message: format!("date parse {:?}: {e}", RedactedValue(s.len())),
         }
     })?;
     let Some(epoch) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1) else {
@@ -1830,7 +1833,7 @@ fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
             });
     }
     PgOutputDecodeSnafu {
-        message: format!("timestamp parse '{s}' failed"),
+        message: format!("timestamp parse {:?} failed", RedactedValue(s.len())),
     }
     .fail()
 }
@@ -2236,7 +2239,7 @@ fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
 
     let combined = format!("{int_part}{frac}");
     let magnitude: i128 = combined.parse().map_err(|e| super::Error::PgOutputDecode {
-        message: format!("numeric '{s}' parse to i128: {e}"),
+        message: format!("numeric {:?} parse to i128: {e}", RedactedValue(s.len())),
     })?;
     let value = sign * magnitude;
 
@@ -2344,7 +2347,10 @@ fn sci_err(s: &str, reason: &str) -> Result<String> {
 
 fn scientific_notation_numeric_error(s: &str, reason: &str) -> super::Error {
     super::Error::PgOutputDecode {
-        message: format!("scientific-notation numeric parse '{s}': {reason}"),
+        message: format!(
+            "scientific-notation numeric parse {:?}: {reason}",
+            RedactedValue(s.len())
+        ),
     }
 }
 
@@ -2380,7 +2386,7 @@ fn parse_pg_timestamp_micros(s: &str) -> Result<i64> {
         return Ok(dt.and_utc().timestamp_micros());
     }
     PgOutputDecodeSnafu {
-        message: format!("timestamp parse '{s}' failed"),
+        message: format!("timestamp parse {:?} failed", RedactedValue(s.len())),
     }
     .fail()
 }
@@ -2391,6 +2397,23 @@ mod tests {
     use crate::postgres_replication::pgoutput::{Column as PgColumn, Value as PgValue};
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    /// A text value that fails to decode is never quoted in the error: row
+    /// values can hold credentials, and pgoutput decode errors are logged.
+    #[test]
+    fn decode_errors_never_show_text_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let errors = [
+            parse_pg_date_days_since_epoch(FAKE_SECRET).expect_err("not a date"),
+            parse_pg_timestamp_nanos(FAKE_SECRET).expect_err("not a timestamp"),
+            parse_pg_array_literal(&format!("{{{FAKE_SECRET}")).expect_err("not an array"),
+        ];
+        for err in errors {
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                assert!(!rendered.contains(FAKE_SECRET), "value leaked: {rendered}");
+            }
+        }
+    }
 
     #[test]
     fn lsn_committer_supports_deferral() {
@@ -3184,7 +3207,10 @@ mod tests {
             let err = parse_pg_array_literal(bad).expect_err(bad);
             assert_eq!(
                 err.to_string(),
-                format!("pgoutput decode error: postgres array literal parse '{bad}': {reason}"),
+                format!(
+                    "pgoutput decode error: postgres array literal parse <{}-byte value not shown>: {reason}",
+                    bad.len()
+                ),
                 "wrong rejection for {bad}"
             );
         }

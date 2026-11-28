@@ -202,7 +202,7 @@ impl ExecutionPlan for CayenneUpdateExec {
             // (`key_tombstones_wait_for_staged_appends`).
             let write_guard = Arc::new(if table.key_tombstones_wait_for_staged_appends() {
                 table
-                    .lock_write_after_staged_appends()
+                    .lock_write_after_staged_appends("the delete or update")
                     .await
                     .map_err(DataFusionError::from)?
             } else {

@@ -1,4 +1,5 @@
 name: surface
+duration: 50s
 description: >
   Query surface beyond the extended corpus answers through Spice as PostgreSQL
   answers it over the same rows, federated and on every acceleration engine:

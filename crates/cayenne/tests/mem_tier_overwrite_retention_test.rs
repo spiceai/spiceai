@@ -35,10 +35,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::display::array_value_to_string;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, PreparedOverwrite,
-    SlotAdvancer,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, PreparedOverwrite, SlotAdvancer};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -72,7 +69,7 @@ fn memory_tier_options(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.join(name).to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: VortexConfig {
             cdc_durability: CdcDurability::Memory,
@@ -136,15 +133,21 @@ fn id_name_batch(rows: &[(i64, &str)]) -> TestResult<RecordBatch> {
     )?)
 }
 
-async fn overwrite(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<()> {
+async fn insert(
+    table: &Arc<CayenneTableProvider>,
+    batch: RecordBatch,
+    op: InsertOp,
+) -> TestResult<()> {
     let ctx = SessionContext::new();
     let schema = batch.schema();
     let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
-    let plan = table
-        .insert_into(&ctx.state(), input, InsertOp::Overwrite)
-        .await?;
+    let plan = table.insert_into(&ctx.state(), input, op).await?;
     datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(())
+}
+
+async fn overwrite(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<()> {
+    insert(table, batch, InsertOp::Overwrite).await
 }
 
 async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> TestResult<()> {
@@ -153,12 +156,14 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&catalog),
-            memory_tier_options(&fixture, NAME, &id_name_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_name_schema()),
+            )
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
@@ -195,8 +200,9 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
     // Nothing durable describes the replaced rows: a restart serves the overwrite.
     drop(table);
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .open(NAME)
+        fixture
+            .data_store
+            .open(Arc::clone(&catalog), ctx.runtime_env(), NAME)
             .await?,
     );
     reopened.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -212,7 +218,7 @@ async fn overwrite_replaces_the_in_memory_tier_impl(fixture: TestFixture) -> Tes
     Ok(())
 }
 
-test_with_backends!(overwrite_replaces_the_in_memory_tier_impl);
+test_on_data_store!(overwrite_replaces_the_in_memory_tier_impl);
 
 fn id_value_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -235,25 +241,54 @@ fn id_value_batch(rows: &[(i64, i64)]) -> TestResult<RecordBatch> {
     )?)
 }
 
+/// A retention pass judges each key by its live version, and deletes the matching
+/// rows it can see, durable or in RAM.
+///
+/// On a `cdc_durability: memory` table every checkpoint arms a pass, and that
+/// checkpoint has already made the in-memory tier durable, so a pass finds rows in
+/// RAM only when they were applied between the arming checkpoint and the debounced
+/// pass. A test cannot hit that window on purpose. An append arms the pass here
+/// instead: it publishes durably and leaves the tier alone, so the pass runs with the
+/// rows applied before the append still in RAM.
 async fn retention_judges_a_key_by_its_live_version_impl(fixture: TestFixture) -> TestResult<()> {
     const NAME: &str = "retention_live_version";
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
+
+    // (7, 10) matches `value < 50` and (8, 70) does not. They are made durable through
+    // a handle without `retention_sql`, so no pass deletes (7, 10) before its
+    // replacement reaches RAM.
+    let seeder = Arc::new(
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+            )
+            .await?,
+    );
+    seeder.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    cdc_apply(&seeder, id_value_batch(&[(7, 10), (8, 70)])?).await?;
+    seeder.checkpoint_mem_tier().await?;
+    seeder.quiesce().await;
+    drop(seeder);
+
     let table = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            vec![col("value").lt(lit(50_i64))],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .open_with(Arc::clone(&catalog), ctx.runtime_env(), NAME, |builder| {
+                builder.with_retention_filters(vec![col("value").lt(lit(50_i64))])
+            })
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    assert!(
+        table.cdc_durability().is_memory(),
+        "precondition: the reopened table keeps CDC changes in RAM"
+    );
 
-    // (7, 10) matches `value < 50` and is durable; (8, 70) does not match.
-    cdc_apply(&table, id_value_batch(&[(7, 10), (8, 70)])?).await?;
-    table.checkpoint_mem_tier().await?;
     // Key 7's live version (7, 60) does not match, and exists only in RAM.
     cdc_apply(&table, id_value_batch(&[(7, 60)])?).await?;
     assert_eq!(
@@ -261,31 +296,41 @@ async fn retention_judges_a_key_by_its_live_version_impl(fixture: TestFixture) -
         ["7,60", "8,70"],
         "precondition: the live version is visible before retention runs"
     );
-
+    insert(&table, id_value_batch(&[(11, 80)])?, InsertOp::Append).await?;
     table.flush_pending_maintenance().await?;
     assert_eq!(
         table_rows(&table).await?,
-        ["7,60", "8,70"],
+        ["11,80", "7,60", "8,70"],
         "retention must not delete a key whose live version does not match `retention_sql`"
     );
     table.checkpoint_mem_tier().await?;
-    assert_eq!(table_rows(&table).await?, ["7,60", "8,70"]);
+    table.flush_pending_maintenance().await?;
+    assert_eq!(table_rows(&table).await?, ["11,80", "7,60", "8,70"]);
 
-    // Rows that do match are still deleted: (9, 5) is durable, and the checkpoint
-    // that made it so arms the pass; (10, 3) is still in RAM when the pass runs.
+    // A matching row in RAM is deleted by the pass that runs while it is there.
     cdc_apply(&table, id_value_batch(&[(9, 5)])?).await?;
-    table.checkpoint_mem_tier().await?;
-    cdc_apply(&table, id_value_batch(&[(10, 3)])?).await?;
+    insert(&table, id_value_batch(&[(12, 90)])?, InsertOp::Append).await?;
     table.flush_pending_maintenance().await?;
     assert_eq!(
         table_rows(&table).await?,
-        ["7,60", "8,70"],
-        "retention must still delete rows that match `retention_sql`, durable or in RAM"
+        ["11,80", "12,90", "7,60", "8,70"],
+        "retention must delete a row that matches `retention_sql` while it is in RAM"
+    );
+
+    // A matching row that reaches RAM after a pass is deleted by the pass that the
+    // checkpoint making it durable arms.
+    cdc_apply(&table, id_value_batch(&[(10, 3)])?).await?;
+    table.checkpoint_mem_tier().await?;
+    table.flush_pending_maintenance().await?;
+    assert_eq!(
+        table_rows(&table).await?,
+        ["11,80", "12,90", "7,60", "8,70"],
+        "retention must delete a durable row that matches `retention_sql`"
     );
     Ok(())
 }
 
-test_with_backends!(retention_judges_a_key_by_its_live_version_impl);
+test_on_data_store!(retention_judges_a_key_by_its_live_version_impl);
 
 /// How long the cancellation test waits for a step before failing.
 const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -329,13 +374,15 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            vec![col("value").lt(lit(50_i64))],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create_with(
+                catalog,
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+                |builder| builder.with_retention_filters(vec![col("value").lt(lit(50_i64))]),
+            )
+            .await?,
     );
     let advancer = Arc::new(GatedSlotAdvancer {
         entered: Notify::new(),
@@ -376,7 +423,7 @@ async fn a_cancelled_overwrite_still_applies_retention_impl(
     Ok(())
 }
 
-test_with_backends!(a_cancelled_overwrite_still_applies_retention_impl);
+test_on_data_store!(a_cancelled_overwrite_still_applies_retention_impl);
 
 /// A partitioned table's overwrite commits every partition in one transaction and
 /// then publishes each partition's new snapshot. One partition's publish waiting,
@@ -472,6 +519,9 @@ async fn a_waiting_publish_does_not_hold_back_the_other_partitions_impl(
     Ok(())
 }
 
+// Stays on SQLite: it commits the partitions' overwrites in one transaction of the
+// SQLite metastore, which a partitioned table uses and the object-native metastore
+// does not provide.
 test_with_backends!(a_waiting_publish_does_not_hold_back_the_other_partitions_impl);
 
 /// An overwrite's catalog commit and its publish are separate steps. A caller
@@ -489,12 +539,14 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            Arc::clone(&catalog),
-            memory_tier_options(&fixture, NAME, &id_name_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&catalog),
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_name_schema()),
+            )
+            .await?,
     );
     table.install_slot_advancer(Arc::new(NoopSlotAdvancer));
     overwrite(&table, id_name_batch(&[(1, "a")])?).await?;
@@ -535,7 +587,7 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
     Ok(())
 }
 
-test_with_backends!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
+test_on_data_store!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
 
 /// Records the highest durable epoch a checkpoint reported.
 #[derive(Default)]
@@ -562,12 +614,14 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            memory_tier_options(&fixture, NAME, &id_value_schema()),
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                memory_tier_options(&fixture, NAME, &id_value_schema()),
+            )
+            .await?,
     );
     let advancer = Arc::new(RecordingSlotAdvancer::default());
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
@@ -585,8 +639,9 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
     let reopened_catalog = common::fixture_catalog(fixture.connection_string()).await?;
     reopened_catalog.init().await?;
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(reopened_catalog, ctx.runtime_env())
-            .open(NAME)
+        fixture
+            .data_store
+            .open(reopened_catalog, ctx.runtime_env(), NAME)
             .await?,
     );
     assert_eq!(
@@ -597,7 +652,7 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
     Ok(())
 }
 
-test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
+test_on_data_store!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
 
 /// Saves the position a checkpoint covers through the object-native catalog, as
 /// a source's position store does, and records the epoch it acknowledges.

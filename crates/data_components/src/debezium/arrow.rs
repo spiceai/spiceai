@@ -33,6 +33,7 @@ use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use serde_json::Value as Json;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod changes;
@@ -62,10 +63,14 @@ pub enum Error {
     #[snafu(display("Missing the required `field` name"))]
     MissingFieldName,
 
-    #[snafu(display("Missing the required field {field_name} in {value}"))]
+    /// The row is deliberately not carried or displayed: change events hold
+    /// source data (including credentials) that must never reach logs.
+    #[snafu(display(
+        "Missing the required field '{field_name}' in a change event row. The row's values are not shown. Make the column nullable or resnapshot the source so every change event carries it"
+    ))]
     MissingFieldInValue {
         field_name: String,
-        value: serde_json::Value,
+        value: RowNotShown,
     },
 
     #[snafu(display(
@@ -106,13 +111,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to ingest a change event: the value {value} of column '{column}' is not a timestamp. \
+        "Failed to ingest a change event: the value of column '{column}' is not a timestamp (found {found}). \
         Expected an ISO 8601 string or an integer. \
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     InvalidTimestampValue {
         column: String,
-        value: serde_json::Value,
+        /// The JSON kind of the value, never the value itself.
+        found: &'static str,
     },
 
     #[snafu(display(
@@ -181,7 +187,74 @@ pub enum Error {
     DecimalPrecisionExceeded { value: i128, precision: u8 },
 }
 
+/// Takes the place of a change event row in an error, keeping none of it.
+///
+/// Rows hold source data (including credentials) and errors are logged, so an
+/// error built from a row (`value: row`) stores and prints nothing of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RowNotShown;
+
+impl From<serde_json::Value> for RowNotShown {
+    fn from(_row: serde_json::Value) -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for RowNotShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<row not shown>")
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// A stable, payload-free name for this decode failure.
+    ///
+    /// Log this, never [`Display`], when a change event is skipped: several
+    /// variants embed the row or a field value in their message.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingParametersForDecimal => "missing_parameters_for_decimal",
+            Self::MissingPrecisionForDecimal => "missing_precision_for_decimal",
+            Self::UnableToParsePrecision { .. } => "unable_to_parse_precision",
+            Self::UnableToParseScale { .. } => "unable_to_parse_scale",
+            Self::MissingScaleForDecimal => "missing_scale_for_decimal",
+            Self::MissingItemsForArray => "missing_items_for_array",
+            Self::MissingFieldName => "missing_field_name",
+            Self::MissingFieldInValue { .. } => "missing_required_field",
+            Self::MissingStructBuilder { .. } => "missing_struct_builder",
+            Self::DowncastBuilder => "downcast_builder",
+            Self::InvalidChangeEventSchema { .. } => "invalid_change_event_schema",
+            Self::UnableToDecodeBase64 { .. } => "unable_to_decode_base64",
+            Self::Decimal128BytesNot16Bytes { .. } => "decimal128_bytes_not_16_bytes",
+            Self::UnableToConvertToI64 => "unable_to_convert_to_i64",
+            Self::UnableToConvertToF64 => "unable_to_convert_to_f64",
+            Self::TimestampOutOfRange { .. } => "timestamp_out_of_range",
+            Self::InvalidTimestampValue { .. } => "invalid_timestamp_value",
+            Self::NotATimestamp { .. } => "not_a_timestamp",
+            Self::UnknownTimestampUnit { .. } => "unknown_timestamp_unit",
+            Self::DataTypeNotSupported { .. } => "data_type_not_supported",
+            Self::ListDataTypeNotSupported { .. } => "list_data_type_not_supported",
+            Self::DebeziumFieldNotSupported { .. } => "debezium_field_not_supported",
+            Self::UnableToParseTimestamp { .. } => "unable_to_parse_timestamp",
+            Self::DeleteOpWithoutBeforeField => "delete_op_without_before_field",
+            Self::UpdateOpWithoutBeforeField => "update_op_without_before_field",
+            Self::InvalidDecimalJson { .. } => "invalid_decimal_json",
+            Self::VariableScaleDecimalParsingOverflow => "variable_scale_decimal_parsing_overflow",
+            Self::MissingScaleForVariableScaleDecimal => "missing_scale_for_variable_scale_decimal",
+            Self::MissingValueForVariableScaleDecimal => "missing_value_for_variable_scale_decimal",
+            Self::UnsupportedTypeForVariableScaleDecimal { .. } => {
+                "unsupported_type_for_variable_scale_decimal"
+            }
+            Self::NonIntegerScaleForVariableScaleDecimal => {
+                "non_integer_scale_for_variable_scale_decimal"
+            }
+            Self::DecimalPrecisionExceeded { .. } => "decimal_precision_exceeded",
+        }
+    }
+}
 
 pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<Schema> {
     let arrow_fields = fields
@@ -234,6 +307,28 @@ pub(crate) fn timestamp_semantic_types<'a>(
         .collect()
 }
 
+/// The value each column takes in a change event that does not carry it, by
+/// column name: the default Debezium declares for the column in the table's
+/// event schema.
+pub type ColumnDefaults = HashMap<String, serde_json::Value>;
+
+/// The declared non-null defaults of `fields`, a table's row schema.
+///
+/// `ALTER TABLE ... ADD COLUMN c ... NOT NULL DEFAULT d` rewrites no row, so a
+/// row unchanged since keeps a change event without `c`, while the table's
+/// schema, taken from the newest event, requires it. Postgres reads such a row
+/// with `d`; replaying its older event uses the same value.
+#[must_use]
+pub fn column_defaults(fields: &[ChangeEventField]) -> ColumnDefaults {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let default = field.default.as_ref().filter(|d| !d.is_null())?;
+            Some((field.field.clone()?, default.clone()))
+        })
+        .collect()
+}
+
 /// Appends one row to `builder`. `semantic_types` holds the Debezium semantic
 /// type of each builder field (see [`timestamp_semantic_types`]); it is empty
 /// for an event without a schema.
@@ -242,22 +337,41 @@ pub fn append_value_to_struct_builder(
     builder: &mut StructBuilder,
     semantic_types: &[Option<&str>],
 ) -> Result<()> {
+    append_value_to_struct_builder_with_defaults(
+        value,
+        builder,
+        semantic_types,
+        &ColumnDefaults::new(),
+    )
+}
+
+/// [`append_value_to_struct_builder`], where a required column the event does
+/// not carry takes its value from `defaults` (see [`column_defaults`]).
+pub fn append_value_to_struct_builder_with_defaults(
+    value: serde_json::Value,
+    builder: &mut StructBuilder,
+    semantic_types: &[Option<&str>],
+    defaults: &ColumnDefaults,
+) -> Result<()> {
     builder.append(true);
     let null_value = serde_json::Value::Null;
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        // If the field is missing from the message (e.g. due to schema evolution),
-        // append null for nullable fields instead of failing.
+        // A column missing from the message predates it (schema evolution):
+        // a nullable one is null, and a required one takes its declared default.
         let field_value = match value.get(field.name()) {
             Some(v) => v,
             None if field.is_nullable() => &null_value,
-            None => {
-                return MissingFieldInValueSnafu {
-                    field_name: field.name().clone(),
-                    value,
+            None => match defaults.get(field.name()) {
+                Some(default) => default,
+                None => {
+                    return MissingFieldInValueSnafu {
+                        field_name: field.name().clone(),
+                        value,
+                    }
+                    .fail();
                 }
-                .fail();
-            }
+            },
         };
 
         let semantic_type = semantic_types.get(idx).copied().flatten();
@@ -494,7 +608,7 @@ fn append_timestamp<T: ArrowTimestampType>(
 ) -> Result<()> {
     let invalid = || InvalidTimestampValueSnafu {
         column,
-        value: value.clone(),
+        found: json_kind(value),
     };
     let converted = match value {
         Json::Null => None,
@@ -541,6 +655,19 @@ fn append_timestamp<T: ArrowTimestampType>(
     };
     downcast_builder::<PrimitiveBuilder<T>>(builder)?.append_option(converted);
     Ok(())
+}
+
+/// The kind of a JSON value, for errors that must not show the value itself.
+fn json_kind(value: &Json) -> &'static str {
+    match value {
+        Json::Null => "null",
+        Json::Bool(_) => "a boolean",
+        Json::Number(n) if n.is_f64() => "a non-integer number",
+        Json::Number(_) => "an integer",
+        Json::String(_) => "a string",
+        Json::Array(_) => "an array",
+        Json::Object(_) => "an object",
+    }
 }
 
 /// The unit of an integer-encoded Debezium timestamp semantic type.
@@ -1075,9 +1202,9 @@ mod tests {
                 "Failed to ingest a change event: the value {value} of column 'at' is outside the range of its type Timestamp(Nanosecond). Declare the column with a coarser time unit, such as `Timestamp(Microsecond, UTC)` for `timestamptz` or `Timestamp(Microsecond)` for `timestamp`. {DOCS}"
             )
         };
-        let not_a_timestamp = |value: &str| {
+        let not_a_timestamp = |found: &str| {
             format!(
-                "Failed to ingest a change event: the value {value} of column 'at' is not a timestamp. Expected an ISO 8601 string or an integer. {DOCS}"
+                "Failed to ingest a change event: the value of column 'at' is not a timestamp (found {found}). Expected an ISO 8601 string or an integer. {DOCS}"
             )
         };
         let cases = [
@@ -1096,9 +1223,9 @@ mod tests {
                 MICROS,
                 out_of_range("18446744073709551615"),
             ),
-            (json!("infinity"), None, not_a_timestamp("\"infinity\"")),
-            (json!(1.5), MICROS, not_a_timestamp("1.5")),
-            (json!(true), None, not_a_timestamp("true")),
+            (json!("infinity"), None, not_a_timestamp("a string")),
+            (json!(1.5), MICROS, not_a_timestamp("a non-integer number")),
+            (json!(true), None, not_a_timestamp("a boolean")),
             // A day count is not an epoch offset in any timestamp unit.
             (
                 json!(20_775),
@@ -1198,13 +1325,51 @@ mod tests {
         let err = append_value_to_struct_builder(value, &mut builder, &[])
             .expect_err("Should fail when required field is missing");
         assert!(
-            matches!(
-                &err,
-                Error::MissingFieldInValue { field_name, value }
-                    if field_name == "status" && *value == json!({"id": 42})
-            ),
-            "the missing non-nullable `status` column must be named, with the message it was missing from, got: {err:?}"
+            matches!(&err, Error::MissingFieldInValue { field_name, .. } if field_name == "status"),
+            "the missing non-nullable `status` column must be named, got: {err:?}"
         );
+        assert_eq!(err.kind(), "missing_required_field");
+        assert!(
+            !err.kind().contains("42"),
+            "kind must not carry the row or field values, got: {}",
+            err.kind()
+        );
+    }
+
+    /// A change event that fails to decode must never put the row's values in
+    /// the error: rows carry source data such as API keys, and stream errors
+    /// are logged verbatim. Only the column name may appear.
+    #[test]
+    fn decode_errors_never_show_row_values() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("api_key", DataType::Utf8, false),
+            Field::new("ip_allow_list_enabled", DataType::Boolean, false),
+        ]);
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+        let row = json!({"id": "app-1", "api_key": FAKE_SECRET, "api_key_2": FAKE_SECRET});
+        let err = append_value_to_struct_builder(row, &mut builder, &[])
+            .expect_err("a row without a required column must fail");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
+            assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
+        }
+
+        let err = decode_timestamp(&json!(FAKE_SECRET), TimeUnit::Microsecond, None, None)
+            .expect_err("a non-timestamp string must fail");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "column value leaked: {rendered}"
+            );
+        }
+        assert!(err.to_string().contains("column 'at'"), "{err}");
     }
 
     #[test]

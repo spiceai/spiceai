@@ -646,7 +646,10 @@ impl McpToolCatalog {
                     BoundedHttpClient::new(tool_name, abandoned.clone()).map_err(|e| {
                         Error::CouldNotConstructTool {
                             name: "mcp_streamable_http".to_string(),
-                            e: format!("Failed to create the HTTP client for '{url}': {e}"),
+                            e: format!(
+                                "Failed to create the HTTP client for '{}': {e}",
+                                redact::redact_url_credentials(url.as_str())
+                            ),
                         }
                     })?;
                 let mut transport_config =

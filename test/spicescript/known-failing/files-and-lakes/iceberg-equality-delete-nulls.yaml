@@ -3,6 +3,7 @@
 # right per the Iceberg spec — after Spice deletes a row that shares the NULL
 # row's non-NULL keys. Move this script up a level once DuckDB is fixed.
 name: iceberg-equality-delete-nulls
+duration: 30s
 description: >
   After Spice deletes ('x', false, …) with an equality delete, a row ('x', NULL,
   …) survives for every reader of the table.

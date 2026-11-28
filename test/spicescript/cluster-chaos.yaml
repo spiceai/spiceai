@@ -1,4 +1,5 @@
 name: cluster-chaos
+duration: 417s
 tags: [long]
 description: >
   On a cluster of Cayenne accelerations, readers running throughout get the

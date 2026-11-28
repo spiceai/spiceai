@@ -16,7 +16,12 @@ limitations under the License.
 
 //! Metadata catalog operations for a domain.
 
-use super::{super::actions, Domain, invalid, publish::rewrite_inline, validate_uuid};
+use super::{
+    super::actions,
+    Domain, invalid,
+    publish::{rewrite_inline, snapshot_manifest_action},
+    validate_uuid,
+};
 use crate::{
     catalog::{
         CatalogError, CatalogResult, MemTierDurableCommit, MetadataCatalog, SnapshotSequenceCommit,
@@ -31,24 +36,6 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cayenne_metastore_actions::{Action, Kind, ObjRef, proto};
 use std::collections::HashMap;
-
-/// The action that records `files` as manifest rows of `snapshot_id`, refusing a
-/// row of another table or snapshot.
-fn snapshot_manifest_action(
-    table_id: &str,
-    snapshot_id: &str,
-    files: &[SnapshotFile],
-) -> CatalogResult<Action> {
-    if files
-        .iter()
-        .any(|f| f.table_id != table_id || f.snapshot_id != snapshot_id)
-    {
-        return Err(invalid(format!(
-            "snapshot file identity does not match snapshot '{snapshot_id}' of table '{table_id}'"
-        )));
-    }
-    Ok(actions::add_files(table_id, snapshot_id, files, false))
-}
 
 #[async_trait]
 impl MetadataCatalog for Domain {
@@ -88,7 +75,6 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .list_pending_write_back(table_id, limit, after))
     }
     async fn clear_pending_write_back(
@@ -115,7 +101,7 @@ impl MetadataCatalog for Domain {
             .await
     }
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.pending_write_back_count(table_id)
+        self.read().await?.pending_write_back_count(table_id)
     }
     fn data_write_gate(&self, _table_id: &str) -> crate::catalog::DataWriteGate {
         self.data_writes.clone()
@@ -139,16 +125,16 @@ impl MetadataCatalog for Domain {
         Ok(())
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
-        Ok(self.read().await?.reader.list_table_names())
+        Ok(self.read().await?.list_table_names())
     }
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
-        self.read().await?.reader.get_table(table_name).await
+        self.read().await?.get_table(table_name).await
     }
     async fn get_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.get_sequence_number(table_id)
+        self.read().await?.get_sequence_number(table_id)
     }
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self.read().await?.reader.get_table_delete_files(table_id))
+        Ok(self.read().await?.get_table_delete_files(table_id))
     }
     async fn get_orphan_eligible_delete_files(
         &self,
@@ -156,14 +142,13 @@ impl MetadataCatalog for Domain {
         max_sequence: i64,
         limit: usize,
     ) -> CatalogResult<Vec<DeleteFile>> {
-        Ok(self.read().await?.reader.get_orphan_eligible_delete_files(
-            table_id,
-            max_sequence,
-            limit,
-        ))
+        Ok(self
+            .read()
+            .await?
+            .get_orphan_eligible_delete_files(table_id, max_sequence, limit))
     }
     async fn get_insert_records(&self, table_id: &str) -> CatalogResult<HashMap<Box<[u8]>, i64>> {
-        Ok(self.read().await?.reader.get_insert_records(table_id))
+        Ok(self.read().await?.get_insert_records(table_id))
     }
     async fn get_snapshot_sequence(
         &self,
@@ -173,28 +158,19 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_snapshot_sequence(table_id, snapshot_id))
     }
     async fn get_all_snapshot_sequences(
         &self,
         table_id: &str,
     ) -> CatalogResult<HashMap<String, i64>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_all_snapshot_sequences(table_id))
+        Ok(self.read().await?.get_all_snapshot_sequences(table_id))
     }
     async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>> {
-        Ok(self.read().await?.reader.get_partitions(table_id))
+        Ok(self.read().await?.get_partitions(table_id))
     }
     async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
-        self.read()
-            .await?
-            .reader
-            .get_table_statistics(table_id)
-            .await
+        self.read().await?.get_table_statistics(table_id).await
     }
     async fn get_snapshot_file_statistics(
         &self,
@@ -204,39 +180,30 @@ impl MetadataCatalog for Domain {
     ) -> CatalogResult<Option<SnapshotFileStatistics>> {
         self.read()
             .await?
-            .reader
             .get_snapshot_file_statistics(table_id, snapshot_id, file_path)
             .await
     }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self.read().await?.reader.get_all_snapshot_files(table_id))
+        Ok(self.read().await?.get_all_snapshot_files(table_id))
     }
     async fn get_snapshot_files(
         &self,
         table_id: &str,
         snapshot_id: &str,
     ) -> CatalogResult<Vec<SnapshotFile>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_snapshot_files(table_id, snapshot_id))
+        Ok(self.read().await?.get_snapshot_files(table_id, snapshot_id))
     }
     async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
-        self.read()
-            .await?
-            .reader
-            .list_cold_tier_files(table_id)
-            .await
+        self.read().await?.list_cold_tier_files(table_id).await
     }
     async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
-        self.read().await?.reader.get_pk_index(table_id).await
+        self.read().await?.get_pk_index(table_id).await
     }
     async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
-        Ok(self.read().await?.reader.list_index_runs(table_id))
+        Ok(self.read().await?.list_index_runs(table_id))
     }
     async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>> {
-        Ok(self.read().await?.reader.get_inlined_data(table_id))
+        Ok(self.read().await?.get_inlined_data(table_id))
     }
     async fn get_inlined_data_for_partition(
         &self,
@@ -246,27 +213,22 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_inlined_data_for_partition(table_id, partition_key))
     }
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.read().await?.reader.get_inlined_data_count(table_id)
+        self.read().await?.get_inlined_data_count(table_id)
     }
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
-        self.read().await?.reader.get_inlined_data_stats(table_id)
+        self.read().await?.get_inlined_data_stats(table_id)
     }
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
-        Ok(self.read().await?.reader.get_inlined_deletes(table_id))
+        Ok(self.read().await?.get_inlined_deletes(table_id))
     }
     async fn get_published_inlined_deletes(
         &self,
         table_id: &str,
     ) -> CatalogResult<Vec<InlinedDelete>> {
-        Ok(self
-            .read()
-            .await?
-            .reader
-            .get_published_inlined_deletes(table_id))
+        Ok(self.read().await?.get_published_inlined_deletes(table_id))
     }
     async fn get_unpublished_inlined_delete_ids(
         &self,
@@ -275,11 +237,10 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_unpublished_inlined_delete_ids(table_id))
     }
     async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
-        self.read().await?.reader.table_storage_stats(table_id)
+        self.read().await?.table_storage_stats(table_id)
     }
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
         self.create_identified(
@@ -540,16 +501,18 @@ impl MetadataCatalog for Domain {
         table_id: &str,
         snapshot_id: &str,
         sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<()> {
-        self.inner
-            .take()
-            .await
-            .commit(vec![actions::set_group(
+        let mut batch = vec![actions::set_group(table_id, snapshot_id, sequence_number)];
+        if let Some(files) = files {
+            batch.push(snapshot_manifest_action(
                 table_id,
                 snapshot_id,
-                sequence_number,
-            )])
-            .await
+                files,
+                false,
+            )?);
+        }
+        self.inner.take().await.commit(batch).await
     }
     async fn clear_snapshot_sequence(
         &self,
@@ -636,12 +599,16 @@ impl MetadataCatalog for Domain {
         old_snapshot_ids: &[String],
         new_snapshot_id: &str,
         new_sequence_number: i64,
+        files: Option<&[SnapshotFile]>,
     ) -> CatalogResult<bool> {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         for id in old_snapshot_ids {
             validate_uuid("old_snapshot_id", id)?;
         }
+        let manifest = files
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
+            .transpose()?;
         let mut inner = self.inner.take().await;
         let table = inner.table(table_id)?;
         let unique: std::collections::BTreeSet<_> = old_snapshot_ids.iter().collect();
@@ -657,12 +624,12 @@ impl MetadataCatalog for Domain {
         // manifest rows: a scan that captured them as live before the in-memory
         // swap still reads them from those rows. The retirement sweep forgets
         // the rows together with the files, once no scan holds them.
-        inner
-            .commit(vec![
-                actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
-                actions::set_group(table_id, new_snapshot_id, new_sequence_number),
-            ])
-            .await?;
+        let mut batch = vec![
+            actions::remove_groups(table_id, proto::Select::Listed, old_snapshot_ids, true),
+            actions::set_group(table_id, new_snapshot_id, new_sequence_number),
+        ];
+        batch.extend(manifest);
+        inner.commit(batch).await?;
         Ok(true)
     }
     async fn commit_overwrite(
@@ -676,7 +643,7 @@ impl MetadataCatalog for Domain {
         validate_uuid("table_id", table_id)?;
         validate_uuid("new_snapshot_id", new_snapshot_id)?;
         let manifest = files
-            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files))
+            .map(|files| snapshot_manifest_action(table_id, new_snapshot_id, files, false))
             .transpose()?;
         let mut inner = self.inner.take().await;
         let mut batch = actions::overwrite_clear(table_id, new_snapshot_id);
@@ -797,7 +764,7 @@ impl MetadataCatalog for Domain {
         snapshot_id: &str,
         files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        let manifest = snapshot_manifest_action(table_id, snapshot_id, files)?;
+        let manifest = snapshot_manifest_action(table_id, snapshot_id, files, false)?;
         self.inner
             .take()
             .await
@@ -856,8 +823,11 @@ impl MetadataCatalog for Domain {
             .table(table_id)?
             .files
             .iter()
-            .filter(|((snapshot, path), _)| snapshot == snapshot_id && !file_names.contains(path))
-            .map(|(_, file)| file.clone())
+            .filter(|((snapshot, path), _)| {
+                snapshot.as_ref() == snapshot_id
+                    && !file_names.iter().any(|name| name.as_str() == path.as_ref())
+            })
+            .map(|(_, file)| (**file).clone())
             .collect();
         let mut batch = vec![actions::remove_files(
             table_id,
@@ -875,17 +845,15 @@ impl MetadataCatalog for Domain {
         inner.commit(batch).await
     }
     async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
-        let inner = self.read().await?;
-        let table = inner.reader.get_table(table_name).await?;
+        let reader = self.read().await?;
+        let table = reader.get_table(table_name).await?;
         crate::cayenne_catalog::verify_stored_data_files_in(
             &table,
             table.vortex_config.memory_mode,
             crate::metadata::SettingsChangeAction::KeepStored,
-            async { Ok(inner.reader.get_all_snapshot_sequences(&table.table_id)) },
+            async { Ok(reader.get_all_snapshot_sequences(&table.table_id)) },
             |snapshot_id| {
-                std::future::ready(Ok(inner
-                    .reader
-                    .get_snapshot_files(&table.table_id, &snapshot_id)))
+                std::future::ready(Ok(reader.get_snapshot_files(&table.table_id, &snapshot_id)))
             },
         )
         .await
@@ -1086,7 +1054,6 @@ impl MetadataCatalog for Domain {
         Ok(self
             .read()
             .await?
-            .reader
             .get_inlined_data_above_sequence(table_id, after_sequence))
     }
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {

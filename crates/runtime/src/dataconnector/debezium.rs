@@ -546,13 +546,19 @@ impl DataConnector for Debezium {
             schema
         };
 
+        // A row unchanged since a NOT NULL column was added keeps an older
+        // event without it; that event takes the column's declared default.
+        let column_defaults = debezium::arrow::column_defaults(&metadata.schema_fields);
         let mut debezium_kafka = DebeziumKafka::new(
             refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
             self.batching,
             projection,
-        );
+        )
+        .with_dataset_name(dataset.name.to_string())
+        .with_runtime_status(context.runtime_status())
+        .with_column_defaults(column_defaults);
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {
             debezium_kafka = debezium_kafka.with_offset_commit_hook(Arc::new(

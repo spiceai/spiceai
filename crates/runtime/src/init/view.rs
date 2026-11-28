@@ -164,7 +164,8 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 type TablesRead = HashMap<ResolvedTableReference, TableReference>;
 
 /// The tables a view's SQL reads: every table the planner looks up to plan it,
-/// including tables only a subquery reads, and no CTEs. `None` when the SQL
+/// including tables only a subquery reads, and the tables its table functions
+/// search, and no CTEs. `None` when the SQL
 /// does not resolve, in which case registering the view reports the error.
 fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<TablesRead> {
     let mut statements = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).ok()?;
@@ -172,7 +173,11 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
         return None;
     }
     let statement = statements.pop_front()?;
-    let tables = state.resolve_table_references(&statement).ok()?;
+    let mut tables = state.resolve_table_references(&statement).ok()?;
+    // The planner does not look up a table function's table arguments, e.g. the
+    // `docs` of `text_search(docs, 'fox')`, as tables. A column argument only
+    // matches a table of the same name.
+    tables.extend(view::table_function_arguments(&statement));
     Some(
         tables
             .into_iter()
@@ -504,7 +509,9 @@ impl Runtime {
 
                     // Validate SQL and extract dependencies in a single parse
                     let sql = view.sql.as_ref();
-                    let statements = match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+                    let statements = match crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(sql, &PostgreSqlDialect {})
+                        .and_then(|()| DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}))
+                    {
                         Ok(stmts) => stmts,
                         Err(e) => {
                             if log_errors.0 {
@@ -560,8 +567,10 @@ impl Runtime {
                         return None;
                     }
 
-                    // Extract dependencies from the validated statement
-                    let dependencies = view::get_dependent_table_names(&statement);
+                    // Extract dependencies from the validated statement. Ordering keeps
+                    // only the views, so a table function's column arguments drop out.
+                    let mut dependencies = view::get_dependent_table_names(&statement);
+                    dependencies.extend(view::table_function_arguments(&statement));
 
                     // What the acceleration block asks for and the runtime will not do as
                     // written — settings `enabled: false` discards (#13514), the deprecated

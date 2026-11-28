@@ -22,6 +22,21 @@ not_ready phase=preparing_source phase_s=412
 
 Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the only ready one), `finalizing` and `finished`. Failing to bind is a warning, never a failed run.
 
+## Scenario scripts (`testoperator script`)
+
+`testoperator script` runs YAML scenario scripts against a prebuilt `spiced`: each
+script starts its own sources, starts `spiced` on a spicepod, changes things while it
+runs, and checks every answer against an oracle. See
+[`tools/spicescript/README.md`](../spicescript/README.md) for the script format and
+options.
+
+```bash
+testoperator script --jobs 4 --spiced target/release/spiced test/spicescript
+```
+
+It exits 0 when every check passes, 1 when a check fails, and 2 when the run can't
+finish (a script that doesn't parse, a source that doesn't start).
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.

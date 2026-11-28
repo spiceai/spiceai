@@ -41,6 +41,31 @@ pub struct Results {
     pub scripts: Vec<ScriptResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<ScriptSummary>,
+    /// Scripts selected but not run, because a variable their `requires-env`
+    /// names is unset. Kept apart from `scripts`, so nothing reading those
+    /// counts one as passed or takes a run time from it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_run: Vec<NotRun>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct NotRun {
+    pub name: String,
+    pub file: PathBuf,
+    /// The `requires-env` variables that were unset or empty.
+    pub missing_env: Vec<String>,
+}
+
+impl std::fmt::Display for NotRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}): {} unset",
+            self.name,
+            self.file.display(),
+            self.missing_env.join(", ")
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -401,6 +426,7 @@ mod tests {
         );
         result.repetition = Some(1);
         let mut results = Results {
+            not_run: Vec::new(),
             partition: None,
             complete: false,
             seconds: 0.0,
@@ -420,6 +446,7 @@ mod tests {
             Script::parse("name: s\nspicepod: {}\nsteps: [{start: {}}]").expect("script parses");
         let report = Report::default();
         let mut results = Results {
+            not_run: Vec::new(),
             partition: None,
             complete: false,
             seconds: 0.0,
