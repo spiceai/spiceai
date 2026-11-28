@@ -5,7 +5,8 @@ description: >
   Search on Cayenne beyond single queries: rrf fuses text_search and
   vector_search into exactly the documents either finds; a text_search
   filtered on other columns returns the matching rows; /v1/search returns
-  the documents vector search ranks first; and on a dataset kept current by
+  the documents vector search ranks first, once for a dataset named more than
+  once; and on a dataset kept current by
   change capture both indexes follow inserts, updates and deletes without a
   refresh.
 
@@ -22,6 +23,12 @@ spicepod:
   version: v1
   kind: Spicepod
   name: search-hybrid
+  # Tool calls (`/v1/tools/search`) require `runtime.auth`.
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [search-key]
   embeddings:
     - from: model2vec:minishlab/potion-base-2M
       name: potion
@@ -44,6 +51,7 @@ spicepod:
           embeddings: [{ from: potion, row_id: [id] }]
 
 defaults:
+  api-key: search-key
   # A cluster buckets each acceleration on this column (--cluster).
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
@@ -76,6 +84,98 @@ steps:
   # /v1/search: the documents vector search ranks first.
   - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox fox fox fox", "limit": 3}' }
     expect: { status: 200, body-contains: '"results"' }
+  # A search asks for 1 to 10,000 results per dataset, wherever it takes a `limit`: outside the
+  # range it is refused before anything is searched, with the range, the value and the fix.
+  # At the bound nothing is cut short: vector search returns each of the 76 documents with a body.
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox", "limit": 10000}' }
+    expect: { status: 200, json: [ { pointer: /results, length: 76 } ] }
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox", "limit": 10001}' }
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, equals: '`limit` must be between 1 and 10000, but was 10001. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search' }
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs"], "text": "fox", "limit": 0}' }
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, equals: '`limit` must be between 1 and 10000, but was 0. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search' }
+  # The `search` tool, through the MCP gateway (POST /v1/tools/search is the tool-catalog search).
+  # A failed tool call is also answered 200, so the call must return a result with
+  # `isError: false` and the documents found: the vector matches show all 76 documents with a
+  # body and the keyword matches the 60 whose body holds 'fox', 136 with their text, and none of
+  # the 4 whose body is NULL.
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: 'application/json, text/event-stream'
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: search
+      body: '{"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "search", "arguments": {"datasets": ["docs"], "text": "fox", "limit": 10000}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect:
+      status: 200
+      body-matches:
+        - '"id":11,"result":\{'
+        - '"isError":false'
+        # A match reads `id: <n>\ncolumn: body\n---\n<body>`, each newline escaped twice in the
+        # response.
+        - '(?s)\A(?:.*?\\\\nid: \d+\\\\ncolumn: body\\\\n---\\\\n\w){136}'
+        - '\\\\nid: 4\\\\ncolumn: body\\\\n---\\\\nfox fox fox fox stone stone stone stone stone stone stone stone\\\\n'
+        - '\\\\nid: 80\\\\ncolumn: body\\\\n---\\\\nstone stone stone stone stone stone stone stone stone stone stone stone\\\\n'
+      body-lacks:
+        - '"error":'
+        - '"isError":true'
+        - '(?s)(?:\\\\nid: \d+\\\\ncolumn: body\\\\n---\\\\n\w.*?){137}'
+        - '\\\\nid: (17|34|51|68)\\\\n'
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: 'application/json, text/event-stream'
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: search
+      body: '{"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {"name": "search", "arguments": {"datasets": ["docs"], "text": "fox", "limit": 10001}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect:
+      status: 200
+      body-contains: '`limit` must be between 1 and 10000, but was 10001. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search'
+      body-matches: '"isError":\s*true'
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: 'application/json, text/event-stream'
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: search
+      body: '{"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "search", "arguments": {"datasets": ["docs"], "text": "fox", "limit": 0}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect:
+      status: 200
+      body-contains: '`limit` must be between 1 and 10000, but was 0.'
+  # At the bound each search function returns every row it matches, compared with the source.
+  - query: SELECT id FROM text_search(docs, 'fox', limit => 10000)
+    oracle-sql: SELECT id FROM docs WHERE fox > 0 AND body IS NOT NULL
+  - query: SELECT id FROM text_search(docs, 'fox', limit => 10001)
+    expect-error: '`limit` must be between 1 and 10000, but was 10001. Request fewer results, or query the table without a search function to read every row. See https://spiceai.org/docs/reference/sql/search'
+  - query: SELECT id FROM vector_search(docs, 'fox', limit => 10000)
+    oracle-sql: SELECT id FROM docs WHERE body IS NOT NULL
+  - query: SELECT id FROM vector_search(docs, 'fox', limit => 10001)
+    expect-error: '`limit` must be between 1 and 10000, but was 10001.'
+  - query: SELECT id FROM vector_search(docs, 'fox', limit => 0)
+    expect-error: '`limit` must be between 1 and 10000, but was 0.'
+
+  # A dataset named more than once, under any spelling, is searched once and its matches are
+  # returned once, under the name it was first given.
+  - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"datasets": ["docs", "public.docs", "spice.public.docs", "docs"], "text": "fox fox fox fox", "limit": 3}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /results, length: 3 }
+        - { pointer: /results/*/dataset, equals: docs }
 
   # The indexes of a change-captured dataset follow the source.
   - query: SELECT id FROM text_search(docs_cdc, 'fox')

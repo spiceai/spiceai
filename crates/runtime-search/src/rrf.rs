@@ -453,6 +453,7 @@ impl ReciprocalRankFusionArgs {
         match func_name {
             name if name == TEXT_SEARCH_UDTF_NAME => {
                 let search_args = Self::parse_search_args(args)?;
+                Self::check_nested_limit(search_args.3)?;
                 Ok(RrfNestedQuery::text_search(
                     TextSearchArgs {
                         table: search_args.0,
@@ -466,6 +467,7 @@ impl ReciprocalRankFusionArgs {
             }
             name if name == VECTOR_SEARCH_UDTF_NAME => {
                 let search_args = Self::parse_search_args(args)?;
+                Self::check_nested_limit(search_args.3)?;
                 Ok(RrfNestedQuery::vector_search(
                     VectorSearchArgs {
                         table: search_args.0,
@@ -482,6 +484,14 @@ impl ReciprocalRankFusionArgs {
                 "{RRF_UDF_NAME} only supports {TEXT_SEARCH_UDTF_NAME} and {VECTOR_SEARCH_UDTF_NAME} nested queries, got: {func_name}"
             ),
         }
+    }
+
+    /// A nested `text_search` or `vector_search` takes the same `limit` range as one called alone.
+    fn check_nested_limit(limit: Option<usize>) -> Result<()> {
+        if let Some(limit) = limit {
+            crate::request::check_sql_search_limit(u64::try_from(limit).unwrap_or(u64::MAX))?;
+        }
+        Ok(())
     }
 
     fn parse_limit_u64(value: u64) -> Result<usize> {

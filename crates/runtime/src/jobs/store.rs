@@ -47,6 +47,14 @@ use super::state::{
     JobSchema, JobState, JobStatus, now_ms_or_zero,
 };
 
+/// The result bytes a job may still store: `maximum_size` less the bytes of the chunks it
+/// already `written`.
+#[derive(Debug, Clone, Copy)]
+struct ChunkBudget {
+    written: usize,
+    maximum_size: Option<u64>,
+}
+
 /// Stores job state and results in the shared object store.
 ///
 /// Layout:
@@ -109,6 +117,56 @@ impl JobStore {
         self
     }
 
+    /// The scheduler this store writes as.
+    #[must_use]
+    pub(crate) fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Takes over a queued job whose scheduler stopped: this store's node holds it from now on.
+    /// The takeover lands only while the job is still queued and held as in `observed`, so of
+    /// the schedulers that recover the same job one takes it over and the others get `None`.
+    pub async fn take_over_pending_job(&self, observed: &JobState) -> Result<Option<JobState>> {
+        let node = self.node_id.clone();
+        let (state, taken) = self
+            .modify_job(&observed.job_id, |state| {
+                if state.status != JobStatus::Pending
+                    || state.scheduler_node != observed.scheduler_node
+                {
+                    return Ok(false);
+                }
+                state.scheduler_node = Some(node.clone());
+                Ok(true)
+            })
+            .await?;
+        Ok(taken.then_some(state))
+    }
+
+    /// Marks a job that is still waiting to run as failed, without running it: one whose
+    /// scheduler stopped before it could start it under its caller.
+    pub async fn fail_pending_job(
+        &self,
+        job_id: &str,
+        error_code: JobErrorCode,
+        message: impl Into<String>,
+    ) -> Result<Option<JobState>> {
+        let error = super::state::JobError {
+            error_code,
+            message: message.into(),
+            sql_state: None,
+        };
+        let (state, failed) = self
+            .modify_job(job_id, |state| {
+                if state.status != JobStatus::Pending {
+                    return Ok(false);
+                }
+                state.set_failed(error.clone());
+                Ok(true)
+            })
+            .await?;
+        Ok(failed.then_some(state))
+    }
+
     /// Generates a new unique job ID.
     ///
     /// Returns a Databricks-style formatted ID like "01ABC-DEF-456-7890AB".
@@ -143,12 +201,26 @@ impl JobStore {
         read_only: bool,
         owner: String,
     ) -> Result<JobState> {
-        let job_id = Self::generate_job_id();
+        self.create_job_with_id(Self::generate_job_id(), request, read_only, owner)
+            .await
+    }
+
+    /// Creates a new pending job under `job_id` and stores it.
+    pub async fn create_job_with_id(
+        &self,
+        job_id: String,
+        request: SubmitQueryRequest,
+        read_only: bool,
+        owner: String,
+    ) -> Result<JobState> {
         let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
             .with_owner(owner)
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size);
         state.read_only = read_only;
+        // The scheduler that accepted the job holds it until it starts, so the recovery sweep
+        // can tell a queued job whose scheduler stopped.
+        state.scheduler_node = Some(self.node_id.clone());
         self.write_job_state(&mut state).await?;
         Ok(state)
     }
@@ -306,6 +378,7 @@ impl JobStore {
         job_id: &str,
         driver: &JobDriver,
         mut stream: SendableRecordBatchStream,
+        on_written: &(dyn Fn(u64) + Send + Sync),
     ) -> Result<JobResult> {
         let state = self.get_job(job_id).await?;
 
@@ -350,7 +423,16 @@ impl JobStore {
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
-                    .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
+                    .write_chunk(
+                        job_id,
+                        driver,
+                        chunk_index,
+                        &current_chunk_batches,
+                        ChunkBudget {
+                            written: total_bytes,
+                            maximum_size: state.maximum_size,
+                        },
+                    )
                     .await?;
                 total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
@@ -360,11 +442,7 @@ impl JobStore {
                     }
                 })?;
 
-                if let Some(maximum_size) = state.maximum_size
-                    && (total_bytes as u64) > maximum_size
-                {
-                    return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
-                }
+                on_written(u64::try_from(total_bytes).unwrap_or(u64::MAX));
 
                 chunk_indices.push(chunk_index);
                 chunk_row_offsets.push(committed_rows);
@@ -391,7 +469,16 @@ impl JobStore {
         // Flush remaining batches
         if !current_chunk_batches.is_empty() {
             let bytes = self
-                .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
+                .write_chunk(
+                    job_id,
+                    driver,
+                    chunk_index,
+                    &current_chunk_batches,
+                    ChunkBudget {
+                        written: total_bytes,
+                        maximum_size: state.maximum_size,
+                    },
+                )
                 .await?;
             total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                 super::error::Error::IntegerOverflow {
@@ -400,12 +487,6 @@ impl JobStore {
                     right_value: bytes,
                 }
             })?;
-
-            if let Some(maximum_size) = state.maximum_size
-                && (total_bytes as u64) > maximum_size
-            {
-                return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
-            }
 
             chunk_indices.push(chunk_index);
             chunk_row_offsets.push(committed_rows);
@@ -478,6 +559,7 @@ impl JobStore {
         driver: &JobDriver,
         chunk_index: usize,
         batches: &[RecordBatch],
+        budget: ChunkBudget,
     ) -> Result<usize> {
         if batches.is_empty() {
             return Ok(0);
@@ -499,6 +581,18 @@ impl JobStore {
 
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
+
+        // Checked before the chunk is stored, so a job that fails for its size never leaves
+        // more than `maximum_size` bytes of results behind.
+        if let Some(maximum_size) = budget.maximum_size
+            && u64::try_from(budget.written.saturating_add(bytes_len)).unwrap_or(u64::MAX)
+                > maximum_size
+        {
+            return Err(super::error::Error::MaximumJobSizeExceeded {
+                job_id: job_id.to_string(),
+                maximum_size,
+            });
+        }
 
         let written = fenced_put(
             self.store.as_ref(),
@@ -805,6 +899,20 @@ impl JobStore {
             deleted_objects,
         );
         Ok(deleted_count)
+    }
+
+    /// Deletes, best effort, the result chunks of `job_id`, as for a job whose results are
+    /// discarded. Returns how many it deleted.
+    pub(crate) async fn delete_job_chunks(&self, job_id: &str) -> usize {
+        let mut stream = self.store.list(Some(&self.job_chunks_prefix(job_id)));
+        let mut deleted = 0usize;
+        while let Some(entry) = stream.next().await {
+            let Ok(meta) = entry else { continue };
+            if self.store.delete(&meta.location).await.is_ok() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        deleted
     }
 
     fn jobs_prefix(&self) -> Path {
@@ -1446,6 +1554,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write empty stream");
@@ -1486,6 +1595,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write single batch stream");
@@ -1535,6 +1645,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -1584,6 +1695,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -1644,6 +1756,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -1680,6 +1793,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -1716,6 +1830,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream");
@@ -1770,6 +1885,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream within maximum size limit");
@@ -1818,12 +1934,19 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await;
 
             assert!(
                 matches!(result, Err(Error::MaximumJobSizeExceeded { .. })),
                 "Expected MaximumJobSizeExceeded error, got: {result:?}"
+            );
+            // The chunk that would pass the limit is never stored.
+            let chunk = job_store.read_chunk(&state.job_id, 0).await;
+            assert!(
+                matches!(chunk, Err(Error::ChunkNotFound { chunk_index: 0, .. })),
+                "a chunk over the maximum size must not be stored, got: {chunk:?}"
             );
         }
 
@@ -1859,6 +1982,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await;
 
@@ -1900,6 +2024,7 @@ mod tests {
                     &state.job_id,
                     &start(&job_store, &state.job_id).await,
                     stream,
+                    &|_| {},
                 )
                 .await
                 .expect("to write stream without maximum size limit");
@@ -2126,7 +2251,12 @@ mod tests {
             let successor_driver = taken.driver().expect("a driver");
 
             let err = former
-                .write_result_chunks_from_stream(&job_id, &former_driver, int_stream(vec![7, 7]))
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &former_driver,
+                    int_stream(vec![7, 7]),
+                    &|_| {},
+                )
                 .await
                 .expect_err("the former driver must not write results");
             assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
@@ -2152,7 +2282,12 @@ mod tests {
             );
 
             let result = successor
-                .write_result_chunks_from_stream(&job_id, &successor_driver, int_stream(vec![1, 2]))
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &successor_driver,
+                    int_stream(vec![1, 2]),
+                    &|_| {},
+                )
                 .await
                 .expect("the driver writes results");
             let done = successor
@@ -2181,6 +2316,7 @@ mod tests {
                     &job_id,
                     &started.driver().expect("a driver"),
                     int_stream(vec![9, 9, 9]),
+                    &|_| {},
                 )
                 .await
                 .expect("the driver writes while it drives");
@@ -2195,6 +2331,7 @@ mod tests {
                     &job_id,
                     &taken.driver().expect("a driver"),
                     int_stream(vec![1, 2]),
+                    &|_| {},
                 )
                 .await
                 .expect("the new driver writes over the former driver's chunk");

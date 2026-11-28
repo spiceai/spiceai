@@ -196,6 +196,10 @@ impl std::hash::Hash for VectorSearchTableFunc {
 }
 
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
+    runtime_search::request::check_sql_search_limit(parse_non_negative_limit(scalar)?)
+}
+
+fn parse_non_negative_limit(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
     match scalar {
         ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
             DataFusionError::Plan(format!(

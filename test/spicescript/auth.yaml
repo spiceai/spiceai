@@ -3,7 +3,8 @@ duration: 4s
 description: >
   With API keys required, HTTP and Flight accept a valid key (as `x-api-key`
   or a Bearer token, read-write or read-only) and refuse a missing or wrong
-  one with 401 / Unauthenticated, while /health stays public.
+  one with 401 / Unauthenticated, while /health stays public. The deprecated
+  `POST /v1/packages/generate` carries its deprecation headers on those refusals too.
 
 sources:
   src: { kind: postgres }
@@ -52,6 +53,23 @@ steps:
     expect: { status: 200, body-contains: '20' }
   - http: { path: /v1/datasets, api-key: none }
     expect: { status: 401 }
+
+  # The deprecated package endpoint names its deprecation on every answer, the refusals of
+  # authentication and write access included. Another route does not.
+  - http: { method: POST, path: /v1/packages/generate, api-key: none, headers: { content-type: application/json }, body: '{}' }
+    expect:
+      status: 401
+      headers:
+        deprecation: '@1794873600'
+        link: '<https://spiceai.org/docs/api/http/packages#deprecation>; rel="deprecation"; type="text/html"'
+  - http: { method: POST, path: /v1/packages/generate, api-key: reader-key, headers: { content-type: application/json }, body: '{}' }
+    expect:
+      status: 403
+      headers:
+        deprecation: '@1794873600'
+        link: '<https://spiceai.org/docs/api/http/packages#deprecation>; rel="deprecation"; type="text/html"'
+  - http: { method: POST, path: /v1/datasets/t/acceleration/refresh, api-key: none }
+    expect: { status: 401, lacks-headers: [deprecation, link] }
 
   # Flight.
   - query: SELECT count(*) AS n FROM t

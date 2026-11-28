@@ -46,8 +46,10 @@ pub struct SearchRequestBaseJson {
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
 
-    /// Number of documents to return for each dataset
+    /// Number of documents to return for each dataset, from 1 to 10000 (default 3). A response can therefore hold up to 10,000 rows for each dataset searched.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 10000))]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1, maximum = 10000))]
     pub limit: Option<usize>,
 
     /// An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.
@@ -97,6 +99,34 @@ pub struct SearchRequest {
     pub keywords: Vec<String>,
 }
 
+/// The most results a search returns for each dataset: `/v1/search`, the `search` tool, and the
+/// `limit` argument of the SQL `text_search` and `vector_search` functions.
+pub const MAX_SEARCH_LIMIT: usize = 10_000;
+
+/// `limit` when it is between 1 and [`MAX_SEARCH_LIMIT`]; otherwise the error `/v1/search` and the
+/// `search` tool return, which states the range, the value received and the fix.
+pub fn check_search_limit(limit: usize) -> std::result::Result<usize, String> {
+    if (1..=MAX_SEARCH_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(format!(
+            "`limit` must be between 1 and {MAX_SEARCH_LIMIT}, but was {limit}. Request fewer results, or use /v1/sql to read every row. See https://spiceai.org/docs/api/http/search"
+        ))
+    }
+}
+
+/// `limit` when it is between 1 and [`MAX_SEARCH_LIMIT`]; otherwise the planning error of the SQL
+/// `text_search` and `vector_search` functions, with the fix written for SQL.
+pub fn check_sql_search_limit(limit: u64) -> datafusion::error::Result<u64> {
+    if usize::try_from(limit).is_ok_and(|limit| (1..=MAX_SEARCH_LIMIT).contains(&limit)) {
+        Ok(limit)
+    } else {
+        Err(datafusion::error::DataFusionError::Plan(format!(
+            "`limit` must be between 1 and {MAX_SEARCH_LIMIT}, but was {limit}. Request fewer results, or query the table without a search function to read every row. See https://spiceai.org/docs/reference/sql/search"
+        )))
+    }
+}
+
 /// Rejects empty or whitespace-only search text for every consumer of
 /// [`SearchRequestBaseJson`] / [`SearchRequestHTTPJson`] (HTTP `/v1/search` and
 /// the MCP/search tool).
@@ -112,10 +142,11 @@ impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
 
     fn try_from(req: SearchRequestHTTPJson) -> Result<Self, Self::Error> {
         reject_empty_search_text(&req.base.text)?;
+        let limit = check_search_limit(req.base.limit.unwrap_or(default_limit()))?;
         Ok(SearchRequest::new(
             req.base.text,
             req.base.datasets,
-            req.base.limit.unwrap_or(default_limit()),
+            limit,
             req.base
                 .where_cond
                 .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
@@ -132,10 +163,11 @@ impl TryFrom<SearchRequestBaseJson> for SearchRequest {
 
     fn try_from(req: SearchRequestBaseJson) -> Result<Self, Self::Error> {
         reject_empty_search_text(&req.text)?;
+        let limit = check_search_limit(req.limit.unwrap_or(default_limit()))?;
         Ok(SearchRequest::new(
             req.text,
             req.datasets,
-            req.limit.unwrap_or(default_limit()),
+            limit,
             req.where_cond
                 .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
                 .transpose()?,

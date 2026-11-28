@@ -309,8 +309,8 @@ fn adopt_spicepod(
 }
 
 /// Sends the step's request, retrying as its timing asks, until the response
-/// carries what the step expects.
-pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<String> {
+/// carries what the step expects, then keeps the values it captures.
+pub(super) async fn http_step(instance: &mut Instance, step: &HttpStep) -> Result<String> {
     let started = Instant::now();
     let headers = step
         .headers
@@ -323,16 +323,19 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         .iter()
         .map(|(k, v)| Ok((k.clone(), instance.sql(v)?)))
         .collect::<Result<Vec<_>>>()?;
-    let path = with_query(&step.path, &query);
-    loop {
+    let path = with_query(&instance.sql(&step.path)?, &query);
+    let instance_ref = &*instance;
+    let outcome = loop {
         let result = async {
-            let response = instance
+            let response = instance_ref
                 .spiced
                 .http(&step.method, &path, &headers, body.as_deref(), &step.key)
                 .await;
             if step.refused {
                 return match response {
-                    Err(e) if is_connection_refused(&e) => Ok("connection refused".to_string()),
+                    Err(e) if is_connection_refused(&e) => {
+                        Ok(("connection refused".to_string(), String::new()))
+                    }
                     Err(e) => Err(e.context("expected the connection to be refused")),
                     Ok((status, _, text)) => Err(anyhow!(
                         "spiced answered {status}, expected the connection to be refused: {}",
@@ -394,14 +397,46 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
                         .map(|(k, v)| format!("{k}: {v}"))
                 })
                 .collect();
-            Ok(format!("{status} {}", shown.join(", ")))
+            Ok((format!("{status} {}", shown.join(", ")), text))
         }
         .await;
         if let Some(outcome) = settled(step.timing, started, result) {
-            return outcome;
+            break outcome;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let (shown, text) = outcome?;
+    capture(instance, &step.capture, &text)?;
+    Ok(shown)
+}
+
+/// Keeps the values of the JSON body `text` that `pointers` names, as
+/// `${captured.<name>}` for later steps.
+fn capture(instance: &mut Instance, pointers: &[(String, String)], text: &str) -> Result<()> {
+    if pointers.is_empty() {
+        return Ok(());
     }
+    let body: Value = serde_json::from_str(text)
+        .with_context(|| format!("`capture` needs a JSON body, got {}", one_line(text, 200)))?;
+    let Value::Object(context) = &mut instance.context else {
+        bail!("the instance's placeholders are not a mapping");
+    };
+    let Value::Object(captured) = context
+        .entry("captured")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+    else {
+        bail!("`captured` is not a mapping");
+    };
+    for (name, pointer) in pointers {
+        let value = body.pointer(pointer).with_context(|| {
+            format!(
+                "`capture` {name}: {pointer} reaches nothing in {}",
+                one_line(text, 200)
+            )
+        })?;
+        captured.insert(name.clone(), value.clone());
+    }
+    Ok(())
 }
 
 /// Whether `error` is a request that no listener accepted.

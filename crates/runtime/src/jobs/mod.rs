@@ -22,6 +22,7 @@ limitations under the License.
 //! - Results are chunked and stored in the shared object store
 //! - Only works in cluster mode (requires scheduler state location)
 
+mod admission;
 mod error;
 mod executor;
 mod state;
@@ -29,6 +30,7 @@ mod store;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+pub use admission::{Limits as JobLimits, MAX_JOB_RESULT_BYTES};
 pub use error::{Error, Result};
 pub use executor::JobExecutor;
 pub use state::JobErrorCode;
@@ -48,4 +50,10 @@ pub use store::JobStore;
 pub async fn current_job_owner() -> String {
     let context = RequestContext::current(AsyncMarker::new().await);
     context.cache_namespace().storage_id().to_string()
+}
+
+/// Milliseconds since the Unix epoch now.
+#[must_use]
+pub(crate) fn now_ms() -> u64 {
+    state::now_ms_or_zero()
 }

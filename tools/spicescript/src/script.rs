@@ -905,6 +905,9 @@ pub struct HttpStep {
     pub body_lacks: Vec<regex::Regex>,
     /// Predicates over the body parsed as JSON.
     pub json: Vec<crate::json_assert::JsonAssertion>,
+    /// Values of the JSON body kept for later steps, by name and JSON Pointer:
+    /// a later step reads one as `${captured.<name>}`.
+    pub capture: Vec<(String, String)>,
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
@@ -2398,6 +2401,19 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 Some(_) => bail!("`expect` must be a mapping"),
             };
             inner.finish()?;
+            let capture = match opts.take("capture") {
+                None => Vec::new(),
+                Some(Value::Object(m)) => m
+                    .into_iter()
+                    .map(|(name, pointer)| match pointer {
+                        Value::String(p) if p.starts_with('/') => Ok((name, p)),
+                        _ => bail!(
+                            "`capture` maps each name to a JSON Pointer, such as `/queries/0/query_id`"
+                        ),
+                    })
+                    .collect::<Result<_>>()?,
+                Some(_) => bail!("`capture` must map names to JSON Pointers"),
+            };
             let timing = opts.timing("a check")?;
             Action::Http(HttpStep {
                 method,
@@ -2412,6 +2428,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 body_matches,
                 body_lacks,
                 json,
+                capture,
                 timing,
                 key,
                 refused,

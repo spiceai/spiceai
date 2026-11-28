@@ -16,7 +16,10 @@ limitations under the License.
 
 use async_trait::async_trait;
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, Tool, object},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject, Tool,
+        object,
+    },
     service::ServiceError,
 };
 use serde_json::Value;
@@ -241,7 +244,7 @@ impl McpProxy for McpToolWrapper {
         if self.reconnected_after_close(&result).await {
             result = self.client.read().await.call_tool(params).await;
         }
-        result
+        result.map(|response| self.within_result_limit(response))
     }
 
     async fn call_tool_once(
@@ -258,9 +261,40 @@ impl McpProxy for McpToolWrapper {
         if self.reconnected_after_close(&result).await {
             result = self.client.read().await.call_tool_once(request).await;
         }
-        result
+        result.map(|response| match response {
+            CallToolResponse::Complete(result) => {
+                CallToolResponse::Complete(self.within_result_limit(result))
+            }
+            other => other,
+        })
     }
 }
+
+impl McpToolWrapper {
+    /// `result`, or in its place a tool error when it is larger than [`MAX_TOOL_RESULT_SIZE`].
+    ///
+    /// A proxied call (`/v1/mcp`) holds to the same limit as [`SpiceModelTool::call`]: the
+    /// oversized result is dropped here, before the gateway records it in task history or
+    /// returns it. The failure is reported in the result (`isError`), as the gateway reports
+    /// any other tool failure, so the caller sees why the call failed.
+    fn within_result_limit(&self, result: CallToolResult) -> CallToolResult {
+        if !result_exceeds_limit(&result, MAX_TOOL_RESULT_SIZE) {
+            return result;
+        }
+        let (_, exposed_name) = Self::task_history_labels(&self.server_name, &self.spec);
+        let message = tool_result_too_large_message(&exposed_name);
+        tracing::warn!("{message}");
+        CallToolResult::error(vec![ContentBlock::text(message)])
+    }
+}
+
+// A stdio MCP server's message is one line, and rmcp drops a line longer than this before
+// decoding it. The bound keeps a stdio server's response from growing without limit before
+// `within_result_limit` can measure it, so it must stay finite and close to the result limit.
+const _: () = assert!(
+    rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH <= MAX_TOOL_RESULT_SIZE,
+    "rmcp's stdio line limit must not exceed the MCP tool result limit"
+);
 
 /// The text of a transport failure, without the client-type prefix the
 /// transport puts in front of an over-limit response.

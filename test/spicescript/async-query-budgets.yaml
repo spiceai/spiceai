@@ -1,0 +1,385 @@
+name: async-query-budgets
+duration: 158s
+description: >
+  On a scheduler, each caller runs up to 64 async queries at once. Further
+  queries wait as PENDING and start in submission order as running ones
+  finish or are cancelled; another caller is unaffected; a `maximum_size`
+  above 100 GiB is refused with 400; the scheduler publishes how many it
+  holds. When the scheduler holding the queries is killed and started
+  again, it starts with an empty budget and the queries it takes over count
+  against it: it publishes a public caller's 64 running and 4 waiting queries
+  as its own, a new query waits behind them, and the waiting ones start in
+  their order; an authenticated caller's fail with a request to resubmit, as
+  its running ones do. (Two schedulers each admitting up to 64:
+  async-query-budgets-schedulers.yaml.)
+
+sources:
+  lake: { kind: files }
+
+variants:
+  authenticated: {}
+  public: { spicepod: { runtime: { auth: { api-key: { enabled: false } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: async-query-budgets
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [a-key:rw, b-key]
+  datasets:
+    - from: 'file://${sources.lake.path}/nums/'
+      name: nums
+      params: { file_format: parquet }
+    - from: 'file://${sources.lake.path}/wide/'
+      name: wide
+      params: { file_format: parquet }
+
+defaults:
+  cluster: { executors: 1 }
+  api-key: a-key
+  compare-variants: false
+
+steps:
+  - generate:
+      lake:
+        table: nums
+        rows: 2000
+        seed: 31
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+  # Each long query reads 2000 x 2000 x 16000 rows, so none finishes on its own while the
+  # script runs: only the timeout, a cancel or the kill ends one.
+  - generate:
+      lake:
+        table: wide
+        rows: 16000
+        seed: 32
+        primary-key: id
+        format: parquet
+        columns:
+          - { name: id, sequence: 1 }
+  - start: {}
+
+  # A `maximum_size` above 100 GiB is refused, never lowered, and creates no job.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT 1", "maximum_size": 214748364800}' }
+    expect:
+      status: 400
+      json:
+        - { pointer: /error, equals: '`maximum_size` is 214748364800 bytes, above 107374182400 (100 GiB), the most an async query can store. Omit it to use 100 GiB, or set a smaller value. See https://spiceai.org/docs/api/http/queries' }
+
+  # 70 queries that run far longer than this script (a filtered three-way cross join of 2,000
+  # rows), except the first, which stops at its 20 s timeout: 64 run, 6 wait.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 1", "timeout_seconds": 30}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 2"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 3"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 4"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 5"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 6"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 7"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 8"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 9"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 10"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 11"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 12"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 13"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 14"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 15"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 16"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 17"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 18"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 19"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 20"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 21"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 22"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 23"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 24"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 25"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 26"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 27"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 28"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 29"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 30"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 31"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 32"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 33"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 34"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 35"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 36"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 37"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 38"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 39"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 40"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 41"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 42"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 43"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 44"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 45"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 46"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 47"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 48"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 49"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 50"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 51"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 52"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 53"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 54"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 55"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 56"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 57"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 58"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 59"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 60"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 61"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 62"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 63"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 64"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 65"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 66"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 67"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 68"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 69"}' }
+    expect: { status: 202 }
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 70"}' }
+    expect: { status: 202 }
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 64 } ] }
+    eventually: 60s
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 6 }
+        - { pointer: /queries/*/sql_preview, matches: '> (65|66|67|68|69|70)$' }
+
+  # The scheduler publishes what it holds, and that it has refused nothing yet.
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, above: 63, timeout: 30s }
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, above: 5, timeout: 30s }
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, below: 7, timeout: 30s }
+  - wait-metric: { name: async_query_submissions_rejected, labels: { reason: queue_full }, below: 1, timeout: 30s }
+  - wait-metric: { name: async_query_submissions_rejected, labels: { reason: result_budget }, below: 1, timeout: 30s }
+
+  # Cancelling a running query starts the oldest waiting one, and the rest keep waiting.
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /queries/0/sql_preview, matches: '> 64$' } ] }
+    capture: { newest_running: /queries/0/query_id }
+  - http: { method: POST, path: '/v1/queries/${captured.newest_running}/cancel' }
+    expect: { status: 200, json: [ { pointer: /status, equals: CANCELLED } ] }
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 5 }
+        - { pointer: /queries/*/sql_preview, matches: '> (66|67|68|69|70)$' }
+    eventually: 30s
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 64 }
+        - { pointer: /queries/*/sql_preview, matches: '> 65$', count: 1 }
+    eventually: 30s
+
+  # Another caller is unaffected: its query runs at once.
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 0"}', api-key: b-key }
+    expect: { status: 202 }
+    only: authenticated
+  - http: { method: GET, path: /v1/queries, query: { status: running }, api-key: b-key }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 1 } ] }
+    eventually: 30s
+    only: authenticated
+
+  # When the first query reaches its timeout, the oldest waiting query starts, and the rest
+  # keep waiting.
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 4 }
+        - { pointer: /queries/*/sql_preview, matches: '> (67|68|69|70)$' }
+    eventually: 90s
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 64 } ] }
+    eventually: 30s
+
+  # The scheduler holding the queries is killed and started again, with an empty budget. A
+  # public caller's queries are taken over and count against it: the 64 running take its 64
+  # slots and the 4 waiting keep their order and count. An authenticated caller's queries
+  # cannot be run without the request that submitted them, so they fail with a request to
+  # resubmit.
+  - kill-spiced: {}
+  - start: {}
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 4 }
+        - { pointer: /queries/*/sql_preview, matches: '> (67|68|69|70)$' }
+    consistently: 20s
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 64 } ] }
+    eventually: 60s
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 0 } ] }
+    eventually: 60s
+    only: authenticated
+  - http: { method: GET, path: /v1/queries, query: { status: failed } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 69 }
+    eventually: 60s
+    only: authenticated
+  # They failed with the request to resubmit, not for any other reason: the newest, which was
+  # waiting, says so through the API, and the log names each running query (this caller's 64
+  # and the other caller's 1) and each of the 4 waiting.
+  - http: { method: GET, path: /v1/queries, query: { status: failed } }
+    expect: { status: 200, json: [ { pointer: /queries/0/sql_preview, matches: '> 70$' } ] }
+    capture: { newest_failed: /queries/0/query_id }
+    only: authenticated
+  - http: { method: GET, path: '/v1/queries/${captured.newest_failed}' }
+    expect:
+      status: 200
+      json:
+        - { pointer: /status, equals: FAILED }
+        - { pointer: /error/error_code, equals: SCHEDULER_UNAVAILABLE }
+        - { pointer: /error/message, equals: 'The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.' }
+    only: authenticated
+  - assert-log:
+      count:
+        'was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query': 65
+        'was waiting on a scheduler that stopped, and it cannot be run under the identity that submitted it, so it is marked failed; resubmit the query': 4
+    only: authenticated
+  - http: { method: GET, path: /v1/queries, query: { status: cancelled } }
+    expect: { status: 200, json: [ { pointer: /total_count, equals: 1 } ] }
+
+  # The job records above read the same whether or not the started scheduler took the queries
+  # over, so what it holds shows that it did: the 4 waiting queries wait here, and the 64
+  # running hold the caller's 64 running slots here.
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, above: 3, timeout: 120s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, below: 5, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, above: 63, timeout: 60s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
+    only: public
+  # Its budget holds them: a new query waits behind the 4, and cancelling a running query
+  # starts the oldest waiting one. (A submission is answered PENDING whether it runs at once or
+  # waits, so the queue shows which.)
+  - http: { method: POST, path: /v1/queries, headers: { content-type: application/json }, body: '{"sql": "SELECT count(*) AS n FROM nums a, nums b, wide c WHERE a.id + b.id + c.id > 71"}' }
+    expect: { status: 202 }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 5 }
+        - { pointer: /queries/*/sql_preview, matches: '> (67|68|69|70|71)$' }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect: { status: 200, json: [ { pointer: /queries/0/sql_preview, matches: '> 66$' } ] }
+    capture: { newest_running: /queries/0/query_id }
+    only: public
+  - http: { method: POST, path: '/v1/queries/${captured.newest_running}/cancel' }
+    expect: { status: 200, json: [ { pointer: /status, equals: CANCELLED } ] }
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: pending } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 4 }
+        - { pointer: /queries/*/sql_preview, matches: '> (68|69|70|71)$' }
+    eventually: 30s
+    only: public
+  - http: { method: GET, path: /v1/queries, query: { status: running } }
+    expect:
+      status: 200
+      json:
+        - { pointer: /total_count, equals: 64 }
+        - { pointer: /queries/*/sql_preview, matches: '> 67$', count: 1 }
+    eventually: 30s
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, above: 63, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: running }, below: 65, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, above: 3, timeout: 30s }
+    only: public
+  - wait-metric: { name: async_query_active_count, labels: { status: pending }, below: 5, timeout: 30s }
+    only: public
