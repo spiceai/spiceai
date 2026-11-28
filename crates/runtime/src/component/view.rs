@@ -175,13 +175,14 @@ fn view_definition(
             Arc::clone(&view.runtime).get_valid_datasets(&view.app, crate::LogErrors(false))
         };
         for name in names {
-            let read = if let Some(dataset) = datasets.iter().find(|ds| ds.name == name) {
+            let read = if let Some(dataset) = datasets.iter().find(|ds| same_table(&ds.name, &name))
+            {
                 dataset.definition().await?
             } else if let Some(spec) = view
                 .app
                 .views
                 .iter()
-                .find(|spec| TableReference::from(spec.name.as_str()) == name)
+                .find(|spec| same_table(&TableReference::from(spec.name.as_str()), &name))
                 && depth < MAX_VIEW_DEPTH
             {
                 let builder = super::view::ViewBuilder::try_from(spec.clone())
@@ -216,6 +217,17 @@ fn view_definition(
 
 /// The tables `sql` reads, or none when it does not parse (the view then fails
 /// to register on its own).
+/// Whether `a` and `b` name one table: a reference the SQL qualifies
+/// (`spice.public.orders`, `public.orders`) names the dataset the Spicepod calls
+/// `orders`, as the query planner resolves it.
+fn same_table(a: &TableReference, b: &TableReference) -> bool {
+    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+    a.clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        == b.clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
 fn read_table_names(sql: &str) -> Vec<TableReference> {
     use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
     match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
@@ -389,5 +401,49 @@ mod tests {
             message.contains("WARN forged"),
             "the name is still reported in full, only escaped: {message:?}"
         );
+    }
+
+    /// The definition of a view over `sql`, in an app whose dataset `orders` reads `from`.
+    async fn view_definition_over(sql: &str, from: &str) -> runtime_acceleration::SourceDefinition {
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: recent_orders\nsql: {sql:?}\n")).expect("yaml parses");
+        let app = std::sync::Arc::new(
+            app::AppBuilder::new("view_definition_test")
+                .with_dataset(spicepod::component::dataset::Dataset::new(from, "orders"))
+                .with_view(view.clone())
+                .build(),
+        );
+        let runtime = std::sync::Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::App::clone(&app))
+                .build()
+                .await,
+        );
+        let spec = ViewBuilder::try_from(view).expect("view builds").build();
+        super::view_definition(&super::View::new(spec, runtime, app), 0)
+            .await
+            .expect("the view's definition resolves")
+    }
+
+    /// A view that names its dataset by a qualified reference reads that dataset, so its
+    /// definition carries the dataset's source: two views over datasets of different sources
+    /// are different definitions however the SQL spells the name.
+    #[tokio::test]
+    async fn a_qualified_reference_resolves_to_the_dataset_it_names() {
+        for sql in [
+            "SELECT * FROM orders",
+            "SELECT * FROM public.orders",
+            "SELECT * FROM spice.public.orders",
+        ] {
+            for from in ["s3://bucket-a/orders/", "s3://bucket-b/orders/"] {
+                let definition = view_definition_over(sql, from).await;
+                let froms = definition
+                    .reads
+                    .iter()
+                    .map(|(_, read)| read.from.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(froms, vec![from], "`{sql}` must read the dataset `orders`");
+            }
+        }
     }
 }
