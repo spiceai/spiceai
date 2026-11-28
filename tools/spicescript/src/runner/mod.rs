@@ -1220,30 +1220,18 @@ async fn create_instances(
                 source_ctx.insert(name.clone(), Value::Object(entry));
                 namespaces.insert(name.clone(), namespace);
             }
-            // `spiced` serves HTTP on every interface when `rootless_reach`
-            // is set, so its port must be free on the wildcard address too.
-            // A port served beyond loopback must be free there too: a loopback
-            // probe misses a listener on another address. Bridged nodes serve
-            // the scheduler and executor ports at the routable address.
-            let wide_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
-            let loopback_ip: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
-            let http_port = crate::docker::free_port_on(if rootless_reach || bridge.is_some() {
-                wide_ip
-            } else {
-                loopback_ip
-            })?;
-            let node_ip = if bridge.is_some() {
-                wide_ip
-            } else {
-                loopback_ip
-            };
+            let probe = ProbeAddresses::new(rootless_reach, bridge.is_some(), variant.listen);
+            // A read-write API key of this instance's own, for a client that cannot be told
+            // the script's (a CDC sink). `spiced` requires it when this runner binds it beyond
+            // loopback; see `wide_listener` below.
+            let instance_api_key = format!("spicescript-{run_id}-{index}");
             let context = json!({
                 "sources": source_ctx,
                 "matrix": combo,
                 "variant": { "name": variant_name },
-                "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port_on(node_ip)?,
-                    "executor_port": crate::docker::free_port_on(node_ip)?, "http_port": http_port,
-                    "flight_port": crate::docker::free_port_on(node_ip)?,
+                "instance": { "name": label, "dir": dir.display().to_string(), "api_key": instance_api_key, "port": crate::docker::free_port_on(probe.node)?,
+                    "executor_port": crate::docker::free_port_on(probe.node)?, "http_port": crate::docker::free_port_on(probe.http)?,
+                    "flight_port": crate::docker::free_port_on(probe.flight)?,
                     "host_from_container": host_from_container },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
@@ -1253,6 +1241,19 @@ async fn create_instances(
                 .with_context(|| format!("variant '{variant_name}'"))?;
             let mut spicepod = template::substitute(&spicepod, &context)?;
             disable_results_cache_unless_configured(&mut spicepod);
+            // This runner binds `spiced` beyond loopback where a container could not reach it
+            // otherwise (a rootless daemon, a bridge container). Without `runtime.auth` such a
+            // listener serves a caller without credentials read-only, so the runner configures
+            // the instance's own read-write key there, as a user exposing `spiced` would, and
+            // sends it with every step that names no other. A `listen: every-interface` variant
+            // binds beyond loopback to check what such a caller is served there, so it gets no
+            // key, though its ports are probed on every interface (see `ProbeAddresses`).
+            let api_key = default_api_key(
+                &mut spicepod,
+                runner_configures_auth(rootless_reach, bridge.is_some(), variant.listen),
+                &instance_api_key,
+                script.defaults.api_key.as_deref(),
+            );
             let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
             let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
             let cluster = runs_cluster(script, options);
@@ -1413,6 +1414,10 @@ async fn create_instances(
                 .transpose()
                 .context("the sidecar")?;
             let mut spiced = Spiced::new(first_binary.clone(), dir, env)?;
+            // Widen the listeners first, so the ports the script was told in advance, set
+            // below and probed where they are served, are served as given.
+            spiced.set_http_on_every_interface(rootless_reach)?;
+            spiced.set_every_interface(variant.listen == crate::script::Listen::EveryInterface)?;
             let port = |name: &str| {
                 context["instance"][name]
                     .as_u64()
@@ -1421,11 +1426,10 @@ async fn create_instances(
             if let Some(port) = port("http_port") {
                 spiced.set_http_port(port);
             }
-            spiced.set_http_on_every_interface(rootless_reach);
             if let Some(port) = port("flight_port") {
                 spiced.set_flight_port(port);
             }
-            spiced.set_api_key(script.defaults.api_key.clone())?;
+            spiced.set_api_key(api_key)?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
             if let Some((scheduler, _)) = &cluster_args {
                 spiced_args.extend(scheduler.iter().cloned());
@@ -1460,6 +1464,38 @@ async fn create_instances(
         }
     }
     Ok(instances)
+}
+
+/// The address each port a script is told in advance (`${instance.http_port}` and its
+/// siblings) is probed on before it is given out: the address its listener binds, because a
+/// loopback probe misses a listener on another address (see `docker::free_port_on`).
+#[derive(Debug, PartialEq, Eq)]
+struct ProbeAddresses {
+    http: std::net::IpAddr,
+    flight: std::net::IpAddr,
+    /// The scheduler and executor ports of a cluster node.
+    node: std::net::IpAddr,
+}
+
+impl ProbeAddresses {
+    /// HTTP binds every interface behind a rootless Docker daemon, which cannot reach this
+    /// machine's loopback; a bridged cluster's nodes serve at the routable address; and
+    /// `listen: every-interface` binds HTTP and Flight on every interface.
+    fn new(rootless_reach: bool, bridged: bool, listen: crate::script::Listen) -> Self {
+        let every_interface = listen == crate::script::Listen::EveryInterface;
+        let at = |wide: bool| -> std::net::IpAddr {
+            if wide {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            }
+        };
+        Self {
+            http: at(rootless_reach || bridged || every_interface),
+            flight: at(bridged || every_interface),
+            node: at(bridged),
+        }
+    }
 }
 
 /// The sidecar of the instance whose placeholders are `context`, in a
@@ -1903,6 +1939,56 @@ fn disable_results_cache_unless_configured(spicepod: &mut Value) {
         .or_insert_with(|| json!({ "enabled": false }));
 }
 
+/// The API key sent with each step that names none, for an instance whose spicepod is
+/// `spicepod`. When this runner binds `spiced` beyond loopback (`wide_listener`) and the
+/// spicepod configures no `runtime.auth`, the runner configures it with the instance's own
+/// read-write key, `instance_api_key`, the only key `spiced` then accepts, so that key is sent
+/// even when the script sets `defaults.api-key`, which nothing configured. The script's
+/// `defaults.api-key`, `script_api_key`, is sent otherwise.
+fn default_api_key(
+    spicepod: &mut Value,
+    wide_listener: bool,
+    instance_api_key: &str,
+    script_api_key: Option<&str>,
+) -> Option<String> {
+    if wide_listener && spicepod.pointer("/runtime/auth").is_none_or(Value::is_null) {
+        require_api_key(spicepod, instance_api_key);
+        return Some(instance_api_key.to_string());
+    }
+    script_api_key.map(str::to_string)
+}
+
+/// Whether this runner configures the instance's own key in `runtime.auth`: where it binds
+/// `spiced` beyond loopback only so that a container can reach it (a rootless daemon, a bridge
+/// container). A `listen: every-interface` variant binds beyond loopback to check what a caller
+/// without credentials is served there, so it is left without a key.
+fn runner_configures_auth(
+    rootless_reach: bool,
+    bridged: bool,
+    listen: crate::script::Listen,
+) -> bool {
+    (rootless_reach || bridged) && listen != crate::script::Listen::EveryInterface
+}
+
+/// Configures `runtime.auth` on `spicepod` with one read-write API key, `key`.
+fn require_api_key(spicepod: &mut Value, key: &str) {
+    let Value::Object(root) = spicepod else {
+        return;
+    };
+    let runtime = root
+        .entry("runtime")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !runtime.is_object() {
+        *runtime = Value::Object(Map::new());
+    }
+    if let Value::Object(runtime) = runtime {
+        runtime.insert(
+            "auth".to_string(),
+            json!({ "api-key": { "enabled": true, "keys": [format!("{key}:rw")] } }),
+        );
+    }
+}
+
 /// Applies a start's `patch:` to the instance's spicepod, for this and every
 /// later start.
 fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<()> {
@@ -1912,6 +1998,10 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
     ensure!(
         patch.env.is_empty(),
         "a start's `patch` cannot change `env`; an instance's environment is fixed when it is created"
+    );
+    ensure!(
+        patch.listen == crate::script::Listen::Loopback,
+        "a start's `patch` cannot change `listen`; set it on a variant"
     );
     let resolved = VariantSpec {
         spicepod: patch
@@ -1930,6 +2020,7 @@ fn apply_patch(instance: &mut Instance, patch: Option<&VariantSpec>) -> Result<(
             .map(|(k, v)| Ok((k.clone(), template::substitute(v, &instance.context)?)))
             .collect::<Result<_>>()?,
         env: patch.env.clone(),
+        listen: patch.listen,
         when: Map::new(),
     };
     template::apply_variant(&mut instance.spicepod, &resolved)?;
@@ -2026,6 +2117,122 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Each port a script is told in advance is probed where its listener binds: on every
+    /// interface for `listen: every-interface`, for HTTP behind a rootless daemon, and for a
+    /// bridged cluster, and otherwise at loopback.
+    #[test]
+    fn a_port_is_probed_where_its_listener_binds() {
+        use crate::script::Listen;
+        let every: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+        let loopback: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let probe = |http, flight, node| ProbeAddresses { http, flight, node };
+        for (rootless_reach, bridged, listen, expected) in [
+            (
+                false,
+                false,
+                Listen::Loopback,
+                probe(loopback, loopback, loopback),
+            ),
+            (
+                false,
+                false,
+                Listen::EveryInterface,
+                probe(every, every, loopback),
+            ),
+            (
+                true,
+                false,
+                Listen::Loopback,
+                probe(every, loopback, loopback),
+            ),
+            (
+                true,
+                false,
+                Listen::EveryInterface,
+                probe(every, every, loopback),
+            ),
+            (false, true, Listen::Loopback, probe(every, every, every)),
+        ] {
+            assert_eq!(
+                ProbeAddresses::new(rootless_reach, bridged, listen),
+                expected,
+                "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
+            );
+        }
+    }
+
+    /// The runner configures the instance's own key only where it widened the listener so a
+    /// container can reach it; a `listen: every-interface` variant keeps serving callers
+    /// without credentials, which is what it checks.
+    #[test]
+    fn an_every_interface_variant_is_left_without_a_key() {
+        use crate::script::Listen;
+        for (rootless_reach, bridged, listen, expected) in [
+            (false, false, Listen::Loopback, false),
+            (false, false, Listen::EveryInterface, false),
+            (true, false, Listen::Loopback, true),
+            (true, false, Listen::EveryInterface, false),
+            (false, true, Listen::Loopback, true),
+            (false, true, Listen::EveryInterface, false),
+        ] {
+            assert_eq!(
+                runner_configures_auth(rootless_reach, bridged, listen),
+                expected,
+                "rootless reach: {rootless_reach}, bridged: {bridged}, {listen:?}"
+            );
+        }
+    }
+
+    /// A step that names no API key is sent one the instance's `runtime.auth` accepts. Where
+    /// this runner binds `spiced` beyond loopback and the spicepod configures no `runtime.auth`,
+    /// the runner configures the instance's own key, the only one `spiced` then accepts, so that
+    /// key is sent whatever the script's `defaults.api-key`. Otherwise the spicepod is left as
+    /// the script wrote it, and the script's own key is sent.
+    #[test]
+    fn a_step_naming_no_key_is_sent_one_the_instance_accepts() {
+        let instance = "spicescript-run-0";
+        let no_auth = json!({ "datasets": [] });
+        let own_auth = json!({ "runtime": { "auth": { "api-key": { "enabled": true, "keys": ["writer:rw"] } } } });
+        for (wide_listener, spicepod, script_key, sent, accepted) in [
+            (
+                true,
+                &no_auth,
+                Some("writer"),
+                Some(instance),
+                Some(json!(["spicescript-run-0:rw"])),
+            ),
+            (
+                true,
+                &no_auth,
+                None,
+                Some(instance),
+                Some(json!(["spicescript-run-0:rw"])),
+            ),
+            (
+                true,
+                &own_auth,
+                Some("writer"),
+                Some("writer"),
+                Some(json!(["writer:rw"])),
+            ),
+            (false, &no_auth, Some("writer"), Some("writer"), None),
+            (false, &no_auth, None, None, None),
+        ] {
+            let case =
+                format!("wide listener: {wide_listener}, script key: {script_key:?}, {spicepod}");
+            let mut spicepod = spicepod.clone();
+            let key = default_api_key(&mut spicepod, wide_listener, instance, script_key);
+            assert_eq!(
+                (
+                    key.as_deref(),
+                    spicepod.pointer("/runtime/auth/api-key/keys").cloned()
+                ),
+                (sent, accepted),
+                "{case}"
+            );
+        }
+    }
 
     /// An executor gives back its share of the combination's reservation the
     /// first time it starts, and only then: a restart (after `kill-executor`)

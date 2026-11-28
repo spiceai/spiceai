@@ -104,6 +104,9 @@ fn forward_stderr(tool_name: String, stderr: ChildStderr) {
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
 
+    /// Which of the server's tools only read (`access`, `read_only_tools` on its `tools:` entry).
+    access: super::access::McpToolAccess,
+
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
     description: Option<String>,
@@ -376,6 +379,22 @@ impl Drop for McpToolCatalog {
 }
 
 impl McpToolCatalog {
+    /// Declares which of the server's tools only read (see [`super::access::McpToolAccess`]);
+    /// every tool can write otherwise.
+    #[must_use]
+    pub(crate) fn with_access(mut self, access: super::access::McpToolAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// The names of the tools the server reported in its last `tools/list`.
+    pub(crate) fn listed_tool_names(&self) -> Vec<String> {
+        self.tool_cache
+            .read()
+            .map(|cache| cache.tools.keys().map(ToString::to_string).collect())
+            .unwrap_or_default()
+    }
+
     pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
         let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
@@ -454,6 +473,7 @@ impl McpToolCatalog {
 
         let catalog = Self {
             client,
+            access: super::access::McpToolAccess::default(),
             name: name.to_string(),
             description,
             heartbeat_task,
@@ -722,6 +742,7 @@ impl McpToolCatalog {
         });
         Self {
             client: Arc::clone(&client),
+            access: super::access::McpToolAccess::default(),
             name: name.to_string(),
             description: None,
             heartbeat_task: tokio::spawn(async {}),
@@ -1150,11 +1171,13 @@ impl SpiceToolCatalog for McpToolCatalog {
         tools
             .into_iter()
             .map(|t| {
+                let access = self.access.of(&t.name);
                 Arc::new(McpToolWrapper::new(
                     Arc::clone(&self.client),
                     self.with_spicepod_description(t),
                     self.name.clone(),
                     Arc::clone(&self.reconnector),
+                    access,
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()
@@ -1189,11 +1212,13 @@ impl SpiceToolCatalog for McpToolCatalog {
             return None;
         };
 
+        let access = self.access.of(&tool.name);
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             self.with_spicepod_description(tool),
             self.name.clone(),
             Arc::clone(&self.reconnector),
+            access,
         )))
     }
 
@@ -1207,11 +1232,13 @@ impl SpiceToolCatalog for McpToolCatalog {
             let cache = self.tool_cache.read().ok()?;
             try_get_cached_spec(&cache, name, Instant::now())?.clone()
         };
+        let access = self.access.of(&spec.name);
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             self.with_spicepod_description(spec),
             self.name.clone(),
             Arc::clone(&self.reconnector),
+            access,
         )))
     }
 
@@ -1228,6 +1255,7 @@ impl SpiceToolCatalog for McpToolCatalog {
                     self.with_spicepod_description(spec.clone()),
                     self.name.clone(),
                     Arc::clone(&self.reconnector),
+                    self.access.of(&spec.name),
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()

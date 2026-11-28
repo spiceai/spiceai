@@ -217,7 +217,7 @@ as changing the script.
 | `duckdb` | A DuckDB file per instance, written before `start` or while Spice is stopped. `${sources.<name>.params}` holds `duckdb_open`; `.path` is the file path and `.adbc_params` holds the DuckDB ADBC parameters. CLI and library are one DuckDB release (see **DuckDB releases**). |
 | `ducklake` | A DuckLake lake with its catalog in PostgreSQL, written with the CLI of one DuckDB release (see **DuckDB releases**). `version` is that release; the catalog runs the default PostgreSQL image. |
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
-| `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms`, `times`, `repeat` (the body is `body` that many times over, with any `{i}` in it replaced by each copy's index, so the copies differ as real records do) and `encoding: gzip` or `encoding: zstd` (the body is sent compressed, gzip at its best level or zstd at level 3, with `Content-Encoding`, for a response small on the wire that decodes to many times its size); `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
+| `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms`, `times`, `repeat` (the body is `body` that many times over, with any `{i}` in it replaced by each copy's index, so the copies differ as real records do) and `encoding: gzip` or `encoding: zstd` (the body is sent compressed, gzip at its best level or zstd at level 3, with `Content-Encoding`, for a response small on the wire that decodes to many times its size); `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`, and `json <path> <pointer>`: per request, the values a JSON Pointer (`*` fans out) reaches in its body, as one JSON array (`[]` when none; no value when the body is not JSON); `json <path> <pointer> last` for the last request only. |
 
 **A source shared by every instance.** `shared: true` on a source gives every
 instance of a run the same namespace (database) instead of one each, for
@@ -275,7 +275,10 @@ with each other, and each ran the writes separately.
 **Variants** are [JSON merge patches](https://www.rfc-editor.org/rfc/rfc7386).
 `spicepod:` patches the whole spicepod, and `datasets:` patches datasets by name
 (`*` for all), since a merge patch replaces a list wholesale. A variant may also
-set `env:` for `spiced`, whose values take the same placeholders, and `when: { <matrix key>: <value> }` to exist only in some
+set `env:` for `spiced`, whose values take the same placeholders, `listen: every-interface` to
+bind its HTTP, Flight, metrics and OpenTelemetry listeners to `0.0.0.0` instead of loopback (for
+what a listener beyond loopback serves; the runner still reaches it at loopback, and adds no
+`runtime.auth`), and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
@@ -300,8 +303,23 @@ file_format: parquet }`.
 [sidecar](#sidecars) to read from), `${instance.host_from_container}` (the
 host such a container reaches `spiced` at: `host.docker.internal`, or this machine's routable address
 when a rootless Docker daemon runs a `host-network` source, since its containers cannot reach this
-machine's loopback; `spiced` then serves HTTP on every interface), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
+machine's loopback; `spiced` then serves HTTP on every interface), `${instance.api_key}` (a
+read-write API key of the instance's own, for a client the runner cannot hand the script's key,
+such as a CDC sink in a container), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
+
+When the runner itself binds `spiced` beyond loopback (for a rootless Docker daemon, or in a
+bridge container), `spiced` serves a caller without credentials read-only there, so a spicepod
+without `runtime.auth` gets one: `${instance.api_key}` as its only, read-write, key, which every
+step that names no other key sends. Elsewhere the key is unused, and a spicepod without
+`runtime.auth` stays without it. A client in a container must send the key too. Debezium Server
+3.1's HTTP sink cannot (a header set with the `InsertHeader` transform arrives JSON-encoded, and
+its JWT option sends `Bearer: <token>`), so the scripts that run it (`debezium-direct.yaml`,
+`debezium-offset-recovery.yaml`, `feed-chaos.yaml`) start a small relay in the Debezium container
+(`ApiKeyRelay.java`, which the container's `command` writes): Debezium posts to the relay on the
+container's loopback, and the relay forwards to `spiced` with `X-API-Key` added, as a sidecar
+proxy adding a credential would. A request the relay cannot forward is dropped, so Debezium sees
+the connection fail, as it would posting to `spiced` directly.
 
 ### Steps
 

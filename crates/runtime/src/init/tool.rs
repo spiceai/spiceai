@@ -26,7 +26,7 @@ use crate::{
     status,
     tools::{
         self, Tooling,
-        factory::{ToolFactoryNotFound, default_available_catalogs},
+        factory::{ToolAccessConfigError, ToolFactoryNotFound, default_available_catalogs},
     },
 };
 use app::App;
@@ -392,7 +392,10 @@ impl Runtime {
                     &tool.name,
                     status::ComponentStatus::error_with_message(e.to_string()),
                 );
-                if is_permanent_tool_failure(&e) {
+                if let Some(config) = access_config_error_of(&e) {
+                    // The message names the tool, what is wrong and the fix.
+                    tracing::error!("{config}");
+                } else if is_permanent_tool_failure(&e) {
                     tracing::warn!(
                         "Unable to load tool '{}' from spicepod. It is not available until its configuration is fixed. Error: {}",
                         tool.name,
@@ -411,13 +414,23 @@ impl Runtime {
     }
 }
 
+/// The invalid `access` or `read_only_tools` a tool failed to load for, if that is why.
+fn access_config_error_of(err: &crate::Error) -> Option<&ToolAccessConfigError> {
+    let crate::Error::UnableToInitializeLlmTool { source } = err else {
+        return None;
+    };
+    source.downcast_ref::<ToolAccessConfigError>()
+}
+
 /// Returns `true` when a tool load failure is a mistake in the Spicepod, which no retry can
 /// clear: a `from` no tool factory handles, or an invalid MCP directive or `mcp_args`.
 fn is_permanent_tool_failure(err: &crate::Error) -> bool {
     let crate::Error::UnableToInitializeLlmTool { source } = err else {
         return false;
     };
-    if source.downcast_ref::<ToolFactoryNotFound>().is_some() {
+    if source.downcast_ref::<ToolFactoryNotFound>().is_some()
+        || source.downcast_ref::<ToolAccessConfigError>().is_some()
+    {
         return true;
     }
     #[cfg(feature = "mcp")]

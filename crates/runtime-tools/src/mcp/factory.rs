@@ -24,7 +24,7 @@ use spicepod::component::tool::Tool;
 use crate::catalog::SpiceToolCatalog;
 use crate::factory::ToolCatalogFactory;
 
-use super::{MCPConfig, MCPType, catalog::McpToolCatalog};
+use super::{MCPConfig, MCPType, access::McpToolAccess, catalog::McpToolCatalog};
 
 pub struct McpCatalogFactory {}
 
@@ -47,10 +47,21 @@ impl ToolCatalogFactory for McpCatalogFactory {
         let mcp_type = MCPType::from_str(id)?;
         let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets, &env)?;
 
+        let access =
+            McpToolAccess::from_spicepod(component.access.as_ref(), &component.read_only_tools);
         let ctlg =
             McpToolCatalog::try_new(cfg, component.name.as_str(), component.description.clone())
                 .await
-                .boxed()?;
+                .boxed()?
+                .with_access(access.clone());
+
+        let listed = ctlg.listed_tool_names();
+        for entry in access.unmatched(&listed) {
+            tracing::warn!(
+                "Tool '{}' (mcp): `read_only_tools` entry '{entry}' matches no tool the server reports, so it has no effect. Check the server's tool names. See: https://spiceai.org/docs/components/tools",
+                component.name
+            );
+        }
 
         Ok(Arc::new(ctlg))
     }

@@ -993,14 +993,15 @@ pub async fn run(
         (false, ClientAuthMode::Request)
     ) {
         tracing::warn!(
-            "Insecure configuration: `client_auth: request` is set without `runtime.auth`. \
-             Client certificates are optional in this mode and no other authentication is \
-             configured, so a client that presents no certificate reaches the API \
-             unauthenticated — including write/DDL/DML endpoints. Use `client_auth: required` \
-             to reject certificate-less clients, or configure `runtime.auth`."
+            "`client_auth: request` is set without `runtime.auth`, so a client that presents no certificate is served as a caller without credentials: read-only on a listener beyond loopback, and the local operator on a loopback-only listener. Use `client_auth: required` to refuse clients without a certificate, or configure `runtime.auth`. See https://spiceai.org/docs/api/auth"
         );
     }
-    if let Some(app) = app.as_ref()
+    // A request without credentials writes only as the local operator, on a loopback-only
+    // listener, so the warning applies only when there is one.
+    let loopback_only_listener = util::net::is_loopback_addr(&args.runtime.http_bind_address)
+        || util::net::is_loopback_addr(&args.runtime.flight_bind_address);
+    if loopback_only_listener
+        && let Some(app) = app.as_ref()
         && let Some(warning) =
             endpoint_auth.unauthenticated_writes_warning(app, client_auth_mode.into_spicepod())
     {

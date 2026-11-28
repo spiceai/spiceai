@@ -462,6 +462,11 @@ impl SpiceModelTool for ToolRegistrySearchTool {
                 &self.tool_embeddings,
             )
             .await?;
+            // Only the tools this caller may call are offered; `tool_invoke` still authorizes
+            // the call.
+            let can_write = ::tools::caller_can_write().await;
+            ranked_tools
+                .retain(|ranked_tool| can_write || ranked_tool.access == ToolAccess::ReadOnly);
             ranked_tools.sort_by(|left, right| {
                 right
                     .score
@@ -630,6 +635,8 @@ struct ToolInvokeParams {
 #[derive(Debug)]
 struct RankedTool {
     tool_id: String,
+    /// Who may call the tool, which decides who it is offered to.
+    access: ToolAccess,
     description: Option<String>,
     parameters: Option<Value>,
     score: f64,
@@ -670,6 +677,7 @@ struct MatchSource {
 #[derive(Debug)]
 struct ToolDocument {
     tool_id: String,
+    access: ToolAccess,
     description: Option<String>,
     parameters: Option<Value>,
     name_text: String,
@@ -691,6 +699,7 @@ struct ToolDocument {
 impl ToolDocument {
     fn new(tool: &Arc<dyn SpiceModelTool>) -> Self {
         let tool_id = tool.name().to_string();
+        let access = tool.access();
         let description = tool
             .description()
             .map(|description| description.to_string());
@@ -735,6 +744,7 @@ impl ToolDocument {
             parameter_token_counts,
             parameter_key_tokens,
             tool_id,
+            access,
             description,
             parameters,
         }
@@ -824,6 +834,7 @@ async fn hybrid_rank_tools(
 
             RankedTool {
                 tool_id: document.tool_id.clone(),
+                access: document.access,
                 description: document.description.clone(),
                 parameters: document.parameters.clone(),
                 score: if max_score > 0.0 {

@@ -304,19 +304,44 @@ impl RequestContext {
     ///
     /// Mapping:
     /// - `Protocol::Internal` → [`CacheNamespace::System`].
+    /// - A principal that shares the results cache of callers without credentials
+    ///   (`AuthPrincipal::results_cache_is_shared`, the local operator) →
+    ///   [`CacheNamespace::Public`].
     /// - Authenticated principal whose `stable_id()` is `Some(id)` →
     ///   [`CacheNamespace::Principal(id)`].
     /// - Anything else (no principal, anonymous principal) →
     ///   [`CacheNamespace::Public`].
+    ///
+    /// What a caller owns (its async query jobs and active queries) and the model caches it
+    /// reuses follow [`Self::caller_namespace`] instead.
     #[must_use]
     pub fn cache_namespace(&self) -> CacheNamespace {
+        self.namespace(true)
+    }
+
+    /// The scope of the caller this request runs for: the async query jobs and active queries it
+    /// owns, and the model caches it may reuse. The same as [`Self::cache_namespace`], except
+    /// that a principal sharing the results cache of callers without credentials keeps its own
+    /// scope here, so what it owns is not theirs.
+    #[must_use]
+    pub fn caller_namespace(&self) -> CacheNamespace {
+        self.namespace(false)
+    }
+
+    fn namespace(&self, for_results_cache: bool) -> CacheNamespace {
         if let Some(ns) = &self.cache_namespace_override {
             return ns.clone();
         }
         if matches!(self.protocol(), Protocol::Internal) {
             return CacheNamespace::System;
         }
-        match self.auth_principal.get().and_then(|p| p.stable_id()) {
+        let Some(principal) = self.auth_principal.get() else {
+            return CacheNamespace::Public;
+        };
+        if for_results_cache && principal.results_cache_is_shared() {
+            return CacheNamespace::Public;
+        }
+        match principal.stable_id() {
             Some(id) => CacheNamespace::Principal(Arc::from(id.as_ref())),
             None => CacheNamespace::Public,
         }
@@ -861,6 +886,64 @@ mod tests {
         assert_eq!(
             rx.await.expect("spawned task reported its context"),
             CacheNamespace::Public
+        );
+    }
+
+    /// A principal with an identity of its own, as an API key has.
+    struct KeyHolder;
+
+    impl runtime_auth::AuthPrincipal for KeyHolder {
+        fn username(&self) -> &'static str {
+            "key-holder"
+        }
+
+        fn groups(&self) -> &[&str] {
+            &["read_write"]
+        }
+
+        fn stable_id(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed("apikey:0123456789abcdef"))
+        }
+    }
+
+    /// The local operator shares the results cache of callers without credentials, but owns
+    /// its jobs and active queries in a scope of its own; any other principal with a stable id
+    /// has its own scope for both, and a request without a principal shares the public one.
+    #[test]
+    fn the_local_operator_shares_the_results_cache_but_not_what_it_owns() {
+        use crate::{CacheNamespace, RequestContext};
+        use runtime_auth::{AuthPrincipalRef, AuthRequestContext, LocalPrincipal};
+        use std::sync::Arc;
+
+        let namespaces = |protocol: Protocol, principal: Option<AuthPrincipalRef>| {
+            let context = RequestContext::builder(protocol).build();
+            if let Some(principal) = principal {
+                context
+                    .set_auth_principal(principal)
+                    .expect("an empty context takes a principal");
+            }
+            (context.cache_namespace(), context.caller_namespace())
+        };
+
+        assert_eq!(
+            namespaces(Protocol::Http, Some(Arc::new(LocalPrincipal))),
+            (
+                CacheNamespace::Public,
+                CacheNamespace::Principal(Arc::from("local:operator"))
+            )
+        );
+        let key = CacheNamespace::Principal(Arc::from("apikey:0123456789abcdef"));
+        assert_eq!(
+            namespaces(Protocol::Http, Some(Arc::new(KeyHolder))),
+            (key.clone(), key)
+        );
+        assert_eq!(
+            namespaces(Protocol::Http, None),
+            (CacheNamespace::Public, CacheNamespace::Public)
+        );
+        assert_eq!(
+            namespaces(Protocol::Internal, Some(Arc::new(LocalPrincipal))),
+            (CacheNamespace::System, CacheNamespace::System)
         );
     }
 

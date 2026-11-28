@@ -21,8 +21,59 @@ sources:
     # accept (431 Request Header Fields Too Large) and the engine stops.
     image: quay.io/debezium/server:3.1
     host-network: true
-    command: [sleep, infinity]
-    ready: 'true'
+    # Debezium Server 3.1's HTTP sink cannot send an API key Spice accepts (a header set
+    # with the `InsertHeader` transform arrives JSON-encoded, and its JWT option sends
+    # `Bearer: <token>`), so each instance's Debezium posts through a relay beside it
+    # that adds the instance's key, as a sidecar proxy adding a credential would. `spiced`
+    # checks the key when spicescript serves it beyond loopback (`${instance.api_key}`).
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/ApiKeyRelay.java <<'EOF'
+        // Forwards each POST to the upstream at args[1] with `X-API-Key: args[2]` added, and writes
+        // the loopback port it listens on to the file args[0]. A request the upstream does not answer
+        // (it is down) is dropped, so the sender sees the connection fail, as it would posting there.
+        import com.sun.net.httpserver.HttpServer;
+        import java.net.InetSocketAddress;
+        import java.net.URI;
+        import java.net.http.HttpClient;
+        import java.net.http.HttpRequest;
+        import java.net.http.HttpResponse;
+        import java.nio.file.Files;
+        import java.nio.file.Path;
+        import java.nio.file.StandardCopyOption;
+
+        public class ApiKeyRelay {
+            public static void main(String[] args) throws Exception {
+                var client = HttpClient.newHttpClient();
+                var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+                server.createContext("/", exchange -> {
+                    try (exchange) {
+                        var request = HttpRequest.newBuilder(URI.create(args[1] + exchange.getRequestURI()))
+                            .header("Content-Type", exchange.getRequestHeaders().getFirst("Content-Type"))
+                            .header("X-API-Key", args[2])
+                            .POST(HttpRequest.BodyPublishers.ofByteArray(exchange.getRequestBody().readAllBytes()))
+                            .build();
+                        var answer = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                        var body = answer.body();
+                        exchange.sendResponseHeaders(answer.statusCode(), body.length == 0 ? -1 : body.length);
+                        if (body.length > 0) {
+                            exchange.getResponseBody().write(body);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+                server.start();
+                var partial = Path.of(args[0] + ".partial");
+                Files.writeString(partial, String.valueOf(server.getAddress().getPort()));
+                Files.move(partial, Path.of(args[0]), StandardCopyOption.ATOMIC_MOVE);
+            }
+        }
+        EOF
+        exec sleep infinity
+    ready: test -s /tmp/ApiKeyRelay.java
 
 variants:
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
@@ -57,8 +108,15 @@ steps:
       dbz: &debezium >-
         mkdir -p /tmp/${sources.src.namespace};
         cd /debezium;
+        kill -0 "$(cat /tmp/${sources.src.namespace}/relay.pid 2>/dev/null)" 2>/dev/null || {
+        rm -f /tmp/${sources.src.namespace}/relay.port;
+        nohup java /tmp/ApiKeyRelay.java /tmp/${sources.src.namespace}/relay.port
+        http://${instance.host_from_container}:${instance.http_port} ${instance.api_key}
+        > /tmp/${sources.src.namespace}/relay.log 2>&1 < /dev/null &
+        echo $! > /tmp/${sources.src.namespace}/relay.pid;
+        for _ in $(seq 600); do [ -s /tmp/${sources.src.namespace}/relay.port ] && break; sleep 0.1; done; };
         DEBEZIUM_SINK_TYPE=http
-        DEBEZIUM_SINK_HTTP_URL=http://${instance.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
+        DEBEZIUM_SINK_HTTP_URL=http://127.0.0.1:$(cat /tmp/${sources.src.namespace}/relay.port)/v1/datasets/t/cdc
         DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
         DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
         DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0

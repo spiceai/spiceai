@@ -380,8 +380,37 @@ impl Source for MockHttp {
                     })
                     .collect(),
             }),
+            ["json", path, pointer, rest @ ..] if matches!(rest, [] | ["last"]) => {
+                crate::json_assert::check_pointer(pointer)?;
+                let requests = matching(path);
+                let requests = if rest.is_empty() {
+                    requests
+                } else {
+                    requests.into_iter().last().into_iter().collect()
+                };
+                Ok(TextResult {
+                    columns: vec![(*pointer).to_string()],
+                    rows: requests
+                        .into_iter()
+                        .map(|r| {
+                            let values = serde_json::from_str::<serde_json::Value>(&r.body)
+                                .ok()
+                                .map(|body| {
+                                    serde_json::Value::Array(
+                                        crate::json_assert::resolve(&body, pointer)
+                                            .into_iter()
+                                            .cloned()
+                                            .collect(),
+                                    )
+                                    .to_string()
+                                });
+                            vec![values]
+                        })
+                        .collect(),
+                })
+            }
             _ => bail!(
-                "a mock HTTP source answers `count <path>`, `log <path>` or `header <path> <name>`, not `{text}`"
+                "a mock HTTP source answers `count <path>`, `log <path>`, `header <path> <name>` or `json <path> <pointer> [last]`, not `{text}`"
             ),
         }
     }
@@ -398,5 +427,44 @@ impl Source for MockHttp {
         _rows: &mut (dyn Iterator<Item = Vec<Option<String>>> + Send),
     ) -> Result<u64> {
         bail!("a mock HTTP source serves routes; add them with source-exec")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `json` query whose pointer is not a JSON Pointer is a script error,
+    /// whatever its first character, and never a panic or a silent miss.
+    #[tokio::test]
+    async fn json_query_refuses_a_pointer_without_a_leading_slash() {
+        let mock = MockHttp::start().await.expect("mock server starts");
+        mock.exec("ns", "{ path: /p, body: '{}' }")
+            .await
+            .expect("route is added");
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/ns/p", mock.port))
+            .body(r#"{"a":1}"#)
+            .send()
+            .await
+            .expect("request reaches the mock");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        for pointer in ["é", "a"] {
+            let err = mock
+                .query("ns", &format!("json /p {pointer}"))
+                .await
+                .expect_err("a pointer without a leading '/' is refused");
+            assert_eq!(
+                err.to_string(),
+                format!("`pointer` '{pointer}' must be empty or start with '/' (a JSON Pointer)")
+            );
+        }
+
+        let resolved = mock
+            .query("ns", "json /p /a")
+            .await
+            .expect("a JSON Pointer resolves");
+        assert_eq!(resolved.rows, vec![vec![Some("[1]".to_string())]]);
     }
 }

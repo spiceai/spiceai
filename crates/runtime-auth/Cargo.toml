@@ -14,6 +14,8 @@ axum.workspace = true
 tonic.workspace = true
 tower.workspace = true
 tracing.workspace = true
+# `util::net` decides which listeners are loopback-only.
+util = { workspace = true, default-features = false }
 futures.workspace = true
 base64.workspace = true
 pin-project.workspace = true

@@ -856,12 +856,25 @@ impl RemoteScalarUdf {
     }
 }
 
+/// Refuses a call from a principal without write access, and from a client request without
+/// credentials, which a listener beyond loopback serves read-only. The runtime's own work (an
+/// acceleration refresh) runs with no principal and may call the function.
 async fn require_read_write_api_key(
     function_name: &str,
 ) -> std::result::Result<(), DataFusionError> {
     let context = RequestContext::current(AsyncMarker::new().await);
     let Some(principal) = runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) else {
-        return Ok(());
+        if matches!(
+            context.protocol(),
+            runtime_request_context::Protocol::Internal
+        ) {
+            return Ok(());
+        }
+        return Err(DataFusionError::Execution(format!(
+            "remote function '{function_name}' needs write access, and the request has no credentials, which this runtime serves read-only {}. {}",
+            runtime_auth::anonymous::READ_ONLY_BECAUSE,
+            runtime_auth::anonymous::HOW_TO_WRITE,
+        )));
     };
     let groups = principal.groups();
     if groups.contains(&"write") || groups.contains(&"read_write") {
@@ -2914,6 +2927,29 @@ mod tests {
             .await
             .expect_err("read-only principal should be rejected");
         assert!(err.to_string().contains("read-write API key"));
+    }
+
+    /// A client request without credentials (anonymous, on a listener beyond loopback) is
+    /// refused; the runtime's own work, which has no principal either, is not.
+    #[tokio::test]
+    async fn anonymous_request_rejected_and_internal_work_allowed() {
+        let anonymous =
+            Arc::new(RequestContext::builder(runtime_request_context::Protocol::Http).build());
+        let err = anonymous
+            .scope(async { require_read_write_api_key("remote_fn").await })
+            .await
+            .expect_err("a request without credentials should be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Execution error: remote function 'remote_fn' needs write access, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+        );
+
+        let internal =
+            Arc::new(RequestContext::builder(runtime_request_context::Protocol::Internal).build());
+        internal
+            .scope(async { require_read_write_api_key("remote_fn").await })
+            .await
+            .expect("the runtime's own work should be allowed");
     }
 
     #[tokio::test]

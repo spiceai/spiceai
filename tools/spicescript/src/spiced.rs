@@ -51,6 +51,9 @@ pub struct Spiced {
     /// Serves HTTP on every interface, not only loopback, for a container
     /// that cannot reach this machine's loopback.
     http_on_every_interface: bool,
+    /// Serves HTTP, Flight, metrics and OpenTelemetry on every interface (`listen:
+    /// every-interface` on a variant).
+    every_interface: bool,
     flight: u16,
     metrics: u16,
     otel: u16,
@@ -186,6 +189,7 @@ impl Spiced {
             env_removed: Vec::new(),
             http: free_port()?,
             http_on_every_interface: false,
+            every_interface: false,
             flight: free_port()?,
             metrics: free_port()?,
             otel: free_port()?,
@@ -236,9 +240,39 @@ impl Spiced {
 
     /// Serves HTTP on every interface (`0.0.0.0`) rather than only loopback,
     /// so a container behind a rootless Docker daemon, which reaches this
-    /// machine only at its routable address, can post to it.
-    pub fn set_http_on_every_interface(&mut self, every: bool) {
+    /// machine only at its routable address, can post to it. The HTTP port is
+    /// given out again if it is not free there, as [`Self::set_every_interface`]
+    /// does for every port.
+    pub fn set_http_on_every_interface(&mut self, every: bool) -> Result<()> {
         self.http_on_every_interface = every;
+        if every {
+            self.http = crate::docker::port_still_free_on(
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                self.http,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Serves HTTP, Flight, metrics and OpenTelemetry on every interface (`0.0.0.0`) rather
+    /// than only loopback, for a script about what a listener beyond loopback serves. A port
+    /// chosen for loopback need not be free on every interface, so each that is not is given
+    /// out again from those that are. Set a port the script was told in advance afterwards,
+    /// with [`Self::set_http_port`] or [`Self::set_flight_port`], so it is served as given.
+    pub fn set_every_interface(&mut self, every: bool) -> Result<()> {
+        self.every_interface = every;
+        if every {
+            let every = std::net::Ipv4Addr::UNSPECIFIED.into();
+            for port in [
+                &mut self.http,
+                &mut self.flight,
+                &mut self.metrics,
+                &mut self.otel,
+            ] {
+                *port = crate::docker::port_still_free_on(every, *port)?;
+            }
+        }
+        Ok(())
     }
 
     /// Serves Flight on `port`, one a script was told in advance
@@ -381,12 +415,19 @@ impl Spiced {
             .container
             .as_ref()
             .is_some_and(|run| run.bridge.is_some());
-        let host = if bridged { "0.0.0.0" } else { "127.0.0.1" };
+        let host = if bridged || self.every_interface {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         let child = command
             .arg("--telemetry-enabled=false")
             .args([
                 "--http",
-                &http_listen(self.http_on_every_interface || bridged, self.http),
+                &http_listen(
+                    self.http_on_every_interface || bridged || self.every_interface,
+                    self.http,
+                ),
             ])
             .args(["--flight", &format!("{host}:{}", self.flight)])
             .args(["--metrics", &format!("{host}:{}", self.metrics)])
@@ -1333,5 +1374,93 @@ mod bridge_tests {
             None
         );
         assert_eq!(node_bind_port(&args(&["--node-bind-address"])), None);
+    }
+}
+
+#[cfg(test)]
+mod listen_port_tests {
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+
+    use super::Spiced;
+
+    const EVERY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// An instance on every interface binds each of its four ports on `0.0.0.0`, and the runner
+    /// reaches each at `127.0.0.1`, so each must be free on both. A port chosen while the
+    /// instance was to listen on loopback, and since held on the wildcard address, which a
+    /// loopback probe misses on macOS, is given out again.
+    #[test]
+    fn an_instance_on_every_interface_gets_ports_free_on_every_interface() {
+        let dir = std::env::temp_dir().join(format!("spicescript-listen-{}", std::process::id()));
+        let mut spiced = Spiced::new(
+            "spiced".into(),
+            dir.clone(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an instance");
+        let chosen = [spiced.http, spiced.flight, spiced.metrics, spiced.otel];
+        let _held: Vec<TcpListener> = chosen
+            .iter()
+            .map(|port| TcpListener::bind((EVERY, *port)).expect("hold the port on 0.0.0.0"))
+            .collect();
+
+        spiced
+            .set_every_interface(true)
+            .expect("ports free on every interface");
+
+        for (name, port) in [
+            ("http", spiced.http),
+            ("flight", spiced.flight),
+            ("metrics", spiced.metrics),
+            ("otel", spiced.otel),
+        ] {
+            for ip in [EVERY, LOOPBACK] {
+                TcpListener::bind((ip, port)).unwrap_or_else(|e| {
+                    panic!("{name} port {port} (chosen {chosen:?}) is not free on {ip}: {e}")
+                });
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// HTTP alone on every interface, for a container behind a rootless Docker daemon, gets
+    /// an HTTP port free there and at loopback, and keeps a free one as it is.
+    #[test]
+    fn http_on_every_interface_gets_an_http_port_free_on_every_interface() {
+        let dir =
+            std::env::temp_dir().join(format!("spicescript-listen-http-{}", std::process::id()));
+        let mut held = Spiced::new(
+            "spiced".into(),
+            dir.clone(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an instance");
+        let mut free = Spiced::new(
+            "spiced".into(),
+            dir.clone(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("an instance");
+        let chosen = held.http;
+        let _held = TcpListener::bind((EVERY, chosen)).expect("hold the port on 0.0.0.0");
+        let kept = crate::docker::free_port_on(EVERY).expect("a port free on every interface");
+        free.set_http_port(kept);
+
+        held.set_http_on_every_interface(true)
+            .expect("a port free on every interface");
+        free.set_http_on_every_interface(true)
+            .expect("a port free on every interface");
+
+        assert_ne!(
+            held.http, chosen,
+            "a port held on 0.0.0.0 is given out again"
+        );
+        for ip in [EVERY, LOOPBACK] {
+            TcpListener::bind((ip, held.http))
+                .unwrap_or_else(|e| panic!("HTTP port {} is not free on {ip}: {e}", held.http));
+        }
+        assert_eq!(free.http, kept, "a port free on every interface is kept");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

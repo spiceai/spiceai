@@ -20,6 +20,7 @@ limitations under the License.
 //! (`server/discover`, sessionless Streamable HTTP) and still answers legacy
 //! `initialize` so existing clients keep working until that handshake is dropped.
 
+pub mod access;
 pub mod catalog;
 pub mod factory;
 mod http_client;

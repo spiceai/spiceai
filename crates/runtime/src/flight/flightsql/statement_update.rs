@@ -72,9 +72,7 @@ pub(crate) async fn do_put(
                     "Accepting a statement update the scheduler forwarded to this executor"
                 );
             } else {
-                return Err(Status::unauthenticated(
-                    "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
-                ));
+                return Err(crate::flight::write_without_credentials_refusal(&context));
             }
         }
     }

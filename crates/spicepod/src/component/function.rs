@@ -290,6 +290,26 @@ pub struct FunctionArg {
     pub arrow_type: String,
 }
 
+impl Function {
+    /// The execution tier `from` selects, lowercased: the text before the first `:` (`http`,
+    /// `https`, `wasm`), or all of `from` when it has none (`sql`).
+    #[must_use]
+    pub fn scheme(&self) -> String {
+        self.from
+            .split_once(':')
+            .map_or(self.from.as_str(), |(scheme, _)| scheme)
+            .to_ascii_lowercase()
+    }
+
+    /// Whether a call of the function makes a request outside Spice: an `http://` or `https://`
+    /// function calls its endpoint. Such a call needs write access, in SQL and as a tool alike,
+    /// and this is the one place that is decided.
+    #[must_use]
+    pub fn executes_code(&self) -> bool {
+        matches!(self.scheme().as_str(), "http" | "https")
+    }
+}
+
 impl Nameable for Function {
     fn name(&self) -> &str {
         &self.name

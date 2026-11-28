@@ -250,9 +250,25 @@ pub struct VariantSpec {
     /// Extra environment for this variant's `spiced`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The addresses this variant's `spiced` listens on: `loopback` (the default) or
+    /// `every-interface` (`0.0.0.0`), for scripts about what a listener beyond loopback serves.
+    /// The runner still reaches it at loopback.
+    #[serde(default)]
+    pub listen: Listen,
     /// Run this variant only in matrix combinations with these values.
     #[serde(default)]
     pub when: Map<String, Value>,
+}
+
+/// The addresses a `spiced` listens on (`listen:` on a variant).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Listen {
+    /// HTTP, Flight, metrics and OpenTelemetry on `127.0.0.1`.
+    #[default]
+    Loopback,
+    /// HTTP, Flight, metrics and OpenTelemetry on `0.0.0.0`.
+    EveryInterface,
 }
 
 #[derive(Debug, Clone, Deserialize)]

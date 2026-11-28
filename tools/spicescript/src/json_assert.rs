@@ -113,10 +113,7 @@ impl JsonAssertion {
             }
             None => bail!("each `json` assertion needs a `pointer`"),
         };
-        ensure!(
-            pointer.is_empty() || pointer.starts_with('/'),
-            "`pointer` '{pointer}' must be empty or start with '/' (a JSON Pointer)"
-        );
+        check_pointer(&pointer)?;
         let mut predicates = Vec::new();
         if let Some(v) = map.remove("equals") {
             predicates.push(Predicate::Equals(v));
@@ -339,9 +336,20 @@ fn objects_equal(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
             .all(|(k, v)| b.get(k).is_some_and(|w| json_equal(v, w)))
 }
 
+/// Refuses a `pointer` that is not a JSON Pointer: it must be empty (the whole
+/// value) or start with `/`. [`resolve`] relies on this.
+pub(crate) fn check_pointer(pointer: &str) -> Result<()> {
+    ensure!(
+        pointer.is_empty() || pointer.starts_with('/'),
+        "`pointer` '{pointer}' must be empty or start with '/' (a JSON Pointer)"
+    );
+    Ok(())
+}
+
 /// Every value `pointer` reaches in `root`, where a `*` segment fans out over
-/// an array's elements or an object's members.
-fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
+/// an array's elements or an object's members. `pointer` has passed
+/// [`check_pointer`].
+pub(crate) fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
     let mut current = vec![root];
     if pointer.is_empty() {
         return current;

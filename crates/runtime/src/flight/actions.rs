@@ -243,16 +243,16 @@ async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
         .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
-    if crate::flight::is_auth_read_only(context.as_ref()) {
-        return Err(Status::permission_denied(
-            "API key does not allow write access",
-        ));
+    if let Some(refusal) =
+        crate::flight::write_access_refusal(context.as_ref(), "API key does not allow write access")
+    {
+        return Err(Status::permission_denied(refusal));
     }
 
     let df = get_current_datafusion(&context);
     let cancelled = df
         .query_cancel_registry()
-        .cancel_owned(parsed, &crate::jobs::current_job_owner().await);
+        .cancel_owned(parsed, crate::jobs::current_job_caller().await.owner());
 
     let resp = CancelQueryResponse {
         query_id: req.query_id,

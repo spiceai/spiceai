@@ -387,9 +387,8 @@ mod tests {
     }
 
     /// A tool exposed as a SQL function is held to the tool's access like every other path
-    /// that runs it: with no principal on a runtime that authenticates callers (the default
-    /// until the runtime starts serving) a read-write tool is refused before it runs, and a
-    /// principal with write access may call it.
+    /// that runs it: a request with no principal (anonymous, on a listener beyond loopback) is
+    /// refused a read-write tool before it runs, and a principal with write access may call it.
     #[tokio::test]
     async fn tool_function_is_held_to_the_tool_access() {
         use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
@@ -407,7 +406,7 @@ mod tests {
             .expect_err("a request with no principal is refused a read-write tool");
         assert_eq!(
             error.to_string(),
-            "Execution error: tool-backed function 'send_alert' call failed: Failed to call tool 'send_alert': the tool can change data or act outside Spice, and the request has no credentials. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+            "Execution error: tool-backed function 'send_alert' call failed: Failed to call tool 'send_alert': the tool can change data or act outside Spice, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(tool.runs.load(Ordering::SeqCst), 0, "the tool must not run");
 

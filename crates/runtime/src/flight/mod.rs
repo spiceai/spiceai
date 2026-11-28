@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::app_context_extension::AppContextExtension;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
-use crate::datafusion::sql_validator::validate_sql_query_read_only;
+use crate::datafusion::sql_validator::{ReadOnlyCaller, validate_sql_query_read_only};
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
@@ -913,19 +913,50 @@ pub(crate) fn transaction_outcome_to_flight_stream(
     })
 }
 
-/// Returns `true` when the request has an authenticated principal that
-/// lacks write permission (`"write"` or `"read_write"` group), or no principal
-/// and comes to an executor from a cluster node other than the scheduler, which
-/// only reads there.
-/// Returns `false` when there is no principal otherwise (auth not configured)
-/// or the principal has write access.
+/// Returns `true` when the request may only read: its principal lacks write permission
+/// (`"write"` or `"read_write"` group), or it has none and
+/// [`crate::cluster::peer::request_without_credentials_is_read_only`] says so. A request
+/// without credentials has no principal unless it is the local operator, on a loopback-only
+/// listener of a runtime without `runtime.auth` (see `runtime_auth::anonymous`).
 pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
     match context.auth_principal() {
-        Some(principal) => !principal
-            .groups()
-            .iter()
-            .any(|g| *g == "write" || *g == "read_write"),
-        None => crate::cluster::peer::is_from_peer_executor(context),
+        Some(principal) => !runtime_auth::principal_has_write_access(principal),
+        None => crate::cluster::peer::request_without_credentials_is_read_only(context),
+    }
+}
+
+/// Why `context` may not write, for a Flight call that changes data: `read_only_key` for a
+/// principal without write access, or the refusal of a request without credentials that may
+/// only read ([`crate::cluster::peer::request_without_credentials_is_read_only`]). `None` when
+/// it may write.
+pub(crate) fn write_access_refusal(
+    context: &RequestContext,
+    read_only_key: &str,
+) -> Option<String> {
+    match context.auth_principal() {
+        Some(principal) if runtime_auth::principal_has_write_access(principal) => None,
+        Some(_) => Some(read_only_key.to_string()),
+        None if crate::cluster::peer::request_without_credentials_is_read_only(context) => {
+            Some(runtime_auth::anonymous::write_route_refusal())
+        }
+        None => None,
+    }
+}
+
+/// The refusal of a Flight write (a `DoPut` or a statement update) that arrives without
+/// credentials and that the scheduler did not forward.
+///
+/// On an executor's Flight server it came from another cluster node, which the executor does
+/// not take writes from: it is refused as unauthenticated. On any other listener it reached
+/// Spice over the network or through a proxy, which a runtime without `runtime.auth` serves
+/// read-only (`runtime.auth` refuses a request without credentials before it gets here).
+pub(crate) fn write_without_credentials_refusal(context: &RequestContext) -> Status {
+    if crate::cluster::peer::cluster_peer_role(context).is_some() {
+        Status::unauthenticated(
+            "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+        )
+    } else {
+        Status::permission_denied(runtime_auth::anonymous::write_route_refusal())
     }
 }
 
@@ -964,7 +995,7 @@ pub(crate) async fn check_read_only_sql(
     } else {
         plan
     };
-    if let Err(e) = validate_sql_query_read_only(&plan) {
+    if let Err(e) = validate_sql_query_read_only(&plan, ReadOnlyCaller::of(context)) {
         return Err(Status::permission_denied(format!(
             "Write access denied. {e}"
         )));
@@ -1245,6 +1276,17 @@ pub async fn start(
 
     let server = configure_flight_server_transport(Server::builder());
     let auth_configured = endpoint_auth.flight_basic_auth.is_some();
+    // Without `runtime.auth` and a required client certificate, a request may arrive without
+    // credentials; this listener's bind address decides how it is served.
+    let serves_anonymous_requests = !auth_configured
+        && !tls_config.as_ref().is_some_and(|tls| {
+            matches!(
+                tls.client_auth,
+                runtime_tls::ClientAuthEnforcement::Required
+            )
+        });
+    let anonymous_access =
+        (!auth_configured).then(|| runtime_auth::AnonymousAccess::of_listener(&bind_address));
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -1276,6 +1318,7 @@ pub async fn start(
         // principal is already present).
         .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
+        .layer(middleware::AnonymousAccessLayer::new(anonymous_access))
         .layer(FlightSessionLayer::new(
             rt.datafusion(),
             session_store,
@@ -1311,6 +1354,9 @@ pub async fn start(
         // Bind succeeded; emit the started log + metric now so a failed
         // bind doesn't show up as a phantom "Flight listening" line.
         tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        if serves_anonymous_requests {
+            crate::http::log_anonymous_access("Flight", &bind_address);
+        }
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         let incoming = runtime_tls::flight_incoming::tls_incoming(
             listener,
@@ -1329,12 +1375,18 @@ pub async fn start(
         // is_address_in_use_error mapping below still surfaces
         // bind-time failures to the caller.
         tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        if serves_anonymous_requests {
+            crate::http::log_anonymous_access("Flight", &bind_address);
+        }
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server
             .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
         tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        if serves_anonymous_requests {
+            crate::http::log_anonymous_access("Flight", &bind_address);
+        }
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server.serve(bind_address).await
     };

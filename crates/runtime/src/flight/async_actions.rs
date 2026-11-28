@@ -261,7 +261,11 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let _ = super::check_read_only_sql(&context, &datafusion, &request.sql, None).await?;
 
     let state = executor
-        .submit(request, read_only, crate::jobs::current_job_owner().await)
+        .submit(
+            request,
+            read_only,
+            crate::jobs::current_job_caller().await.owner().to_string(),
+        )
         .await
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 
@@ -287,7 +291,7 @@ pub async fn handle_get_async_query_status(body: &[u8]) -> Result<Vec<u8>, Statu
     let state = executor
         .get_status(
             request.query_id.as_str(),
-            &crate::jobs::current_job_owner().await,
+            &crate::jobs::current_job_caller().await,
         )
         .await
         .map_err(|e| Status::not_found(format!("Query not found: {e}")))?;
@@ -310,7 +314,7 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
     })?;
 
     // Check job status first
-    let caller = crate::jobs::current_job_owner().await;
+    let caller = crate::jobs::current_job_caller().await;
     let state = executor
         .get_status(request.query_id.as_str(), &caller)
         .await
@@ -361,10 +365,10 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
 
     // Cancellation is a write. `POST /v1/queries/{id}/cancel` refuses a
     // read-only principal, and this action must refuse it identically.
-    if super::is_auth_read_only(&context) {
-        return Err(Status::permission_denied(
-            "API key does not allow write access",
-        ));
+    if let Some(refusal) =
+        super::write_access_refusal(&context, "API key does not allow write access")
+    {
+        return Err(Status::permission_denied(refusal));
     }
 
     let request: CancelAsyncQueryRequest = serde_json::from_slice(body).map_err(|e| {
@@ -374,7 +378,7 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let state = executor
         .cancel(
             request.query_id.as_str(),
-            &crate::jobs::current_job_owner().await,
+            &crate::jobs::current_job_caller().await,
         )
         .await
         .map_err(|e| match &e {

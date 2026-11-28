@@ -25,7 +25,7 @@ use axum::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tools::{SpiceModelTool, ToolCallDenied};
+use tools::{SpiceModelTool, ToolAccess, ToolCallDenied};
 
 use crate::{
     Runtime,
@@ -85,8 +85,11 @@ pub(crate) struct SearchToolsQuery {
     )
 ))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    // Only the tools this caller may call; a call is still authorized on its own.
+    let can_write = ::tools::caller_can_write().await;
     let tools = rt
         .list_all_tools()
+        .filter(|tool| std::future::ready(can_write || tool.access() == ToolAccess::ReadOnly))
         .map(|tool| ListToolElement::from_tool(&tool))
         .collect::<Vec<_>>()
         .await;
@@ -128,8 +131,10 @@ pub(crate) async fn search(
 ) -> Response {
     match tool_registry_prompt_tools(Arc::clone(&rt), query.embedding_model.as_deref()).await {
         Ok(tools) => {
+            let can_write = ::tools::caller_can_write().await;
             let tools = tools
                 .iter()
+                .filter(|tool| can_write || tool.access() == ToolAccess::ReadOnly)
                 .map(ListToolElement::from_tool)
                 .collect::<Vec<_>>();
             (StatusCode::OK, Json(tools)).into_response()
@@ -252,4 +257,138 @@ fn not_found(message: &str) -> Response {
 
 fn bad_request(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"message": message}))).into_response()
+}
+
+#[cfg(test)]
+#[cfg(feature = "http-functions")]
+mod tests {
+    use std::{future::Future, sync::Arc};
+
+    use axum::{
+        Extension,
+        extract::{Path, Query},
+        http::StatusCode,
+        response::Response,
+    };
+    use http_body_util::BodyExt;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use runtime_request_context::{Protocol, RequestContext};
+    use spicepod::component::runtime::ApiKey;
+
+    use super::{SearchToolsQuery, list, post};
+    use crate::Runtime;
+
+    fn read_only() -> ApiKey {
+        ApiKey::ReadOnly {
+            key: "read-only".to_string(),
+        }
+    }
+
+    fn read_write() -> ApiKey {
+        ApiKey::ReadWrite {
+            key: "read-write".to_string(),
+        }
+    }
+
+    /// Runs `future` in a request authenticated with `key`, as the API key layer attaches it.
+    async fn as_caller<F: Future>(key: ApiKey, future: F) -> F::Output {
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        context
+            .set_auth_principal(Arc::new(key) as AuthPrincipalRef)
+            .expect("a new request has no principal yet");
+        context.scope(future).await
+    }
+
+    async fn answer(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a response body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The names of the tools `GET /v1/tools` offers the caller with `key`, sorted.
+    async fn offered(rt: &Arc<Runtime>, key: ApiKey) -> Vec<String> {
+        let (status, text) = answer(as_caller(key, list(Extension(Arc::clone(rt)))).await).await;
+        assert_eq!(status, StatusCode::OK, "GET /v1/tools: {text}");
+        let tools: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("a JSON array of tools");
+        let mut names: Vec<String> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("a tool name").to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `POST /v1/tools/{name}` with `{"x": 21}`, by the caller with `key`.
+    async fn call(rt: &Arc<Runtime>, key: ApiKey, name: &str) -> (StatusCode, String) {
+        let response = as_caller(
+            key,
+            post(
+                Extension(Arc::clone(rt)),
+                Path(name.to_string()),
+                Query(SearchToolsQuery::default()),
+                r#"{"x": 21}"#.to_string(),
+            ),
+        )
+        .await;
+        answer(response).await
+    }
+
+    /// A `functions:` entry, parsed as a Spicepod declares it.
+    fn function(declaration: &str) -> spicepod::component::function::Function {
+        yaml::from_str(declaration).expect("the function declaration parses")
+    }
+
+    /// Every tool `GET /v1/tools` offers a read-only caller is one it may call. A function exposed
+    /// as a tool that calls out over HTTP needs write access, as it does in SQL, so only a caller
+    /// with write access is offered it, and a read-only caller that names it anyway is refused as
+    /// for any tool that needs write access.
+    #[tokio::test]
+    async fn a_read_only_caller_may_call_every_tool_it_is_offered() {
+        let app = app::AppBuilder::new("tool_offers")
+            .with_function(function(
+                "name: double\nfrom: sql\nsignature:\n  args: [{ name: x, type: int64 }]\n  returns: int64\nbody: \"x * 2\"\n",
+            ))
+            // Never reached: only a caller with write access may call it, and none does here.
+            .with_function(function(
+                "name: score\nfrom: https://functions.example.com/score\nsignature:\n  args: [{ name: x, type: int64 }]\n  returns: int64\n",
+            ))
+            .with_runtime(spicepod::component::runtime::Runtime {
+                functions: spicepod::component::runtime::Functions::enabled(),
+                ..Default::default()
+            })
+            .build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        assert_eq!(
+            offered(&rt, read_write()).await,
+            ["double", "score"],
+            "a caller with write access is offered both functions"
+        );
+
+        let offers = offered(&rt, read_only()).await;
+        for name in &offers {
+            assert_eq!(
+                call(&rt, read_only(), name).await,
+                (StatusCode::OK, "42".to_string()),
+                "tool '{name}', offered to a read-only caller, refused its call"
+            );
+        }
+        assert_eq!(offers, ["double"]);
+
+        assert_eq!(
+            call(&rt, read_only(), "score").await,
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"message":"Failed to call tool 'score': the tool can change data or act outside Spice, and the credentials on this request do not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"}"#
+                    .to_string()
+            ),
+            "a read-only caller that names the function anyway"
+        );
+    }
 }

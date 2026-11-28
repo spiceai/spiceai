@@ -1,0 +1,149 @@
+name: anonymous-access
+duration: 9s
+description: >
+  Without `runtime.auth`, a request without credentials is served by what its
+  listener is bound to. On a listener bound only to loopback it is the local
+  operator, with full access: SQL writes over HTTP and Flight, `DoPut` and
+  write routes succeed. On a listener bound to `0.0.0.0` it is read-only: the
+  same writes are refused (`403` over HTTP, `PERMISSION_DENIED` over Flight)
+  with a message that says why and how to get write access, and nothing is
+  written, while queries still answer. A loopback request that came through a
+  proxy (`X-Forwarded-For` or `Forwarded`) is read-only too. An OTLP metrics
+  export over HTTP is a write too: a local collector's is stored, and one sent
+  to the `0.0.0.0` listener is refused and stores nothing. Each listener
+  says at startup which way it serves such requests. The local operator shares
+  the results cache of callers without credentials, so its answers say
+  `Results-Cache-Scope: shared`, as they did before it had an identity.
+
+sources:
+  src: { kind: postgres }
+
+# The variants listen differently, so they answer writes differently.
+variants:
+  loopback: {}
+  every-interface: { listen: every-interface }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: anonymous-access
+  runtime:
+    caching:
+      sql_results: { enabled: true }
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      access: read_write
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, write_mode: acceleration, primary_key: id }
+    - from: sink:otel_metrics
+      name: otel_metrics
+      access: read_write
+      params: { otlp_metrics: all }
+      acceleration: { enabled: true }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id bigint PRIMARY KEY, name text, qty int);
+        INSERT INTO items VALUES (1, 'one', 10), (2, 'two', 20);
+  - start: {}
+
+  # Each listener says how it serves requests without credentials.
+  - assert-log:
+      count:
+        "INFO .*Spice Runtime HTTP on 127\\.0\\.0\\.1:\\d+ serves requests without credentials as the local operator, with full access, because it listens only on loopback and `runtime\\.auth` is not configured\\. A request that came through a proxy \\(it carries `Forwarded` or `X-Forwarded-For`\\) is served read-only\\. Configure `runtime\\.auth` before listening on other addresses\\. See https://spiceai\\.org/docs/api/auth": 1
+        "INFO .*Spice Runtime Flight on 127\\.0\\.0\\.1:\\d+ serves requests without credentials as the local operator, with full access": 1
+        "WARN .*`runtime\\.auth` is not configured, so any process on this machine can modify dataset 'items' \\(`access: read_write`\\)": 1
+      lacks: ["serves requests without credentials read-only"]
+    only: loopback
+  - assert-log:
+      count:
+        "WARN .*Spice Runtime HTTP on 0\\.0\\.0\\.0:\\d+ serves requests without credentials read-only, because it listens beyond loopback \\(0\\.0\\.0\\.0 is not a loopback address\\) and `runtime\\.auth` is not configured: any caller who can reach it can query every dataset, but cannot write data or call read-write tools\\. To allow writes, configure `runtime\\.auth` with an API key ending in `:rw`\\. See https://spiceai\\.org/docs/api/auth": 1
+        "WARN .*Spice Runtime Flight on 0\\.0\\.0\\.0:\\d+ serves requests without credentials read-only, because it listens beyond loopback \\(0\\.0\\.0\\.0 is not a loopback address\\)": 1
+      lacks: ["as the local operator", "any process on this machine can modify"]
+    only: every-interface
+
+  # Every caller reads.
+  - query: SELECT id, name, qty FROM items ORDER BY id
+    expect: { rows: [['1', 'one', '10'], ['2', 'two', '20']] }
+
+  # The results cache is the shared one, for the local operator too: a repeat is a hit.
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: "SELECT count(*) AS n FROM items WHERE qty >= 10" }
+    expect: { status: 200, headers: { results-cache-scope: shared, results-cache-status: MISS } }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: "SELECT count(*) AS n FROM items WHERE qty >= 10" }
+    expect: { status: 200, headers: { results-cache-scope: shared, results-cache-status: HIT } }
+
+  # A write route. (Before the writes below: a full refresh reloads the source's rows.)
+  - refresh: items
+    only: loopback
+  - http: { method: POST, path: /v1/datasets/items/acceleration/refresh }
+    expect:
+      status: 403
+      json:
+        - { pointer: /message, equals: "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth" }
+    only: every-interface
+  - http: { method: POST, path: /v1/datasets/items/acceleration/refresh, headers: { x-forwarded-for: 192.0.2.60 } }
+    expect:
+      status: 403
+      json:
+        - { pointer: /message, equals: "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth" }
+    only: loopback
+
+  # SQL over HTTP.
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: "INSERT INTO items VALUES (3, 'three', 30)" }
+    expect: { status: 200 }
+    only: loopback
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain }, body: "INSERT INTO items VALUES (3, 'three', 30)" }
+    expect:
+      status: 403
+      body-contains: "INSERT operations are not allowed for a request without credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth"
+    only: every-interface
+  # Through a proxy, a loopback request is a network caller.
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, x-forwarded-for: 192.0.2.60 }, body: "INSERT INTO items VALUES (4, 'proxied', 40)" }
+    expect: { status: 403, body-contains: "INSERT operations are not allowed for a request without credentials" }
+  - http: { method: POST, path: /v1/sql, headers: { content-type: text/plain, forwarded: 'for=192.0.2.60;proto=http' }, body: "DELETE FROM items WHERE id = 1" }
+    expect: { status: 403, body-contains: "DELETE operations are not allowed for a request without credentials" }
+
+  # Flight: SQL ExecuteUpdate and DoPut.
+  - flight-exec: UPDATE items SET qty = qty + 1 WHERE id = 2
+    count: 1
+    only: loopback
+  - flight-exec: UPDATE items SET qty = qty + 1 WHERE id = 2
+    expect-error: "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured."
+    only: every-interface
+  - flight-put: { dataset: items, rows: [[5, five, 50]] }
+    only: loopback
+  - flight-put: { dataset: items, rows: [[5, five, 50]] }
+    expect-error: Permission denied
+    only: every-interface
+
+  # An OTLP metrics export over HTTP: a local collector's is stored; a network caller's is
+  # refused before anything is written. A `sink:` dataset registers its table on its first
+  # write, so on the read-only listener the table never appears.
+  - http: { method: POST, path: /v1/metrics, headers: { content-type: application/json }, body: '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"checkout"}}]},"scopeMetrics":[{"metrics":[{"name":"checkout_requests","gauge":{"dataPoints":[{"asInt":"7","timeUnixNano":"1763500000000000000"}]}}]}]}]}' }
+    expect: { status: 200 }
+    only: loopback
+  - query: SELECT metric_name, metric_type, value_int FROM otel_metrics
+    expect: { rows: [['checkout_requests', 'gauge', '7']] }
+    only: loopback
+  - http: { method: POST, path: /v1/metrics, headers: { content-type: application/json }, body: '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"checkout"}}]},"scopeMetrics":[{"metrics":[{"name":"checkout_requests","gauge":{"dataPoints":[{"asInt":"7","timeUnixNano":"1763500000000000000"}]}}]}]}]}' }
+    expect:
+      status: 403
+      json:
+        - { pointer: /message, equals: "This route changes data, and the request has no credentials, which this runtime serves read-only because it reached Spice over the network or through a proxy and `runtime.auth` is not configured. Configure `runtime.auth` with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`) and send it with the request. See https://spiceai.org/docs/api/auth" }
+    only: every-interface
+  - query: SELECT count(*) FROM otel_metrics
+    expect-error: "table 'spice.public.otel_metrics' not found"
+    only: every-interface
+
+  # What landed: the local operator's writes; nothing from a read-only caller.
+  - query: SELECT id, name, qty FROM items ORDER BY id DESC
+    expect: { rows: [['5', 'five', '50'], ['3', 'three', '30'], ['2', 'two', '21'], ['1', 'one', '10']] }
+    only: loopback
+  - query: SELECT id, name, qty FROM items ORDER BY id DESC
+    expect: { rows: [['2', 'two', '20'], ['1', 'one', '10']] }
+    only: every-interface

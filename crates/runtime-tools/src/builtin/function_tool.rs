@@ -44,11 +44,9 @@ use datafusion::common::utils::quote_identifier;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
-use tools::{SpiceModelTool, ToolAccess};
+use tools::{SpiceModelTool, ToolAccess, caller_can_write};
 
-use runtime_auth::{AuthRequestContext, principal_has_write_access};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
-use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Build a [`FunctionAsTool`] from a user-declared [`Function`]. Fails
 /// when the function's signature references Arrow types the tool bridge
@@ -91,6 +89,11 @@ pub fn build(
         name: decl.name.clone(),
         description: decl.description.clone(),
         args: decl.signature.args.clone(),
+        access: if decl.executes_code() {
+            ToolAccess::ReadWrite
+        } else {
+            ToolAccess::ReadOnly
+        },
         df,
     })
 }
@@ -127,6 +130,9 @@ pub struct FunctionAsTool {
     name: String,
     description: Option<String>,
     args: Vec<FunctionArg>,
+    /// What a call can change: read-write for a function that calls out
+    /// ([`Function::executes_code`]), read-only otherwise.
+    access: ToolAccess,
     df: Weak<dyn QueryEngine>,
 }
 
@@ -154,10 +160,12 @@ impl SpiceModelTool for FunctionAsTool {
         Some(build_parameters_schema(&self.args))
     }
 
-    /// Runs the function in a `SELECT`, read-only for a principal without write access, so a
-    /// read-only key is refused the functions that run code or call out, as in its own SQL.
+    /// A function that calls out ([`Function::executes_code`]) needs write access, as it does
+    /// in SQL, so only a caller with write access is offered it or may call it. Any other
+    /// function runs in a `SELECT` that is read-only unless the caller may write, so any caller
+    /// may call it.
     fn access(&self) -> ToolAccess {
-        ToolAccess::ReadOnly
+        self.access
     }
 
     async fn run(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -185,10 +193,10 @@ impl SpiceModelTool for FunctionAsTool {
             )
         })?;
 
+        // Read-only unless the caller may write, as the `sql` tool runs, so a function that
+        // runs code or calls out needs write access.
         let batches = df
-            .execute_query(
-                QueryRequest::new(&sql).read_only(current_principal_requires_read_only().await),
-            )
+            .execute_query(QueryRequest::new(&sql).read_only(!caller_can_write().await))
             .await
             .map_err(|e| {
                 Box::<dyn std::error::Error + Send + Sync>::from(format!("query failed: {e}"))
@@ -198,14 +206,6 @@ impl SpiceModelTool for FunctionAsTool {
 
         extract_single_cell_as_json(&batches)
     }
-}
-
-/// Whether the request is made by a principal without write access. A request with no principal
-/// is not.
-async fn current_principal_requires_read_only() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {

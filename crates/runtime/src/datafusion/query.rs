@@ -106,7 +106,7 @@ use super::managed_runtime;
 use crate::datafusion::{
     DataFusion,
     query::cache::RequestCacheManager,
-    sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
+    sql_validator::{ReadOnlyCaller, validate_sql_query_operations, validate_sql_query_read_only},
 };
 use crate::task_history::correlation;
 use managed_runtime::ManagedRuntimeError;
@@ -510,7 +510,7 @@ impl Query {
             self.query_id,
             sql_preview.as_ref(),
             request_context.protocol(),
-            Arc::from(request_context.cache_namespace().storage_id()),
+            Arc::from(request_context.caller_namespace().storage_id()),
             cancel_token.clone(),
         );
         QueryLifetimeGuards {
@@ -1178,7 +1178,8 @@ impl Query {
             return Err(Error::UnableToExecuteQuery { source: e });
         }
         if self.read_only
-            && let Err(e) = validate_sql_query_read_only(&plan)
+            && let Err(e) =
+                validate_sql_query_read_only(&plan, ReadOnlyCaller::of(&request_context))
         {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
@@ -1671,7 +1672,7 @@ impl Query {
                 }
 
                 if ctx.read_only
-                    && let Err(e) = validate_sql_query_read_only(&plan)
+                    && let Err(e) = validate_sql_query_read_only(&plan, ReadOnlyCaller::of(&request_context))
                 {
                     let e = find_datafusion_root(e);
                     handle_error!(
@@ -2245,7 +2246,8 @@ impl Query {
             return Err(e);
         }
         if self.read_only
-            && let Err(e) = validate_sql_query_read_only(&plan)
+            && let Err(e) =
+                validate_sql_query_read_only(&plan, ReadOnlyCaller::of(&request_context))
         {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);

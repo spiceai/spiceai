@@ -37,7 +37,7 @@ use super::prepared_statement_query::{
     PreparedStatement, decode_param_values, encode_single_row_parameters, param_error_to_status,
 };
 use super::within_decompression_bound;
-use crate::flight::is_auth_read_only;
+use crate::flight::write_access_refusal;
 use crate::{
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
     flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
@@ -103,10 +103,11 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    if is_auth_read_only(&context) {
-        return Err(Status::permission_denied(
-            "Write access denied. Verify that authentication key used has write access and try again.",
-        ));
+    if let Some(refusal) = write_access_refusal(
+        &context,
+        "Write access denied. Verify that authentication key used has write access and try again.",
+    ) {
+        return Err(Status::permission_denied(refusal));
     }
 
     tracing::trace!("do_get_prepared_statement_update: {query:?}");

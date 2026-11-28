@@ -45,7 +45,7 @@ use tonic::{Request, Response, Status};
 use super::substrait_consumer::SpiceSubstraitConsumer;
 use crate::datafusion::query::{Query, QueryBuilder};
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use crate::datafusion::sql_validator::validate_sql_query_read_only;
+use crate::datafusion::sql_validator::{ReadOnlyCaller, validate_sql_query_read_only};
 use crate::flight::{
     Service, handle_datafusion_error, is_auth_read_only,
     metrics::track_flight_request,
@@ -168,7 +168,7 @@ pub(crate) async fn get_flight_info(
 
     let read_only = is_auth_read_only(&context);
     if read_only {
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::of(&context))
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 
@@ -261,7 +261,7 @@ async fn run_plan(
     datafusion: &Arc<DataFusion>,
 ) -> Result<cache::result::query::QueryResult, Status> {
     if is_auth_read_only(context) {
-        validate_sql_query_read_only(&plan)
+        validate_sql_query_read_only(&plan, ReadOnlyCaller::of(context))
             .map_err(|e| Status::permission_denied(format!("Write access denied. {e}")))?;
     }
 

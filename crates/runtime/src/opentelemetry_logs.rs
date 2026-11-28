@@ -1436,8 +1436,8 @@ mod tests {
         let engine = FakeQueryEngine::new(&["logs_a", "logs_b"], &[]);
         let service = service(&engine, &["logs_a", "logs_b"]);
         let count = u64::try_from(MAX_LOGS_BATCH_ROWS).expect("fits") + 5;
-        let response = service
-            .export(Request::new(records(count)))
+        let response = local_operator()
+            .scope(service.export(Request::new(records(count))))
             .await
             .expect("stored")
             .into_inner();
@@ -1455,8 +1455,8 @@ mod tests {
     async fn no_store_dataset_is_unimplemented_and_names_the_fix() {
         let engine = FakeQueryEngine::new(&[], &[]);
         let service = service(&engine, &[]);
-        let status = service
-            .export(Request::new(records(3)))
+        let status = local_operator()
+            .scope(service.export(Request::new(records(3))))
             .await
             .expect_err("nothing can store the export");
         assert_eq!(status.code(), tonic::Code::Unimplemented);
@@ -1470,8 +1470,8 @@ mod tests {
     async fn a_logs_dataset_still_loading_asks_the_exporter_to_retry() {
         let engine = FakeQueryEngine::new(&["logs_a"], &[]);
         let service = service(&engine, &["logs_a", "logs_b"]);
-        let status = service
-            .export(Request::new(records(3)))
+        let status = local_operator()
+            .scope(service.export(Request::new(records(3))))
             .await
             .expect_err("logs_b cannot store the export yet");
         assert_eq!(status.code(), tonic::Code::Unavailable);
@@ -1486,8 +1486,8 @@ mod tests {
     async fn an_export_with_no_records_succeeds_without_a_store() {
         let engine = FakeQueryEngine::new(&[], &[]);
         let service = service(&engine, &[]);
-        let response = service
-            .export(Request::new(records(0)))
+        let response = local_operator()
+            .scope(service.export(Request::new(records(0))))
             .await
             .expect("an empty export stores nothing and fails nothing")
             .into_inner();
@@ -1500,8 +1500,8 @@ mod tests {
         let service = service(&engine, &["otel_logs"]);
         let mut request = records(2);
         request.resource_logs[0].scope_logs[0].log_records[0].time_unix_nano = u64::MAX;
-        let response = service
-            .export(Request::new(request))
+        let response = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect("one record is stored")
             .into_inner();
@@ -1525,8 +1525,8 @@ mod tests {
         let service = service(&engine, &["otel_logs"]);
         let mut request = records(1);
         request.resource_logs[0].scope_logs[0].log_records[0].time_unix_nano = u64::MAX;
-        let status = service
-            .export(Request::new(request))
+        let status = local_operator()
+            .scope(service.export(Request::new(request)))
             .await
             .expect_err("nothing can be stored");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -1541,8 +1541,8 @@ mod tests {
     async fn a_failed_store_write_asks_the_exporter_to_retry() {
         let engine = FakeQueryEngine::new(&["otel_logs"], &["otel_logs"]);
         let service = service(&engine, &["otel_logs"]);
-        let status = service
-            .export(Request::new(records(3)))
+        let status = local_operator()
+            .scope(service.export(Request::new(records(3))))
             .await
             .expect_err("the write failed");
         assert_eq!(status.code(), tonic::Code::Unavailable);
@@ -1551,6 +1551,19 @@ mod tests {
             "Failed to write to the OpenTelemetry logs dataset 'otel_logs'; retry the export"
         );
         assert!(engine.writes.lock().is_empty());
+    }
+
+    /// The context of an export from a collector on this machine to a runtime without
+    /// `runtime.auth`: the local operator, which may write. The export tests run in it, as a
+    /// local collector's export does.
+    fn local_operator() -> Arc<RequestContext> {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Flight).build());
+        context
+            .set_auth_principal(
+                Arc::new(runtime_auth::anonymous::LocalPrincipal) as AuthPrincipalRef
+            )
+            .expect("auth principal should be set");
+        context
     }
 
     fn context_with_api_key(key: ApiKey) -> Arc<RequestContext> {
@@ -1577,6 +1590,26 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert_eq!(status.message(), "API key does not allow write access");
+        assert!(engine.writes.lock().is_empty());
+    }
+
+    /// An export without credentials, from a caller the runtime serves read-only (it reached a
+    /// runtime without `runtime.auth` over the network), is refused before anything is stored.
+    #[tokio::test]
+    async fn otlp_grpc_export_without_credentials_is_denied_and_writes_nothing() {
+        let engine = FakeQueryEngine::new(&["otel_logs"], &[]);
+        let service = service(&engine, &["otel_logs"]);
+
+        let status = Arc::new(RequestContextBuilder::new(Protocol::Flight).build())
+            .scope(service.export(Request::new(records(3))))
+            .await
+            .expect_err("an export without credentials must not be stored");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            runtime_auth::anonymous::write_route_refusal()
+        );
         assert!(engine.writes.lock().is_empty());
     }
 }

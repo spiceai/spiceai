@@ -136,6 +136,10 @@ async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A `DoPut` without credentials that reached Spice through a proxy is refused. The test app
+/// listens only on loopback and has no `runtime.auth`, so a direct request without credentials
+/// is the local operator and may write; this one carries `X-Forwarded-For`, which a loopback
+/// listener serves read-only.
 #[tokio::test]
 async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -145,14 +149,21 @@ async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
             let (channel, _df) = start_spice_test_app(None, None, None).await?;
 
             let mut client = create_flight_client(channel, None)?;
+            client.add_header("x-forwarded-for", "203.0.113.7")?;
 
             let response =
                 write_record_batches(&mut client, vec![test_record_batch()?].into_iter()).await;
 
-            assert!(
-                response.is_err(),
-                "Expected an error but got a successful result"
-            );
+            match response {
+                Err(FlightError::Tonic(status)) => {
+                    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status}");
+                    assert_eq!(
+                        status.message(),
+                        runtime_auth::anonymous::write_route_refusal()
+                    );
+                }
+                other => panic!("expected the DoPut to be refused, got {other:?}"),
+            }
 
             Ok(())
         })
