@@ -1223,6 +1223,26 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 }
 
 impl TableFunctionImpl for ReciprocalRankFusion {
+    /// Runs the fusion once for each row of a `LATERAL` input whose options read its
+    /// columns. The nested search calls take literal arguments only: `DataFusion` evaluates
+    /// an input-dependent argument for each row, and a search call is not an expression it
+    /// can evaluate.
+    fn bind_with_input(
+        &self,
+        args: datafusion::catalog::TableFunctionArgs,
+        input: &datafusion::common::DFSchema,
+    ) -> datafusion::common::Result<
+        Option<datafusion::physical_plan::table_function::TableFunctionBinding>,
+    > {
+        runtime_datafusion_udfs::lateral::bind_per_row(
+            RRF_UDF_NAME,
+            Arc::new(ReciprocalRankFusion::from_ctx(&self.session_context)),
+            &args,
+            input,
+            runtime_datafusion_udfs::lateral::NullRows::Skip,
+        )
+    }
+
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         let rrf_args = Arc::new(ReciprocalRankFusionArgs::from_udtf_exprs(args)?);
         let serializable_args = rrf_args.to_serializable()?;

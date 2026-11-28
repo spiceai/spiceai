@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `de1c731731d882d1f597a819d50dad440a3cbd29` | `spiceai-55` |
+| [datafusion](#datafusion) | `14ccab7f48237d2b1aa9ad93f91cab94e3f386bf` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `c5f1094e4f5aa7bc0cb5d3bf0f7753a33e5fc39d` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b0464de933ba5e0cf5e8847f5b4341b75908667f` | `spiceai-55` |
@@ -260,9 +260,12 @@ merges upstream `55.3.0` (apache/datafusion@7941823cf077678fef337a29f8307e5d721d
 stream. #311 backports upstream's correlated count-bug fixes for aggregates without `GROUP BY`, #310 gives
 the column of an `ANY`/`ALL` subquery a name of its own, #309 quotes the qualifier of a wildcard inside an
 expression, and #308 keeps a regex that matches a backslash from becoming `LIKE`. On top of #308, #312 has
-`ANY`/`ALL` over an aggregate without `GROUP BY` compare with that aggregate's one row, and #306
-ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern; the pin is #306's merge commit
-(`de1c731731d882d1f597a819d50dad440a3cbd29`).
+`ANY`/`ALL` over an aggregate without `GROUP BY` compare with that aggregate's one row; none of these changes a
+manifest. On top of #312, #306 ports apache/datafusion#23188 so `SIMILAR TO` is an anchored SQL pattern, #313 has `ANY`/`ALL`
+compare with a groupless aggregate's row when a `HAVING` filters it, #315 supports `Decimal256` in `avg`,
+Parquet bloom filters and hash join keys, and #318 lets a table function bind to a `LATERAL` input and run
+once for each of its rows. #318 adds `datafusion-execution` and `futures` to `functions-table`'s manifest, and
+the pin is #318's merge commit.
 Outside the six files #298 resolved by hand, every Spice patch's diff against `55.3.0` is line for line
 its diff against `55.2.0`. Of those six, #251 keeps its empty-file rule beside upstream's null-partition
 statistics (apache/datafusion#26310), and #277's ordered *partial* path is replaced by upstream's
@@ -417,6 +420,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Optimizer: correlated count-bug compensation for an aggregate without `GROUP BY` under `EXISTS`, `ANY`/`ALL` and `IN` (backport of apache/datafusion#25391, #26544 and #26677; spiceai/datafusion#311) | An outer row with no inner row is dropped, so `EXISTS (SELECT count(*) …)` loses rows; the shapes the backport cannot compensate fail at planning instead | silent (wrong data) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_correlated_count_without_group_by_keeps_the_rows_with_no_match`; in the fork, `decorrelate_predicate_subquery.rs::exists_subquery_disjunction_with_count_bug` and the count-bug cases in `subquery.slt` and `not_in_correlated.slt` |
 | Optimizer: `RewriteSetComparison` writes `x op ANY (sub)` and `x op ALL (sub)` as the scalar comparison `x op (sub)` when the subquery is an aggregate without `GROUP BY` under projections and aliases, which returns exactly one row; correlated, only in a projection or filter; and keeps each rewritten expression's name, a backport of apache/datafusion#26657, which is upstream in `56.0.0` (`optimizer/src/rewrite_set_comparison.rs`; spiceai/datafusion#312) | An outer row with no inner row compares with no row instead of the aggregate's row (`max` NULL, `count` 0): `t.v > ALL (SELECT max(s.v) FROM s WHERE s.k = t.k)` keeps it, `t.v - 40 = ANY (SELECT count(*) …)` drops it, and the same comparison in a `SELECT` list fails to plan | silent (wrong data / query failure) | `crates/runtime-datafusion/src/fork_backport_guards.rs::any_all_over_an_aggregate_without_group_by_compares_with_its_row`; in the fork, the groupless-aggregate ANY/ALL cases in `subquery.slt` |
 | `SIMILAR TO` and `NOT SIMILAR TO` translate the SQL pattern (`%` any string, `_` one character, `.` `^` `$` literal) into an anchored regex before matching, instead of handing it to the regex kernel unchanged; `ESCAPE` is refused (`physical-expr/src/expressions/similar_to_pattern.rs`, `binary.rs`; apache/datafusion#23188, spiceai/datafusion#306) | `%` and `_` never match as wildcards and a pattern matches anywhere in the string: `'abc' SIMILAR TO 'a%'` is false and `'abc' SIMILAR TO 'b'` is true, so `WHERE c SIMILAR TO '(AUTO|BUILD)%'` returned 0 rows where `LIKE` returned 59,894 | silent (wrong rows) | `crates/runtime-datafusion/src/fork_backport_guards.rs::similar_to_matches_the_whole_string_with_sql_wildcards`; `crates/cayenne/tests/similar_to_semantics_test.rs` for a Cayenne table |
+| A table function binds to a `LATERAL` input through `TableFunctionImpl::bind_with_input`, which resolves its static arguments at planning and returns the arguments that read the left relation's columns as expressions; `TableFunctionExec` evaluates them for each input batch, runs the function once for each row (rows with equal arguments included), joins each output row to the row that produced it, and applies `ON`; `LEFT JOIN LATERAL` keeps a row with no match, with NULLs (`session/src/table.rs`, `physical-plan/src/table_function.rs`, `expr/src/table_function.rs`, `sql/src/relation/join.rs`; spiceai/datafusion#318) | `FROM q CROSS JOIN LATERAL text_search(docs, q.term)` fails to plan, because a table function accepts only literal arguments, so a search cannot run once per row of a queries table. Spice's table functions implement `bind_with_input` (`crates/runtime-datafusion-udfs/src/lateral.rs`), so losing the API fails to build; a re-cut that keeps it and drops the operator loses the rows | build | the `bind_with_input` implementations; for the behaviour, `test/spicescript/search.yaml`, its `LATERAL` steps and its accelerated `term_hits` view. Not run distributed: the plan has no protobuf form. In the fork, `table_functions.slt` and `user_defined_table_functions.rs` |
 
 ## arrow-rs
 

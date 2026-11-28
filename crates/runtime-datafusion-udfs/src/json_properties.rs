@@ -98,8 +98,8 @@ use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::Result as DataFusionResult;
+use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider};
+use datafusion::common::{DFSchema, Result as DataFusionResult};
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
@@ -107,6 +107,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::table_function::TableFunctionBinding;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::memory::MemorySourceConfig;
@@ -115,6 +116,8 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
+
+use crate::lateral::{NullRows, bind_per_row};
 
 pub const FLATTEN_JSON_PROPERTIES_UDTF_NAME: &str = "flatten_json_properties";
 runtime_udfs_api::register_spice_function!(
@@ -908,6 +911,23 @@ impl Debug for FlattenJsonPropertiesTableFunc {
 }
 
 impl TableFunctionImpl for FlattenJsonPropertiesTableFunc {
+    /// Flattens the JSON Schema of each row of a `LATERAL` input, as in
+    /// `FROM docs d CROSS JOIN LATERAL flatten_json_properties(d.body)`. A NULL document gives
+    /// no rows.
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        input: &DFSchema,
+    ) -> DataFusionResult<Option<TableFunctionBinding>> {
+        bind_per_row(
+            FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+            Arc::new(self.clone()),
+            &args,
+            input,
+            NullRows::Call,
+        )
+    }
+
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let parsed = parse_udtf_args(exprs)?;
         let rows = parsed
