@@ -1,7 +1,7 @@
-name: debezium-kafka-arrow
+name: debezium-kafka-memory
 duration: 49s
 description: >
-  An Arrow acceleration in memory of a Debezium topic in Kafka (`from:
+  A Cayenne acceleration in memory of a Debezium topic in Kafka (`from:
   debezium:`) starts and answers as PostgreSQL does after the snapshot and
   later changes. Its consumer group is named, so after spiced restarts the
   group has committed offsets while the acceleration is empty: the dataset
@@ -40,7 +40,7 @@ spicepod:
         kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
         kafka_security_protocol: plaintext
         kafka_consumer_group_id: spice-${sources.src.namespace}
-      acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
 
 defaults:
   expect: { oracle: src }

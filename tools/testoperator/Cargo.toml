@@ -34,7 +34,7 @@ serde.workspace = true
 serde_json.workspace = true
 yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
-spicepod = { path = "../../crates/spicepod" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
 system-adapter-protocol.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
@@ -46,30 +46,12 @@ tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+# The scenario runner signals and inspects processes with Unix-only APIs.
+[target.'cfg(unix)'.dependencies]
+spicescript = { path = "../spicescript" }
+
 [features]
 default = ["append"]
-anonymous_telemetry = []
-aws-secrets-manager = []
-clickhouse = []
-databricks = []
-debezium = []
-delta_lake = []
-dremio = []
-duckdb = []
-flightsql = []
-ftp = []
-imap = []
-keyring-secret-store = []
-models = []
-mssql = []
-mysql = []
-odbc = []
-postgres = []
-sharepoint = []
-snowflake = []
-spark = []
-sqlite = []
-
 append = ["test-framework/file_append"]
 
 [lints]

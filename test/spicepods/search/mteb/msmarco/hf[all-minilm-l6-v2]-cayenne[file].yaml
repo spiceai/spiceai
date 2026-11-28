@@ -56,7 +56,9 @@ datasets:
       engine: cayenne
       mode: file
 
-  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/test/0.parquet
+  # Judgments for the dev split (6,980 queries, binary grades), the split MTEB reports for MSMARCO.
+  # `test_queries` holds every split's queries; the harness sends only the judged ones.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/dev/0.parquet
     name: relevance_data
     params:
       file_format: parquet

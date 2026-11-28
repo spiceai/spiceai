@@ -430,7 +430,16 @@ installSpiceCli() {
     fi
 
     local target_file="$INSTALL_DIR/$target_name"
-    cp "$tmp_dir/$SPICE_CLI_FILENAME" "$target_file"
+    # Copied next to the installed binary, then renamed over it: a spice running from the install
+    # directory does not block the upgrade, as writing over it in place would on Linux ("Text file
+    # busy"), and a failed copy leaves the installed binary as it was.
+    local staged="$INSTALL_DIR/.$target_name.install.$$"
+    if ! { cp "$tmp_dir/$SPICE_CLI_FILENAME" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$target_file"; }; then
+        rm -f "$staged"
+        echo -e "${red}Error:${reset} Failed to install $target_name into $INSTALL_DIR"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
 
     if [ -f "$target_file" ]; then
         echo -e "${green}✓${reset} $target_name installed to $INSTALL_DIR"
@@ -467,7 +476,16 @@ installSpiced() {
     fi
 
     local target_file="$INSTALL_DIR/$target_name"
-    cp "$tmp_dir/$SPICED_FILENAME" "$target_file"
+    # Copied next to the installed binary, then renamed over it: a spiced running from the install
+    # directory does not block the upgrade, as writing over it in place would on Linux ("Text file
+    # busy"), and a failed copy leaves the installed binary as it was.
+    local staged="$INSTALL_DIR/.$target_name.install.$$"
+    if ! { cp "$tmp_dir/$SPICED_FILENAME" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$target_file"; }; then
+        rm -f "$staged"
+        echo -e "${red}Error:${reset} Failed to install $target_name into $INSTALL_DIR"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
 
     if [ -f "$target_file" ]; then
         echo -e "${green}✓${reset} $target_name installed to $INSTALL_DIR"

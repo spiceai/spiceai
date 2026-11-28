@@ -23,95 +23,110 @@ use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use std::collections::HashSet;
 
 /// A single primary key: (`partition_key_value`, optional `sort_key_value`).
 pub type PrimaryKey = (AttributeValue, Option<AttributeValue>);
 
-/// Extract primary key values from DML filter expressions.
+/// A key that a filter allows. `None` means the filter does not restrict that key column.
+type PartialKey = (Option<AttributeValue>, Option<AttributeValue>);
+
+/// Extract the primary keys of the items that DML filter expressions select.
 ///
-/// Supports:
-/// - `pk = <literal>` (single item, no sort key)
-/// - `pk = <literal> AND sk = <literal>` (single item with sort key)
-/// - `pk = <lit> OR pk = <lit> OR ...` (multiple items, no sort key)
-/// - `(pk = <lit> AND sk = <lit>) OR (pk = <lit> AND sk = <lit>) OR ...`
+/// The filters are conjuncts: an item is selected only when its key satisfies every filter.
+/// Each filter can combine, with `AND` and `OR`:
+/// - `pk = <literal>`, `sk = <literal>`
+/// - `pk IN (<literal>, ...)`, `sk IN (<literal>, ...)`
+/// - `(pk, sk) = (<literal>, <literal>)`, `(pk, sk) IN ((<literal>, <literal>), ...)`
 ///
-/// Rejects filters on non-primary-key columns.
+/// Every selected key must have a partition key value, and a sort key value when the table has a
+/// sort key. Filters on other columns are rejected. Filters that contradict each other select no
+/// key.
 pub(crate) fn extract_primary_keys(
     filters: &[Expr],
     partition_key: &str,
     sort_key: Option<&str>,
     time_format: &str,
 ) -> Result<Vec<PrimaryKey>, DataFusionError> {
-    if filters.is_empty() {
+    let Some((first, rest)) = filters.split_first() else {
         return Err(DataFusionError::Plan(
             "DynamoDB DML requires a WHERE clause on the primary key".to_string(),
         ));
+    };
+
+    let mut allowed = keys_allowed_by(first, partition_key, sort_key, time_format)?;
+    for filter in rest {
+        let other = keys_allowed_by(filter, partition_key, sort_key, time_format)?;
+        allowed = intersect(&allowed, &other);
     }
 
-    let mut keys = Vec::new();
-    for filter in filters {
-        extract_keys_from_expr(filter, partition_key, sort_key, time_format, &mut keys)?;
-    }
-
-    if keys.is_empty() {
-        return Err(DataFusionError::Plan(
-            "DynamoDB DML: no primary key values found in WHERE clause".to_string(),
-        ));
+    let mut keys: Vec<PrimaryKey> = Vec::with_capacity(allowed.len());
+    let mut seen = HashSet::with_capacity(allowed.len());
+    for key in allowed {
+        match key {
+            (Some(pk_val), sk_val) if sort_key.is_none() || sk_val.is_some() => {
+                if seen.insert((key_identity(&pk_val), sk_val.as_ref().map(key_identity))) {
+                    keys.push((pk_val, sk_val));
+                }
+            }
+            _ => {
+                let key_columns = match sort_key {
+                    Some(sk) => format!("partition key '{partition_key}' and sort key '{sk}'"),
+                    None => format!("partition key '{partition_key}'"),
+                };
+                return Err(DataFusionError::Plan(format!(
+                    "DynamoDB DML requires the WHERE clause to give a value for the {key_columns} of each item"
+                )));
+            }
+        }
     }
 
     Ok(keys)
 }
 
-fn extract_keys_from_expr(
+/// A hashable identity for a key value. Key attributes are strings, numbers or binary; any other
+/// value gets its debug text.
+fn key_identity(value: &AttributeValue) -> (char, Vec<u8>) {
+    match value {
+        AttributeValue::S(s) => ('S', s.as_bytes().to_vec()),
+        AttributeValue::N(n) => ('N', n.as_bytes().to_vec()),
+        AttributeValue::B(b) => ('B', b.as_ref().to_vec()),
+        other => ('?', format!("{other:?}").into_bytes()),
+    }
+}
+
+/// The keys `expr` allows: `OR` is the union of its sides, `AND` the intersection.
+fn keys_allowed_by(
     expr: &Expr,
     partition_key: &str,
     sort_key: Option<&str>,
     time_format: &str,
-    keys: &mut Vec<PrimaryKey>,
-) -> Result<(), DataFusionError> {
+) -> Result<Vec<PartialKey>, DataFusionError> {
+    let full_keys = |keys: Vec<PrimaryKey>| {
+        keys.into_iter()
+            .map(|(pk, sk)| (Some(pk), sk))
+            .collect::<Vec<_>>()
+    };
+
     match expr {
-        // OR: each side is a separate key
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Or,
             right,
         }) => {
-            extract_keys_from_expr(left, partition_key, sort_key, time_format, keys)?;
-            extract_keys_from_expr(right, partition_key, sort_key, time_format, keys)?;
+            let mut keys = keys_allowed_by(left, partition_key, sort_key, time_format)?;
+            keys.extend(keys_allowed_by(right, partition_key, sort_key, time_format)?);
+            Ok(keys)
         }
-        // AND: combine pk and sk from both sides into a single key
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::And,
             right,
-        }) => {
-            let mut pk_val = None;
-            let mut sk_val = None;
-            collect_key_equalities(
-                left,
-                partition_key,
-                sort_key,
-                time_format,
-                &mut pk_val,
-                &mut sk_val,
-            )?;
-            collect_key_equalities(
-                right,
-                partition_key,
-                sort_key,
-                time_format,
-                &mut pk_val,
-                &mut sk_val,
-            )?;
-
-            let Some(pk) = pk_val else {
-                return Err(DataFusionError::Plan(format!(
-                    "DynamoDB DML: AND expression must include partition key '{partition_key}'"
-                )));
-            };
-            keys.push((pk, sk_val));
-        }
-        // Simple equality: pk = <literal>
+        }) => Ok(intersect(
+            &keys_allowed_by(left, partition_key, sort_key, time_format)?,
+            &keys_allowed_by(right, partition_key, sort_key, time_format)?,
+        )),
+        // Equality: pk = <literal>, sk = <literal> or (pk, sk) = (<literal>, <literal>)
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
@@ -121,36 +136,33 @@ fn extract_keys_from_expr(
             | (Expr::Literal(scalar, _), Expr::Column(col)) => {
                 let col = col.name();
                 if col == partition_key {
-                    let attr = scalar_to_attribute_value(scalar, time_format)?;
-                    keys.push((attr, None));
+                    Ok(vec![(Some(scalar_to_attribute_value(scalar, time_format)?), None)])
                 } else if sort_key.is_some_and(|sk| sk == col) {
-                    return Err(DataFusionError::Plan(
-                            "DynamoDB DML: sort key filter must be combined with partition key using AND".to_string(),
-                        ));
+                    Ok(vec![(None, Some(scalar_to_attribute_value(scalar, time_format)?))])
                 } else {
-                    return Err(DataFusionError::Plan(format!(
+                    Err(DataFusionError::Plan(format!(
                         "DynamoDB DML only supports filters on primary key columns, got '{col}'"
-                    )));
+                    )))
                 }
             }
             (Expr::ScalarFunction(func), Expr::Literal(scalar, _))
             | (Expr::Literal(scalar, _), Expr::ScalarFunction(func)) => {
+                let mut keys = Vec::new();
                 extract_keys_from_struct_eq(
                     func,
                     scalar,
                     partition_key,
                     sort_key,
                     time_format,
-                    keys,
+                    &mut keys,
                 )?;
+                Ok(full_keys(keys))
             }
-            _ => {
-                return Err(DataFusionError::Plan(
-                        "DynamoDB DML only supports column = literal or struct = struct filters on primary key columns".to_string(),
-                    ));
-            }
+            _ => Err(DataFusionError::Plan(
+                "DynamoDB DML only supports column = literal or struct = struct filters on primary key columns".to_string(),
+            )),
         },
-        // Simple IN list: pk IN (v1, v2, v3)
+        // IN list: pk IN (v1, v2, v3), sk IN (v1, v2, v3) or (pk, sk) IN ((v1, v2), ...)
         Expr::InList(InList {
             expr: in_expr,
             list,
@@ -161,68 +173,70 @@ fn extract_keys_from_expr(
                     "DynamoDB DML does not support NOT IN".to_string(),
                 ));
             }
-            extract_keys_from_in_list(in_expr, list, partition_key, sort_key, time_format, keys)?;
+            if let Expr::Column(col) = in_expr.as_ref() {
+                let col = col.name();
+                let is_partition_key = col == partition_key;
+                let is_sort_key = sort_key.is_some_and(|sk| sk == col);
+                if !(is_partition_key || is_sort_key) {
+                    return Err(DataFusionError::Plan(format!(
+                        "DynamoDB DML only supports filters on primary key columns, got '{col}'"
+                    )));
+                }
+                let mut keys = Vec::with_capacity(list.len());
+                for item in list {
+                    let Expr::Literal(scalar, _) = item else {
+                        return Err(DataFusionError::Plan(format!(
+                            "DynamoDB DML IN list values must be literals, got: {item}"
+                        )));
+                    };
+                    // A NULL in an IN list matches no item.
+                    if scalar.is_null() {
+                        continue;
+                    }
+                    let attr = scalar_to_attribute_value(scalar, time_format)?;
+                    keys.push(if is_partition_key {
+                        (Some(attr), None)
+                    } else {
+                        (None, Some(attr))
+                    });
+                }
+                return Ok(keys);
+            }
+            let mut keys = Vec::new();
+            extract_keys_from_in_list(
+                in_expr,
+                list,
+                partition_key,
+                sort_key,
+                time_format,
+                &mut keys,
+            )?;
+            Ok(full_keys(keys))
         }
-        _ => {
-            return Err(DataFusionError::Plan(format!(
-                "DynamoDB DML: unsupported filter expression: {expr}"
-            )));
-        }
+        _ => Err(DataFusionError::Plan(format!(
+            "DynamoDB DML: unsupported filter expression: {expr}"
+        ))),
     }
-    Ok(())
 }
 
-fn collect_key_equalities(
-    expr: &Expr,
-    partition_key: &str,
-    sort_key: Option<&str>,
-    time_format: &str,
-    pk_val: &mut Option<AttributeValue>,
-    sk_val: &mut Option<AttributeValue>,
-) -> Result<(), DataFusionError> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And,
-            right,
-        }) => {
-            collect_key_equalities(left, partition_key, sort_key, time_format, pk_val, sk_val)?;
-            collect_key_equalities(right, partition_key, sort_key, time_format, pk_val, sk_val)?;
-        }
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::Eq,
-            right,
-        }) => {
-            let (col, scalar) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(scalar, _))
-                | (Expr::Literal(scalar, _), Expr::Column(col)) => (col.name(), scalar),
-                _ => {
-                    return Err(DataFusionError::Plan(
-                        "DynamoDB DML only supports column = literal filters on primary key columns"
-                            .to_string(),
-                    ));
-                }
-            };
+/// The keys both `left` and `right` allow.
+fn intersect(left: &[PartialKey], right: &[PartialKey]) -> Vec<PartialKey> {
+    fn agree(a: Option<&AttributeValue>, b: Option<&AttributeValue>) -> bool {
+        a.zip(b).is_none_or(|(a, b)| a == b)
+    }
 
-            let attr = scalar_to_attribute_value(scalar, time_format)?;
-            if col == partition_key {
-                *pk_val = Some(attr);
-            } else if sort_key.is_some_and(|sk| sk == col) {
-                *sk_val = Some(attr);
-            } else {
-                return Err(DataFusionError::Plan(format!(
-                    "DynamoDB DML only supports filters on primary key columns, got '{col}'"
-                )));
+    let mut keys = Vec::new();
+    for (l_pk, l_sk) in left {
+        for (r_pk, r_sk) in right {
+            if agree(l_pk.as_ref(), r_pk.as_ref()) && agree(l_sk.as_ref(), r_sk.as_ref()) {
+                keys.push((
+                    l_pk.as_ref().or(r_pk.as_ref()).cloned(),
+                    l_sk.as_ref().or(r_sk.as_ref()).cloned(),
+                ));
             }
         }
-        _ => {
-            return Err(DataFusionError::Plan(format!(
-                "DynamoDB DML: unsupported filter expression in AND clause: {expr}"
-            )));
-        }
     }
-    Ok(())
+    keys
 }
 
 fn extract_keys_from_in_list(
@@ -234,25 +248,6 @@ fn extract_keys_from_in_list(
     keys: &mut Vec<PrimaryKey>,
 ) -> Result<(), DataFusionError> {
     match in_expr {
-        Expr::Column(col) => {
-            if col.name() != partition_key {
-                return Err(DataFusionError::Plan(format!(
-                    "DynamoDB DML IN list only supports partition key column '{}', got '{}'",
-                    partition_key,
-                    col.name()
-                )));
-            }
-            for item in list {
-                let Expr::Literal(scalar, _) = item else {
-                    return Err(DataFusionError::Plan(format!(
-                        "DynamoDB DML IN list values must be literals, got: {item}"
-                    )));
-                };
-                let attr = scalar_to_attribute_value(scalar, time_format)?;
-                keys.push((attr, None));
-            }
-            Ok(())
-        }
         Expr::ScalarFunction(func) => {
             let columns: Vec<&str> = func
                 .args
@@ -452,4 +447,115 @@ pub(crate) fn extract_key_pair_from_struct_func(
         .transpose()?;
 
     Ok((pk_attr, sk_attr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::{col, lit};
+
+    fn s(value: &str) -> AttributeValue {
+        AttributeValue::S(value.to_string())
+    }
+
+    fn keys(filters: &[Expr], sort_key: Option<&str>) -> Result<Vec<PrimaryKey>, DataFusionError> {
+        extract_primary_keys(filters, "pk", sort_key, "")
+    }
+
+    #[test]
+    fn an_item_must_satisfy_every_filter() -> Result<(), DataFusionError> {
+        let a_or_b = col("pk").in_list(vec![lit("a"), lit("b")], false);
+        let b_or_c = col("pk").in_list(vec![lit("b"), lit("c")], false);
+
+        assert_eq!(
+            keys(&[a_or_b.clone(), col("pk").eq(lit("c"))], None)?,
+            vec![]
+        );
+        assert_eq!(keys(&[a_or_b, b_or_c], None)?, vec![(s("b"), None)]);
+        assert_eq!(
+            keys(
+                &[col("pk").in_list(vec![lit("a"), lit("b"), lit("c"), lit("a")], false)],
+                None
+            )?,
+            vec![(s("a"), None), (s("b"), None), (s("c"), None)]
+        );
+        assert_eq!(
+            keys(
+                &[col("pk").in_list(
+                    vec![lit("a"), lit(ScalarValue::Utf8(None)), lit("b"), lit("c")],
+                    false
+                )],
+                None
+            )?,
+            vec![(s("a"), None), (s("b"), None), (s("c"), None)]
+        );
+        assert_eq!(
+            keys(
+                &[col("pk")
+                    .eq(lit("a"))
+                    .and(col("pk").eq(lit("b")))
+                    .or(col("pk").eq(lit("c")))],
+                None
+            )?,
+            vec![(s("c"), None)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_key_can_come_from_separate_filters() -> Result<(), DataFusionError> {
+        assert_eq!(
+            keys(
+                &[col("pk").eq(lit("a")), col("sk").eq(lit("1"))],
+                Some("sk")
+            )?,
+            vec![(s("a"), Some(s("1")))]
+        );
+        assert_eq!(
+            keys(
+                &[
+                    col("sk").eq(lit("1")),
+                    col("pk").eq(lit("a")).or(col("pk").eq(lit("b")))
+                ],
+                Some("sk")
+            )?,
+            vec![(s("a"), Some(s("1"))), (s("b"), Some(s("1")))]
+        );
+        assert_eq!(
+            keys(
+                &[
+                    col("pk").eq(lit("a")),
+                    col("sk").in_list(vec![lit("1"), lit("2")], false)
+                ],
+                Some("sk")
+            )?,
+            vec![(s("a"), Some(s("1"))), (s("a"), Some(s("2")))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_filter_on_another_column_is_refused() {
+        assert!(matches!(
+            keys(&[col("pk").eq(lit("a")), col("score").eq(lit(f64::NAN))], None),
+            Err(DataFusionError::Plan(message)) if message.contains("got 'score'")
+        ));
+    }
+
+    #[test]
+    fn every_item_needs_its_full_key() {
+        let refused = |result: Result<Vec<PrimaryKey>, DataFusionError>| {
+            matches!(result, Err(DataFusionError::Plan(message))
+                if message.contains("partition key 'pk' and sort key 'sk'"))
+        };
+
+        assert!(refused(keys(&[col("pk").eq(lit("a"))], Some("sk"))));
+        assert!(refused(keys(
+            &[col("pk")
+                .eq(lit("a"))
+                .and(col("sk").eq(lit("1")))
+                .or(col("pk").eq(lit("b")))],
+            Some("sk")
+        )));
+    }
 }

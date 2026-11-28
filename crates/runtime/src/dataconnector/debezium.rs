@@ -566,6 +566,8 @@ impl DataConnector for Debezium {
             self.batching,
             projection,
         )
+        .with_dataset_name(dataset.name.to_string())
+        .with_runtime_status(context.runtime_status())
         .with_column_defaults(column_defaults);
 
         if let Some(debezium_kafka_sys) = debezium_kafka_sys {

@@ -188,8 +188,9 @@ version and the rest re-read and retry, so a dataset completes about one head
 replacement per round trip.
 
 **Local directories: each durable write does its own full flush.** A local
-directory is the local and on-prem path. Its state survives a process crash or
-kill; whether it survives a power loss is an [open decision](#open-decisions).
+directory is the local and on-prem path, for development, testing and getting
+started. Its state survives a process crash or kill, with no promise for an OS
+crash or a power loss.
 A local create or CAS syncs its
 staged file, links or renames it into place, then syncs the directory, both with
 `sync_all`, which Rust's standard library implements with `F_FULLFSYNC` on
@@ -1913,8 +1914,7 @@ way, is Milestone 1 ([Garbage collection](#garbage-collection)).
   proposed.
 - **Tests use an in-memory store** for most suites, so their speed does not
   depend on fsync and no durability setting ships. Local directories are
-  tested for process kill and restart; a power-loss test belongs to the
-  flush-tier [open decision](#open-decisions).
+  tested for process kill and restart; power loss is not promised.
 - **Status** lines come from the prototype's own notes, not from runs in this
   document.
 
@@ -2019,8 +2019,8 @@ import, and the remaining sources' positions are step 5.
   commit); `accelerators/accelerator-cayenne/src/change_sink.rs`
   (caching writes).
 - **Exit:** commits per second and CDC freshness at P99 and P99.9 against the
-  per-call baseline, interleaved, on Linux and macOS; a power-loss test on a local
-  directory; a keyless source never duplicating rows across a crash. A local
+  per-call baseline, interleaved, on Linux and macOS; a keyless source never
+  duplicating rows across a crash. A local
   speed comparison with the SQLite metastore runs SQLite at `synchronous = FULL`,
   or states that today's `synchronous = NORMAL` does not survive power loss.
 
@@ -2218,7 +2218,6 @@ The direction document links here; this is the one list.
 | Log-object reclamation: deleting batches, checkpoints and objects below the checkpoint, and whether sealed rows move from inline records to data files (about 11 MB of log per minute at 2,000 rows/s inline, against 2.2 MB with a 7× slower reopen as files) | Log bytes per minute under CDC ([#16132](https://github.com/spiceai/spiceai/issues/16132)); the deletion is [#15995](https://github.com/spiceai/spiceai/issues/15995) | Step 8 |
 | The retention T for data files and deletion vectors (about an hour, as for log objects, or shorter) | Retained bytes per hour at T on a full-refresh and a CDC workload, against query duration at P99 and P99.9 | Step 7 |
 | The orphan floor with a second process sweeping: whether one hour against the head's store time stays safe when a sweep can run outside the writer's process, or the writer's age check of decision 1.10 returns; and aging a dropped folder on a store time instead of an instance's clock | The data-files model with a second sweeping process; [#16133](https://github.com/spiceai/spiceai/issues/16133) and [#16136](https://github.com/spiceai/spiceai/issues/16136) | Step 7 |
-| Local directories: one durable local store for data and metastore, and its flush tier (today a full flush per write, `F_FULLFSYNC` on macOS; an ordered barrier on macOS is the candidate) | Write P99 and P99.9 at each tier, interleaved, and a power-loss test ([#16134](https://github.com/spiceai/spiceai/issues/16134)) | Step 8 |
 | An S3 Express directory bucket as the destination | Request cost, latency and prefix count on real S3 Express ([#16135](https://github.com/spiceai/spiceai/issues/16135)) | Step 8 |
 | Decision 3.4: shift the buffer or stamp at commit | Shift time at P99 and P99.9 against a retry, on Milestone 1's code | Gate before M3 |
 | Checkpoint delta pages | Step 5's checkpoint bytes per committed metadata byte | Step 5 |
