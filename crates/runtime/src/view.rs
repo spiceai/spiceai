@@ -44,7 +44,7 @@ use std::sync::{
 };
 
 pub(crate) use runtime_datafusion::dependent_tables::{
-    get_dependent_table_names, table_function_arguments,
+    FunctionCall, function_calls, get_dependent_table_names, table_function_arguments,
 };
 
 /// The tables a view reads: the tables its SQL names, and the arguments of its
