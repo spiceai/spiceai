@@ -1174,6 +1174,8 @@ async fn a_kill_at_any_storage_request_of_two_pipelined_cdc_bursts_is_all_or_not
             .sweep_orphan_files_now()
             .await
             .expect("the orphan sweep");
+        // It retires them, and the retirement sweep deletes them.
+        next.table.reclaim_retired_snapshots_now().await;
         let named = next.named_files(&location).await;
         let left: Vec<String> = location
             .stored_files()

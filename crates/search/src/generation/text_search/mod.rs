@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -59,6 +59,7 @@ pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
 pub mod exec;
 pub mod index;
+mod negative_query;
 pub mod query;
 mod util;
 
@@ -502,11 +503,23 @@ fn top_docs_limit(requested: usize, num_docs: u64) -> usize {
 /// field-scoped queries (title:foo) and boosts (term^2) are honored. Fall back to a bag-of-words
 /// OR clause for inputs the parser rejects (e.g. unbalanced quotes, lone special characters in
 /// conversational queries).
+///
+/// The parsed query is rewritten so `AND NOT` and a leading `NOT` match documents; see
+/// [`negative_query`].
 fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query>> {
     match parser.parse_query(literal) {
-        Ok(parsed) => Ok(parsed),
+        Ok(parsed) => Ok(negative_query::rewrite_negative_clauses(parsed)),
+        // Tantivy rejects a query of only excluding terms (`NOT x`, `-x`). Its
+        // lenient parser already inserts `AllQuery`; the rewrite below turns that
+        // into `Must(AllQuery)` plus the `MustNot` clauses (every document except
+        // `x`). Other parse failures still fall back to a bag-of-words OR.
+        Err(QueryParserError::AllButQueryForbidden) => {
+            let (parsed, _) = parser.parse_query_lenient(literal);
+            Ok(negative_query::rewrite_negative_clauses(parsed))
+        }
         Err(_) => parser
             .build_query_from_user_input_ast(parse_query_literal(literal))
+            .map(negative_query::rewrite_negative_clauses)
             .context(InvalidTextSearchQuerySnafu {
                 query: literal.to_string(),
             }),

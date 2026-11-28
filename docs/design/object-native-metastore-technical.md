@@ -1455,11 +1455,22 @@ the writer's process.
   fenced or discarded its write, or a deletion vector whose write failed. It
   never becomes visible.
 - The orphan sweep lists the dataset's data path, the only listing of a
-  dataset's data in normal operation. It deletes an object only when no
-  committed manifest row or deletion names it, no write of this process holds
-  it in the writer's record, it is not a retired file waiting out T (the
-  retired set is read before the listing and again before the deletes), and it
-  is older than one hour on the store's clock.
+  dataset's data in normal operation. It judges an object an orphan only when
+  no committed manifest row or deletion names it, no write of this process
+  holds it in the writer's record, it is not a retired file waiting out T (the
+  retired set is read before the listing and again before it acts), and it is
+  older than one hour on the store's clock.
+- **It retires; it does not delete.** The sweep commits one `RetireFiles`
+  record naming its orphans, through the dataset's log, and the retirement
+  sweep deletes them after T like any retired file. The judgment comes from
+  the process's view of the dataset. A writer that another instance has taken
+  over from, and that has not learned it yet, has a view that predates the new
+  writer's commits, so the judgment alone can name a file the new writer
+  committed. The record is what licenses acting on the judgment: its
+  publication is conditional on the lease generation, so that writer is
+  refused, retires nothing, and learns it was fenced. A record that would
+  name a file live at the head leaves it out. No delete of an orphan therefore
+  depends on lease timing or on any machine's clock.
 - **Every key is classified by file.** A data file or deletion vector anywhere
   under the data path is a candidate, flat or under a folder from an earlier
   build. `_lookup_index/` is not, because the lookup index reclaims its own
@@ -1472,11 +1483,14 @@ the writer's process.
   newer than the last head and wait for the next commit's sweep, which delays
   them and leaks nothing. So no clock object and no empty commit are needed.
 - **No writer age check.** Decision 1.10's writer refuses an upload older than
-  T_O so that GC cannot delete it under a later commit. Here only the lease
-  holder sweeps, its record holds every key it has not committed, and the
+  T_O so that GC cannot delete it under a later commit. Here only a sweep
+  whose `RetireFiles` record commits under the current lease retires anything,
+  the lease holder's record holds every key it has not committed, and the
   lease fences every other writer's commit, so no commit can name a file the
-  sweep deletes. The model checks this with the record and the lease alone
-  (`data-files-intent`), and the floor is a backstop.
+  sweep retires. The model checks this with the record and the lease alone
+  (`data-files-intent`; with a fenced writer that keeps sweeping from its stale
+  view, `data-files-retire`, and the control
+  `data-files-retire-orphan-deletes-directly`), and the floor is a backstop.
 - **Unfinished multipart uploads are not aborted.** A listing does not show
   them, they cost storage, and S3 Express directory buckets have no lifecycle
   rule that would remove them; aborting them is tracked in
@@ -2127,6 +2141,20 @@ committed file sets, CDC, and the data-file lifecycle.
   - *replay after takeover:* PostgreSQL resumes from the committed position;
     SQS redelivers undeleted messages, so the new holder skips files the log
     already records.
+- **PostgreSQL consumer identity and rollback:** an object-native dataset's
+  generated slot is named for the dataset and the identity recorded in its state
+  location. Instances sharing that location share the slot; another location
+  has its own consumer. The SQLite copy retained for rollback keeps its
+  instance-scoped default slot.
+  Acknowledging the object-native copy therefore does not advance the SQLite
+  copy's default slot. An explicitly configured slot keeps its configured name
+  across upgrades: if its acknowledged position exceeds the durable position in
+  the copy being opened, that copy rebuilds from the source before resuming.
+  Separate slots can retain WAL independently while either copy is stopped;
+  the upgrade does not drop the rollback copy's slot.
+  The engine check is `test/spicescript/cayenne-vnext-rollback.yaml`: both slot
+  policies against both release lines, with source row oracles, slot identities
+  and positions, and a rebuild required only for the explicitly shared slot.
 - **Prerequisites:** data placement (step 6). Until then data files are on the
   writer's local disk, so a standby could neither read them nor take over
   (model: `standby-local-files`).

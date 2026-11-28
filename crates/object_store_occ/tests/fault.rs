@@ -472,6 +472,54 @@ async fn delete_faults_match_each_path() {
     }
 }
 
+/// A held delete stays in flight: the object is kept, and the paths after it
+/// in the stream wait, until `deliver` applies it; the caller hears only on
+/// `respond`.
+#[tokio::test]
+async fn held_delete_lands_only_on_delivery() {
+    let directory = tempfile::tempdir().expect("directory");
+    for inner in backends(directory.path()) {
+        let store = Arc::new(FaultStore::new(Arc::clone(&inner)));
+        for name in ["h/a", "h/b"] {
+            inner
+                .put(&Path::from(name), Bytes::from(name).into())
+                .await
+                .expect("seed");
+        }
+        store.arm(Op::Delete, |p| p.as_ref() == "h/a", Fault::Hold);
+        let caller = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            caller
+                .delete_stream(
+                    futures::stream::iter(["h/a", "h/b"].map(|p| Ok(Path::from(p)))).boxed(),
+                )
+                .map(|r| r.map(|p| p.to_string()).map_err(|e| e.to_string()))
+                .collect::<Vec<_>>()
+                .await
+        });
+        let id = store.wait_held(None).await;
+        assert!(!task.is_finished());
+        assert_eq!(stored(&inner, "h/a").await.as_deref(), Some(&b"h/a"[..]));
+        assert_eq!(stored(&inner, "h/b").await.as_deref(), Some(&b"h/b"[..]));
+        assert_eq!(ops(&store), vec![], "nothing applied while held");
+        store.deliver(id).await.expect("deliver");
+        assert_eq!(stored(&inner, "h/a").await, None);
+        assert!(!task.is_finished(), "the caller waits for the response");
+        store.respond(id).expect("respond");
+        let answers = task.await.expect("join");
+        assert_eq!(answers, vec![Ok("h/a".into()), Ok("h/b".into())]);
+        assert_eq!(stored(&inner, "h/b").await, None);
+        assert_eq!(
+            ops(&store),
+            vec![
+                (Op::Delete, "h/a".into(), true),
+                (Op::Delete, "h/b".into(), true)
+            ]
+        );
+        println!("{inner}: a held delete lands on delivery, answers on respond");
+    }
+}
+
 #[tokio::test]
 async fn copy_and_rename_faults_refuse_or_apply() {
     let directory = tempfile::tempdir().expect("directory");

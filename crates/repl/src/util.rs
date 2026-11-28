@@ -19,7 +19,7 @@ limitations under the License.
 use dialoguer::{Select, theme::ColorfulTheme};
 use rustyline::DefaultEditor;
 use serde::Deserialize;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,7 +97,14 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    /// Start a new spinner.
+    /// Start a spinner on stderr when stdout is a TTY. Piped and redirected
+    /// stdout stay byte-clean so JSON and other machine output can be parsed.
+    #[must_use]
+    pub fn start_if_stdout_tty() -> Option<Self> {
+        io::stdout().is_terminal().then(Self::start)
+    }
+
+    /// Start a new spinner on stderr.
     #[must_use]
     pub fn start() -> Self {
         let running = Arc::new(AtomicBool::new(true));
@@ -107,14 +114,14 @@ impl Spinner {
             let mut idx = 0;
             while running_clone.load(Ordering::Relaxed) {
                 let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
-                print!("\r{frame} ");
-                let _ = io::stdout().flush();
+                eprint!("\r{frame} ");
+                let _ = io::stderr().flush();
                 idx += 1;
                 tokio::time::sleep(Duration::from_millis(80)).await;
             }
             // Clear spinner
-            print!("\r  \r");
-            let _ = io::stdout().flush();
+            eprint!("\r  \r");
+            let _ = io::stderr().flush();
         });
 
         Self {
@@ -378,6 +385,17 @@ mod tests {
         // Verify spinner frames are defined correctly
         assert_eq!(SPINNER_FRAMES.len(), 10);
         assert!(SPINNER_FRAMES.iter().all(|f| !f.is_empty()));
+    }
+
+    #[test]
+    fn spinner_is_absent_when_stdout_is_not_a_tty() {
+        if io::stdout().is_terminal() {
+            return;
+        }
+        assert!(
+            Spinner::start_if_stdout_tty().is_none(),
+            "piped stdout must not start a spinner"
+        );
     }
 
     // Paused time: the animation's 80 ms ticks elapse only when the runtime is

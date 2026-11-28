@@ -10,7 +10,11 @@
 //! The `data-files-retire` traces add per-file retirement. Each record is one of
 //! this test's own encoding: `AddFiles`, `RemoveFiles`, `ReplaceFiles` (which
 //! removes its inputs, adds its outputs and names the files it carries in
-//! place), a prepared `ReplaceFiles`, its resolve, or `ForgetRetired{files}`.
+//! place), a prepared `ReplaceFiles`, its resolve, `RetireFiles{files}` (the
+//! orphan sweep's, for files no record names), or `ForgetRetired{files}`. The
+//! orphan sweep retires a file by that record, through the head log at the
+//! generation its process believes it holds, and the retirement sweep deletes
+//! it; a process another has taken over from is refused by the head log.
 //! A removing record lists the files it retires; the safe writer retires
 //! exactly the files it removes, so a carried file is never retired. The replay
 //! folds the real records into the live set and the retired set (each retired
@@ -39,8 +43,9 @@
 //! independent invariant fails. The controls: whole-snapshot retirement,
 //! retiring a carried file, ignoring T for local and remote readers,
 //! forgetting early, ignoring the restore hold, sweeping from the uncommitted
-//! local view, and the orphan sweep ignoring a prepared transaction's
-//! reservation. A record that retires a file it keeps live (whole-snapshot,
+//! local view, the orphan sweep ignoring a prepared transaction's
+//! reservation, and the orphan sweep deleting on its own view's judgment
+//! instead of retiring through the fenced log. A record that retires a file it keeps live (whole-snapshot,
 //! retires-carried) is refused when the replay compares its fold with the
 //! model's retired set, since the safe writer never writes one.
 //!
@@ -155,6 +160,10 @@ enum Record {
     ForgetRetired {
         files: Vec<File>,
     },
+    /// Files no record names, retired by the orphan sweep.
+    RetireFiles {
+        files: Vec<File>,
+    },
 }
 impl Record {
     /// The live files this record removes.
@@ -227,6 +236,11 @@ impl Head {
                     self.retired.remove(&f);
                 }
             }
+            Payload::Record(Record::RetireFiles { files }) => {
+                for f in files {
+                    self.retired.entry(f).or_insert(version);
+                }
+            }
         }
     }
 }
@@ -286,6 +300,10 @@ enum Control {
     IgnoresRestoreHold,
     /// The orphan sweep runs while a prepared transaction reserves the table.
     OrphanIgnoresReservation,
+    /// The orphan sweep deletes what its process's view does not name, with
+    /// no commit, so a writer another has taken over from, unaware of it,
+    /// deletes on a stale judgment.
+    OrphanDeletesDirectly,
 }
 
 /// The client side of one writer process, as the protocol keeps it.
@@ -1104,7 +1122,7 @@ impl Replay {
                 // The sweeper's own rule, from real state.
                 let head = self.state().await?;
                 let key = model_key(key);
-                if self.retire {
+                if self.retire && self.control != Control::OrphanDeletesDirectly {
                     // The lease holder's orphan sweep: unnamed by the live or
                     // the retired set, not held by its own writes, and never
                     // while a prepared transaction reserves the table.
@@ -1127,7 +1145,7 @@ impl Replay {
                     require(!self.intends(holder, key), || {
                         format!("orphan sweep of {key:?} that the holder's write holds")
                     })?;
-                } else {
+                } else if !self.retire {
                     // Unnamed and fenced.
                     require(
                         u64::from(key.0) < head.lease
@@ -1137,6 +1155,65 @@ impl Replay {
                 }
                 result(self.store.delete(&data_path(key.0, key.1)).await)?;
                 self.cover("orphan swept");
+            }
+            DataFileOp::OrphanRetired {
+                writer,
+                generation,
+                key,
+                committed,
+            } => {
+                // The sweeping process's own rule: never a file its own writes
+                // hold. What else it judges unnamed comes from its view, which
+                // may predate a takeover; the record's lease condition is what
+                // keeps that judgment from deleting a file the new writer names.
+                let key = model_key(key);
+                require(!self.intends(&self.clients[writer], key), || {
+                    format!("orphan retirement of {key:?} that its writer's write holds")
+                })?;
+                let file = self
+                    .stored()
+                    .await?
+                    .into_iter()
+                    .find(|f| key_of(*f) == key)
+                    .ok_or_else(|| format!("orphan retirement of {key:?}, which is not stored"))?;
+                let head = self.state().await?;
+                let payload = result(serde_json::to_vec(&Payload::Record(Record::RetireFiles {
+                    files: vec![file],
+                })))?;
+                let mut log = self.writer(generation).await?;
+                let real = match log.prepare(Bytes::from(payload)).await {
+                    Ok(receipt) => matches!(
+                        result(log.commit(&receipt).await)?,
+                        Outcome::Accepted { .. }
+                    ),
+                    Err(_) if log.state().head.lease > u64::from(generation) => false,
+                    Err(e) => return Err(format!("prepare orphan retirement: {e}")),
+                };
+                require(real == committed, || {
+                    format!("orphan retirement committed: model {committed}; real {real}")
+                })?;
+                if real {
+                    // Committed under the lease: no record named the file.
+                    let named = head
+                        .live
+                        .iter()
+                        .chain(head.retired.keys())
+                        .any(|f| key_of(*f) == key);
+                    require(!named, || {
+                        format!("orphan retirement of a named file {key:?}")
+                    })?;
+                    if self.control != Control::OrphanIgnoresReservation {
+                        require(head.prepared.is_none(), || {
+                            format!("orphan retirement of {key:?} while a transaction is prepared")
+                        })?;
+                    }
+                    self.cover("orphan retired");
+                } else {
+                    // The refusal tells the writer it lost the lease.
+                    self.clients[writer] = Client::default();
+                    self.end_sweep(writer);
+                    self.cover("orphan retirement refused (fenced)");
+                }
             }
             DataFileOp::TxResolved { writer, id, commit } => {
                 let head = self.state().await?;
@@ -1718,8 +1795,8 @@ async fn retirement_traces_replay_on_real_storage() {
 
 /// Witnesses in `data-files-retire.jsonl` and walks in
 /// `data-files-retire-walk.jsonl` (see `traces/README.md`).
-const RETIRE_WITNESSES: usize = 66;
-const RETIRE_WALKS: usize = 80;
+const RETIRE_WITNESSES: usize = 80;
+const RETIRE_WALKS: usize = 100;
 /// Real paths the retirement traces must reach.
 const RETIRE_COVERAGE: &[&str] = &[
     "AddFiles committed",
@@ -1746,6 +1823,8 @@ const RETIRE_COVERAGE: &[&str] = &[
     "remote reader fetched a file removed after its confirm",
     "remote fetch past T - S found the file deleted",
     "orphan swept",
+    "orphan retired",
+    "orphan retirement refused (fenced)",
     "resolved committed",
     "resolved aborted",
     "commit refused before I/O (fenced)",
@@ -1805,6 +1884,12 @@ async fn retirement_counterexamples_are_refused_and_caught() {
             "data-files-retire-prepared-orphan-ignores-reservation",
             Control::OrphanIgnoresReservation,
             "while a transaction is prepared",
+            "committed file missing from the store",
+        ),
+        (
+            "data-files-retire-orphan-deletes-directly",
+            Control::OrphanDeletesDirectly,
+            "that the holder's write holds",
             "committed file missing from the store",
         ),
     ] {

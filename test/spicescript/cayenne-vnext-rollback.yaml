@@ -1,24 +1,37 @@
 name: cayenne-vnext-rollback
-duration: 27s
+duration: 72s
 description: >
   An upgrade into the object-native Cayenne metastore, a rollback, and an
   upgrade again, with a full acceleration and PostgreSQL and MySQL change
   capture. The release keeps them in the SQLite metastore; the binary under
   test loads each from its source instead, follows the sources further, and
-  leaves the release's copy exactly as it was. The release then starts again
-  on that copy while the sources changed again, and must answer as its sources
-  do, whatever position the binary under test moved the PostgreSQL slot to
-  (here past changes the release's copy does not hold). Upgrading again
+  leaves the release's copy exactly as it was. Default slots keep the two
+  copies' acknowledgements separate; an explicit slot shares them. The release
+  then starts again on that copy while the sources changed again, and must
+  answer as its sources do, even when the upgraded copy acknowledged changes
+  the release's copy does not hold. Upgrading again
   serves each dataset from its object-native copy, which catches up from its
   source in turn.
 
 matrix:
   from: [2.3.x, 2.4.x]
+  slot: [default, explicit]
 from: '${matrix.from}'
 
 sources:
   pg: { kind: postgres }
   my: { kind: mysql }
+
+# Default slots belong to different durable copies. An explicit slot exercises
+# rollback when the upgraded copy has acknowledged past the release's copy.
+variants:
+  default:
+    when: { slot: default }
+  explicit:
+    when: { slot: explicit }
+    datasets:
+      pg_a:
+        params: { $merge: '${sources.pg.params}', pg_replication_slot: spice_rollback }
 
 spicepod:
   version: v1
@@ -73,8 +86,10 @@ steps:
       matching: ['^\.spice/data/(full|pg_a|my_a)/', '^\.spice/data/metadata/cayenne\.db']
   - source-exec: { pg: "UPDATE items SET v = 'while down' WHERE id <= 20; UPDATE ta SET v = 'while down' WHERE id BETWEEN 500 AND 520" }
   - source-exec: { my: "UPDATE ma SET v = 'while down' WHERE id BETWEEN 500 AND 520" }
-  # Where the release left the slot acknowledged.
-  - source-exec: { pg: "CREATE TABLE acked AS SELECT confirmed_flush_lsn AS before FROM pg_replication_slots WHERE slot_name LIKE 'spice_pg_a%'" }
+  # Capture the release's slot by identity, not a prefix matching both copies.
+  - source-exec: { pg: "CREATE TABLE acked AS SELECT slot_name, confirmed_flush_lsn AS before FROM pg_replication_slots" }
+  - source-query: { pg: "SELECT count(*) FROM acked" }
+    expect: { rows: [['1']] }
   - upgrade: {}
   - query: SELECT * FROM full
     expect: { oracle: pg }
@@ -103,11 +118,22 @@ steps:
     expect: { oracle: my }
     oracle-sql: SELECT * FROM ma
     eventually: 60s
-  # The binary under test acknowledges the slot past those changes (its
-  # in-memory tier checkpoints within 10 s), past what the release's copy holds.
+  # A shared slot must advance past the release's saved position. The default
+  # location-scoped slot advances independently and leaves the release's slot
+  # unchanged. Both checks require a slot, so neither can pass on an empty join.
   - source-query:
-      pg: "SELECT CASE WHEN bool_and(s.confirmed_flush_lsn > a.before) THEN 'advanced' ELSE 'not yet' END AS slot FROM pg_replication_slots s, acked a WHERE s.slot_name LIKE 'spice_pg_a%'"
+      pg: "SELECT CASE WHEN count(*) = 1 AND bool_and(s.confirmed_flush_lsn > a.before) THEN 'advanced' ELSE 'not yet' END AS slot FROM pg_replication_slots s JOIN acked a USING (slot_name)"
+    when: { slot: explicit }
     expect: { rows: [['advanced']] }
+    eventually: 60s
+  - source-query:
+      pg: "SELECT count(*) FROM pg_replication_slots s JOIN acked a USING (slot_name) WHERE s.confirmed_flush_lsn = a.before AND NOT s.active"
+    when: { slot: default }
+    expect: { rows: [['1']] }
+  - source-query:
+      pg: "SELECT count(*) FROM pg_replication_slots s, acked a WHERE s.slot_name <> a.slot_name AND s.active AND s.confirmed_flush_lsn > a.before"
+    when: { slot: default }
+    expect: { rows: [['1']] }
     eventually: 60s
 
   # Rolled back: the release on its own copy, which holds the state from
@@ -133,12 +159,17 @@ steps:
     expect: { rows: [['0']] }
   - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM my_a
     expect: { rows: [['0']] }
-  # How: the release finds the PostgreSQL slot acknowledged past the position
+  # With an explicit slot, the release finds it acknowledged past the position
   # its copy recorded as applied, and rebuilds that acceleration from the source
   # (a full re-read, which keeps no row the source no longer has); it resumes
   # MySQL from the GTID position its copy recorded, re-reading the binlog since.
   - assert-log:
-      contains: ["Dataset 'pg_a' will have its acceleration rebuilt from the source"]
+      contains: ['Dataset ''pg_a'' will have its acceleration rebuilt from the source.*rebuild_cause="acknowledged_past"']
+    when: { slot: explicit }
+  - assert-log:
+      lacks: "Dataset 'pg_a' will have its acceleration rebuilt from the source"
+    when: { slot: default }
+  - assert-log:
       count: { "resuming from persisted GTID position dataset=my_a": 1 }
 
   # Upgraded again: each dataset is served from its object-native copy, which
