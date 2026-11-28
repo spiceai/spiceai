@@ -30,8 +30,8 @@ static DEFAULT_RULES: &[&dyn LogTransformRule] = &[&OpenDalS3ReadRetryRule];
 /// Recognizes a dependency diagnostic and supplies its replacement message.
 ///
 /// Rules are tried in registration order until one returns a transformation.
-/// Return `None` for unsupported records so later rules can try them, or the
-/// original record can pass through unchanged if no rule matches.
+/// Return `None` for unsupported records so later rules can try them. A record
+/// that no rule matches is forwarded with the credentials in its URLs redacted.
 trait LogTransformRule: Send + Sync {
     fn transform(&self, record: &Record<'_>) -> Option<LogTransform>;
 }
@@ -109,7 +109,8 @@ impl DependencyLogTracer {
         } else {
             0
         };
-        let message = with_skipped(&transform.message, skipped);
+        let message =
+            redact::redact_message_credentials(&with_skipped(&transform.message, skipped));
 
         // Forward directly to preserve source locations and the current span,
         // and avoid re-entering the global dependency logger.
@@ -122,7 +123,11 @@ impl DependencyLogTracer {
             self.forward(
                 record,
                 Level::Debug,
-                format_args!("{}: {:?}", diagnostic.label, diagnostic.message),
+                format_args!(
+                    "{}: {:?}",
+                    diagnostic.label,
+                    redact::redact_message_credentials(&diagnostic.message)
+                ),
             );
         }
     }
@@ -159,6 +164,16 @@ impl Log for DependencyLogTracer {
             return;
         }
 
+        // Dependencies format URLs into their messages, and a listing table's URL
+        // carries the source credentials in its fragment.
+        let mut message = String::new();
+        if std::fmt::write(&mut message, *record.args()).is_ok() {
+            let redacted = redact::redact_message_credentials(&message);
+            if redacted != message {
+                self.forward(record, record.level(), format_args!("{redacted}"));
+                return;
+            }
+        }
         self.inner.log(record);
     }
 
@@ -679,6 +694,48 @@ mod tests {
         let second =
             output_with_tracer(&tracer, "warn", OPENDAL_RETRY_TARGET, Level::Warn, message);
         assert!(second.is_empty(), "{second}");
+    }
+
+    #[test]
+    fn a_dependency_record_keeps_credentials_in_a_url_out_of_the_log() {
+        let out = output(
+            "debug",
+            "datafusion_catalog_listing::helpers",
+            Level::Debug,
+            "Ignoring file: file_path='late/b.csv', table_path='abfs://probe/late/#account=acct&access_key=KEYMARKER&container=probe'",
+        );
+        assert!(!out.contains("KEYMARKER"), "{out}");
+        assert!(
+            out.contains("DEBUG datafusion_catalog_listing::helpers: Ignoring file"),
+            "{out}"
+        );
+        assert!(out.contains("access_key=***"), "{out}");
+    }
+
+    #[test]
+    fn a_retry_diagnostic_keeps_credentials_in_its_url_out_of_the_log() {
+        let url = format!("{URL}?X-Amz-Signature=SIGMARKER");
+        let out = output(
+            "debug",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic(&url),
+        );
+        assert!(out.contains("WARN"), "{out}");
+        assert!(out.contains("S3 read retry diagnostic"), "{out}");
+        assert!(!out.contains("SIGMARKER"), "{out}");
+    }
+
+    #[test]
+    fn an_unrecognized_retry_keeps_credentials_in_its_url_out_of_the_log() {
+        let out = output(
+            "warn",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            "will retry Read (attempt 1) after 1s because: something new at https://bucket.s3.amazonaws.com/x.avro?X-Amz-Signature=SIGMARKER",
+        );
+        assert!(out.contains("something new"), "{out}");
+        assert!(!out.contains("SIGMARKER"), "{out}");
     }
 
     #[derive(Clone, Default)]
