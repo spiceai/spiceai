@@ -87,6 +87,7 @@ async fn run_inner(
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(6))
             .with_query_executor(executor.clone()),
+        None,
     )
     .await?;
 
@@ -127,7 +128,8 @@ async fn run_inner(
         builder = builder.with_query_executors(client_executors);
     }
 
-    let (_query_set, test_builder) = super::build_test_with_validation(args, &app, builder).await?;
+    let (_query_set, test_builder) =
+        super::build_test_with_validation(args, &app, builder, None).await?;
 
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
