@@ -114,12 +114,12 @@ async fn create_logical_slot(client: &tokio_postgres::Client, slot: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inspect_finds_an_inactive_leftover_and_its_retained_wal() -> Result<(), anyhow::Error> {
+    const LEFTOVER: &str = "spice_itest_rollback_inactive";
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let client = connect_as(port, "postgres", common::PG_PASSWORD).await?;
 
-    const LEFTOVER: &str = "spice_itest_rollback_inactive";
     create_logical_slot(&client, LEFTOVER).await;
     client
         .batch_execute(
@@ -154,7 +154,7 @@ async fn inspect_finds_an_inactive_leftover_and_its_retained_wal() -> Result<(),
 async fn inspect_is_absent_when_the_slot_does_not_exist() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let client = connect_as(port, "postgres", common::PG_PASSWORD).await?;
     let lookup = inspect_inactive_rollback_slot(&client, "spice_itest_rollback_missing").await;
     assert_eq!(lookup, RollbackSlotLookup::Absent);
@@ -163,9 +163,11 @@ async fn inspect_is_absent_when_the_slot_does_not_exist() -> Result<(), anyhow::
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inspect_does_not_treat_the_live_slot_as_a_leftover() -> Result<(), anyhow::Error> {
+    const LIVE: &str = "spice_itest_rollback_live_active";
+    const PUBLICATION: &str = "spice_itest_rollback_live_pub";
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let source = connect_as(port, "postgres", common::PG_PASSWORD).await?;
     source
         .batch_execute(
@@ -175,8 +177,6 @@ async fn inspect_does_not_treat_the_live_slot_as_a_leftover() -> Result<(), anyh
         )
         .await?;
 
-    const LIVE: &str = "spice_itest_rollback_live_active";
-    const PUBLICATION: &str = "spice_itest_rollback_live_pub";
     let collector = ReplicationMetricsCollector::new();
     let mut stream = start_replication_stream(ReplicationStreamInput {
         dataset_name: "repl_users".into(),
@@ -216,9 +216,12 @@ async fn inspect_does_not_treat_the_live_slot_as_a_leftover() -> Result<(), anyh
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_records_inactive_leftover_metrics() -> Result<(), anyhow::Error> {
+    const LEFTOVER: &str = "spice_itest_rollback_wired_leftover";
+    const LIVE: &str = "spice_itest_rollback_wired_live";
+    const PUBLICATION: &str = "spice_itest_rollback_wired_pub";
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let source = connect_as(port, "postgres", common::PG_PASSWORD).await?;
     source
         .batch_execute(
@@ -228,9 +231,6 @@ async fn stream_records_inactive_leftover_metrics() -> Result<(), anyhow::Error>
         )
         .await?;
 
-    const LEFTOVER: &str = "spice_itest_rollback_wired_leftover";
-    const LIVE: &str = "spice_itest_rollback_wired_live";
-    const PUBLICATION: &str = "spice_itest_rollback_wired_pub";
     create_logical_slot(&source, LEFTOVER).await;
     source
         .batch_execute("INSERT INTO public.repl_users VALUES (2, 'Bob') ON CONFLICT DO NOTHING;")
@@ -276,9 +276,10 @@ async fn stream_records_inactive_leftover_metrics() -> Result<(), anyhow::Error>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inspect_degrades_when_pg_current_wal_lsn_is_not_executable() -> Result<(), anyhow::Error> {
+    const LEFTOVER: &str = "spice_itest_rollback_noperm";
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let admin = connect_as(port, "postgres", common::PG_PASSWORD).await?;
 
     admin
@@ -297,7 +298,6 @@ async fn inspect_degrades_when_pg_current_wal_lsn_is_not_executable() -> Result<
         .await?;
 
     let limited = connect_as(port, "spice_limited", LIMITED_PASSWORD).await?;
-    const LEFTOVER: &str = "spice_itest_rollback_noperm";
     create_logical_slot(&limited, LEFTOVER).await;
 
     let lookup = inspect_inactive_rollback_slot(&limited, LEFTOVER).await;
