@@ -108,9 +108,9 @@ impl WriterLease {
             })?;
         Ok(match role {
             object_store_occ::lease::Role::Holder { acquired, .. } => LeaseRole::Holder {
-                valid_until_boot_ns: started_boot_ns
-                    .map(|started| holder_deadline_boot_ns(started, self.lease.duration()))
-                    .unwrap_or(0),
+                valid_until_boot_ns: started_boot_ns.map_or(0, |started| {
+                    holder_deadline_boot_ns(started, self.lease.duration())
+                }),
                 continuous: acquired
                     == object_store_occ::lease::Acquired::Renewed {
                         by_other_process: false,
