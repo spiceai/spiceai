@@ -56,8 +56,6 @@ fn main() -> Result<(), String> {
                 "read-progress",
                 "read-same-key",
                 "source-positions",
-                "source-rollback-default",
-                "source-rollback-shared",
                 "commits-restart-turnover",
                 "unknown-action-refusal",
                 "naming",

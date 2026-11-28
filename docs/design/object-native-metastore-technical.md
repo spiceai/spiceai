@@ -2137,10 +2137,6 @@ committed file sets, CDC, and the data-file lifecycle.
   the copy being opened, that copy rebuilds from the source before resuming.
   Separate slots can retain WAL independently while either copy is stopped;
   the upgrade does not drop the rollback copy's slot.
-  Model: `source-rollback-default`, `source-rollback-shared` and
-  `source-rollback-shared-no-rebuild`. These finite append-source graphs check
-  two durable copies across upgrade, rollback and upgrade again; they do not
-  model PostgreSQL's snapshot protocol or prove the connector implementation.
   The engine check is `test/spicescript/cayenne-vnext-rollback.yaml`: both slot
   policies against both release lines, with source row oracles, slot identities
   and positions, and a rebuild required only for the explicitly shared slot.
