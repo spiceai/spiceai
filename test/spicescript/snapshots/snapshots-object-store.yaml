@@ -1,4 +1,5 @@
 name: snapshots-object-store
+duration: 8s
 description: >
   Cayenne snapshots kept in an S3-compatible store (rustfs) under
   `runtime.state.location`: written after a refresh that changes the data;

@@ -150,6 +150,22 @@ pub fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// `Debug` for a component's params with credentials in URL values redacted, so a
+/// spec printed in an error or log line does not leak a source URL's secrets.
+pub(crate) struct RedactedParams<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(key, value)| (key, redact::redact_source_credentials(value))),
+            )
+            .finish()
+    }
+}
+
 /// Enum representing the initialization type of a component.
 ///
 /// [`ComponentInitialization::OnStartup`] indicates that the component should be

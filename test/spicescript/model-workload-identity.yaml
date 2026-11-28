@@ -1,4 +1,5 @@
 name: model-workload-identity
+duration: 8s
 description: >
   OpenAI and Anthropic models follow one workload identity contract. An
   Anthropic model with no params takes its federation settings from the

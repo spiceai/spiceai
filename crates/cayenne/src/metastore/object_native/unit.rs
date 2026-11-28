@@ -710,6 +710,10 @@ impl UnitLease {
                 member.data_writes.hold_until(until);
             }
             member.data_writes.set(true);
+            #[cfg(test)]
+            if let Some(hook) = member.inner.after_writer_gate_open.lock().take() {
+                hook(&member.inner);
+            }
         }
     }
 

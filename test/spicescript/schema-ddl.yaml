@@ -1,4 +1,5 @@
 name: schema-ddl
+duration: 48s
 tags: [long]
 description: >
   After a column is dropped, renamed or retyped at the source, a full refresh

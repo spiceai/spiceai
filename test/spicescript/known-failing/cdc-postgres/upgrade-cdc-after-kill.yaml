@@ -1,5 +1,6 @@
 # Known failing (#15543).
 name: upgrade-cdc-after-kill
+duration: 64s
 description: >
   As postgres-cdc-upgrade.yaml and mysql-cdc-upgrade.yaml together, but the older runtime is killed (SIGKILL) rather than
   stopped, 15 seconds after its last change: under the default

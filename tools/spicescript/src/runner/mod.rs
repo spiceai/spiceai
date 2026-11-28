@@ -84,7 +84,7 @@ mod steps;
 
 use api::{http_step, refresh, source_query, spice_cli};
 use background::{start_background, stop_background};
-use checks::{assert_files, assert_log, assert_status, metric_value, wait_metric};
+use checks::{assert_files, assert_log, assert_status, mark_files, metric_value, wait_metric};
 use cluster::{
     bridge_address, check_bridged_sources, cluster_args, make_cluster_ready, published_to_bridge,
     spicepod_for_bridge, start_executors, undistributed_engine, unpartitionable_acceleration,
@@ -390,6 +390,9 @@ pub struct Options {
     pub pki: PathBuf,
     /// `--log-capture`: where a script with a failure leaves its logs.
     pub log_capture: Option<PathBuf>,
+    /// `--executor-image`: the image cluster executors run in under
+    /// `defaults.cluster.containers`.
+    pub executor_image: String,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -489,6 +492,9 @@ struct Instance {
     spiced: Spiced,
     /// The binary under test, which an `upgrade` step starts.
     target_binary: PathBuf,
+    /// The binary the instance started on, which a `downgrade` step starts:
+    /// the release `from:` or `--from` names, or else the binary under test.
+    first_binary: PathBuf,
     base_release: Option<crate::release::BaseRelease>,
     /// The cluster executors started beside `spiced` (by `--cluster`,
     /// `defaults.cluster` or `defaults.executor-args`), spares last.
@@ -524,6 +530,8 @@ struct Instance {
     background: BTreeMap<String, Background>,
     /// `/metrics` scrapes taken by `mark-metrics`, by id.
     metric_marks: BTreeMap<String, String>,
+    /// Files recorded by `mark-files`, by id.
+    file_marks: BTreeMap<String, checks::FileMarks>,
     /// When this instance began each corpus's queries, by corpus position:
     /// the start of the `eventually` limit they share.
     corpus_started: BTreeMap<usize, Instant>,
@@ -553,9 +561,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The image cluster executors run in under `defaults.cluster.containers`:
-/// a Linux `spiced` needs nothing beyond its base libraries.
-const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
+/// The image cluster executors run in under `defaults.cluster.containers`
+/// unless `--executor-image` names another: a Linux `spiced` built with the
+/// default features needs nothing beyond its base libraries.
+pub const DEFAULT_EXECUTOR_IMAGE: &str = "ubuntu:26.04";
 
 /// The partition assignment interval a cluster runs with (see
 /// `make_cluster_ready`).
@@ -1376,7 +1385,7 @@ async fn create_instances(
                     let work_dir = std::path::absolute(&options.work_dir)?;
                     let script_dir = std::path::absolute(&script.dir)?;
                     executor.set_container(ContainerRun {
-                        image: EXECUTOR_IMAGE.to_string(),
+                        image: options.executor_image.clone(),
                         name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
                             .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
                         volumes: vec![
@@ -1406,7 +1415,7 @@ async fn create_instances(
                 })
                 .transpose()
                 .context("the sidecar")?;
-            let mut spiced = Spiced::new(first_binary, dir, env)?;
+            let mut spiced = Spiced::new(first_binary.clone(), dir, env)?;
             let port = |name: &str| {
                 context["instance"][name]
                     .as_u64()
@@ -1430,6 +1439,7 @@ async fn create_instances(
                 variant: variant_name.clone(),
                 spiced,
                 target_binary: target.binary.clone(),
+                first_binary,
                 base_release: base_release.cloned(),
                 active_executors: executors.len().saturating_sub(spare_count),
                 executors,
@@ -1440,6 +1450,7 @@ async fn create_instances(
                 broken: None,
                 answers: BTreeMap::new(),
                 metric_marks: BTreeMap::new(),
+                file_marks: BTreeMap::new(),
                 named: BTreeMap::new(),
                 context: context_for_steps,
                 spice_cli: options.spice_cli.clone(),

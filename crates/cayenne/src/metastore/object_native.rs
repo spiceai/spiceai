@@ -103,16 +103,19 @@ impl Default for LeaseSettings {
 }
 
 struct Inner {
-    reader: DatasetStateReader,
+    /// Shared with the state published for reads until the next change, which
+    /// copies it first if it is still shared: a copy shares the state's
+    /// collections, so it costs what the change touches, not the state's size.
+    reader: Arc<DatasetStateReader>,
     head: Head,
     /// Rises each time the committed state changes: a commit, records
     /// followed from the writer, or the state read again. A table reloads
     /// what it caches from the catalog when the revision differs from the one
     /// it last loaded at (see [`crate::catalog::MetadataCatalog::follow_commits`]).
     revision: u64,
-    /// A batch of followed records failed to apply after part of it changed
-    /// the state, and the reader's cursor already covers it: the next follow
-    /// reads the log again rather than resume from there.
+    /// A batch of followed records failed to apply, and the reader's cursor
+    /// already covers it: the next follow reads the log again rather than
+    /// resume from there.
     reread: bool,
     /// The log's [`Domain::data_writes`], closed the moment this instance
     /// stops writing the log.

@@ -572,3 +572,169 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
         })
         .await
 }
+
+/// Runs a DML statement and returns the row count it reports.
+async fn run_dml(rt: &Runtime, query: &str) -> Result<u64, anyhow::Error> {
+    let query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let data = query_result.data.try_collect::<Vec<_>>().await?;
+    let mut count = 0;
+    for batch in &data {
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or_else(|| anyhow::anyhow!("DML result is not a UInt64 count"))?;
+        count += counts.iter().flatten().sum::<u64>();
+    }
+    Ok(count)
+}
+
+/// Reads the table straight from `DynamoDB`: one sorted entry per item, its string attributes
+/// joined with spaces.
+async fn scan_items(
+    client: &Client,
+    table_name: &str,
+    attributes: &[&str],
+) -> Result<Vec<String>, anyhow::Error> {
+    let output = client.scan().table_name(table_name).send().await?;
+    let mut items: Vec<String> = output
+        .items()
+        .iter()
+        .map(|item| {
+            attributes
+                .iter()
+                .map(|name| match item.get(*name) {
+                    Some(AttributeValue::S(value)) => value.as_str(),
+                    _ => "-",
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    items.sort();
+    Ok(items)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_dml_changes_only_items_the_condition_selects() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,info",
+    ));
+
+    let table_name = "dml_condition_test";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
+
+            create_table(&client, table_name).await;
+            for i in 1..=4 {
+                client
+                    .put_item()
+                    .table_name(table_name)
+                    .item("id", AttributeValue::S(format!("{i}")))
+                    .item("name", AttributeValue::S(format!("item{i}")))
+                    .send()
+                    .await?;
+            }
+
+            let rt = setup_runtime(table_name, port).await?;
+
+            let deleted = run_dml(
+                &rt,
+                &format!("DELETE FROM {table_name} WHERE id IN ('1', '2') AND id = '3'"),
+            )
+            .await?;
+            assert_eq!(deleted, 0, "no item is both in ('1', '2') and '3'");
+
+            let updated = run_dml(
+                &rt,
+                &format!("UPDATE {table_name} SET name = 'changed' WHERE id = '9'"),
+            )
+            .await?;
+            assert_eq!(updated, 0, "there is no item '9' to update");
+
+            let updated = run_dml(
+                &rt,
+                &format!("UPDATE {table_name} SET name = 'changed' WHERE id = '4'"),
+            )
+            .await?;
+            assert_eq!(updated, 1);
+
+            assert_eq!(
+                scan_items(&client, table_name, &["id", "name"]).await?,
+                vec!["1 item1", "2 item2", "3 item3", "4 changed"]
+            );
+
+            running_container.cleanup().await;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_dml_composite_key_from_and_conditions() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,info",
+    ));
+
+    let table_name = "dml_composite_and_test";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
+
+            create_composite_key_table(&client, table_name).await;
+            for (pk, sk, val) in [
+                ("a", "1", "alpha-one"),
+                ("a", "2", "alpha-two"),
+                ("b", "1", "beta-one"),
+            ] {
+                client
+                    .put_item()
+                    .table_name(table_name)
+                    .item("pk", AttributeValue::S(pk.to_string()))
+                    .item("sk", AttributeValue::S(sk.to_string()))
+                    .item("val", AttributeValue::S(val.to_string()))
+                    .send()
+                    .await?;
+            }
+
+            let rt = setup_runtime(table_name, port).await?;
+
+            let deleted = run_dml(
+                &rt,
+                &format!("DELETE FROM {table_name} WHERE pk = 'a' AND sk = '1'"),
+            )
+            .await?;
+            assert_eq!(deleted, 1);
+
+            let updated = run_dml(
+                &rt,
+                &format!("UPDATE {table_name} SET val = 'changed' WHERE pk = 'b' AND sk = '1'"),
+            )
+            .await?;
+            assert_eq!(updated, 1);
+
+            assert_eq!(
+                scan_items(&client, table_name, &["pk", "sk", "val"]).await?,
+                vec!["a 2 alpha-two", "b 1 changed"]
+            );
+
+            running_container.cleanup().await;
+
+            Ok(())
+        })
+        .await
+}

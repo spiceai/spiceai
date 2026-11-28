@@ -7,9 +7,10 @@ name: Trunk tests
 # when its failures go unaddressed. Add a job here, and to `needs` of the
 # `Trunk tests` job at the end, to move a test out of the merge queue.
 #
-# It runs the model integration tests (integration_llms.yml), the nextest tests
-# the gate leaves to after merge (`make nextest-post-merge`,
-# NEXTEST_POST_MERGE_FILTER in the Makefile), and spicescript
+# It runs the model integration tests (integration_llms.yml), the Cayenne
+# object-native set (cayenne_object_native.yml), the nextest tests the gate
+# leaves to after merge (`make nextest-post-merge`, NEXTEST_POST_MERGE_FILTER
+# in the Makefile), and spicescript
 # (tools/spicescript):
 # - every script in test/spicescript, including those tagged `long`, which the
 #   merge queue skips;
@@ -309,6 +310,20 @@ jobs:
           dockerhub-oidc-connection-id: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           hf-token: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
 
+      # The checked-out commit sets up the runner: testoperator, which takes the
+      # `script` subcommand, or on a release branch or an older run's commit that
+      # predates it, the standalone spicescript binary, which takes none.
+      - name: Resolve the runner's subcommand
+        id: runner
+        env:
+          RUNNER_PATH: ${{ steps.spicescript.outputs.path }}
+        run: |
+          case "$(basename "$RUNNER_PATH")" in
+            testoperator) echo "subcommand=script" >> "$GITHUB_OUTPUT" ;;
+            spicescript) echo "subcommand=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Unexpected spicescript runner '$RUNNER_PATH'"; exit 1 ;;
+          esac
+
       # Upgrade scripts start on the release their `from:` names; the token is
       # for the releases API's rate limit.
       - name: Run scripts
@@ -316,7 +331,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+          "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 4 \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -366,7 +381,12 @@ jobs:
         run: |
           DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
           export DATABRICKS_TOKEN
-          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+          # --require-all-env: this job is meant to hold every live script's
+          # credentials, so a script whose `requires-env` finds one unset (a
+          # secret gone, a token step skipped) fails the job rather than
+          # quietly testing less.
+          "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 3 \
+            --require-all-env \
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
             --results "$RUNNER_TEMP/spicescript-results.json" \
@@ -391,7 +411,7 @@ jobs:
               "--matrix source=ducklake test/spicescript" \
               "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
               # shellcheck disable=SC2086 # args holds several words
-              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+              "${{ steps.spicescript.outputs.path }}" ${{ steps.runner.outputs.subcommand }} --jobs 4 \
                 --duckdb-version "$version" \
                 --spiced "$(command -v spiced)" \
                 --spice-cli "$(command -v spice)" \
@@ -442,6 +462,19 @@ jobs:
       actions: read
       id-token: write
     secrets: inherit
+
+  # The metastore model's `all` set with its controls, and the object-native
+  # data-path suites on every store at full depth (cayenne_object_native.yml).
+  # The merge queue runs its quick set.
+  cayenne-object-native:
+    name: Cayenne object-native
+    needs: resolve
+    uses: ./.github/workflows/cayenne_object_native.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      set: all
+    permissions:
+      contents: read
 
   # The nextest tests that sign-off and the merge queue skip: the SF1
   # result-correctness lanes, which compare Cayenne with standalone DuckDB and
@@ -602,7 +635,7 @@ jobs:
     environment: secret-free
     name: Trunk tests
     if: ${{ !cancelled() }}
-    needs: [resolve, build, spicescript, models, nextest, default-features]
+    needs: [resolve, build, spicescript, models, cayenne-object-native, nextest, default-features]
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
     permissions:

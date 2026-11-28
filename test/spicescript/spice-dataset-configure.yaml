@@ -1,0 +1,104 @@
+name: spice-dataset-configure
+duration: 3s
+tags: [macos-smoke]
+description: >
+  `spice dataset configure` adds a dataset to an app the way the quickstarts
+  do, and Spice serves it. Answering the interactive prompts writes
+  `datasets/<name>/dataset.yaml`, references it from the spicepod, and
+  accelerates the dataset into Cayenne, the default engine, in memory; `spice
+  dataset add` with flags adds one inline with its params, file mode and a
+  `refresh_sql`. Both
+  load again after a restart, and `spice refresh` with a one-off
+  `--refresh-sql` refreshes with it once. Needs no Docker, so it runs on the
+  macOS runners.
+
+sources:
+  src: { kind: files }
+
+defaults:
+  # The CLI adds datasets as the script runs, which a cluster's executors,
+  # started from the spicepod before, cannot follow; and `orders` is a memory
+  # acceleration, which does not run distributed.
+  single-node: datasets are added by the CLI while it runs, after the executors start
+
+# The app as `spice init` leaves it: no datasets until the CLI adds them.
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: spice-dataset-configure
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 1000
+        seed: 1
+        format: parquet
+        files: 1
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: qty, int: [1, 10] }
+  - generate:
+      src:
+        table: blocks
+        rows: 3
+        seed: 1
+        format: csv
+        files: 1
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: block_number, sequence: 101 }
+
+  # The interactive prompts, in order: dataset name, description, from, and
+  # whether to accelerate locally.
+  - spice: [dataset, configure]
+    input: |
+      orders
+      Orders placed
+      file:${sources.src.path}/orders/part-00000.parquet
+      y
+    output-contains: Saved datasets/orders/dataset.yaml
+  - assert-files: { contains: ['^datasets/orders/dataset\.yaml$'] }
+  - start: {}
+  - query: SELECT count(*) AS n, sum(id) AS s, min(id) AS lo, max(id) AS hi FROM orders
+    expect: { rows: [['1000', '500500', '1', '1000']] }
+  # Served from the Cayenne acceleration, not read from the file per query.
+  - explain: SELECT sum(qty) FROM orders
+    contains: [CayenneAccelerationExec]
+
+  # The flags, against the running app; a restart loads the spicepod they wrote.
+  - spice:
+      - dataset
+      - add
+      - blocks
+      - --from
+      - 'file:${sources.src.path}/blocks/'
+      - --param
+      - file_format=csv
+      - --set
+      - acceleration.enabled=true
+      - --set
+      - acceleration.mode=file
+      - --set
+      - 'acceleration.refresh_sql=SELECT * FROM blocks WHERE id <= 2'
+  - restart: {}
+  # `blocks` is accelerated on disk (Cayenne file mode, on this host's
+  # filesystem); `orders` stays in memory, the default.
+  # A table this small can live in the metastore alone, so the check is that
+  # one exists, not that `blocks` has data files yet.
+  - assert-files: { contains: ['^\.spice/data/metadata/cayenne\.db$'], lacks-dirs: ['^\.spice/data/orders/$'] }
+  - query: SELECT count(*) AS n, sum(id) AS s FROM orders
+    expect: { rows: [['1000', '500500']] }
+  - query: SELECT id, block_number FROM blocks ORDER BY id
+    expect: { rows: [['1', '101'], ['2', '102']] }
+
+  # A one-off override, then the configured refresh_sql again.
+  - spice: [refresh, blocks, --refresh-jitter-max=1s, --refresh-sql, SELECT * FROM blocks WHERE id = 3]
+    output-contains: Dataset refresh triggered
+  - query: SELECT id, block_number FROM blocks ORDER BY id
+    expect: { rows: [['3', '103']] }
+    eventually: 30s
+  - refresh: blocks
+  - query: SELECT id, block_number FROM blocks ORDER BY id
+    expect: { rows: [['1', '101'], ['2', '102']] }
+  - assert-log: { clean: true }

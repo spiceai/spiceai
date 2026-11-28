@@ -1,4 +1,5 @@
 name: snapshots-source-replication
+duration: 32s
 description: >
   An S3 file_format: snapshot reader starts before publication, discovers
   Cayenne from metadata without a source connector, and follows replacements,

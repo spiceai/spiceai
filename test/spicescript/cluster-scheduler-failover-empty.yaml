@@ -1,4 +1,5 @@
 name: cluster-scheduler-failover-empty
+duration: 102s
 tags: [long]
 description: >
   A cluster scheduler killed and started again after its registration has

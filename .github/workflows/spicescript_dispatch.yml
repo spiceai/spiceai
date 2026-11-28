@@ -110,10 +110,10 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
-      - name: Build spicescript
+      - name: Build testoperator
         uses: $/.github/actions/build-tool
         with:
-          package: spicescript
+          package: testoperator
 
   test:
     name: 'spicescript (${{ matrix.partition }})'
@@ -183,11 +183,11 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
-      - name: Download spicescript
+      - name: Download testoperator
         id: spicescript
         uses: $/.github/actions/build-tool
         with:
-          package: spicescript
+          package: testoperator
 
       # Scripts pull images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
@@ -233,7 +233,7 @@ jobs:
           for entry in "${script_paths[@]}"; do
             [[ "$entry" != -* ]] || { echo "::error::scripts entry '$entry' starts with '-'; give script paths only"; exit 1; }
           done
-          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+          "${{ steps.spicescript.outputs.path }}" script --jobs 4 \
             --partition ${{ matrix.partition }} \
             --spiced "$SPICED" \
             --spice-cli "$SPICE_CLI" \

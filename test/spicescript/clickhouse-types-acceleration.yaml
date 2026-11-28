@@ -1,4 +1,5 @@
 name: clickhouse-types-acceleration
+duration: 14s
 tags: [long]
 description: >
   A ClickHouse table with the common types the literal matrix does not cover

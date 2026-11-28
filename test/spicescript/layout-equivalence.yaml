@@ -1,4 +1,5 @@
 name: layout-equivalence
+duration: 91s
 tags: [long]
 description: >
   How Cayenne lays data out never changes an answer: sorted, sharded,

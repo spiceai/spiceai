@@ -1,4 +1,5 @@
 name: postgres-cdc-parity
+duration: 607s
 description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne
@@ -251,11 +252,12 @@ steps:
     only: object-native-s3
 
   # 180 s of CDC updates and deletes at a fixed rate: the dataset's objects in
-  # the state location, sampled every 10 s, stay under a bound and do not trend
-  # upward, the data files and deletion vectors stay within the same bound
-  # afterwards, and the table still matches the source. The bounds are a few
-  # compactions' worth of the table (about 20,000 rows), far below what 180 s
-  # of unreclaimed files would leave (#16133).
+  # the state location, sampled every 10 s, stay under a bound, the data files
+  # and deletion vectors stay within their bounds afterwards, and the table
+  # still matches the source (#16133). The samples also trend upward, which
+  # the ledger records: a retired file is deleted only after the one-hour data
+  # file retention, so every file the churn retires is still stored when the
+  # samples are taken.
   - background:
       id: churn
       source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
@@ -274,7 +276,7 @@ steps:
   - query: SELECT * FROM orders
     eventually: 90s
     only: object-native-s3
-  # After the retention grace, with no further change.
+  # After 20 s with no further change.
   - sleep: 20s
     only: object-native-s3
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }

@@ -68,9 +68,16 @@ fn read_text_column(batch: &RecordBatch, name: &str) -> anyhow::Result<Vec<Strin
 
 /// Builds the search config by reading the queries from `test_queries`, which every search spicepod
 /// exposes with `_id`/`text` columns.
-pub(crate) async fn init_search_config(
+///
+/// Only queries with at least one relevance judgment in `qrels` are sent. Retrieval quality is
+/// scored over judged queries alone, so an unjudged query adds load and run time without changing
+/// any quality metric. Some datasets ship a query file far larger than their judged split (MTEB
+/// MSMARCO's `queries` file holds every split's queries, while its `test` judgments cover a small
+/// subset), and sending all of them can keep a run from finishing.
+pub(crate) async fn init_search_config<S: ::std::hash::BuildHasher>(
     spiced_instance: &SpicedInstance,
     search_limit: Option<usize>,
+    qrels: &HashMap<String, HashMap<String, i32, S>, S>,
 ) -> anyhow::Result<SearchConfig> {
     let mut spice_client = spiced_instance.spice_client(None, false).await?;
 
@@ -80,21 +87,39 @@ pub(crate) async fn init_search_config(
     )
     .await?;
 
-    let queries = to_search_requests(&records, search_limit)?;
+    let (queries, skipped) = to_search_requests(&records, search_limit, qrels)?;
+    anyhow::ensure!(
+        !queries.is_empty(),
+        "None of the {skipped} queries in `test_queries` has a relevance judgment in \
+         `relevance_data`; check that `test_queries._id` and `relevance_data.\"query-id\"` hold \
+         the same ids"
+    );
+    println!(
+        "Sending {} judged queries ({skipped} queries without relevance judgments skipped)",
+        queries.len()
+    );
 
     Ok(SearchConfig::new().add_requests(queries))
 }
 
-fn to_search_requests(
+/// Converts `test_queries` rows into search requests, keeping only queries judged in `qrels`.
+/// Returns the requests and the number of unjudged queries skipped.
+fn to_search_requests<S: ::std::hash::BuildHasher>(
     records: &[RecordBatch],
     search_limit: Option<usize>,
-) -> anyhow::Result<Vec<SearchRequest>> {
+    qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+) -> anyhow::Result<(Vec<SearchRequest>, usize)> {
     let mut queries = Vec::new();
+    let mut skipped = 0;
     for batch in records {
         let ids = read_text_column(batch, "id")?;
         let texts = read_text_column(batch, "text")?;
 
         for (id, text) in ids.into_iter().zip(texts) {
+            if !qrels.contains_key(&id) {
+                skipped += 1;
+                continue;
+            }
             let mut search_request = SearchRequest::new(id, text);
             if let Some(limit) = search_limit {
                 search_request = search_request.with_limit(limit);
@@ -103,7 +128,7 @@ fn to_search_requests(
         }
     }
 
-    Ok(queries)
+    Ok((queries, skipped))
 }
 
 /// Loads the relevance judgments (qrels) from `relevance_data`, keyed query id → corpus id → grade.
@@ -234,6 +259,7 @@ async fn execute_sql(
 mod tests {
     use super::{
         primary_key_value_to_string, rank_scores, read_text_column, sole_primary_key_value,
+        to_search_requests,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -277,6 +303,44 @@ mod tests {
             // Integer ids stringify to "1"/"2"; string ids stay "a"/"b" — both are exercised here.
             assert_eq!(values.len(), 2);
         }
+    }
+
+    #[test]
+    fn to_search_requests_keeps_only_judged_queries() {
+        let ids = Arc::new(StringArray::from(vec!["q1", "q2", "q3", "q4"]));
+        let texts = Arc::new(StringArray::from(vec!["one", "two", "three", "four"]));
+        let batch = RecordBatch::try_from_iter(vec![("id", ids as _), ("text", texts as _)])
+            .expect("failed to build batch");
+        let qrels: HashMap<String, HashMap<String, i32>> = HashMap::from([
+            ("q2".to_string(), HashMap::from([("d1".to_string(), 1)])),
+            ("q4".to_string(), HashMap::from([("d2".to_string(), 2)])),
+            // A judged query missing from `test_queries` is not invented.
+            ("q9".to_string(), HashMap::from([("d3".to_string(), 1)])),
+        ]);
+
+        let (requests, skipped) =
+            to_search_requests(&[batch], Some(10), &qrels).expect("failed to build requests");
+
+        let ids: Vec<&str> = requests.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["q2", "q4"]);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn to_search_requests_matches_integer_ids_against_text_qrels() {
+        let ids = Arc::new(Int64Array::from(vec![1_i64, 2]));
+        let texts = Arc::new(StringArray::from(vec!["one", "two"]));
+        let batch = RecordBatch::try_from_iter(vec![("id", ids as _), ("text", texts as _)])
+            .expect("failed to build batch");
+        let qrels: HashMap<String, HashMap<String, i32>> =
+            HashMap::from([("2".to_string(), HashMap::from([("d".to_string(), 1)]))]);
+
+        let (requests, skipped) =
+            to_search_requests(&[batch], None, &qrels).expect("failed to build requests");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "2");
+        assert_eq!(skipped, 1);
     }
 
     #[test]

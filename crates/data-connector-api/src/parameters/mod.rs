@@ -82,6 +82,11 @@ pub trait ConnectorContext: Send + Sync {
     /// The `--role` the runtime started with. A Spicepod reload cannot change it.
     fn role(&self) -> Role;
 
+    /// The runtime's component-status tracker. A connector that skips data that
+    /// will not be retried keeps the resolved [`runtime_status::RuntimeStatus`]
+    /// after the call — never this context.
+    fn runtime_status(&self) -> Arc<runtime_status::RuntimeStatus>;
+
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry>;
