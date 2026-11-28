@@ -790,9 +790,17 @@ impl KafkaConsumer {
         let Some(topic) = self.topic.get() else {
             return Ok(());
         };
-        self.consumer
+        let subscribed = self
+            .consumer
             .subscribe(&[topic])
-            .context(UnableToSubscribeToTopicSnafu { topic })
+            .context(UnableToSubscribeToTopicSnafu { topic });
+        if subscribed.is_err() {
+            // The next change stream subscribes again rather than read a
+            // consumer that holds no assignment.
+            self.subscribe_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        subscribed
     }
 
     /// Receive a JSON message from the Kafka topic.
@@ -2699,6 +2707,27 @@ mod tests {
             .expect("consumer");
         consumer.subscribe("t").expect("subscribe");
         consumer
+    }
+
+    /// A subscription the change stream could not make is attempted again by the
+    /// next stream, rather than treated as made: a retried stream would
+    /// otherwise read a consumer with no assignment and wait forever.
+    #[tokio::test]
+    async fn failed_subscribe_on_read_is_retried() {
+        let cluster = cluster_holding_payloads(&[]);
+        let consumer = KafkaConsumer::create_for_dataset("t", None, &mock_cluster_config(&cluster))
+            .expect("consumer");
+        // librdkafka refuses an empty topic name before contacting the cluster.
+        consumer.subscribe_on_read("");
+        for attempt in 1..=2 {
+            let Err(err) = consumer.subscribe_if_pending() else {
+                panic!("attempt {attempt}: subscribing to an empty topic name succeeded");
+            };
+            assert!(
+                matches!(&err, Error::UnableToSubscribeToTopic { topic, .. } if topic.is_empty()),
+                "attempt {attempt}: {err}"
+            );
+        }
     }
 
     /// The next envelope of `stream`.
