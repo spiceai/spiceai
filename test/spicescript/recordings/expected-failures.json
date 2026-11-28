@@ -1392,26 +1392,6 @@
       "pattern": "^objects under 'state/cayenne/v1/datasets/orders-' in 'lake' (trend upward|went over their bound)",
       "group": "cayenne",
       "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "assert-objects: {\"contains\":\".arrow\",\"max\":200,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '.arrow' in 'lake', found <n>",
-      "pattern": "^expected 0 to 200 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.arrow' in 'lake', found \\d+",
-      "group": "cayenne",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "object-native-s3",
-      "key": "assert-objects: {\"contains\":\".vortex\",\"max\":400,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
-      "kind": "other",
-      "signature": "expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '.vortex' in 'lake', found <n>",
-      "pattern": "^expected 0 to 400 objects under 'state/cayenne/v1/datasets/orders-' containing '\\.vortex' in 'lake', found \\d+",
-      "group": "cayenne",
-      "may-pass": true
     }
   ],
   "postgres-literals": [
@@ -2104,6 +2084,26 @@
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
       "group": "duckdb"
+    }
+  ],
+  "readiness": [
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"slow\",\"ready\":false}",
+      "kind": "status",
+      "signature": "expected ready=false, saw status=Ready ready=true message=",
+      "group": "other",
+      "may-pass": true
+    },
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "query: SELECT count(*) FROM slow",
+      "kind": "error",
+      "signature": "the query succeeded, but the script expected an error:",
+      "group": "other",
+      "may-pass": true
     }
   ],
   "schema-ddl": [

@@ -15,7 +15,8 @@
 name: Set up spicescript
 description: >-
   Everything a spicescript job needs before it runs scripts: RustFS credentials
-  and the MinIO client, the spicescript binary, a Docker Hub login, the AWS and
+  and the MinIO client, the runner (`testoperator`, whose `script` subcommand
+  runs the scenarios), a Docker Hub login, the AWS and
   DuckDB CLIs, and the Hugging Face token. The calling job needs
   `id-token: write` (RustFS and Docker Hub use its GitHub OIDC token).
 
@@ -36,7 +37,7 @@ inputs:
 
 outputs:
   path:
-    description: 'Path to the spicescript binary'
+    description: 'Path to the testoperator binary; run scripts with its `script` subcommand'
     value: ${{ steps.spicescript.outputs.path }}
 
 runs:
@@ -58,11 +59,11 @@ runs:
         minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
         minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
-    - name: Download spicescript
+    - name: Download testoperator
       id: spicescript
       uses: $/.github/actions/build-tool
       with:
-        package: spicescript
+        package: testoperator
 
     # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
     # images as they start, so the login has to last the whole job. Docker Hub logins use

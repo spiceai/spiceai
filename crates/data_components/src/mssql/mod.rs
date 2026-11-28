@@ -28,6 +28,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::Session,
+    common::ScalarValue,
     common::TableReference,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
@@ -186,7 +187,7 @@ impl TableProvider for SqlServerTableProvider {
         let mut results = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            results.push(classify_mssql_filter(filter));
+            results.push(classify_mssql_filter(filter, &self.schema));
         }
         Ok(results)
     }
@@ -226,7 +227,18 @@ pub fn project_schema(
     Ok(schema)
 }
 
-fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
+/// How far SQL Server can be trusted to evaluate `filter` as `DataFusion` does.
+///
+/// SQL Server compares text by the column's collation (the default ignores case and trailing
+/// spaces), pads binary values with zero bytes, converts a text literal without an `N` prefix to
+/// the database code page, and gives functions and `LIKE` other meanings (`LOG` is the natural
+/// logarithm; a `LIKE` pattern has no backslash escape, reads `[...]` as a character class and
+/// follows the collation's letters). So only comparisons between columns and literals it reads
+/// the same way are pushed. On text and binary, an equality or `IN` returns every row
+/// `DataFusion` keeps and maybe more, so it is pushed as inexact; other comparisons on them are
+/// not pushed.
+fn classify_mssql_filter(filter: &Expr, schema: &Schema) -> TableProviderFilterPushDown {
+    use TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
     match filter {
         Expr::BinaryExpr(binary_expr) => match binary_expr.op {
             Operator::Eq
@@ -235,84 +247,199 @@ fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
             | Operator::LtEq
             | Operator::Gt
             | Operator::GtEq => {
-                if is_time_related_expr(&binary_expr.left)
-                    || is_time_related_expr(&binary_expr.right)
-                {
-                    TableProviderFilterPushDown::Unsupported
+                let (left, right) = (binary_expr.left.as_ref(), binary_expr.right.as_ref());
+                if !is_pushable_operand(left) || !is_pushable_operand(right) {
+                    Unsupported
+                } else if is_text(left, schema) || is_text(right, schema) {
+                    if binary_expr.op == Operator::Eq {
+                        Inexact
+                    } else {
+                        Unsupported
+                    }
                 } else {
-                    TableProviderFilterPushDown::Exact
+                    Exact
                 }
             }
             Operator::And | Operator::Or => {
-                let left = classify_mssql_filter(&binary_expr.left);
-                let right = classify_mssql_filter(&binary_expr.right);
-                if left == TableProviderFilterPushDown::Unsupported
-                    || right == TableProviderFilterPushDown::Unsupported
-                {
-                    TableProviderFilterPushDown::Unsupported
+                let left = classify_mssql_filter(&binary_expr.left, schema);
+                let right = classify_mssql_filter(&binary_expr.right, schema);
+                if left == Unsupported || right == Unsupported {
+                    Unsupported
                 } else {
-                    TableProviderFilterPushDown::Inexact
+                    Inexact
                 }
             }
-            _ => TableProviderFilterPushDown::Unsupported,
+            _ => Unsupported,
         },
-        Expr::Not(inner) => classify_mssql_filter(inner),
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            if is_time_related_expr(inner) {
-                TableProviderFilterPushDown::Unsupported
+        // A negated inexact filter could drop rows `DataFusion` keeps.
+        Expr::Not(inner) => {
+            if classify_mssql_filter(inner, schema) == Exact {
+                Exact
             } else {
-                TableProviderFilterPushDown::Inexact
+                Unsupported
             }
         }
-        Expr::Like(like) => {
-            if is_time_related_expr(&like.expr) {
-                TableProviderFilterPushDown::Unsupported
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            if is_pushable_operand(inner) {
+                Inexact
             } else {
-                TableProviderFilterPushDown::Inexact
+                Unsupported
             }
         }
         Expr::Between(between) => {
-            if is_time_related_expr(&between.expr)
-                || is_time_related_expr(&between.low)
-                || is_time_related_expr(&between.high)
+            let operands = [&between.expr, &between.low, &between.high];
+            if operands.iter().all(|e| is_pushable_operand(e))
+                && !operands.iter().any(|e| is_text(e, schema))
             {
-                TableProviderFilterPushDown::Unsupported
+                Inexact
             } else {
-                TableProviderFilterPushDown::Inexact
+                Unsupported
             }
         }
         Expr::InList(in_list) => {
-            if is_time_related_expr(&in_list.expr) || in_list.list.iter().any(is_time_related_expr)
+            let negated_text = in_list.negated
+                && (is_text(&in_list.expr, schema)
+                    || in_list.list.iter().any(|e| is_text(e, schema)));
+            if is_pushable_operand(&in_list.expr)
+                && in_list.list.iter().all(is_pushable_operand)
+                && !negated_text
             {
-                TableProviderFilterPushDown::Unsupported
+                Inexact
             } else {
-                TableProviderFilterPushDown::Inexact
+                Unsupported
             }
         }
-        _ => TableProviderFilterPushDown::Unsupported,
+        _ => Unsupported,
     }
 }
 
-fn is_time_related_expr(expr: &Expr) -> bool {
+/// A column, or a literal SQL Server reads as the same value.
+fn is_pushable_operand(expr: &Expr) -> bool {
     match expr {
-        Expr::Cast(cast) => {
-            matches!(
-                cast.field.data_type(),
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
-            )
-        }
-        Expr::Literal(literal, _) => {
-            matches!(
-                literal.data_type(),
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
-            )
-        }
-        Expr::ScalarVariable(field, _) => {
-            matches!(
-                field.data_type(),
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
-            )
-        }
+        Expr::Column(_) => true,
+        Expr::Literal(value, _) => match value {
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::LargeUtf8(Some(text))
+            | ScalarValue::Utf8View(Some(text)) => {
+                // In a T-SQL string, a backslash before a line break continues the line: both go.
+                text.is_ascii() && !text.contains("\\\n") && !text.contains("\\\r")
+            }
+            ScalarValue::Int8(Some(_))
+            | ScalarValue::Int16(Some(_))
+            | ScalarValue::Int32(Some(_))
+            | ScalarValue::Int64(Some(_))
+            | ScalarValue::UInt8(Some(_))
+            | ScalarValue::UInt16(Some(_))
+            | ScalarValue::UInt32(Some(_))
+            | ScalarValue::UInt64(Some(_))
+            | ScalarValue::Float32(Some(_))
+            | ScalarValue::Float64(Some(_))
+            | ScalarValue::Decimal128(Some(_), _, _)
+            | ScalarValue::Decimal256(Some(_), _, _)
+            | ScalarValue::Date32(Some(_)) => true,
+            _ => false,
+        },
         _ => false,
+    }
+}
+
+/// Whether SQL Server compares `expr` other than by code point: text, binary, or a column of
+/// unknown type.
+fn is_text(expr: &Expr, schema: &Schema) -> bool {
+    match expr {
+        Expr::Column(column) => schema
+            .field_with_name(column.name())
+            .map_or(true, |field| is_text_type(field.data_type())),
+        Expr::Literal(value, _) => is_text_type(&value.data_type()),
+        _ => false,
+    }
+}
+
+/// Text, compared by the column's collation, and binary, compared after zero padding.
+pub(crate) fn is_text_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use TableProviderFilterPushDown::{Exact, Inexact, Unsupported};
+    use datafusion::prelude::{cast, col, lit};
+
+    fn classify(filter: &Expr) -> TableProviderFilterPushDown {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::Binary, true),
+        ]);
+        classify_mssql_filter(filter, &schema)
+    }
+
+    #[test]
+    fn text_is_compared_by_sql_server_only_where_it_keeps_every_matching_row() {
+        assert_eq!(classify(&col("s").eq(lit("A"))), Inexact);
+        assert_eq!(
+            classify(&col("s").in_list(vec![lit("A"), lit("b")], false)),
+            Inexact
+        );
+
+        assert_eq!(classify(&col("s").not_eq(lit("a"))), Unsupported);
+        assert_eq!(classify(&col("s").gt(lit("Z"))), Unsupported);
+        assert_eq!(
+            classify(&Expr::Not(Box::new(col("s").eq(lit("a"))))),
+            Unsupported
+        );
+        assert_eq!(
+            classify(&col("s").in_list(vec![lit("a")], true)),
+            Unsupported
+        );
+        assert_eq!(classify(&col("s").not_like(lit("a%"))), Unsupported);
+        assert_eq!(classify(&col("s").like(lit("A%"))), Unsupported);
+        assert_eq!(classify(&col("s").like(lit("50\\%"))), Unsupported);
+        assert_eq!(classify(&col("s").ilike(lit("a%"))), Unsupported);
+        assert_eq!(classify(&col("s").between(lit("a"), lit("c"))), Unsupported);
+        assert_eq!(classify(&col("unknown").eq(lit(1))), Inexact);
+        assert_eq!(classify(&col("s").is_null()), Inexact);
+        assert_eq!(classify(&col("b").not_eq(lit(1))), Unsupported);
+        assert_eq!(classify(&col("s").eq(lit("日本"))), Unsupported);
+        assert_eq!(classify(&col("s").eq(lit("x\\\ny"))), Unsupported);
+        assert_eq!(classify(&col("s").eq(lit("x\\\r\ny"))), Unsupported);
+        assert_eq!(
+            classify(&col("id").gt(lit(1)).or(col("s").like(lit("a%")))),
+            Unsupported
+        );
+    }
+
+    #[test]
+    fn numbers_are_compared_by_sql_server() {
+        assert_eq!(classify(&col("id").gt(lit(1))), Exact);
+        assert_eq!(classify(&Expr::Not(Box::new(col("id").eq(lit(1))))), Exact);
+        assert_eq!(
+            classify(&col("id").gt(lit(1)).and(col("s").eq(lit("a")))),
+            Inexact
+        );
+    }
+
+    #[test]
+    fn functions_and_casts_stay_in_datafusion() {
+        let log = datafusion::functions::math::expr_fn::log10(col("id"));
+        assert_eq!(classify(&log.clone().gt(lit(0.5))), Unsupported);
+        assert_eq!(classify(&log.eq(lit(1.0))), Unsupported);
+        assert_eq!(
+            classify(&cast(col("id"), DataType::Int64).eq(lit(1_i64))),
+            Unsupported
+        );
+        let substr = datafusion::functions::unicode::expr_fn::substr(col("s"), lit(1_i64));
+        assert_eq!(classify(&substr.eq(lit("ab"))), Unsupported);
+        assert_eq!(classify(&col("id").gt(lit(1)).is_null()), Unsupported);
     }
 }

@@ -16,12 +16,14 @@ DOTENV_KEY = "harness-dotenv-key"
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runner", type=Path, required=True)
+    parser.add_argument("--runner", nargs="+", required=True,
+                        help="the command that runs scripts, e.g. target/debug/testoperator script")
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--spice-cli", type=Path, default=None,
                         help="the `spice` CLI for `spice:` steps; default: `spice` on PATH")
     args = parser.parse_args()
+    runner = [str(Path(args.runner[0]).resolve()), *args.runner[1:]]
     fixtures = [
         ("nonempty", [{"query": "SELECT 1 AS value", "protocols": ["flightsql", "http"],
                         "expect-empty": True, "expect": {}}],
@@ -108,7 +110,7 @@ def main():
             fixture.write_text(json.dumps({"name": name, "spicepod": spicepod,
                 "steps": [{"start": {}}] + steps, **extra}, indent=2) + "\n")
             cli_flags = ["--spice-cli", str(Path(cli).resolve())] if cli else []
-            result = subprocess.run([str(args.runner.resolve()), "--record-durations", *cli_flags, "--spiced",
+            result = subprocess.run([*runner, "--record-durations", *cli_flags, "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             (args.work_dir / f"{name}.log").write_text(result.stdout)
@@ -132,7 +134,7 @@ def main():
             "steps": [{"start": {}}, {"query": "SELECT 1 AS value", "expect": {"rows": [["2"]]}}]}))
         for flags, code, text in [([], 0, "not run: requires-env"),
                                   (["--require-all-env"], 1, "FAILED not run: requires-env")]:
-            result = subprocess.run([str(args.runner.resolve()), "--record-durations", *flags, "--spiced",
+            result = subprocess.run([*runner, "--record-durations", *flags, "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
                 env={k: v for k, v in os.environ.items() if k != "SPICESCRIPT_HARNESS_UNSET"})

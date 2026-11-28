@@ -37,6 +37,7 @@ use std::{collections::HashMap, sync::Arc};
 
 /// Metadata reads over one replayed [`DatasetState`].
 /// Data files remain in the locations recorded by the writer.
+#[derive(Clone)]
 pub(crate) struct DatasetStateReader {
     pub(crate) state: DatasetState,
     empty: TableState,
@@ -315,7 +316,7 @@ impl DatasetStateReader {
         let Some(s) = self
             .rows(table_id)
             .file_stats
-            .get(&(snapshot_id.to_string(), file_path.to_string()))
+            .get(&(Arc::from(snapshot_id), Arc::from(file_path)))
         else {
             return Ok(None);
         };
@@ -340,8 +341,8 @@ impl DatasetStateReader {
             .iter()
             .map(|((snapshot, path), f)| SnapshotFile {
                 table_id: table_id.to_string(),
-                snapshot_id: snapshot.clone(),
-                file_path: path.clone(),
+                snapshot_id: snapshot.to_string(),
+                file_path: path.to_string(),
                 row_count: f.rows,
                 file_size_bytes: f.size,
                 min_sequence: f.min_seq,
@@ -419,7 +420,7 @@ impl DatasetStateReader {
                 inlined_id: id.clone(),
                 table_id: table_id.to_string(),
                 partition_key: r.partition_key.clone(),
-                data_ipc: r.raw_payload.clone(),
+                data_ipc: r.raw_payload.to_vec(),
                 record_count: r.count,
                 sequence_number: r.seq,
                 created_at: r.created_at.clone(),
@@ -467,7 +468,7 @@ impl DatasetStateReader {
             .map(|(id, r)| InlinedDelete {
                 inlined_id: id.clone(),
                 table_id: table_id.to_string(),
-                delete_ipc: r.raw_payload.clone(),
+                delete_ipc: r.raw_payload.to_vec(),
                 delete_count: r.count,
                 sequence_number: r.seq,
                 published: r.published,
@@ -513,11 +514,11 @@ impl DatasetStateReader {
             ..TableStorageStats::default()
         };
         for ((snapshot, _), f) in &t.files {
-            if snapshot == &t.current_snapshot_id {
+            if snapshot.as_ref() == t.current_snapshot_id {
                 s.current_files = add(s.current_files, 1)?;
                 s.current_bytes = add(s.current_bytes, f.size)?;
                 s.current_rows = add(s.current_rows, f.rows)?;
-            } else if t.groups.contains_key(snapshot) {
+            } else if t.groups.contains_key(snapshot.as_ref()) {
                 s.protected_files = add(s.protected_files, 1)?;
                 s.protected_bytes = add(s.protected_bytes, f.size)?;
                 s.protected_rows = add(s.protected_rows, f.rows)?;

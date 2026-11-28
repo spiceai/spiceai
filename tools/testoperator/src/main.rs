@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::process::ExitCode;
+
 use clap::Parser;
 use test_framework::{anyhow, rustls};
 
@@ -44,13 +46,29 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
-    let cli = Cli::parse();
+    let subcommand = match Cli::parse().subcommand {
+        // A script run has three outcomes (passed, a check failed, the run
+        // could not finish), so it sets the exit code itself.
+        #[cfg(unix)]
+        Commands::Script(args) => return spicescript::exit_code(&spicescript::run(args).await),
+        subcommand => subcommand,
+    };
+    match run(subcommand).await {
+        Ok(()) => ExitCode::SUCCESS,
+        // The report `fn main() -> anyhow::Result<()>` prints.
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    match cli.subcommand {
+async fn run(subcommand: Commands) -> anyhow::Result<()> {
+    match subcommand {
         Commands::Export(
             TestCommands::Throughput(DatasetTestArgs { common, .. })
             | TestCommands::Bench(DatasetTestArgs { common, .. })

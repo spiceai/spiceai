@@ -879,4 +879,42 @@ mod test {
             "the run in progress when its schedule was removed must not finish"
         );
     }
+
+    /// Panics on its first execution only.
+    struct PanicsOnceComponent {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ScheduledTask for PanicsOnceComponent {
+        async fn execute(&self) -> Result<()> {
+            assert!(
+                self.executions.fetch_add(1, Ordering::SeqCst) > 0,
+                "the first execution panics"
+            );
+            Ok(())
+        }
+    }
+
+    /// A trigger waits for a run to end before it schedules the next one, so a run that
+    /// panics must still end the wait. Ticks land at 1s, 2s and 3s; the first run panics.
+    #[tokio::test(start_paused = true)]
+    async fn a_schedule_keeps_running_after_a_run_panics() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let schedule = Schedule::new(
+            Arc::from("a_schedule_keeps_running_after_a_run_panics"),
+            Arc::new(PanicsOnceComponent {
+                executions: Arc::clone(&executions),
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let scheduler = Scheduler::<NotStarted>::new(
+            "a_schedule_keeps_running_after_a_run_panics".into(),
+            vec![Arc::new(schedule)],
+        );
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        scheduler.stop().await;
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+    }
 }

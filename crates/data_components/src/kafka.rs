@@ -92,8 +92,15 @@ pub enum Error {
     #[snafu(display("Unable to receive message from Kafka: {source}"))]
     UnableToReceiveMessage { source: rdkafka::error::KafkaError },
 
-    #[snafu(display("Unable to deserialize JSON message from Kafka: {source}"))]
-    UnableToDeserializeJsonMessage { source: serde_json::Error },
+    #[snafu(display(
+        "Unable to deserialize JSON message from Kafka topic '{topic}' partition {partition} offset {offset}"
+    ))]
+    UnableToDeserializeJsonMessage {
+        topic: String,
+        partition: i32,
+        offset: i64,
+        source: serde_json::Error,
+    },
 
     #[snafu(display("Unable to mark Kafka message as being processed: {source}"))]
     UnableToCommitMessage { source: rdkafka::error::KafkaError },
@@ -130,6 +137,42 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// JSON deserialize failures are skipped per event, not fatal to the poll chunk.
+    #[must_use]
+    pub fn is_change_decode_error(&self) -> bool {
+        matches!(self, Self::UnableToDeserializeJsonMessage { .. })
+    }
+
+    /// Payload-free kind for a skipped JSON deserialize failure.
+    #[must_use]
+    pub fn change_decode_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::UnableToDeserializeJsonMessage { .. } => Some("json_parse"),
+            _ => None,
+        }
+    }
+
+    /// Topic, partition, and offset of a skipped JSON message, when known.
+    #[must_use]
+    pub fn kafka_location(&self) -> Option<(&str, i32, i64)> {
+        match self {
+            Self::UnableToDeserializeJsonMessage {
+                topic,
+                partition,
+                offset,
+                ..
+            }
+            | Self::MessageMissingPayload {
+                topic,
+                partition,
+                offset,
+            } => Some((topic.as_str(), *partition, *offset)),
+            _ => None,
+        }
+    }
+}
 
 /// Returns `true` when `e` indicates the topic does not exist on the broker yet.
 #[must_use]
@@ -614,14 +657,25 @@ fn merge_latest_by_timestamp<K, V>(
 fn deserialize_kafka_json<K: DeserializeOwned, V: DeserializeOwned>(
     key: Option<&[u8]>,
     payload: &[u8],
+    topic: &str,
+    partition: i32,
+    offset: i64,
 ) -> Result<(Option<K>, V)> {
     let key = match key {
-        Some(key_bytes) => {
-            Some(serde_json::from_slice(key_bytes).context(UnableToDeserializeJsonMessageSnafu)?)
-        }
+        Some(key_bytes) => Some(serde_json::from_slice(key_bytes).context(
+            UnableToDeserializeJsonMessageSnafu {
+                topic,
+                partition,
+                offset,
+            },
+        )?),
         None => None,
     };
-    let value = serde_json::from_slice(payload).context(UnableToDeserializeJsonMessageSnafu)?;
+    let value = serde_json::from_slice(payload).context(UnableToDeserializeJsonMessageSnafu {
+        topic,
+        partition,
+        offset,
+    })?;
     Ok((key, value))
 }
 
@@ -631,7 +685,13 @@ fn parse_non_tombstone_message<K: DeserializeOwned, V: DeserializeOwned>(
     let Some(payload) = msg.payload() else {
         return Ok(None);
     };
-    let (key, value) = deserialize_kafka_json(msg.key(), payload)?;
+    let (key, value) = deserialize_kafka_json(
+        msg.key(),
+        payload,
+        msg.topic(),
+        msg.partition(),
+        msg.offset(),
+    )?;
     Ok(Some((key, value, kafka_record_timestamp(msg.timestamp()))))
 }
 
@@ -746,11 +806,20 @@ impl KafkaConsumer {
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
             };
 
+            let topic = msg.topic().to_string();
+            let partition = msg.partition();
+            let offset = msg.offset();
+
             let key = match msg.key() {
                 Some(key_bytes) => match serde_json::from_slice(key_bytes) {
                     Ok(key) => Some(key),
                     Err(e) => {
-                        return Some(Err(Error::UnableToDeserializeJsonMessage { source: e }));
+                        return Some(Err(Error::UnableToDeserializeJsonMessage {
+                            topic,
+                            partition,
+                            offset,
+                            source: e,
+                        }));
                     }
                 },
                 None => None,
@@ -759,7 +828,14 @@ impl KafkaConsumer {
             let payload = msg.payload()?;
             let value = match serde_json::from_slice(payload) {
                 Ok(value) => value,
-                Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
+                Err(e) => {
+                    return Some(Err(Error::UnableToDeserializeJsonMessage {
+                        topic,
+                        partition,
+                        offset,
+                        source: e,
+                    }));
+                }
             };
 
             Some(Ok(KafkaMessage::new(msg, key, value)))
@@ -1360,6 +1436,26 @@ impl MessageBatchCommitter {
         }
     }
 
+    /// Build a committer from explicit topic/partition/offset positions.
+    ///
+    /// Used when a poll chunk mixed successfully decoded messages with events
+    /// that were skipped: both sets must still be committed so a poison-pill
+    /// offset is not re-read.
+    #[must_use]
+    pub fn from_offsets(
+        consumer: &'static KafkaConsumer,
+        positions: impl IntoIterator<Item = (String, i32, i64)>,
+    ) -> Self {
+        let owned: Vec<(String, i32, i64)> = positions.into_iter().collect();
+        let offsets = max_kafka_offsets(owned.iter().map(|(t, p, o)| (t.as_str(), *p, *o)));
+
+        Self {
+            consumer,
+            offsets,
+            offset_commit_hook: None,
+        }
+    }
+
     #[must_use]
     pub fn from_borrowed_messages(
         consumer: &'static KafkaConsumer,
@@ -1556,9 +1652,15 @@ fn messages_to_change_batch(
     if let Some(delimiter) = flatten_json {
         let values = payloads
             .into_iter()
-            .map(|payload| {
+            .zip(messages.iter())
+            .map(|(payload, message)| {
                 serde_json::from_slice::<Value>(payload).map_err(|e| {
-                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage {
+                        topic: message.topic().to_string(),
+                        partition: message.partition(),
+                        offset: message.offset(),
+                        source: e,
+                    })
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1724,11 +1826,11 @@ fn json_bytes_to_change_batch(
     // to avoid silently dropping rows beyond the first batch.
     let reader = ReaderBuilder::new(Arc::clone(schema))
         .build(std::io::Cursor::new(json))
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     let batches: Vec<_> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     if batches.is_empty() {
         return Err(cdc::StreamError::Arrow(
@@ -1741,6 +1843,65 @@ fn json_bytes_to_change_batch(
 
     cdc::wrap_data_as_change_batch(schema, &rb)
         .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+}
+
+/// Describes a JSON-to-Arrow decode failure without the message values.
+///
+/// The Arrow JSON reader quotes the offending value (`failed to parse "<v>" as
+/// Int64`, `expected { got <v>`) and passes value-carrying parse errors through
+/// unchanged. Kafka payloads are source rows that can hold credentials, and
+/// stream errors are logged verbatim, so only the field path and the kind of
+/// failure are kept.
+fn redact_json_decode_error(err: &arrow::error::ArrowError) -> String {
+    use arrow::error::ArrowError;
+
+    const NOT_SHOWN: &str = "the value is not shown";
+    let message = match err {
+        ArrowError::JsonError(message) => message,
+        ArrowError::ParseError(_)
+        | ArrowError::CastError(_)
+        | ArrowError::ComputeError(_)
+        | ArrowError::InvalidArgumentError(_) => {
+            return format!(
+                "Failed to decode a Kafka message: a value could not be converted to its column type ({NOT_SHOWN})"
+            );
+        }
+        other => return other.to_string(),
+    };
+
+    let mut rest = message.as_str();
+    let mut path = Vec::new();
+    while let Some(after) = rest.strip_prefix("whilst decoding field '")
+        && let Some(end) = after.find("': ")
+    {
+        path.push(&after[..end]);
+        rest = &after[end + 3..];
+    }
+
+    let kind = if rest.starts_with("failed to parse") {
+        format!("a value could not be parsed as the column's type ({NOT_SHOWN})")
+    } else if let Some(expected) = rest
+        .strip_prefix("expected ")
+        .and_then(|r| r.split_once(" got "))
+        .map(|(expected, _)| expected)
+    {
+        format!("expected {expected} but found a different JSON value ({NOT_SHOWN})")
+    } else if path.is_empty() {
+        // Structural reader errors (malformed JSON, schema mismatches) name
+        // characters, fields or types, never a decoded value.
+        return err.to_string();
+    } else {
+        format!("the value could not be decoded ({NOT_SHOWN})")
+    };
+
+    if path.is_empty() {
+        format!("Failed to decode a Kafka message: {kind}")
+    } else {
+        format!(
+            "Failed to decode field '{}' of a Kafka message: {kind}",
+            path.join(".")
+        )
+    }
 }
 
 // Public wrappers for benchmarking the two JSON decode paths head-to-head.
@@ -1768,7 +1929,12 @@ pub mod bench_wrappers {
             .iter()
             .map(|p| {
                 serde_json::from_slice::<Value>(p).map_err(|e| {
-                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage {
+                        topic: String::new(),
+                        partition: 0,
+                        offset: 0,
+                        source: e,
+                    })
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2149,6 +2315,37 @@ mod tests {
         );
     }
 
+    /// A message whose value does not match its column must not put the value
+    /// in the error: payloads are source rows that can hold credentials, and
+    /// stream errors are logged verbatim. The field name must still appear.
+    #[test]
+    fn decode_errors_never_show_message_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = test_schema(); // id Int64, name Utf8
+        let cases = [
+            json!({"id": FAKE_SECRET, "name": "app"}),
+            json!({"id": 1, "name": {"api_key": FAKE_SECRET}}),
+            json!({"id": [FAKE_SECRET], "name": "app"}),
+        ];
+        for value in cases {
+            let payload = value.to_string();
+            for err in [
+                values_to_change_batch(std::iter::once(&value), None, &schema)
+                    .expect_err("a mistyped value must be refused"),
+                payloads_to_change_batch(&[payload.as_bytes()], &schema)
+                    .expect_err("a mistyped value must be refused"),
+            ] {
+                for rendered in [err.to_string(), format!("{err:?}")] {
+                    assert!(!rendered.contains(FAKE_SECRET), "value leaked: {rendered}");
+                    assert!(
+                        rendered.contains("field 'id'") || rendered.contains("field 'name'"),
+                        "the field must be named: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_change_batch_has_correct_structure() {
         let schema = test_schema();
@@ -2303,21 +2500,44 @@ mod tests {
     #[test]
     fn deserialize_kafka_json_parses_key_and_value() {
         let (key, value): (Option<String>, serde_json::Value) =
-            deserialize_kafka_json(Some(br#""pk""#), br#"{"id":1}"#).expect("deserialize");
+            deserialize_kafka_json(Some(br#""pk""#), br#"{"id":1}"#, "t", 0, 1)
+                .expect("deserialize");
         assert_eq!(key.as_deref(), Some("pk"));
         assert_eq!(value, json!({"id": 1}));
 
         let (no_key, value): (Option<String>, serde_json::Value) =
-            deserialize_kafka_json(None, br#"{"id":2}"#).expect("deserialize");
+            deserialize_kafka_json(None, br#"{"id":2}"#, "t", 0, 2).expect("deserialize");
         assert!(no_key.is_none());
         assert_eq!(value, json!({"id": 2}));
     }
 
     #[test]
     fn deserialize_kafka_json_rejects_invalid_payload() {
-        let err = deserialize_kafka_json::<String, serde_json::Value>(None, b"not-json")
-            .expect_err("invalid json");
-        assert!(matches!(err, Error::UnableToDeserializeJsonMessage { .. }));
+        let err = deserialize_kafka_json::<String, serde_json::Value>(
+            None,
+            b"s3cr3t-token-value not json",
+            "t",
+            0,
+            7,
+        )
+        .expect_err("invalid json");
+        assert!(matches!(
+            err,
+            Error::UnableToDeserializeJsonMessage {
+                ref topic,
+                partition: 0,
+                offset: 7,
+                ..
+            } if topic == "t"
+        ));
+        let displayed = err.to_string();
+        assert!(
+            !displayed.contains("s3cr3t-token-value"),
+            "deserialize error must not include the payload, got: {displayed}"
+        );
+        assert!(displayed.contains("topic 't'"));
+        assert!(displayed.contains("partition 0"));
+        assert!(displayed.contains("offset 7"));
     }
 
     /// A one-broker mock cluster holding one message on topic `t`, with the
@@ -2343,6 +2563,13 @@ mod tests {
     fn cluster_holding(
         payload: &str,
     ) -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        cluster_holding_payloads(&[payload])
+    }
+
+    /// A one-broker mock cluster holding `payloads`, in order, on topic `t`.
+    fn cluster_holding_payloads(
+        payloads: &[&str],
+    ) -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
         use rdkafka::mocking::MockCluster;
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
@@ -2352,13 +2579,15 @@ mod tests {
             .set("bootstrap.servers", cluster.bootstrap_servers())
             .create()
             .expect("producer");
-        producer
-            .send(BaseRecord::<(), str>::to("t").payload(payload))
-            .map_err(|(e, _)| e)
-            .expect("enqueue message");
+        for payload in payloads {
+            producer
+                .send(BaseRecord::<(), str>::to("t").payload(*payload))
+                .map_err(|(e, _)| e)
+                .expect("enqueue message");
+        }
         producer
             .flush(Duration::from_secs(10))
-            .expect("flush message");
+            .expect("flush messages");
         cluster
     }
 
@@ -2682,6 +2911,133 @@ mod tests {
             (change.num_rows_hint(), change.is_dataset_ready()),
             (1, true),
             "the one change on the topic at start, handed over with the readiness it completes"
+        );
+    }
+
+    #[cfg(feature = "debezium")]
+    const SECRET: &str = "s3cr3t-token-value";
+
+    #[cfg(feature = "debezium")]
+    fn debezium_create_payload(id: i64) -> String {
+        format!(r#"{{"payload": {{"after": {{"id": {id}}}, "op": "c"}}}}"#)
+    }
+
+    #[cfg(feature = "debezium")]
+    fn change_ids(envelope: &ChangeEnvelope) -> Vec<i64> {
+        use arrow::array::{Array, Int64Array, StructArray};
+
+        let batch = envelope.change_batch().expect("change batch");
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data column")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("data is a struct");
+        let id = data
+            .column_by_name("id")
+            .expect("id field")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        id.iter().flatten().collect()
+    }
+
+    /// A poll chunk with a valid event, a bad event, and another valid event
+    /// applies both valid events in order, increments the decode-error metric,
+    /// marks the dataset Error, and never puts the payload in the status message.
+    #[cfg(feature = "debezium")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debezium_applies_valid_events_when_a_chunk_contains_a_bad_event() {
+        const BATCH_WINDOW: Duration = Duration::from_secs(2);
+        let bad = format!(r#"{{"payload": {{"after": {{"secret": "{SECRET}"}}, "op": "c"}}}}"#);
+        let cluster = cluster_holding_payloads(&[
+            &debezium_create_payload(1),
+            &bad,
+            &debezium_create_payload(3),
+        ]);
+        let dataset = datafusion::common::TableReference::bare("orders");
+        let runtime_status = runtime_status::RuntimeStatus::new();
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        let before = runtime_metrics::acceleration::cdc_decode_errors_recorded();
+        let debezium = crate::debezium_kafka::DebeziumKafka::new(
+            id_schema(),
+            vec!["id".to_string()],
+            consumer_subscribed_to_t(&cluster),
+            (10_000, BATCH_WINDOW),
+            None,
+        )
+        .with_dataset_name(dataset.to_string())
+        .with_runtime_status(Arc::clone(&runtime_status));
+        let mut stream = debezium.stream_changes();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    let displayed = e.to_string();
+                    assert!(
+                        !displayed.contains(SECRET),
+                        "stream error must not include the payload, got: {displayed}"
+                    );
+                    panic!("decode of one event must not fail the poll chunk: {e}");
+                }
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => {
+                    ids.extend(change_ids(&envelope));
+                    if ids.len() >= 2 {
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+
+        assert_eq!(ids, vec![1, 3], "both valid events must apply, in order");
+        assert_eq!(
+            runtime_metrics::acceleration::cdc_decode_errors_recorded(),
+            before + 1,
+            "the skipped event must increment dataset_acceleration_cdc_decode_errors"
+        );
+        assert!(
+            runtime_status.is_changes_decode_degraded(&dataset),
+            "a skipped event must set the sticky decode-error condition"
+        );
+        let status = runtime_status
+            .get_dataset_status(&dataset)
+            .expect("dataset status");
+        assert!(
+            status.is_error(),
+            "dataset status must be Error after a skipped event, got {status:?}"
+        );
+        let message = status.error_message().unwrap_or("");
+        assert!(
+            !message.contains(SECRET),
+            "status message must not include the payload, got: {message}"
+        );
+        assert!(
+            message.contains("missing_required_field"),
+            "status message must name the error kind, got: {message}"
+        );
+        assert!(
+            message.contains("topic 't'"),
+            "status message must name the Kafka topic, got: {message}"
+        );
+
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        assert!(
+            runtime_status
+                .get_dataset_status(&dataset)
+                .expect("status")
+                .is_error(),
+            "Ready from a later valid CDC apply must not clear the sticky decode error"
+        );
+        runtime_status.clear_changes_decode_degraded(&dataset);
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        assert_eq!(
+            runtime_status.get_dataset_status(&dataset),
+            Some(runtime_status::ComponentStatus::Ready)
         );
     }
 }

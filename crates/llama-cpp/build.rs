@@ -238,6 +238,7 @@ fn bindings(root: &Path) {
         .allowlist_function("spice_dflash_kind")
         .allowlist_function("spice_arch_splits_by_tensor")
         .allowlist_function("spice_json_schema_to_grammar")
+        .allowlist_function("spice_grammar_check")
         .allowlist_function("spice_string_free")
         .allowlist_type("llama_.*")
         .allowlist_type("spice_mtp.*")

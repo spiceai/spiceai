@@ -52,9 +52,26 @@ const INITIAL_READ_SIZE: u64 = MAX_POSTSCRIPT_SIZE as u64 + EOF_SIZE as u64;
 /// Records the byte range of every `GET`, as `(start, end)` with `None` for an
 /// open end.
 #[derive(Debug)]
-struct RecordingStore {
+pub(super) struct RecordingStore {
     inner: InMemory,
     gets: Mutex<Vec<(String, GetRange)>>,
+}
+
+impl RecordingStore {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            gets: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(super) fn clear_gets(&self) {
+        self.gets.lock().clear();
+    }
+
+    pub(super) fn gets(&self) -> Vec<(String, GetRange)> {
+        self.gets.lock().clone()
+    }
 }
 
 impl fmt::Display for RecordingStore {
@@ -118,7 +135,12 @@ impl ObjectStore for RecordingStore {
     }
 }
 
-async fn write_file(store: &Arc<dyn ObjectStore>, name: &str, ids: &[i64], values: &[i64]) -> u64 {
+pub(super) async fn write_file(
+    store: &Arc<dyn ObjectStore>,
+    name: &str,
+    ids: &[i64],
+    values: &[i64],
+) -> u64 {
     let session = VortexSession::default();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -206,10 +228,7 @@ async fn assert_exact_rows(ctx: &SessionContext, ids: &[i64], values: &[i64]) {
 }
 
 async fn setup(ids: &[i64], values: &[i64]) -> (Arc<RecordingStore>, SessionContext, u64) {
-    let recording = Arc::new(RecordingStore {
-        inner: InMemory::new(),
-        gets: Mutex::new(Vec::new()),
-    });
+    let recording = Arc::new(RecordingStore::new());
     let store = Arc::clone(&recording) as Arc<dyn ObjectStore>;
     let size = write_file(&store, "data/part-000.vortex", ids, values).await;
 

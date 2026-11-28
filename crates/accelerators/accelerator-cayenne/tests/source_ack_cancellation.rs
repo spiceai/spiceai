@@ -227,6 +227,7 @@ async fn native_checkpoint_retains_source_ack_after_producer_cancellation() {
         change(&table, first_id),
         true,
         false,
+        false,
     );
     let producer = tokio::spawn(async move {
         task.start_changes_stream(

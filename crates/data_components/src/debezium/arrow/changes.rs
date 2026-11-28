@@ -66,6 +66,24 @@ pub fn to_change_batch(
     change: &ChangeEvent,
     projection: Option<&SchemaProjection>,
 ) -> super::Result<ChangeBatch> {
+    to_change_batch_with_defaults(
+        table_schema,
+        primary_key,
+        change,
+        projection,
+        &ColumnDefaults::new(),
+    )
+}
+
+/// [`to_change_batch`], where a required column the event does not carry
+/// takes its value from `defaults` (see [`super::column_defaults`]).
+pub fn to_change_batch_with_defaults(
+    table_schema: &SchemaRef,
+    primary_key: &[String],
+    change: &ChangeEvent,
+    projection: Option<&SchemaProjection>,
+    defaults: &ColumnDefaults,
+) -> super::Result<ChangeBatch> {
     let schema = changes_schema(table_schema);
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), 1);
@@ -77,7 +95,7 @@ pub fn to_change_batch(
         change,
         projection,
         &timestamp_semantic_types(table_schema.fields(), change.row_fields()),
-        &ColumnDefaults::new(),
+        defaults,
     )?;
 
     let struct_array = struct_builder.finish();
@@ -304,6 +322,38 @@ mod tests {
             }
         });
         serde_json::from_value(value).expect("valid change event")
+    }
+
+    /// The production failure: a change event missing a non-nullable column.
+    /// The stream error that the refresh task logs (`Changes stream error for
+    /// <dataset>: {err}`) must name the column and never the row's values.
+    #[test]
+    fn missing_column_stream_error_never_shows_row_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            ArrowField::new("id", DataType::Utf8, false),
+            ArrowField::new("api_key", DataType::Utf8, false),
+            ArrowField::new("ip_allow_list_enabled", DataType::Boolean, false),
+        ]));
+        let event = change_event(&serde_json::json!({
+            "id": "app-1",
+            "api_key": FAKE_SECRET,
+            "api_key_2": FAKE_SECRET,
+        }));
+        let err = vector_to_change_batch(&table_schema, &["id".to_string()], &[&event], None)
+            .expect_err("a row without a non-nullable column must fail");
+        let err = crate::cdc::StreamError::Connector {
+            connector: "Debezium",
+            source: Box::new(err),
+        };
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
+            assert!(!rendered.contains("app-1"), "row value leaked: {rendered}");
+            assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
+        }
     }
 
     /// A `json_object` catch-all column folds every non-declared `after` field
@@ -715,6 +765,66 @@ mod tests {
         );
     }
 
+    const SECRET: &str = "s3cr3t-token-value";
+
+    fn required_id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    /// HTTP ingest still uses [`vector_to_change_batch`]: one bad event fails the
+    /// whole vector. The Kafka changes stream decodes per event instead.
+    #[test]
+    fn vector_to_change_batch_fails_the_whole_chunk_when_one_event_is_bad() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+        let err = vector_to_change_batch(&schema, &pk, &[&valid, &bad, &later], None)
+            .expect_err("one bad event must fail the whole vector");
+        assert_eq!(err.kind(), "missing_required_field");
+    }
+
+    #[test]
+    fn decoding_each_event_keeps_valid_neighbors_of_a_bad_event() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+
+        let mut ids = Vec::new();
+        let mut skipped_kind = None;
+        for change in [&valid, &bad, &later] {
+            match to_change_batch(&schema, &pk, change, None) {
+                Ok(batch) => ids.push(id_of(&batch.data(0))),
+                Err(err) => {
+                    assert_eq!(err.kind(), "missing_required_field");
+                    assert!(
+                        !err.kind().contains(SECRET),
+                        "kind must not carry the field value, got {}",
+                        err.kind()
+                    );
+                    skipped_kind = Some(err.kind());
+                }
+            }
+        }
+        assert_eq!(ids, vec![Some(1), Some(3)]);
+        assert_eq!(skipped_kind, Some("missing_required_field"));
+    }
+
     /// A Debezium envelope for one `apps` row whose embedded row schema is
     /// `row_fields`, as a JSON-converter event carries it.
     fn apps_event(row_fields: &serde_json::Value, after: &serde_json::Value) -> ChangeEvent {
@@ -785,6 +895,43 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, vec![false, true]);
+    }
+
+    /// The Kafka changes stream decodes each event on its own, so the
+    /// per-event path must apply the same column defaults as the vector path.
+    #[test]
+    fn decoding_one_older_event_alone_takes_the_column_default() {
+        let old_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+        ]);
+        let new_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "boolean", "optional": false, "default": false, "field": "flag"},
+        ]);
+        let old = apps_event(&old_fields, &serde_json::json!({"id": 1}));
+        let new = apps_event(&new_fields, &serde_json::json!({"id": 2, "flag": true}));
+        let row_fields = new.row_fields().expect("row fields");
+        let table_schema: SchemaRef = Arc::new(
+            crate::debezium::arrow::convert_fields_to_arrow_schema(row_fields.iter().collect())
+                .expect("schema"),
+        );
+        let defaults = crate::debezium::arrow::column_defaults(row_fields);
+        let pk = ["id".to_string()];
+
+        let err = to_change_batch(&table_schema, &pk, &old, None)
+            .expect_err("without defaults the older event lacks a required column");
+        assert_eq!(err.kind(), "missing_required_field");
+
+        let batch = to_change_batch_with_defaults(&table_schema, &pk, &old, None, &defaults)
+            .expect("the older event decodes with the column's default");
+        let flag = batch
+            .data(0)
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("flag is Boolean")
+            .value(0);
+        assert!(!flag);
     }
 
     /// Without a declared default, a required column an event lacks is still
