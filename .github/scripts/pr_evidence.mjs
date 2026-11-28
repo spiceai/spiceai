@@ -40,7 +40,7 @@ export const RUST_AFFECTING = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|
 // judged even when the no-Rust fast-track covers it (`evidenceGate` in pr.yml, a
 // copy test_pr_evidence.mjs keeps equal), and a later change to them makes earlier
 // evidence stale, so the check cannot be weakened under evidence from before.
-export const EVIDENCE_GATE = /^(\.github\/scripts\/(pr_evidence\.mjs|bot_pr_evidence\.sh|test_pr_evidence\.mjs|test_pr_attestation_signoff\.mjs)|\.github\/workflows\/pr\.yml|\.github\/PULL_REQUEST_TEMPLATE\.md|AGENTS\.md|\.github\/evals\/.+)$/;
+export const EVIDENCE_GATE = /^(\.github\/scripts\/(pr_evidence\.mjs|bot_pr_evidence\.sh|test_pr_evidence\.mjs|test_pr_attestation_signoff\.mjs)|\.github\/workflows\/(pr|attestation_script_test|agent_evals_selftest)\.yml|\.github\/PULL_REQUEST_TEMPLATE\.md|AGENTS\.md|\.github\/evals\/.+)$/;
 // What makes earlier evidence stale: shipped code, every test input (spicescript
 // scenarios, Spicepods, expected rows), which can change a check's outcome without
 // changing code, and the evidence check itself. Documentation does not.
@@ -133,8 +133,9 @@ export function evidenceSection(body) {
  * block, naming a commit `resolve` recognizes, and runs to the next such line. It
  * records whether it holds a fenced block with output (a line that is not a `$ `
  * command), the run ids of this repository's run links on its lines, and its
- * commands: the `$ ` lines of the blocks that carry output. A command with no
- * output is no run of it. Output before the first entry belongs to the first entry.
+ * commands: each `$ ` line followed by output of its own before the next `$ ` line
+ * or the end of the block. A command with no output is no run of it. Output before
+ * the first entry belongs to the first entry.
  */
 export function evidenceEntries(section, resolve, repoSlug) {
   const linkPattern = runLinks(repoSlug);
@@ -144,22 +145,25 @@ export function evidenceEntries(section, resolve, repoSlug) {
   let block = null;
   const target = () => current ?? pending;
   const closeBlock = () => {
-    if (block?.output) {
-      target().fenced = true;
-      for (const command of block.commands) target().commands.add(command);
-    }
+    if (block.output) target().fenced = true;
+    for (const command of block.ran) target().commands.add(command);
     block = null;
   };
   for (const { line, fence, fenced } of markedLines(section)) {
     if (fence) {
       if (block) closeBlock();
-      else block = { output: false, commands: [] };
+      else block = { output: false, command: null, ran: [] };
       continue;
     }
     if (fenced) {
       const prompt = PROMPT.exec(line);
-      if (prompt) block.commands.push(prompt[1].trim());
-      else if (line.trim()) block.output = true;
+      if (prompt) {
+        block.command = prompt[1].trim();
+      } else if (line.trim()) {
+        block.output = true;
+        if (block.command !== null) block.ran.push(block.command);
+        block.command = null;
+      }
       continue;
     }
     const runs = [...line.matchAll(linkPattern)].map((match) => match[1]);
@@ -305,21 +309,30 @@ export async function checkEvidence({ github, owner, repo, pullNumber }) {
     );
   }
 
-  // A run link is output only for the commit the run ran at, and only once the run
-  // has finished (with any conclusion: a failing run is evidence too).
+  // A run link is output only for the commit the run ran at, and only for a run
+  // that executed: it finished with a verdict (success or failure; a failing run is
+  // evidence too) and at least one of its jobs ran steps. A run GitHub holds for
+  // approval reads completed/action_required with no job, and a held run closed
+  // later can read failure with no job; neither ran anything.
   const single = entries.filter((entry) => entry.shas.length === 1 && !unlisted(entry));
   const runAt = new Map();
   for (const id of new Set(single.flatMap((entry) => entry.runs))) {
     // eslint-disable-next-line no-await-in-loop
     const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(id) });
-    runAt.set(id, data.status === 'completed' ? String(data.head_sha ?? '').toLowerCase() : null);
+    let executed = data.status === 'completed' && (data.conclusion === 'success' || data.conclusion === 'failure');
+    if (executed) {
+      // eslint-disable-next-line no-await-in-loop
+      const { data: listing } = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: Number(id), per_page: 100 });
+      executed = (listing.jobs ?? []).some((job) => (job.steps ?? []).some((step) => step.conclusion === 'success' || step.conclusion === 'failure'));
+    }
+    runAt.set(id, executed ? String(data.head_sha ?? '').toLowerCase() : null);
   }
   for (const entry of single) {
     entry.hasOutput = entry.fenced || entry.runs.some((id) => runAt.get(id) === entry.shas[0]);
     if (!entry.hasOutput) {
       problems.push(
         `"${entry.line}" names ${short(entry.shas[0])} but carries no output: put the output in a fenced block under it, ` +
-          `or link a finished run of this repository's workflows that ran at ${short(entry.shas[0])}.`
+          `or link a run of this repository's workflows that ran at ${short(entry.shas[0])} and executed.`
       );
     }
   }

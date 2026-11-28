@@ -24,8 +24,9 @@
 # the push, so the Attestation run they start reads the new description: an edit
 # made with GITHUB_TOKEN starts no `edited` run of its own.
 #
-# Two runs of the same workload can update one PR. Only the run whose commit is
-# the PR's head writes: an older run that finishes later leaves the newer run's
+# Two runs of the same workload can update one PR only if the workflow lets them
+# overlap; the callers serialize them with a concurrency group per workload. As a
+# second guard, only the run whose commit is the PR's head writes: an older run that finishes later leaves the newer run's
 # entry alone, since that entry covers the head and the edit would start no new
 # Attestation run to catch the regression. GitHub has no conditional edit, so the
 # head is read again before every write, and after writing `update` reads the
@@ -60,7 +61,8 @@ case "${1:-}" in
         {
           if (match($0, /^ ? ? ?(````*|~~~~*)/)) {
             run = substr($0, RSTART, RLENGTH); sub(/^ */, "", run); rest = substr($0, RSTART + RLENGTH)
-            if (!fenced) { fenced = 1; fence = run; if (!in_section) print; next }
+            # A backtick run with a backtick after it on the line is a code span, not a fence.
+            if (!fenced && !(substr(run, 1, 1) == "`" && index(rest, "`") > 0)) { fenced = 1; fence = run; if (!in_section) print; next }
             if (substr(run, 1, 1) == substr(fence, 1, 1) && length(run) >= length(fence) && rest ~ /^[[:space:]]*$/) {
               fenced = 0; if (!in_section) print; next
             }
@@ -95,6 +97,10 @@ case "${1:-}" in
       sleep "${EVIDENCE_RECHECK_DELAY:-$((RANDOM % 10 + 5))}"
       if has_entry; then
         rm -f "${file}"
+        if ! is_head; then
+          echo "${pr}'s head moved off ${sha:0:12} while its evidence was written; not releasing its runs." >&2
+          exit 1
+        fi
         exit 0
       fi
       yield_if_behind

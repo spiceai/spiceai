@@ -32,6 +32,12 @@ jobs:
   run-schema:
     # The service principal's federation policy trusts this environment's subject.
     environment: ci
+    # Runs for one Spicepod on one branch share a snapshot branch and its PR
+    # ("Upload schema snapshots to branch"), so they run one at a time: two at once
+    # could publish the PR's evidence out of order.
+    concurrency:
+      group: testoperator-schema-${{ github.ref_name }}-${{ github.event.inputs.spicepod_path }}
+      cancel-in-progress: false
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:

@@ -32,10 +32,19 @@ const HEAD = '4d'.repeat(20);
 const BASE = 'f'.repeat(40);
 const ON_BASE = 'e'.repeat(40);
 const ELSEWHERE = '9'.repeat(40);
-// Finished runs: 42 at HEAD, 7 at FIRST, 9 at the base. Run 5 is still queued at HEAD.
+// Executed runs: 42 at HEAD, 7 at FIRST, 9 at the base. At HEAD, run 5 is still
+// queued, run 8 is held for approval, and run 6 was closed while held (failure, no job).
 const RUN = 'https://github.com/o/r/actions/runs/42';
 const done = (headSha) => ({ head_sha: headSha, status: 'completed', conclusion: 'success' });
-const RUN_AT = { 42: done(HEAD), 7: done(FIRST), 9: done(BASE), 5: { head_sha: HEAD, status: 'queued', conclusion: null } };
+const RUN_AT = {
+  42: done(HEAD), 7: done(FIRST), 9: done(BASE),
+  5: { head_sha: HEAD, status: 'queued', conclusion: null },
+  8: { head_sha: HEAD, status: 'completed', conclusion: 'action_required' },
+  6: { head_sha: HEAD, status: 'completed', conclusion: 'failure' },
+};
+// Jobs per run: a run that executed has a job whose steps ran; held and closed-while-held runs have none.
+const JOBS = { 6: [], 8: [] };
+const executedJob = [{ steps: [{ conclusion: 'success' }] }];
 
 const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n## Not a heading\n-->';
 
@@ -88,6 +97,7 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
           reads.push(`run ${runId}`);
           return { data: runs[runId] };
         },
+        listJobsForWorkflowRun: async ({ run_id: runId }) => ({ data: { jobs: JOBS[runId] ?? executedJob } }),
       },
     },
   };
@@ -220,7 +230,7 @@ test('a bare SHA with an unrelated link is not evidence', async () => {
   const result = await check({ body: describe(line) });
   assert.deepEqual(result.problems, [
     `"${line}" names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
-      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)} and executed.`,
   ]);
   assert.equal(result.cited, null);
 });
@@ -232,10 +242,12 @@ test('a run of this repository that ran at the entry\'s commit counts as output'
   assert.deepEqual(reads, ['run 42']);
 });
 
-test('a run at another commit, a queued run, another repository\'s run, a checks page, a gist, or an upload is not output', async () => {
+test('a run at another commit, a queued or held run, one closed without a job, another repository\'s run, a checks page, a gist, or an upload is not output', async () => {
   for (const link of [
     'https://github.com/o/r/actions/runs/9',
     'https://github.com/o/r/actions/runs/5',
+    'https://github.com/o/r/actions/runs/8',
+    'https://github.com/o/r/actions/runs/6',
     'https://github.com/other/repo/actions/runs/42',
     'https://github.com/o/r/pull/7/checks',
     'https://gist.github.com/someone/abc123',
@@ -269,7 +281,7 @@ test('naming the head without output does not refresh an older run', async () =>
   const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\nThe head is ${HEAD.slice(0, 12)}.`) });
   assert.deepEqual(result.problems, [
     `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
-      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)} and executed.`,
     afterHead(`Ran at ${FIRST.slice(0, 12)}:`),
   ]);
   assert.equal(result.cited, FIRST);
@@ -306,9 +318,17 @@ test('a fenced command with no output is not output, and is no re-run of it', as
   const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\n${line}\n\n\`\`\`\n$ make test\n\`\`\``) });
   assert.deepEqual(result.problems, [
     `"${line}" names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
-      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)} and executed.`,
     afterHead(`Ran at ${FIRST.slice(0, 12)}:`),
   ]);
+});
+
+test('in a fence, only a command followed by its own output counts as re-run', async () => {
+  const result = await check({
+    ...withLaterChange,
+    body: describe(`${ran(FIRST, 'make test-integration')}\n\nAt ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ make test\n12 passed\n$ make test-integration\n\`\`\``),
+  });
+  assert.deepEqual(result.problems, [afterHead(`Ran at ${FIRST.slice(0, 12)}:`)]);
 });
 
 test('a fence closes only on its own character: a literal ~~~ inside a backtick block hides nothing', async () => {
@@ -523,19 +543,21 @@ test('the section bot_pr_evidence.sh writes passes the check, on its fenced outp
  * a file. `overwrites` edits are undone right after they land, as a concurrent
  * writer working from an older read would. Returns { body, status, stderr }.
  */
-function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha } = {}) {
+function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha, headAfterEdit } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
     writeFileSync(join(dir, 'body.md'), body);
     writeFileSync(join(dir, 'original.md'), body);
     writeFileSync(join(dir, 'overwrites'), String(overwrites));
+    writeFileSync(join(dir, 'head'), head);
     writeFileSync(
       join(dir, 'gh'),
       `#!/usr/bin/env bash\nd="${dir}"\n` +
-        `if [ "$1 $2" = "pr view" ]; then case "$*" in *headRefOid*) echo ${head};; *) cat "$d/body.md";; esac; fi\n` +
+        'if [ "$1 $2" = "pr view" ]; then case "$*" in *headRefOid*) cat "$d/head";; *) cat "$d/body.md";; esac; fi\n' +
         'if [ "$1 $2" = "pr edit" ]; then\n' +
         '  while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "$d/body.md"; shift; done\n' +
         '  n=$(cat "$d/overwrites"); if [ "$n" -gt 0 ]; then cp "$d/original.md" "$d/body.md"; echo $((n - 1)) > "$d/overwrites"; fi\n' +
+        (headAfterEdit ? `  echo ${headAfterEdit} > "$d/head"\n` : '') +
         'fi\n'
     );
     writeFileSync(join(dir, 'git'), `#!/usr/bin/env bash\necho ${sha}\n`);
@@ -576,6 +598,14 @@ test('bot_pr_evidence.sh update closes a fence only on its own character', () =>
   assert.equal(edited, `## 🧪 Evidence\n\n${botEntry(repoHead, command)}\n## Notes\n\nKeep me.\n`);
 });
 
+test('bot_pr_evidence.sh update reads a one-line code span as text, not a fence', () => {
+  const command = 'testoperator run schema tpch/sf1/x.yaml';
+  const body = '## 🧪 Evidence\n\n```a`b```\n```c`d```\n\n## Notes\n\nKeep me.';
+  const { body: edited, status, stderr } = runUpdate(body, command);
+  assert.equal(status, 0, stderr);
+  assert.equal(edited, `## 🧪 Evidence\n\n${botEntry(repoHead, command)}\n## Notes\n\nKeep me.\n`);
+});
+
 test('bot_pr_evidence.sh update adds the section to a description without one', () => {
   const { body, status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml');
   assert.equal(status, 0, stderr);
@@ -596,6 +626,12 @@ test('bot_pr_evidence.sh update leaves a newer run\'s evidence alone', () => {
   assert.equal(status, 0, stderr);
   assert.match(stderr, /head is no longer 1a1a1a1a1a1a; the run that pushed the head writes its evidence\./);
   assert.equal(after, body);
+});
+
+test('bot_pr_evidence.sh update fails its run when the head moves while it writes, so no runs are released', () => {
+  const { status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml', { headAfterEdit: SECOND });
+  assert.equal(status, 1);
+  assert.match(stderr, /head moved off [0-9a-f]{12} while its evidence was written; not releasing its runs\./);
 });
 
 test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
@@ -619,7 +655,11 @@ test('snapshot workflows key each branch, and its evidence, on one workload', ()
   assert.match(cluster, /^\s*BRANCH_NAME="testoperator-cluster-snapshot-update\/\$\{BRANCH_ID\}-\$\{slug\}-\$\{WORKLOAD_KEY\}"$/m);
   assert.match(cluster, /WORKLOAD="\$\{WORKLOAD\} queries=\$\{CB_SCENARIO_QUERY_FILE\}"/, 'scenario queries are part of the workload');
   assert.equal((cluster.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator cluster bench \$\{WORKLOAD\}"/g) ?? []).length, 2);
+  // Runs that share a branch run one at a time, keyed on the same inputs as the branch.
+  assert.match(bench, /^ {4}concurrency:\n {6}group: testoperator-bench-\$\{\{ github\.event\.inputs\.spiced_commit \|\| github\.run_id \}\}-\$\{\{ github\.event\.inputs\.query_set \}\}-sf\$\{\{ github\.event\.inputs\.scale_factor \}\}-\$\{\{ github\.event\.inputs\.spicepod_path \}\}-\$\{\{ github\.event\.inputs\.layout \}\}-\$\{\{ github\.event\.inputs\.scenario_query_file \}\}-\$\{\{ github\.event\.inputs\.query_overrides \}\}\n {6}cancel-in-progress: false$/m);
+  assert.match(cluster, /^ {4}concurrency:\n {6}group: testoperator-cluster-bench-\$\{\{ github\.event\.inputs\.custom_image_tag \|\| github\.run_id \}\}-.*scenario_query_file \}\}\n {6}cancel-in-progress: false$/m);
   const schema = read('testoperator_run_schema.yml');
+  assert.match(schema, /^ {4}concurrency:\n {6}group: testoperator-schema-\$\{\{ github\.ref_name \}\}-\$\{\{ github\.event\.inputs\.spicepod_path \}\}\n {6}cancel-in-progress: false$/m);
   assert.match(schema, /^\s*BRANCH_NAME="testoperator-snapshot-update\/\$\{SLUG\}"$/m);
   assert.equal((schema.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator run schema \$\{\{ github\.event\.inputs\.spicepod_path \}\}"/g) ?? []).length, 2);
 });

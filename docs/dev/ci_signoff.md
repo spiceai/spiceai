@@ -154,8 +154,8 @@ Every PR that needs a sign-off also needs evidence in its description, in the
 `🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
 (the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). So does a PR the
 no-Rust fast-track covers that changes the check itself: `pr_evidence.mjs`,
-`bot_pr_evidence.sh`, their tests, `pr.yml`, the PR template, `AGENTS.md`, or
-`.github/evals/`. **Attestation** checks it with `.github/scripts/pr_evidence.mjs`
+`bot_pr_evidence.sh`, their tests, the workflows that run those tests, `pr.yml`,
+the PR template, `AGENTS.md`, or `.github/evals/`. **Attestation** checks it with `.github/scripts/pr_evidence.mjs`
 from a checkout of the default branch's tip, which it resolves first and
 verifies exactly before importing, so a PR into an older release branch is
 judged by the current rule:
@@ -164,9 +164,10 @@ judged by the current rule:
   "Evidence"; heading-shaped lines inside pasted output don't count), and it
   says more than the template comment.
 - Each entry names one commit from this PR, on a line outside its output, and
-  carries that output: a non-empty fenced block under it, or a link to a run of
-  this repository's workflows that ran at that commit (checked through the
-  API). Other links, uploads, gists and checks pages are not output: paste an
+  carries that output: a fenced block under it with output beyond its `$ `
+  lines, or a link to a run of this repository's workflows that ran at that
+  commit and executed (it concluded success or failure, with a job that ran
+  steps; checked through the API). Other links, uploads, gists and checks pages are not output: paste an
   excerpt in a fenced block.
 - Every check marked not run, anywhere in the description, gives a real reason
   (`Not run — <reason>`, not the placeholder and not "TODO").
@@ -174,7 +175,7 @@ judged by the current rule:
   (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
   checked by old and new path) or anything under `test/`, unless newer entries
   re-run every command it ran. An entry's commands are the `$ ` lines in its
-  pasted output, compared as written. That is the before-and-after pattern: the
+  pasted output that are followed by output of their own, compared as written. That is the before-and-after pattern: the
   failing run at an older commit, the same command passing at the head. A newer
   run of a different check, or of only some of the commands, refreshes nothing.
   A merge of the base counts only for files it changes against both parents:
@@ -193,19 +194,23 @@ maintainer gives each open PR a fresh event (editing its description is
 enough), and removes and re-adds any PR already in the merge queue, whose entry
 rests on the earlier green check. A Git or API error while verifying the checker
 fails the check rather than skipping it, and a default branch without the module
-fails every PR except the one that adds it.
+fails every PR except the one that introduced the check.
 
 Like the rest of **Attestation**, the check runs the workflow file from the PR's
 merge commit, as every `pull_request` workflow does, so a PR that edits `pr.yml`
-can change what it checks. Code-owner review of workflow changes guards that.
+can change what it checks, and a PR that changes `pr_evidence.mjs` is judged by
+the copy already on the default branch, not by its own. Code-owner review of
+those changes guards both: running a PR's own checker inside **Attestation** would
+put the PR's code in the job that decides it.
 
 Workflows that open PRs with generated commits (snapshot and schema updates)
 write the section with `.github/scripts/bot_pr_evidence.sh`: an entry naming the
 generated commit and linking the run, with the workload's command in a fenced
 block. They key each branch, and so each PR, on one workload (query set, scale,
-Spicepod and query options), so the helper replaces the section on every run.
-Because GitHub has no conditional edit, the helper reads the description back
-after editing and fails its run if its entry is gone. When a maintainer adds
+Spicepod and query options), and run one at a time per workload, so the helper
+replaces the section on every run. The helper writes only while its commit is
+the PR's head, reads the description back, and fails its run, before the held
+runs are released, if its entry is gone or the head moved while it wrote. When a maintainer adds
 commits to such a PR, or to a Dependabot bump that has left its fast-track, they
 add an entry for their own run, as for any other PR.
 

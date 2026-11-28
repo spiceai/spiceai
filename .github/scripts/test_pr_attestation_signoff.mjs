@@ -487,7 +487,7 @@ test('the evidence steps run for every PR that needs a sign-off or changes the e
 });
 
 test('a no-Rust PR that changes the evidence check is still judged by it', async () => {
-  for (const filename of ['.github/scripts/pr_evidence.mjs', '.github/workflows/pr.yml', 'AGENTS.md', '.github/evals/evidence-rule/score_eval.py']) {
+  for (const filename of ['.github/scripts/pr_evidence.mjs', '.github/workflows/pr.yml', '.github/workflows/attestation_script_test.yml', '.github/workflows/agent_evals_selftest.yml', 'AGENTS.md', '.github/evals/evidence-rule/score_eval.py']) {
     // eslint-disable-next-line no-await-in-loop
     const result = await runScript({ script: noRustScript, files: [{ filename: 'docs/dev/testing.md' }, { filename }] });
     assert.equal(result.outputs.fast_track, 'true', filename);
@@ -540,7 +540,7 @@ const git = (cwd, ...args) => {
  * step resolved ('head' for the checkout's own commit); `gitFails`: make the tree
  * read fail; `prFiles`: the PR's changed files (or an Error to throw).
  */
-async function runEvidence({ body, module = true, checkout = true, tip = 'head', gitFails = false, prFiles = [] }) {
+async function runEvidence({ body, module = true, checkout = true, tip = 'head', gitFails = false, prFiles = [], prNumber = 1 }) {
   const workspace = mkdtempSync(join(tmpdir(), 'evidence-'));
   let resolved = tip;
   if (checkout) {
@@ -582,7 +582,7 @@ async function runEvidence({ body, module = true, checkout = true, tip = 'head',
   };
   const context = {
     repo: { owner: 'spiceai', repo: 'spiceai' },
-    payload: { pull_request: { number: 1, base: { sha: BASE } }, repository: { default_branch: 'trunk' } },
+    payload: { pull_request: { number: prNumber, base: { sha: BASE } }, repository: { default_branch: 'trunk' } },
   };
   const previous = { workspace: process.env.GITHUB_WORKSPACE, tip: process.env.EVIDENCE_TIP };
   process.env.GITHUB_WORKSPACE = workspace;
@@ -638,12 +638,17 @@ test('a git error reading the tree fails the step instead of skipping it', async
   assert.deepEqual(calls.failed, [unverified('git could not read the tree: fatal: unable to read tree')]);
 });
 
-test('a tip without the module skips the check only for the PR that adds it', async () => {
-  const adds = await runEvidence({ body: '## Summary', module: false, prFiles: [{ filename: '.github/scripts/pr_evidence.mjs', status: 'added' }] });
-  assert.deepEqual(adds.failed, []);
-  assert.deepEqual(adds.notices, [
+test('a tip without the module skips the check only for the PR that introduced it', async () => {
+  const addsModule = [{ filename: '.github/scripts/pr_evidence.mjs', status: 'added' }];
+  const bootstrap = await runEvidence({ body: '## Summary', module: false, prFiles: addsModule, prNumber: 16914 });
+  assert.deepEqual(bootstrap.failed, []);
+  assert.deepEqual(bootstrap.notices, [
     'This PR adds the evidence check (.github/scripts/pr_evidence.mjs), which trunk does not have yet, so it was skipped.',
   ]);
+  // A later PR adding a module back gets no skip: the exemption cannot be reused.
+  const readds = await runEvidence({ body: '## Summary', module: false, prFiles: addsModule, prNumber: 20000 });
+  assert.deepEqual(readds.notices, []);
+  assert.deepEqual(readds.failed, ['trunk has no evidence rule (.github/scripts/pr_evidence.mjs), so the evidence check could not run. Restore it on trunk.']);
   const other = await runEvidence({ body: '## Summary', module: false, prFiles: [{ filename: 'crates/a.rs', status: 'modified' }] });
   assert.deepEqual(other.notices, []);
   assert.deepEqual(other.failed, ['trunk has no evidence rule (.github/scripts/pr_evidence.mjs), so the evidence check could not run. Restore it on trunk.']);
