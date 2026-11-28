@@ -16,33 +16,42 @@ limitations under the License.
 //! Discovery of the tables that a SQL statement depends on.
 
 use datafusion::common::TableReference;
-use datafusion::sql::{parser, sqlparser::ast};
+use datafusion::sql::{
+    parser,
+    sqlparser::ast::{self, Visit, Visitor},
+};
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 /// Returns the tables a SQL statement reads from. CTE names are excluded, and the
 /// tables inside CTEs, derived tables, joins, and set operations are included.
 #[must_use]
 pub fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
+    match statement {
+        parser::Statement::Statement(statement) => match statement.as_ref() {
+            ast::Statement::Query(query) => get_dependent_table_names_of_query(query),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Walks the query by reference: cloning it would recurse once per level of
+/// every expression tree inside it, as deep as the parser allows.
+fn get_dependent_table_names_of_query(query: &ast::Query) -> Vec<TableReference> {
     let mut table_names = Vec::new();
     let mut cte_names = HashSet::new();
 
-    if let parser::Statement::Statement(statement) = statement.clone()
-        && let ast::Statement::Query(statement) = *statement
-    {
-        // Collect names of CTEs
-        if let Some(with) = statement.with {
-            for table in with.cte_tables {
-                cte_names.insert(TableReference::bare(table.alias.name.to_string()));
-                let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
-                    Box::new(ast::Statement::Query(table.query)),
-                ));
-                // Extend table_names with names found in CTEs if they reference actual tables
-                table_names.extend(cte_table_names);
-            }
+    // Collect names of CTEs
+    if let Some(with) = &query.with {
+        for table in &with.cte_tables {
+            cte_names.insert(TableReference::bare(table.alias.name.to_string()));
+            // Extend table_names with names found in CTEs if they reference actual tables
+            table_names.extend(get_dependent_table_names_of_query(&table.query));
         }
-        // Extract table names from the main query
-        table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
     }
+    // Extract table names from the main query
+    table_names.extend(extract_tables_from_set_expr(&query.body, &cte_names));
 
     // Filter out CTEs and temporary views (aliases of subqueries)
     table_names
@@ -59,13 +68,14 @@ fn extract_tables_from_set_expr(
         ast::SetExpr::Select(select_statement) => {
             let mut table_names = vec![];
             for from in &select_statement.from {
-                let mut relations = vec![from.relation.clone()];
-                for join in &from.joins {
-                    relations.push(join.relation.clone());
-                }
+                let relations = std::iter::once(&from.relation)
+                    .chain(from.joins.iter().map(|join| &join.relation));
 
                 for relation in relations {
                     match relation {
+                        // A table function, e.g. `text_search(docs, 'fox')`, is not a
+                        // table. See `table_function_arguments` for the tables it reads.
+                        ast::TableFactor::Table { args: Some(_), .. } => {}
                         ast::TableFactor::Table { name, .. } => {
                             let table_ref = name.to_string().into();
                             if !cte_names.contains(&table_ref) {
@@ -73,11 +83,7 @@ fn extract_tables_from_set_expr(
                             }
                         }
                         ast::TableFactor::Derived { subquery, .. } => {
-                            table_names.extend(get_dependent_table_names(
-                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                    subquery,
-                                ))),
-                            ));
+                            table_names.extend(get_dependent_table_names_of_query(subquery));
                         }
                         _ => {}
                     }
@@ -91,6 +97,70 @@ fn extract_tables_from_set_expr(
             table_names
         }
         _ => vec![],
+    }
+}
+
+/// Returns the names passed as arguments to the statement's table-function calls,
+/// including calls in subqueries, `LATERAL` calls, and calls nested in another
+/// call's arguments, such as the searches `rrf` fuses. A name may be a table, like
+/// the `docs` of `text_search(docs, 'fox')`, or a column, like the `q.term` of
+/// `LATERAL text_search(docs, q.term)`: the caller tells them apart by the tables
+/// it knows.
+#[must_use]
+pub fn table_function_arguments(statement: &parser::Statement) -> Vec<TableReference> {
+    let parser::Statement::Statement(statement) = statement else {
+        return vec![];
+    };
+    let mut arguments = TableFunctionArguments::default();
+    let _ = statement.visit(&mut arguments);
+    arguments.0
+}
+
+#[derive(Default)]
+struct TableFunctionArguments(Vec<TableReference>);
+
+impl Visitor for TableFunctionArguments {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, table_factor: &ast::TableFactor) -> ControlFlow<()> {
+        match table_factor {
+            ast::TableFactor::Table {
+                args: Some(args), ..
+            } => self.extend(&args.args),
+            ast::TableFactor::Function { args, .. } => self.extend(args),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl TableFunctionArguments {
+    fn extend(&mut self, args: &[ast::FunctionArg]) {
+        for arg in args {
+            let (ast::FunctionArg::Unnamed(arg)
+            | ast::FunctionArg::Named { arg, .. }
+            | ast::FunctionArg::ExprNamed { arg, .. }) = arg;
+            let ast::FunctionArgExpr::Expr(expr) = arg else {
+                continue;
+            };
+            match expr {
+                ast::Expr::Identifier(ident) => self.0.push(ident.to_string().into()),
+                ast::Expr::CompoundIdentifier(parts) => self.0.push(
+                    parts
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        .into(),
+                ),
+                ast::Expr::Function(call) => {
+                    if let ast::FunctionArguments::List(list) = &call.args {
+                        self.extend(&list.args);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -261,5 +331,59 @@ mod tests {
                 .collect();
 
         assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_table_functions() {
+        let cases: [(&str, &[&str]); 3] = [
+            ("SELECT id FROM text_search(docs, 'fox')", &[]),
+            (
+                "SELECT q.term, s.id FROM (VALUES ('fox'), ('dog')) AS q(term)
+                 CROSS JOIN LATERAL text_search(docs, q.term) s",
+                &[],
+            ),
+            (
+                "SELECT t.n, s.value FROM t
+                 LEFT JOIN LATERAL generate_series(1, t.n) s ON true",
+                &["t"],
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let expected: HashSet<TableReference> = expected.iter().map(|&t| t.into()).collect();
+            assert_eq!(expected, extract_table_names_from_sql(sql), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_table_function_arguments() {
+        let cases: [(&str, &[&str]); 6] = [
+            ("SELECT id FROM text_search(docs, 'fox')", &["docs"]),
+            (
+                "SELECT * FROM vector_search(public.docs, 'fox', limit => 5)",
+                &["public.docs"],
+            ),
+            (
+                "SELECT * FROM rrf(text_search(docs, 'fox'), vector_search(qs, 'fox'))",
+                &["docs", "qs"],
+            ),
+            (
+                "SELECT q.term, s.id FROM (VALUES ('fox'), ('dog')) AS q(term)
+                 CROSS JOIN LATERAL text_search(docs, q.term) s",
+                &["docs", "q.term"],
+            ),
+            (
+                "SELECT * FROM t WHERE id IN (SELECT id FROM text_search(docs, 'fox'))",
+                &["docs"],
+            ),
+            ("SELECT a FROM t JOIN u ON t.id = u.id", &[]),
+        ];
+
+        for (sql, expected) in cases {
+            let statements =
+                DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
+            let expected: Vec<TableReference> = expected.iter().map(|&t| t.into()).collect();
+            assert_eq!(expected, table_function_arguments(&statements[0]), "{sql}");
+        }
     }
 }

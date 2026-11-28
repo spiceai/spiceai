@@ -33,6 +33,7 @@ limitations under the License.
 )]
 
 mod disabled_segment_cache;
+mod footer_cache_on_read;
 mod footer_cache_reuse;
 mod process_segment_cache;
 

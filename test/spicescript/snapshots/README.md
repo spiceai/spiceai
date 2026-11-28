@@ -4,9 +4,9 @@ These scripts need `spiced` built with `snapshots` and `postgres`. From the
 repository root, build the runtime and runner together, then record durations:
 
 ```sh
-cargo build --profile lint -p spiced -p spicescript --no-default-features \
+cargo build --profile lint -p spiced -p testoperator --no-default-features \
   --features spiced/postgres,spiced/snapshots
-target/lint/spicescript test/spicescript/snapshots \
+target/lint/testoperator script test/spicescript/snapshots \
   --spiced target/lint/spiced --record-durations
 ```
 

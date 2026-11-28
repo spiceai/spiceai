@@ -139,12 +139,15 @@ pub fn synthetic_object_meta(location: Path, size: u64) -> ObjectMeta {
     }
 }
 
-/// Whether retaining only the footer preserves the initial read's data I/O.
+/// Whether caching only the footer, for an open with no segment cache,
+/// preserves the initial read's data I/O.
 ///
-/// Opening without a cached footer also retains complete segments covered by
-/// the initial tail read. Keep that path when it supplies row data; zone-map
-/// statistics alone do not prevent caching. Unrecognized segments are treated
-/// as data, and metadata that cannot be inspected leaves the footer uncached.
+/// An open without a cached footer serves the complete segments covered by its
+/// initial tail read from that read. With no segment cache to keep them, a later
+/// open given only the footer would read them again, so keep the uncached open
+/// when the tail supplies row data; zone-map statistics alone do not prevent
+/// caching. Unrecognized segments are treated as data, and metadata that cannot
+/// be inspected leaves the footer uncached.
 /// The Vortex writer places footer metadata after all data segments, so reads
 /// that expand to include that metadata cannot prefetch additional row data.
 pub(super) fn can_cache_footer_after_open(footer: &Footer, file_size: u64) -> bool {
