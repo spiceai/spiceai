@@ -63,10 +63,14 @@ pub enum Error {
     #[snafu(display("Missing the required `field` name"))]
     MissingFieldName,
 
-    #[snafu(display("Missing the required field {field_name} in {value}"))]
+    /// The row is deliberately not carried or displayed: change events hold
+    /// source data (including credentials) that must never reach logs.
+    #[snafu(display(
+        "Missing the required field '{field_name}' in a change event row. The row's values are not shown. Make the column nullable or resnapshot the source so every change event carries it"
+    ))]
     MissingFieldInValue {
         field_name: String,
-        value: serde_json::Value,
+        value: RowNotShown,
     },
 
     #[snafu(display(
@@ -147,7 +151,71 @@ pub enum Error {
     DecimalPrecisionExceeded { value: i128, precision: u8 },
 }
 
+/// Takes the place of a change event row in an error, keeping none of it.
+///
+/// Rows hold source data (including credentials) and errors are logged, so an
+/// error built from a row (`value: row`) stores and prints nothing of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RowNotShown;
+
+impl From<serde_json::Value> for RowNotShown {
+    fn from(_row: serde_json::Value) -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for RowNotShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<row not shown>")
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// A stable, payload-free name for this decode failure.
+    ///
+    /// Log this, never [`Display`], when a change event is skipped: several
+    /// variants embed the row or a field value in their message.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingParametersForDecimal => "missing_parameters_for_decimal",
+            Self::MissingPrecisionForDecimal => "missing_precision_for_decimal",
+            Self::UnableToParsePrecision { .. } => "unable_to_parse_precision",
+            Self::UnableToParseScale { .. } => "unable_to_parse_scale",
+            Self::MissingScaleForDecimal => "missing_scale_for_decimal",
+            Self::MissingItemsForArray => "missing_items_for_array",
+            Self::MissingFieldName => "missing_field_name",
+            Self::MissingFieldInValue { .. } => "missing_required_field",
+            Self::MissingStructBuilder { .. } => "missing_struct_builder",
+            Self::DowncastBuilder => "downcast_builder",
+            Self::InvalidChangeEventSchema { .. } => "invalid_change_event_schema",
+            Self::UnableToDecodeBase64 { .. } => "unable_to_decode_base64",
+            Self::Decimal128BytesNot16Bytes { .. } => "decimal128_bytes_not_16_bytes",
+            Self::UnableToConvertToI64 => "unable_to_convert_to_i64",
+            Self::UnableToConvertToF64 => "unable_to_convert_to_f64",
+            Self::TimestampNotSupported { .. } => "timestamp_not_supported",
+            Self::DataTypeNotSupported { .. } => "data_type_not_supported",
+            Self::ListDataTypeNotSupported { .. } => "list_data_type_not_supported",
+            Self::DebeziumFieldNotSupported { .. } => "debezium_field_not_supported",
+            Self::UnableToParseTimestamp { .. } => "unable_to_parse_timestamp",
+            Self::DeleteOpWithoutBeforeField => "delete_op_without_before_field",
+            Self::UpdateOpWithoutBeforeField => "update_op_without_before_field",
+            Self::InvalidDecimalJson { .. } => "invalid_decimal_json",
+            Self::VariableScaleDecimalParsingOverflow => "variable_scale_decimal_parsing_overflow",
+            Self::MissingScaleForVariableScaleDecimal => "missing_scale_for_variable_scale_decimal",
+            Self::MissingValueForVariableScaleDecimal => "missing_value_for_variable_scale_decimal",
+            Self::UnsupportedTypeForVariableScaleDecimal { .. } => {
+                "unsupported_type_for_variable_scale_decimal"
+            }
+            Self::NonIntegerScaleForVariableScaleDecimal => {
+                "non_integer_scale_for_variable_scale_decimal"
+            }
+            Self::DecimalPrecisionExceeded { .. } => "decimal_precision_exceeded",
+        }
+    }
+}
 
 pub fn convert_fields_to_arrow_schema(fields: Vec<&ChangeEventField>) -> Result<Schema> {
     let arrow_fields = fields
@@ -838,13 +906,41 @@ mod tests {
         let err = append_value_to_struct_builder(value, &mut builder)
             .expect_err("Should fail when required field is missing");
         assert!(
-            matches!(
-                &err,
-                Error::MissingFieldInValue { field_name, value }
-                    if field_name == "status" && *value == json!({"id": 42})
-            ),
-            "the missing non-nullable `status` column must be named, with the message it was missing from, got: {err:?}"
+            matches!(&err, Error::MissingFieldInValue { field_name, .. } if field_name == "status"),
+            "the missing non-nullable `status` column must be named, got: {err:?}"
         );
+        assert_eq!(err.kind(), "missing_required_field");
+        assert!(
+            !err.kind().contains("42"),
+            "kind must not carry the row or field values, got: {}",
+            err.kind()
+        );
+    }
+
+    /// A change event that fails to decode must never put the row's values in
+    /// the error: rows carry source data such as API keys, and stream errors
+    /// are logged verbatim. Only the column name may appear.
+    #[test]
+    fn decode_errors_never_show_row_values() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("api_key", DataType::Utf8, false),
+            Field::new("ip_allow_list_enabled", DataType::Boolean, false),
+        ]);
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+        let row = json!({"id": "app-1", "api_key": FAKE_SECRET, "api_key_2": FAKE_SECRET});
+        let err = append_value_to_struct_builder(row, &mut builder)
+            .expect_err("a row without a required column must fail");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
+            assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
+        }
     }
 
     #[test]
