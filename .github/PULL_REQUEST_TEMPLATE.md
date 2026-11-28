@@ -13,7 +13,8 @@ Required when the PR changes shipped code; Attestation checks this section (see 
 For each claim the PR makes (fixed, passes, faster, no regression):
 - the commit SHA it ran at (a commit in this PR), the exact command, and its output in a fenced block or a link to the CI run;
 - for a fix, the same command failing before and passing after;
-- for performance, both arms' commits, the sample count, and P99/P99.9.
+- for performance, both arms' commits, the sample count, and P99/P99.9;
+- the local reviews you ran before pushing (`/code-review`, an adversarial review by a model other than the implementer) and what you did about their findings.
 List every check in scope you did not run as `Not run — <reason>`.
 Re-run and update the SHA after a later commit changes shipped code; older evidence is stale.
 -->
