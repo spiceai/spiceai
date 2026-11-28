@@ -1882,6 +1882,8 @@ async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
         .await
         .expect("the orphan sweep");
     assert_eq!(report.skipped, None, "the orphan sweep ran");
+    // It retires them, and the retirement sweep deletes them.
+    process.table.reclaim_retired_snapshots_now().await;
     let left: Vec<String> = location
         .data_files()
         .await
@@ -1890,8 +1892,8 @@ async fn a_failed_overwrite_commit_leaves_its_files_to_the_orphan_sweep() {
         .collect();
     assert!(
         left.is_empty(),
-        "the orphan sweep left the failed overwrite's files: {left:?} (it deleted {:?})",
-        report.deleted
+        "the orphan sweep left the failed overwrite's files: {left:?} (it retired {:?})",
+        report.retired
     );
     process
         .assert_named_files_stored(&location, "after the orphan sweep")
@@ -2522,8 +2524,9 @@ async fn kill_at_every_request(step: Step) {
             .filter(|key| !named.contains(key))
             .count();
         unnamed_total += unnamed;
-        // The orphan sweep, with no floor, takes every one of them, data files
-        // and deletion vectors alike, and nothing a commit names.
+        // The orphan sweep, with no floor, retires every one of them, data
+        // files and deletion vectors alike, and nothing a commit names; the
+        // retirement sweep then deletes them.
         next.table.set_orphan_age_floor(Duration::ZERO);
         let report = next
             .table
@@ -2531,6 +2534,8 @@ async fn kill_at_every_request(step: Step) {
             .await
             .expect("the orphan sweep");
         assert_eq!(report.skipped, None, "{what}: the orphan sweep ran");
+        // It retires them, and the retirement sweep deletes them.
+        next.table.reclaim_retired_snapshots_now().await;
         let named = next.named_files(&location).await;
         let left: Vec<String> = location
             .probe
@@ -2542,8 +2547,8 @@ async fn kill_at_every_request(step: Step) {
             .collect();
         assert!(
             left.is_empty(),
-            "{what}: files no commit names are left after the orphan sweep: {left:?} (it deleted {:?})",
-            report.deleted
+            "{what}: files no commit names are left after the orphan sweep: {left:?} (it retired {:?})",
+            report.retired
         );
         next.assert_named_files_stored(&location, &format!("{what}, after the orphan sweep"))
             .await;

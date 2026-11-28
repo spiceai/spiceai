@@ -16,8 +16,8 @@ limitations under the License.
 
 //! The orphan sweep of a dataset in the object-native location
 //! (`cayenne::provider::orphan_sweep`), on fault-injecting stores: an
-//! unreferenced object goes only once the store dates it older than the floor
-//! and no write in flight holds it; an object whose commit outcome is unknown,
+//! unreferenced object is retired only once the store dates it older than the
+//! floor and no write in flight holds it, and the retirement sweep deletes it; an object whose commit outcome is unknown,
 //! a reader's snapshot and a committed file the listing misses are kept. A table
 //! that is never written again is swept when it opens, the sweep deletes in
 //! batched requests, and it counts what it reclaimed.
@@ -423,6 +423,17 @@ fn head_of(native: &ObjectNativeCatalog, dataset: &str) -> Path {
         .join("head")
 }
 
+/// The orphan sweep, then the retirement sweep with the retention elapsed, as
+/// the table runs them an hour apart. Returns the orphan sweep's report; what
+/// it retired is deleted by the time this returns.
+async fn sweep_and_reclaim(
+    table: &CayenneTableProvider,
+) -> cayenne::provider::orphan_sweep::OrphanSweep {
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    table.reclaim_retired_snapshots_now().await;
+    swept
+}
+
 async fn eventually<F, Fut>(what: &str, mut condition: F)
 where
     F: FnMut() -> Fut,
@@ -476,10 +487,10 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
         "the fenced write left files no commit names"
     );
 
-    let young = second.table.sweep_orphan_files_now().await.expect("sweep");
+    let young = sweep_and_reclaim(&second.table).await;
     assert!(
-        young.deleted.is_empty(),
-        "nothing is deleted inside the floor: {young:?}"
+        young.retired.is_empty(),
+        "nothing is retired inside the floor: {young:?}"
     );
     assert!(
         young.kept_young >= orphans.len(),
@@ -493,7 +504,7 @@ async fn an_orphan_of_a_fenced_writer_is_reclaimed_after_the_floor_and_never_ado
         .insert(2001, 2500)
         .await
         .expect("the new writer writes");
-    let swept = second.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&second.table).await;
     let remaining = rig
         .data_files(&second.data_prefix, |key| key.ends_with(".vortex"))
         .await;
@@ -554,11 +565,12 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
         .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
         .await;
     let refused = placed.table.sweep_orphan_files_now().await;
+    placed.table.reclaim_retired_snapshots_now().await;
     assert!(
         refused
             .as_ref()
-            .map_or(true, |sweep| sweep.deleted.is_empty()),
-        "the sweep deleted while the outcome was unknown: {refused:?}"
+            .map_or(true, |sweep| sweep.retired.is_empty()),
+        "the sweep retired while the outcome was unknown: {refused:?}"
     );
     assert_eq!(
         rig.data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
@@ -571,7 +583,7 @@ async fn an_upload_whose_commit_outcome_is_unknown_is_not_reclaimed() {
         placed.insert(2001, 2100).await.is_ok()
     })
     .await;
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     let remaining = rig
         .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
         .await;
@@ -619,9 +631,10 @@ async fn a_write_in_flight_keeps_its_uploaded_files_whatever_their_age() {
     rig.faults.respond(held).expect("the writer hears it");
     writer.await.expect("join").expect("the write commits");
     let swept = sweeper.await.expect("join the sweep").expect("sweep");
+    placed.table.reclaim_retired_snapshots_now().await;
     assert!(
-        swept.deleted.is_empty(),
-        "the sweep deleted a write's files in flight: {swept:?}"
+        swept.retired.is_empty(),
+        "the sweep retired a write's files in flight: {swept:?}"
     );
     let remaining = rig
         .data_files(&placed.data_prefix, |key| key.ends_with(".vortex"))
@@ -713,7 +726,7 @@ async fn a_reader_that_opened_before_a_sweep_finishes_with_its_rows() {
         "a compaction replaced the snapshot the reader reads"
     );
     placed.table.sweep_retired_snapshot_dirs_now().await;
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     while let Some(batch) = stream.next().await {
         rows += batch.expect("a later batch").num_rows();
     }
@@ -767,7 +780,7 @@ async fn a_committed_file_the_listing_misses_is_not_dropped() {
         .await
         .expect("drain");
     placed.table.set_orphan_age_floor(Duration::ZERO);
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     assert_eq!(
         placed.count().await.expect("count"),
         (5000, 5000),
@@ -823,8 +836,9 @@ async fn plant_orphans(rig: &Rig, placed: &Placed, sizes: &[usize]) -> (String, 
 
 /// A crashed write left objects no commit names, and the dataset is never
 /// written again. Its next open sweeps them on the one-hour floor: the object
-/// the store dates two hours old goes, the one it dates half an hour old stays,
-/// and every committed file and row is kept.
+/// the store dates two hours old is retired, and goes once the retention has
+/// passed; the one it dates half an hour old stays, and every committed file
+/// and row is kept.
 #[tokio::test]
 async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
     let rig = Rig::new();
@@ -869,7 +883,9 @@ async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
     let reopened = rig
         .place(rig.catalog().await, "orders", Some(data_url))
         .await;
+    reopened.table.wait_for_orphan_sweep().await;
     eventually("the orphan older than the floor is reclaimed", || async {
+        reopened.table.reclaim_retired_snapshots_now().await;
         !rig.data_files(&reopened.data_prefix, |key| key.ends_with(".vortex"))
             .await
             .contains(&old)
@@ -894,8 +910,8 @@ async fn an_orphan_of_a_table_that_is_not_written_again_is_reclaimed_at_open() {
     );
 }
 
-/// The sweep deletes what it reclaims in batched requests: 1001 orphans go in
-/// two `DeleteObjects` requests, not one request each.
+/// What the orphan sweep retires is deleted in batched requests: 1001 orphans
+/// go in two `DeleteObjects` requests, not one request each.
 #[tokio::test]
 async fn the_orphan_sweep_deletes_in_batched_requests() {
     const ORPHANS: usize = 1001;
@@ -918,10 +934,10 @@ async fn the_orphan_sweep_deletes_in_batched_requests() {
         "the orphans are stored"
     );
     placed.table.set_orphan_age_floor(Duration::ZERO);
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     assert_eq!(
         (
-            swept.deleted.len(),
+            swept.retired.len(),
             rig.tracking.delete_requests_under(&dir).len(),
             rig.data_files(
                 dir.rsplit_once('/').map_or("", |(folder, _)| folder),
@@ -932,12 +948,13 @@ async fn the_orphan_sweep_deletes_in_batched_requests() {
             placed.count().await.expect("count"),
         ),
         (ORPHANS, ORPHANS.div_ceil(1000), 0, (1000, 1000)),
-        "orphans deleted, delete requests, orphans left, rows"
+        "orphans retired, delete requests, orphans left, rows"
     );
 }
 
-/// The sweep counts the files and bytes it reclaims in
-/// `cayenne_maintenance_reclaimed_{files,bytes}_total` under its own `op`.
+/// The files and bytes of what the orphan sweep retired count in
+/// `cayenne_maintenance_reclaimed_{files,bytes}_total` under its own `op` when
+/// the retirement sweep deletes them.
 #[tokio::test]
 async fn the_orphan_sweep_counts_what_it_reclaims() {
     crate::common::require_process_per_test("it installs the process-wide meter provider");
@@ -958,9 +975,9 @@ async fn the_orphan_sweep_counts_what_it_reclaims() {
     let sizes = [100, 200, 300];
     let (_dir, keys) = plant_orphans(&rig, &placed, &sizes).await;
     placed.table.set_orphan_age_floor(Duration::ZERO);
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
-    let mut deleted = swept.deleted.clone();
-    deleted.sort();
+    let swept = sweep_and_reclaim(&placed.table).await;
+    let mut retired = swept.retired.clone();
+    retired.sort();
     let stored = placed.native.get_table("orders").await.expect("table");
     let table_prefix = format!("{}/{}/", placed.data_prefix, stored.table_id);
     let planted: Vec<String> = keys
@@ -969,12 +986,12 @@ async fn the_orphan_sweep_counts_what_it_reclaims() {
         .collect();
     assert_eq!(
         (
-            deleted,
+            retired,
             reclaimed(&reader, "cayenne_maintenance_reclaimed_files_total"),
             reclaimed(&reader, "cayenne_maintenance_reclaimed_bytes_total"),
         ),
         (planted, 3, 600),
-        "objects the sweep deleted, and the files and bytes it counted"
+        "objects the sweep retired, and the files and bytes counted as reclaimed"
     );
 }
 
@@ -1028,7 +1045,8 @@ async fn plant(rig: &Rig, key: &str) {
 }
 
 /// A flat data file no commit names, directly under the table's directory, is
-/// kept while the store dates it younger than the floor and deleted after it.
+/// kept while the store dates it younger than the floor, and retired and
+/// deleted after it.
 /// The live files and the files a compaction retired, also flat keys in that
 /// directory, are never deleted, and the rows are unchanged.
 #[tokio::test]
@@ -1090,7 +1108,7 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
     placed.insert(3001, 3100).await.expect("append");
     let young = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert!(
-        young.deleted.is_empty() && young.kept_young >= 1,
+        young.retired.is_empty() && young.kept_young >= 1,
         "the orphan is younger than the floor: {young:?}"
     );
     assert!(
@@ -1103,12 +1121,12 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
     placed.insert(3101, 3200).await.expect("append");
     let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert_eq!(
-        swept.deleted,
+        swept.retired,
         vec![orphan[dir.len() + 1..].to_string()],
-        "the flat orphan, and only it, is deleted after the floor"
+        "the flat orphan, and only it, is retired after the floor"
     );
+    // The orphan sweep itself deletes nothing: live and retired keys are kept.
     let remaining = rig.data_files(&dir, |key| key.ends_with(".vortex")).await;
-    assert!(!remaining.contains(&orphan));
     let mut lost: Vec<&String> = live
         .iter()
         .chain(&retired)
@@ -1120,6 +1138,17 @@ async fn a_flat_orphan_is_reclaimed_after_the_floor_and_live_and_retired_keys_ar
         Vec::<&String>::new(),
         "live and retired keys are kept"
     );
+    // The retirement sweep deletes the orphan with the compaction's inputs,
+    // and keeps every live file.
+    placed.table.reclaim_retired_snapshots_now().await;
+    let remaining = rig.data_files(&dir, |key| key.ends_with(".vortex")).await;
+    assert!(!remaining.contains(&orphan));
+    let mut lost: Vec<&String> = live
+        .iter()
+        .filter(|key| !retired.contains(key) && !remaining.contains(key))
+        .collect();
+    lost.sort();
+    assert_eq!(lost, Vec::<&String>::new(), "live keys are kept");
     assert_eq!(placed.count().await.expect("count"), (3200, 3200));
 }
 
@@ -1162,7 +1191,7 @@ async fn the_orphan_sweep_writes_no_clock_object() {
 
 /// An object the store dates after the dataset's head is young, however old
 /// the floor would make it: it is kept with no floor at all until a commit
-/// moves the head past it, and deleted then.
+/// moves the head past it, and retired then.
 #[tokio::test]
 async fn an_object_newer_than_the_head_is_kept() {
     let rig = Rig::new();
@@ -1181,7 +1210,7 @@ async fn an_object_newer_than_the_head_is_kept() {
     plant(&rig, &orphan).await;
     let kept = placed.table.sweep_orphan_files_now().await.expect("sweep");
     assert_eq!(
-        (kept.deleted.clone(), kept.kept_young),
+        (kept.retired.clone(), kept.kept_young),
         (Vec::<String>::new(), 1),
         "the object newer than the head is kept: {kept:?}"
     );
@@ -1193,11 +1222,17 @@ async fn an_object_newer_than_the_head_is_kept() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     placed.insert(1001, 1100).await.expect("a later write");
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     assert_eq!(
-        swept.deleted,
+        swept.retired,
         vec![orphan[dir.len() + 1..].to_string()],
-        "deleted once the head is past it"
+        "retired once the head is past it"
+    );
+    assert!(
+        !rig.data_files(&dir, |key| key.ends_with(".vortex"))
+            .await
+            .contains(&orphan),
+        "and deleted after the retention"
     );
     assert_eq!(placed.count().await.expect("count"), (1100, 1100));
 }
@@ -1234,11 +1269,11 @@ async fn the_orphan_sweep_leaves_the_lookup_index_alone() {
         .lock()
         .insert(orphan.clone(), Duration::from_hours(2));
     placed.table.set_orphan_age_floor(Duration::ZERO);
-    let swept = placed.table.sweep_orphan_files_now().await.expect("sweep");
+    let swept = sweep_and_reclaim(&placed.table).await;
     assert_eq!(
-        swept.deleted,
+        swept.retired,
         vec![orphan[dir.len() + 1..].to_string()],
-        "only the flat orphan is deleted"
+        "only the flat orphan is retired"
     );
     let index = rig
         .data_files(&format!("{dir}/_lookup_index"), |_| true)

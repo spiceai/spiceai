@@ -1222,6 +1222,8 @@ mod data_path {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let swept = swept.expect("the orphan sweep runs once the outcome is resolved");
+        // What it retired, the retirement sweep deletes.
+        placed.table.reclaim_retired_snapshots_now().await;
         let table_id = placed.table.table_id().to_string();
         let data_prefix = placed
             .data_url
@@ -1251,8 +1253,8 @@ mod data_path {
             .collect();
         assert_eq!(
             stored, named,
-            "nth={nth} landed={landed}: after the orphan sweep the stored data files are the named ones (it deleted {:?})",
-            swept.deleted
+            "nth={nth} landed={landed}: after the orphan sweep the stored data files are the named ones (it retired {:?})",
+            swept.retired
         );
         assert_eq!(
             keyed_totals(&placed.ctx, "events").await,

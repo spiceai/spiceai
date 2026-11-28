@@ -63,7 +63,25 @@
 //! compaction of every live file applied only by a later resolve commit
 //! (`CommitTx`) or discarded (`AbortTx`); while it is unresolved the table
 //! refuses other changes and both sweeps decline. The orphan sweep treats a
-//! retired file as named until its forget. `lean` runs have no scans, restore
+//! retired file as named until its forget.
+//!
+//! In the `retire` runs the orphan sweep deletes nothing itself: it retires a
+//! file it judges unnamed by a commit (`RetireFiles`), and the retirement
+//! sweep deletes it after T like any retired file. Any writer that believes it
+//! holds the lease runs it, including one another's takeover has fenced
+//! without its knowing: that writer judges from its view, the head as of the
+//! takeover, which misses every file the new holder committed since, so the
+//! judgment alone may name a committed file. The commit is conditional on the
+//! lease generation, so a fenced writer's is refused and it retires nothing;
+//! the refusal tells it it was fenced (`RetireOrphan`). For the lease holder
+//! the `orphan-commits` runs model the whole path: the commit, then the
+//! retirement sweep's timer, delete and forget. The other `retire` runs
+//! collapse it into one step, `Sweep`, that deletes the file when the holder
+//! judges it unnamed: a file no head has named, retired under the current
+//! lease, is never named afterwards (the holder's own writes do not hold it,
+//! every other writer is fenced, and a reserved table declines), and no reader
+//! reads it, so deleting it at once reaches the same states of every checked
+//! property as deleting it after T, at a fraction of the graph. `lean` runs have no scans, restore
 //! points or remote readers, so a larger upload bound stays exhaustive.
 //!
 //! The clock advances only while a holder timer or a local or remote query
@@ -87,7 +105,10 @@
 //! `sweep-uncommitted` plans from the holder's local view, with its removal
 //! applied before the record commits; `orphan-ignores-reservation` lets the
 //! orphan sweep run while a prepared transaction reserves the table, and
-//! `retire-ignores-reservation` lets the retirement sweep do so.
+//! `retire-ignores-reservation` lets the retirement sweep do so;
+//! `orphan-deletes-directly` lets the orphan sweep delete what its writer's
+//! view does not name, with no commit, so a fenced writer unaware of the
+//! takeover deletes a file the new holder committed.
 use stateright::{Model, Property};
 
 /// Writer processes.
@@ -132,6 +153,8 @@ enum ModeFlag {
     NoCommittedRead,
     NoResolveByHead,
     NoUploadBeforeCommit,
+    OrphanCommits,
+    OrphanDeletesDirectly,
     OrphanIgnoresReservation,
     Prepared,
     Remote,
@@ -225,6 +248,10 @@ struct Writer {
     /// In the `retire` runs: each retired file this process's sweep has seen,
     /// with the tick it first saw it (its retention timer).
     timers: Vec<(File, u8)>,
+    /// The head version this process's view of the committed state is as of
+    /// once another writer's takeover has fenced it, unknown to it: the last
+    /// head it could have read. The lease holder's view is the current head.
+    view: u8,
 }
 /// A reclamation pass in one process: the files it will forget, the
 /// generation it runs under, and whether one of its deletes failed.
@@ -299,6 +326,11 @@ pub(crate) struct State {
     /// A fenced writer, still running, had an upload land after the takeover.
     fenced_landed: bool,
     reclaimed: bool,
+    /// In the `retire` runs: the orphan sweep committed a retirement.
+    orphan_retired: bool,
+    /// In the `retire` runs: a fenced writer's orphan sweep judged a file
+    /// unnamed from its view, and the lease generation refused the record.
+    fenced_orphan_refused: bool,
     // The `retire` runs; empty, zero or false otherwise.
     /// The logical clock, in ticks.
     now: u8,
@@ -369,6 +401,9 @@ pub(crate) enum Action {
     Read,
     Fetch,
     Sweep(usize),
+    /// In the `retire` runs: writer `w`'s orphan sweep judges stored file `i`
+    /// unnamed from its own view and retires it by a commit.
+    RetireOrphan(usize, usize),
     Compact(usize),
     CompactCarry(usize),
     Remove(usize),
@@ -465,6 +500,8 @@ impl Protocol {
                 (ModeFlag::NoCommittedRead, "no-committed-read"),
                 (ModeFlag::NoResolveByHead, "no-resolve-by-head"),
                 (ModeFlag::NoUploadBeforeCommit, "no-upload-before-commit"),
+                (ModeFlag::OrphanCommits, "orphan-commits"),
+                (ModeFlag::OrphanDeletesDirectly, "orphan-deletes-directly"),
                 (
                     ModeFlag::OrphanIgnoresReservation,
                     "orphan-ignores-reservation",
@@ -582,6 +619,23 @@ impl Protocol {
     fn named_for_orphans(&self, s: &State, file: File) -> bool {
         s.head.contains(&file)
             || entry(&s.retired, file).is_some()
+            || s.prepared.is_some() && !self.has(ModeFlag::OrphanIgnoresReservation)
+    }
+    /// Whether writer `w`'s orphan sweep counts `file` as named. The lease
+    /// holder reads the committed state; a writer another's takeover has
+    /// fenced, unknown to it, reads its view: every file live at or before
+    /// its view's version, and every file retired by then.
+    fn named_in_view(&self, s: &State, w: usize, file: File) -> bool {
+        let writer = &s.writers[w];
+        if writer.generation == Some(s.lease) {
+            return self.named_for_orphans(s, file);
+        }
+        let view = usize::from(writer.view);
+        s.history
+            .iter()
+            .take(view + 1)
+            .any(|set| set.contains(&file))
+            || entry(&s.retired, file).is_some_and(|by| by.version <= writer.view)
             || s.prepared.is_some() && !self.has(ModeFlag::OrphanIgnoresReservation)
     }
     /// The retired set the sweeping process reads: the committed one, and in
@@ -761,16 +815,37 @@ impl Protocol {
             // An unnamed file of a fenced generation: no commit naming it can
             // pass the lease condition. In the `intent` runs: an unnamed file
             // the holder's own intent does not protect.
-            Action::Sweep(i) => s.store.get(i).is_some_and(|f| {
-                !self.named_for_orphans(s, *f)
-                    && if self.has(ModeFlag::Intent) {
-                        Self::holder(s).is_some_and(|holder| {
-                            self.has(ModeFlag::SweepIgnoresIntent) || !Self::intends(holder, *f)
-                        })
-                    } else {
-                        f.0.generation < s.lease
-                    }
-            }),
+            Action::Sweep(i) => {
+                !self.has(ModeFlag::OrphanCommits)
+                    && s.store.get(i).is_some_and(|f| {
+                        !self.named_for_orphans(s, *f)
+                            && if self.has(ModeFlag::Intent) {
+                                Self::holder(s).is_some_and(|holder| {
+                                    self.has(ModeFlag::SweepIgnoresIntent)
+                                        || !Self::intends(holder, *f)
+                                })
+                            } else {
+                                f.0.generation < s.lease
+                            }
+                    })
+            }
+            // A writer that believes it holds the lease, with no commit of its
+            // own outstanding: an unnamed file in its view its own writes do
+            // not hold.
+            Action::RetireOrphan(w, i) => {
+                self.retiring()
+                    && writer(w).generation.is_some()
+                    && writer(w).pending.is_none()
+                    // The holder's own pass is the collapsed `Sweep` outside
+                    // the `orphan-commits` runs.
+                    && (writer(w).generation != Some(s.lease)
+                        || self.has(ModeFlag::OrphanCommits))
+                    && s.store.get(i).is_some_and(|f| {
+                        !self.named_in_view(s, w, *f)
+                            && (self.has(ModeFlag::SweepIgnoresIntent)
+                                || !Self::intends(writer(w), *f))
+                    })
+            }
             Action::CommitTx(w) | Action::AbortTx(w) => {
                 s.prepared.is_some()
                     && Self::holder_index(s) == Some(w)
@@ -981,6 +1056,8 @@ impl Model for Protocol {
             fenced_refused: false,
             fenced_landed: false,
             reclaimed: false,
+            orphan_retired: false,
+            fenced_orphan_refused: false,
             now: 0,
             retired: vec![],
             applied: vec![],
@@ -1045,6 +1122,11 @@ impl Model for Protocol {
         }
         a.extend([Action::Read, Action::Fetch]);
         a.extend((0..s.store.len()).map(Action::Sweep));
+        if self.retiring() {
+            for w in 0..WRITERS {
+                a.extend((0..s.store.len()).map(|i| Action::RetireOrphan(w, i)));
+            }
+        }
         if self.retiring() {
             a.extend([
                 Action::Plan,
@@ -1178,7 +1260,13 @@ impl Model for Protocol {
             Action::Takeover(w) => {
                 // A head commit raising the generation; the new holder starts
                 // with nothing of its own (no timers either), and its earlier
-                // sends stay in flight.
+                // sends stay in flight. A previous holder still running keeps
+                // the view it had, unaware it is fenced.
+                if let Some(h) = Self::holder_index(s)
+                    && h != w
+                {
+                    next.writers[h].view = s.version;
+                }
                 next.takes += 1;
                 next.lease += 1;
                 next.version += 1;
@@ -1249,6 +1337,40 @@ impl Model for Protocol {
                 next.store.remove(i);
                 next.reclaimed = true;
             }
+            Action::RetireOrphan(w, i) => {
+                let file = *s.store.get(i)?;
+                if self.has(ModeFlag::OrphanDeletesDirectly) {
+                    // Deleted on the judgment alone, from the writer's view.
+                    self.deleting(s, &mut next, file);
+                    next.store.remove(i);
+                    next.reclaimed = true;
+                } else if s.writers[w].generation == Some(s.lease) {
+                    // One `RetireFiles` record through the writer's fenced log:
+                    // the retirement sweep deletes the file after T.
+                    next.version += 1;
+                    let removal = Removal {
+                        version: next.version,
+                        tick: Some(s.now),
+                    };
+                    insert_first(&mut next.retired, file, removal);
+                    next.history.push(next.head.clone());
+                    next.orphan_retired = true;
+                } else {
+                    // The lease generation refuses the record: the writer
+                    // learns it was fenced, and retires and deletes nothing.
+                    next.fenced_refused = true;
+                    next.fenced_orphan_refused = true;
+                    let writer = &s.writers[w];
+                    insert_sorted(
+                        &mut next.dropped,
+                        keys(&writer.started).chain(keys(&writer.finished)),
+                    );
+                    next.writers[w] = Writer::default();
+                    if s.sweep.as_ref().is_some_and(|sweep| sweep.writer == w) {
+                        Self::end_sweep(&mut next);
+                    }
+                }
+            }
             Action::CommitTx(_) | Action::AbortTx(_) => {
                 let tx = s.prepared.clone()?;
                 next.prepared = None;
@@ -1288,6 +1410,9 @@ impl Model for Protocol {
                 let (file, generation, _) = *s.deletes.get(i)?;
                 next.deletes.remove(i);
                 self.deleting(s, &mut next, file);
+                // A file no head ever named: a retired orphan.
+                next.reclaimed |=
+                    s.store.contains(&file) && !s.history.iter().any(|set| set.contains(&file));
                 if let Ok(at) = next.store.binary_search(&file) {
                     next.store.remove(at);
                 }
@@ -1419,6 +1544,9 @@ impl Model for Protocol {
             Action::Fetch => "the local scan fetches its next file".into(),
             Action::EndScan => "the local scan ends".into(),
             Action::Sweep(i) => format!("the orphan sweep deletes stored file {i}"),
+            Action::RetireOrphan(w, i) => {
+                format!("writer {w}'s orphan sweep retires stored file {i}")
+            }
             Action::Plan => "the retirement sweep plans: starts timers, sends due deletes".into(),
             Action::DeleteLand(i) => format!("delete {i} lands"),
             Action::DeleteFail(i) => format!("delete {i} fails"),
@@ -1468,6 +1596,8 @@ impl Model for Protocol {
                 ("fenced upload landed", s.fenced_landed),
                 ("delete landed after takeover", s.landed_after_takeover),
                 ("orphan reclaimed", s.reclaimed),
+                ("orphan retired", s.orphan_retired),
+                ("fenced orphan sweep refused", s.fenced_orphan_refused),
                 ("prepared committed", s.tx_committed),
                 ("prepared aborted", s.tx_aborted),
                 ("BAD early delete", s.early_delete),
@@ -1748,6 +1878,7 @@ impl Model for Protocol {
                 Action::Sweep(_) | Action::DeleteLand(_) | Action::DeleteFail(_) => {
                     Event::on(lane_readers, label).to(lane_store)
                 }
+                Action::RetireOrphan(w, _) => Event::on(w, label).to(lane_head),
                 Action::Plan | Action::Forget => Event::on(lane_readers, label).to(lane_head),
                 Action::EndScan
                 | Action::RestoreStart
@@ -1859,6 +1990,12 @@ impl Model for Protocol {
         if !self.retiring() {
             return properties;
         }
+        if self.has(ModeFlag::OrphanCommits) {
+            properties.push(Property::sometimes(
+                "orphan retired by a commit",
+                |_, s: &State| s.orphan_retired,
+            ));
+        }
         properties.extend([
             // I15, per file.
             Property::always(
@@ -1903,6 +2040,9 @@ impl Model for Protocol {
             ),
             Property::sometimes("retired file deleted and forgotten", |_, s: &State| {
                 !s.forgotten.is_empty()
+            }),
+            Property::sometimes("fenced writer's orphan sweep refused", |_, s: &State| {
+                s.fenced_orphan_refused
             }),
             Property::sometimes(
                 "file shared across a removal later deleted and forgotten",
@@ -2053,8 +2193,19 @@ pub enum Op {
     Fetch { key: Key, found: bool },
     /// `EndScan`: the local scan ends.
     ScanEnded,
-    /// `Sweep(i)`: the orphan sweep deletes an unnamed file.
+    /// `Sweep(i)`: the orphan sweep deletes an unnamed file. In the
+    /// `orphan-deletes-directly` control, `RetireOrphan(w, i)` too.
     Swept { key: Key },
+    /// `RetireOrphan(w, i)`: writer `w`'s orphan sweep, believing it holds
+    /// lease `generation`, judges `key` unnamed and commits a `RetireFiles`
+    /// record for it; `committed` when the generation is still the lease's,
+    /// and otherwise the record is refused and the writer learns it is fenced.
+    OrphanRetired {
+        writer: usize,
+        generation: u8,
+        key: Key,
+        committed: bool,
+    },
     /// `CommitTx(w)` / `AbortTx(w)`: the lease holder commits the resolve
     /// record of the prepared transaction `id`.
     TxResolved { writer: usize, id: u8, commit: bool },
@@ -2158,6 +2309,7 @@ fn parse(text: &str) -> Option<Action> {
         ("Fetch", &[]) => Action::Fetch,
         ("EndScan", &[]) => Action::EndScan,
         ("Sweep", &[i]) => Action::Sweep(i),
+        ("RetireOrphan", &[w, i]) => Action::RetireOrphan(w, i),
         ("Plan", &[]) => Action::Plan,
         ("DeleteLand", &[i]) => Action::DeleteLand(i),
         ("DeleteFail", &[i]) => Action::DeleteFail(i),
@@ -2277,6 +2429,19 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             Action::Sweep(i) => Op::Swept {
                 key: state.store[i].0,
             },
+            Action::RetireOrphan(w, i) => {
+                let key = state.store[i].0;
+                if protocol.has(ModeFlag::OrphanDeletesDirectly) {
+                    Op::Swept { key }
+                } else {
+                    Op::OrphanRetired {
+                        writer: w,
+                        generation: state.writers[w].generation?,
+                        key,
+                        committed: next.version > state.version,
+                    }
+                }
+            }
             Action::CommitTx(w) | Action::AbortTx(w) => Op::TxResolved {
                 writer: w,
                 id: state.prepared.as_ref()?.id,

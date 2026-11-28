@@ -1175,3 +1175,69 @@ mod persist {
         );
     }
 }
+
+/// A run file's first bytes give the files and row count its name is derived
+/// from: read from the whole file, and from every prefix long enough to hold
+/// them, they name the file. A shorter prefix asks for more, and bytes that
+/// are not a run file are refused.
+#[test]
+fn a_run_files_first_bytes_name_its_files_and_rows() {
+    let mut builder = RunBuilder::new(encoder());
+    builder
+        .add_batch("0193aaaa_00000.vortex", 0, &column(&[1, 2, 3]))
+        .expect("add");
+    builder
+        .add_batch("0193bbbb_00001.vortex", 0, &column(&[4, 5]))
+        .expect("add");
+    let run = builder.finish().expect("finish");
+    let bytes = run.to_bytes();
+    let expected = RunDescriptor {
+        files: vec![
+            "0193aaaa_00000.vortex".to_string(),
+            "0193bbbb_00001.vortex".to_string(),
+        ],
+        rows: 5,
+    };
+    // header 12 | encoding 8 | count 4 | (4 + 21) * 2 | rows 8
+    let needed = 12 + 8 + 4 + (4 + 21) * 2 + 8;
+    for len in [needed, needed + 1, bytes.len()] {
+        let described = IndexRun::describe(&bytes[..len]).expect("a run file");
+        assert_eq!(described.as_ref(), Some(&expected), "prefix of {len} bytes");
+        assert_eq!(expected.file_name(), run.file_name());
+    }
+    for len in [0, 12, needed - 1] {
+        assert_eq!(
+            IndexRun::describe(&bytes[..len]).expect("a run file's start"),
+            None,
+            "prefix of {len} bytes"
+        );
+    }
+    let mut other = bytes;
+    other[0] ^= 1;
+    assert!(IndexRun::describe(&other).is_err(), "not a run file");
+    // The name changes with the files and with the row count.
+    let renamed = RunDescriptor {
+        rows: 6,
+        ..expected
+    };
+    assert_ne!(renamed.file_name(), run.file_name());
+}
+
+/// A run file whose file list claims a name longer than any object key is
+/// refused from its first bytes, rather than asking for more of the file: a
+/// corrupt length could otherwise have a reader fetch the whole object.
+#[test]
+fn a_run_files_start_with_an_impossible_name_length_is_refused() {
+    let mut builder = RunBuilder::new(encoder());
+    builder
+        .add_batch("0193aaaa_00000.vortex", 0, &column(&[1]))
+        .expect("add");
+    let mut bytes = builder.finish().expect("finish").to_bytes();
+    // header 12 | encoding 8 | count 4 | then the first name's length.
+    bytes[24..28].copy_from_slice(&(1_u32 << 30).to_le_bytes());
+    assert_eq!(
+        IndexRun::describe(&bytes[..64]),
+        Err(crate::persist::Error::Corrupt),
+        "a name longer than any object key is corrupt"
+    );
+}
