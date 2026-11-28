@@ -100,11 +100,6 @@ pub enum CheckpointError {
 /// can clear it along with the dataset checkpoint.
 pub const APPEND_CURSOR_TABLE: &str = "spice_sys_append_cursor";
 
-/// The blob checkpoint table the instance writing an acceleration shared with other
-/// instances records its completed initial load in, one row per dataset: the other
-/// instances serve the dataset from the acceleration only once it holds a row.
-pub const INITIAL_LOAD_TABLE: &str = "spice_sys_initial_load";
-
 /// The **blob** checkpoint shape: a per-dataset store of one opaque `String` payload,
 /// satisfied by the accelerator and called by a data-source connector. Object-safe and
 /// `#[async_trait]` so it is used as `Arc<dyn BlobCheckpointStore>`.

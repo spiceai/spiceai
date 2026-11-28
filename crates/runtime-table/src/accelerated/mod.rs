@@ -490,76 +490,6 @@ pub enum SnapshotCreateTrigger {
 
 /// The decision behind [`AcceleratedTable::scan_readiness`], as a function of
 /// only the state it depends on so it can be exercised exhaustively.
-/// An acceleration shared with other instances through one location: which
-/// role this instance has, and where the writer records its completed initial
-/// load.
-pub enum SharedAcceleration {
-    /// This instance writes the acceleration and records its completed
-    /// initial load in `initial_load` for the replicas.
-    Writer {
-        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    },
-    /// Another instance writes it: this one serves what that instance
-    /// committed, starts no refresh, and is ready once `initial_load` holds the
-    /// writer's record.
-    Replica {
-        initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    },
-}
-
-/// How often a replica checks whether the instance that writes its
-/// acceleration has loaded it, and the writer whether its initial load has
-/// completed.
-const SHARED_LOAD_POLL: Duration = Duration::from_secs(1);
-
-/// Mark a replica's dataset ready once the instance that writes its
-/// acceleration has recorded its completed initial load in the shared
-/// location. Until then the replica's scans are refused (`ready_state:
-/// on_load`) or served by the source, as during any initial load, rather than
-/// answered from a partial acceleration.
-async fn wait_for_writer_load(
-    initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    refresher: Arc<refresh::Refresher>,
-    runtime_status: Arc<status::RuntimeStatus>,
-    dataset_name: TableReference,
-) {
-    while !matches!(initial_load.get().await, Ok(Some(_))) {
-        tokio::time::sleep(SHARED_LOAD_POLL).await;
-    }
-    refresher.set_initial_load_completed(true);
-    runtime_status.update_dataset(&dataset_name, status::ComponentStatus::Ready);
-}
-
-/// Record, once this instance has loaded an acceleration other instances
-/// share, that its initial load completed, so they serve the dataset from it.
-async fn record_initial_load(
-    initial_load: Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>,
-    refresher: Arc<refresh::Refresher>,
-    dataset_name: TableReference,
-) {
-    while !refresher.initial_load_completed() {
-        tokio::time::sleep(SHARED_LOAD_POLL).await;
-    }
-    loop {
-        let recorded = match initial_load.get().await {
-            Ok(Some(_)) => return,
-            Ok(None) => initial_load.upsert("loaded").await,
-            Err(error) => Err(error),
-        };
-        match recorded {
-            Ok(()) => return,
-            Err(error) => {
-                tracing::debug!(
-                    dataset = %dataset_name,
-                    %error,
-                    "Did not record the completed initial load for the instances sharing the acceleration; retrying"
-                );
-                tokio::time::sleep(SHARED_LOAD_POLL).await;
-            }
-        }
-    }
-}
-
 fn scan_readiness_for(
     cluster_role: Option<&ClusterRole>,
     initial_load_completed: bool,
@@ -656,9 +586,6 @@ pub struct Builder {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
-    /// The acceleration is shared with other instances through one location;
-    /// see [`SharedAcceleration`].
-    shared: Option<SharedAcceleration>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
@@ -729,7 +656,6 @@ impl Builder {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cluster_role: None,
-            shared: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
@@ -768,18 +694,6 @@ impl Builder {
     pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
         self.cluster_role = role;
         self
-    }
-
-    /// The acceleration is shared with other instances through one location,
-    /// and this instance is its writer or a replica (see
-    /// `DataAccelerator::writer_role`).
-    pub fn shared(&mut self, shared: SharedAcceleration) -> &mut Self {
-        self.shared = Some(shared);
-        self
-    }
-
-    fn is_replica(&self) -> bool {
-        matches!(self.shared, Some(SharedAcceleration::Replica { .. }))
     }
 
     pub fn acceleration_layout(
@@ -1148,7 +1062,6 @@ impl Builder {
     /// stream supplied for a non-`changes` refresh mode, a retention policy without
     /// a time column, or a refresh SQL that does not plan against the schema.
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
-        let replica = self.is_replica();
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
             return ExpectedChangesModeForChangesStreamSnafu.fail();
         }
@@ -1491,67 +1404,46 @@ impl Builder {
             None
         };
 
-        let (refresh_handle, refresh_trigger) = if replica
-            || matches!(self.cluster_role, Some(ClusterRole::Scheduler))
-        {
-            // A replica starts no refresh: the instance that writes the
-            // acceleration refreshes it, and the replica is ready once that
-            // instance has loaded it (see `wait_for_writer_load`).
-            //
-            // Accelerated tables aren't loaded locally on the scheduler —
-            // executors do. Don't start a refresh task, and leave the
-            // dataset status as `Refreshing` (set by the caller before
-            // this point). The scheduler flips the dataset to `Ready`
-            // only after executors confirm via `PartitionsLoaded` acks
-            // that every assigned partition is loaded; see
-            // `runtime_cluster::PartitionLoadTracker` and the
-            // `PartitionsLoaded` handler in `cluster::service`.
-            // Previously this branch flipped the dataset to `Ready`
-            // immediately, which made `/v1/ready` claim the cluster was
-            // queryable before any data had been loaded on executors.
-            //
-            // `refresh_trigger` is None because the receiver will be
-            // dropped (refresher.start() is not called).
-            //
-            // No refresh will ever be recorded for this table here, so
-            // close the completion signal: the schedule-creation path and
-            // every other caller resolves at once instead of waiting on a
-            // refresh that cannot arrive. Dataset readiness is a separate
-            // concern handled above.
-            refresh_completion.close();
-            (None, None)
-        } else {
-            (
-                refresher
-                    .start(acceleration_refresh_mode)
-                    .await
-                    .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart { source })?,
-                refresh_trigger,
-            )
-        };
+        let (refresh_handle, refresh_trigger) =
+            if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+                // Accelerated tables aren't loaded locally on the scheduler —
+                // executors do. Don't start a refresh task, and leave the
+                // dataset status as `Refreshing` (set by the caller before
+                // this point). The scheduler flips the dataset to `Ready`
+                // only after executors confirm via `PartitionsLoaded` acks
+                // that every assigned partition is loaded; see
+                // `runtime_cluster::PartitionLoadTracker` and the
+                // `PartitionsLoaded` handler in `cluster::service`.
+                // Previously this branch flipped the dataset to `Ready`
+                // immediately, which made `/v1/ready` claim the cluster was
+                // queryable before any data had been loaded on executors.
+                //
+                // `refresh_trigger` is None because the receiver will be
+                // dropped (refresher.start() is not called).
+                //
+                // No refresh will ever be recorded for this table here, so
+                // close the completion signal: the schedule-creation path and
+                // every other caller resolves at once instead of waiting on a
+                // refresh that cannot arrive. Dataset readiness is a separate
+                // concern handled above.
+                refresh_completion.close();
+                (None, None)
+            } else {
+                (
+                    refresher
+                        .start(acceleration_refresh_mode)
+                        .await
+                        .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                            source,
+                        })?,
+                    refresh_trigger,
+                )
+            };
         let mut handlers = refresher.take_background_tasks();
         let initial_snapshot = refresher.take_initial_snapshot();
         let refresher = Arc::new(refresher);
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
-        }
-        match &self.shared {
-            Some(SharedAcceleration::Replica { initial_load }) => {
-                handlers.push(tokio::spawn(wait_for_writer_load(
-                    Arc::clone(initial_load),
-                    Arc::clone(&refresher),
-                    Arc::clone(&self.runtime_status),
-                    self.dataset_name.clone(),
-                )));
-            }
-            Some(SharedAcceleration::Writer { initial_load }) => {
-                handlers.push(tokio::spawn(record_initial_load(
-                    Arc::clone(initial_load),
-                    Arc::clone(&refresher),
-                    self.dataset_name.clone(),
-                )));
-            }
-            None => {}
         }
 
         // In caching mode, `on_zero_results` is effectively a no-op: the
@@ -1625,9 +1517,7 @@ impl Builder {
             self.retention
         };
 
-        // Retention deletes rows: the instance that writes the acceleration
-        // runs it, and a replica serves what that instance kept.
-        if let Some(retention) = retention.filter(|_| !replica) {
+        if let Some(retention) = retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),

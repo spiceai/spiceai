@@ -137,21 +137,6 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 #[async_trait]
 impl DataAccelerator for PartitionedArrowAccelerator {
-    async fn writer_role(
-        &self,
-        _source: &dyn data_accelerator_api::AccelerationSource,
-    ) -> Option<data_accelerator_api::WriterRole> {
-        // Only this instance writes this engine's accelerations.
-        None
-    }
-
-    async fn shared_location_id(
-        &self,
-        _source: &dyn AccelerationSource,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(None)
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
