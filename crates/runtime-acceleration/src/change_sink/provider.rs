@@ -416,7 +416,6 @@ impl ProviderChangeSinkBackend {
                 &self.context.dataset_name.to_string(),
             )? {
                 self.delete_filter(filter, ctx).await?;
-                delete_index_keys(&self.context, batch, chunk, false).await?;
             }
         }
         self.metrics.fixed_cost("durable_delete_apply", apply_start);
@@ -601,8 +600,11 @@ fn primary_key_batch(
     Ok(RecordBatch::try_new(key_schema, arrays)?)
 }
 
-/// Native deletes bypass accelerator index wrappers; provider deletes do not.
-/// Both must also maintain source-side external indexes.
+/// Delete the primary keys of `rows` from the accelerator's own indexes after a
+/// native delete, which bypasses the index wrappers a provider delete goes through.
+///
+/// Source-side indexes are not touched: the change stream that carried the batch
+/// maintains them, in the order of its rows.
 ///
 /// # Errors
 /// Returns an error if primary-key projection fails. Individual index deletion
@@ -611,9 +613,8 @@ pub async fn delete_index_keys(
     context: &ChangeSinkContext,
     batch: &CdcBatch,
     rows: &[usize],
-    include_accelerator: bool,
 ) -> Result<()> {
-    let indexes = change_indexes(context, true, include_accelerator);
+    let indexes = accelerator_indexes(context);
     if indexes.is_empty() {
         return Ok(());
     }
@@ -628,30 +629,17 @@ pub async fn delete_index_keys(
 /// delete, which bypasses the index wrappers a provider delete goes through.
 /// `keys` holds the table's primary-key columns.
 pub async fn delete_accelerator_index_keys(context: &ChangeSinkContext, keys: &RecordBatch) {
-    let indexes = change_indexes(context, false, true);
+    let indexes = accelerator_indexes(context);
     if !indexes.is_empty() {
         delete_keys_from_indexes(context, indexes, keys).await;
     }
 }
 
-fn change_indexes(
-    context: &ChangeSinkContext,
-    include_external: bool,
-    include_accelerator: bool,
-) -> ChangeIndexes {
-    let mut indexes: ChangeIndexes = if include_external {
-        (context.external_indexes)()
-    } else {
-        ChangeIndexes::new()
-    };
-    if include_accelerator {
-        indexes.extend(
-            spice_table::nodes(context.table.as_ref(), LayerWalk::Read)
-                .flat_map(SpiceTable::indexes)
-                .map(Arc::clone),
-        );
-    }
-    indexes
+fn accelerator_indexes(context: &ChangeSinkContext) -> ChangeIndexes {
+    spice_table::nodes(context.table.as_ref(), LayerWalk::Read)
+        .flat_map(SpiceTable::indexes)
+        .map(Arc::clone)
+        .collect()
 }
 
 /// Best effort: a failing index is logged and the rest are still maintained.

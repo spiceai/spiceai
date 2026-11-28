@@ -137,9 +137,8 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// Remove every entry from this index's own store (a CDC truncate).
     ///
     /// Default is a no-op — correct for a co-located index, whose entries are cleared when the
-    /// accelerator truncates the table. An external-store index (in-memory vectors, S3 Vectors,
-    /// Elasticsearch) overrides this to empty its store, so a truncated table does not keep
-    /// serving rows that no longer exist.
+    /// accelerator truncates the table. An index that keeps its own store must override this to
+    /// empty it; otherwise a truncated table keeps serving rows that no longer exist.
     ///
     /// Wrapper implementations MUST forward this to the index they wrap.
     async fn truncate(&self) -> Result<()> {
