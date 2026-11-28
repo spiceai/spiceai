@@ -1140,5 +1140,15 @@
       "group": "cayenne",
       "may-pass": true
     }
+  ],
+  "state-location-down-at-start": [
+    {
+      "run": "state-location-down-at-start",
+      "who": "default",
+      "key": "query: SELECT * FROM items #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.items' not found: table 'spice.public.items' not found",
+      "group": "cayenne"
+    }
   ]
 }

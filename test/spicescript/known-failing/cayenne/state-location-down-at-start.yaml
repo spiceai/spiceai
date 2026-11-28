@@ -1,0 +1,60 @@
+name: state-location-down-at-start
+duration: 228s
+description: >
+  With `runtime.params.cayenne_vnext` enabled, a Cayenne dataset reads its
+  metastore from `runtime.state.location` while its accelerator initializes.
+  The location is down while `spiced` starts and back 20 s later; the dataset
+  should then load and serve. It never loads (#16870): the initialization error
+  is final, so queries return `table … not found` until `spiced` restarts. A
+  store outage after the dataset is Ready recovers as soon as the store is back.
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: state-location-down-at-start
+  runtime:
+    params: { cayenne_vnext: enabled }
+    state:
+      location: s3://${sources.lake.bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id integer PRIMARY KEY, v text);
+        INSERT INTO items SELECT i, 'v' || i FROM generate_series(1, 1000) AS i;
+  - start: {}
+  - query: SELECT * FROM items
+    eventually: 60s
+  # Down for 20 s after the dataset is Ready: recovers once the store is back.
+  - stop-source: lake
+  - sleep: 20s
+  - start-source: lake
+  - query: SELECT * FROM items
+    eventually: 60s
+  # Down while spiced starts.
+  - kill-spiced: {}
+  - stop-source: lake
+  - start: { wait: false }
+  - sleep: 20s
+  - start-source: lake
+  - query: SELECT * FROM items
+    eventually: 180s
