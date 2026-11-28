@@ -69,7 +69,7 @@ use spicepod::component::function::{
 use util::session_state::builder_from_existing;
 
 use crate::user_functions::args_inliner::inline_args_into_plan;
-use crate::user_functions::search_query_rewrite::inline_search_query_args;
+use crate::user_functions::table_function_args_rewrite::inline_table_function_args;
 
 pub(crate) const SQL_TABLE_ARGS_TABLE_NAME: &str = "args";
 
@@ -527,23 +527,30 @@ impl TableProvider for SqlTableProvider {
         )
         .await?;
 
-        // Search UDTFs require their query argument to be a literal while the
-        // SQL planner is constructing the logical plan. The regular args
-        // table cannot satisfy that requirement: its values are only made
-        // literal by `inline_args_into_plan`, after this planning step.
-        // Rewrite search-query argument positions before planning, preserving
-        // the args table for all other references in the body. Parse with
-        // the session's configured SQL dialect so this pre-parse agrees with
-        // the `ctx.sql` planning parse just below.
+        // Table functions in the body (`text_search`, `rrf`, `rerank`, ...)
+        // read their arguments while the SQL planner constructs the logical
+        // plan, and most accept only literals. The regular args table cannot
+        // satisfy that requirement: its values are only made literal by
+        // `inline_args_into_plan`, after this planning step. Rewrite table
+        // function arguments that name a function argument before planning,
+        // preserving the args table for all other references in the body.
+        // Parse with the session's configured SQL dialect so this pre-parse
+        // agrees with the `ctx.sql` planning parse just below.
         let body = {
             let dialect: Box<dyn Dialect> =
                 dialect_from_str(state.config_options().sql_parser.dialect.as_ref())
                     .unwrap_or_else(|| Box::new(GenericDialect {}));
-            inline_search_query_args(
+            let table_arg_names: Vec<&str> = self
+                .table_args
+                .iter()
+                .map(|table_arg| table_arg.name.as_str())
+                .collect();
+            inline_table_function_args(
                 &self.body,
                 dialect.as_ref(),
                 self.arg_schema.as_ref(),
                 &self.args,
+                &table_arg_names,
             )?
         };
         let (session_state, plan) = ctx.sql(&body).await?.into_parts();
