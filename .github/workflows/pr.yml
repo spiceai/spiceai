@@ -3,6 +3,9 @@ name: pr
 
 on:
   pull_request:
+    # `edited` as well as the defaults: Attestation checks the description's
+    # Evidence section, so editing it must re-run the check.
+    types: [opened, synchronize, reopened, edited]
     branches:
       - trunk
       - release-*
@@ -313,8 +316,9 @@ jobs:
       # it. Only `.github/scripts` is checked out, without credentials.
       - name: Check out the base commit's scripts
         if: ${{ github.event_name == 'pull_request' }}
-        # Only the revert fast-track needs these. If the checkout fails, the
-        # import below fails too and the PR takes the normal sign-off path.
+        # The revert fast-track and the evidence check use these. If the
+        # checkout fails, the revert import fails and the PR takes the normal
+        # sign-off path, and the evidence check fails rather than pass unchecked.
         continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -543,6 +547,61 @@ jobs:
               `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
               `clean base merge(s).`
             );
+
+      # Every claim a PR makes needs evidence in its description (AGENTS.md,
+      # Evidence): a commit from the PR it ran at, the output or a link to the run,
+      # a reason on each check not run, and no later commit to shipped code since.
+      # The rule lives in .github/scripts/pr_evidence.mjs and is read from the base
+      # commit, like the revert rule, so a PR cannot rewrite the check that judges
+      # it. The fast-tracks skip it for the reason they skip the sign-off: those
+      # PRs change no shipped code. `!cancelled()` so a failed sign-off and missing
+      # evidence are reported in one run. A base that predates the module skips
+      # with a notice; anything else that stops the check reaching a verdict fails
+      # Attestation, because a check that passes when it cannot run checks nothing.
+      - name: Check the pull request's evidence
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { existsSync } = await import('node:fs');
+            const trusted = `${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts`;
+            if (!existsSync(trusted)) {
+              core.setFailed(
+                "The base commit's scripts were not checked out, so the evidence check " +
+                'could not run. Re-run the job.'
+              );
+              return;
+            }
+            if (!existsSync(`${trusted}/pr_evidence.mjs`)) {
+              core.notice('The base commit predates the evidence check (.github/scripts/pr_evidence.mjs), so it was skipped.');
+              return;
+            }
+
+            const { checkEvidence, describeProblems } = await import(`${trusted}/pr_evidence.mjs`);
+            let result;
+            try {
+              result = await checkEvidence({
+                github,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pullNumber: context.payload.pull_request.number,
+              });
+            } catch (error) {
+              core.setFailed(`Could not read the pull request to check its evidence: ${error.message}. Re-run the job.`);
+              return;
+            }
+
+            if (result.problems.length === 0) {
+              core.info(`The Evidence section is complete and current as of ${result.cited.slice(0, 12)}.`);
+              return;
+            }
+            const message = describeProblems(result.problems);
+            if (result.enforced) {
+              core.setFailed(message);
+            } else {
+              core.warning(`${message}\nThis PR was opened before the evidence check took effect, so this is a warning.`);
+            }
+
       - name: Dependabot fast-track passthrough
         if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track == 'true' }}
         run: echo "Single-commit Dependabot bump fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."

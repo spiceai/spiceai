@@ -148,6 +148,27 @@ against the merge is exactly what finds that out. Fix what it reported and run
 `make signoff` again — the new status replaces the failed one. A `pending`
 status is not a verdict and does not block inheritance.
 
+### Fill in the Evidence section
+
+Every PR that needs a sign-off also needs evidence in its description, in the
+`🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
+(the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). **Attestation**
+checks, with `.github/scripts/pr_evidence.mjs` read from the base commit, that
+the section:
+
+- exists and says more than the template comment;
+- names a commit from this PR that the evidence ran at;
+- carries output, as a fenced code block or a link to the run;
+- gives a reason for every check marked not run (`Not run — <reason>`);
+- is current: no commit after the newest one it names changes a file the
+  sign-off covers (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked)).
+  Merges of the base don't count, as for sign-off inheritance.
+
+It checks form, not truth: whether the output shows what the PR claims is for
+review. Editing the description re-runs **Attestation**. The fast-tracks skip
+the check for the same reason they skip the sign-off. A PR opened before the
+check reached its base branch gets a warning instead of a failure.
+
 ### Reverts are fast-tracked
 
 A pull request that only reverts commits already on the base branch passes
@@ -578,6 +599,14 @@ checks the PR's head commit first, then walks backward through clean, unmodified
 base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
+
+### "The PR description's Evidence section is incomplete"
+
+**Attestation** lists what is missing from the description's Evidence section
+(see [Fill in the Evidence section](#fill-in-the-evidence-section)). Most often
+the evidence names an older commit and a later push changed shipped code:
+re-run the check at the new head and put that SHA in the section. Editing the
+description re-runs the check; you don't need to push.
 
 ### "Runner out of disk — checks did not complete"
 
