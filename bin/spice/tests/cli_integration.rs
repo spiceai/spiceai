@@ -2065,6 +2065,72 @@ mod acceleration {
 
 mod search {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    const SPINNER_FRAMES: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+    const SEARCH_OK_BODY: &str = r#"{"results":[{"matches":{"body":"dolphins are mammals"},"_score":0.91,"dataset":"docs","primary_key":{"id":1}}],"duration_ms":12}"#;
+
+    struct SearchMock {
+        url: String,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    fn spawn_search_mock(status: u16, response_body: &'static str) -> SearchMock {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock search server");
+        let addr = listener.local_addr().expect("mock server address");
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&bodies);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let body = read_http_body(&mut stream);
+                recorded.lock().expect("record search body").push(body);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        SearchMock {
+            url: format!("http://{addr}"),
+            bodies,
+        }
+    }
+
+    fn read_http_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut reader = BufReader::new(stream);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 {
+            let _ = reader.read_exact(&mut body);
+        }
+        body
+    }
 
     #[test]
     fn test_search_help() {
@@ -2073,7 +2139,15 @@ mod search {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("vector or hybrid search"))
+            .stdout(predicate::str::contains(
+                "Search datasets that have embeddings",
+            ))
+            .stdout(predicate::str::contains("QUERY"))
+            .stdout(predicate::str::contains("--datasets"))
+            .stdout(predicate::str::contains("--additional-columns"))
+            .stdout(predicate::str::contains("--where"))
+            .stdout(predicate::str::contains("--keywords"))
+            .stdout(predicate::str::contains("--limit"))
             .stdout(predicate::str::contains("embeddings"));
     }
 
@@ -2085,6 +2159,201 @@ mod search {
             .assert()
             .success()
             .stdout(predicate::str::contains("--limit"));
+    }
+
+    #[test]
+    fn search_help_does_not_leak_internal_comments() {
+        let mut cmd = spice_cmd();
+        let output = cmd
+            .arg("search")
+            .arg("--help")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(!help.contains("validate_cloud_region_usage"), "{help}");
+        assert!(!help.contains("Within the REPL you can scope"), "{help}");
+        assert!(!help.contains("Arguments for the"), "{help}");
+        assert!(
+            !help.contains("--model"),
+            "search help must not advertise --model, which is not in the /v1/search body: {help}"
+        );
+    }
+
+    #[test]
+    fn help_is_a_search_query() {
+        let mock = spawn_search_mock(200, SEARCH_OK_BODY);
+        let mut cmd = spice_cmd();
+        cmd.args(["search", "help", "--endpoint", &mock.url, "-o", "json"])
+            .assert()
+            .success();
+        let bodies = mock.bodies.lock().expect("read recorded bodies");
+        assert_eq!(bodies.len(), 1, "expected one search request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("request body is JSON");
+        assert_eq!(body["text"], "help");
+    }
+
+    #[test]
+    fn piped_json_is_valid_and_has_no_spinner_bytes() {
+        let mock = spawn_search_mock(200, SEARCH_OK_BODY);
+        let mut cmd = spice_cmd();
+        let output = cmd
+            .args(["search", "dolphins", "--endpoint", &mock.url, "-o", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+        assert!(
+            !SPINNER_FRAMES.chars().any(|ch| stdout.contains(ch)),
+            "spinner leaked into stdout: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("search>"),
+            "REPL prompt leaked into stdout: {stdout:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+        assert_eq!(parsed["results"][0]["dataset"], "docs");
+        let bodies = mock.bodies.lock().expect("read recorded bodies");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("request body is JSON");
+        assert_eq!(body["text"], "dolphins");
+    }
+
+    #[test]
+    fn scoping_flags_reach_the_request_body() {
+        let mock = spawn_search_mock(200, SEARCH_OK_BODY);
+        let mut cmd = spice_cmd();
+        cmd.args([
+            "search",
+            "dolphins",
+            "--endpoint",
+            &mock.url,
+            "-o",
+            "json",
+            "--datasets",
+            "docs,wiki",
+            "--additional-columns",
+            "title,url",
+            "--where",
+            "status = 'open'",
+            "--keywords",
+            "mammal,cetacean",
+            "--limit",
+            "5",
+        ])
+        .assert()
+        .success();
+        let bodies = mock.bodies.lock().expect("read recorded bodies");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("request body is JSON");
+        assert_eq!(body["text"], "dolphins");
+        assert_eq!(body["datasets"], serde_json::json!(["docs", "wiki"]));
+        assert_eq!(
+            body["additional_columns"],
+            serde_json::json!(["title", "url"])
+        );
+        assert_eq!(body["where"], "status = 'open'");
+        assert_eq!(body["keywords"], serde_json::json!(["mammal", "cetacean"]));
+        assert_eq!(body["limit"], 5);
+        assert!(body.get("model").is_none());
+    }
+
+    #[test]
+    fn empty_query_exits_nonzero_on_stderr() {
+        let mut cmd = spice_cmd();
+        cmd.args(["search", "-o", "json"])
+            .write_stdin("")
+            .assert()
+            .failure()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("A search query is required"));
+    }
+
+    #[test]
+    fn http_error_exits_nonzero_on_stderr() {
+        let mock = spawn_search_mock(500, r#"{"error":"boom"}"#);
+        let mut cmd = spice_cmd();
+        cmd.args(["search", "dolphins", "--endpoint", &mock.url, "-o", "json"])
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("500"));
+    }
+
+    #[test]
+    fn connection_failure_exits_nonzero_on_stderr() {
+        let mut cmd = spice_cmd();
+        cmd.args([
+            "search",
+            "dolphins",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "-o",
+            "json",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Failed to connect"));
+    }
+
+    #[test]
+    fn empty_query_without_json_flag_still_reports_on_stderr() {
+        let mut cmd = spice_cmd();
+        cmd.arg("search")
+            .write_stdin("")
+            .assert()
+            .failure()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("A search query is required"));
+    }
+
+    #[test]
+    fn stdin_query_is_searched() {
+        let mock = spawn_search_mock(200, SEARCH_OK_BODY);
+        let mut cmd = spice_cmd();
+        cmd.args(["search", "--endpoint", &mock.url, "-o", "json"])
+            .write_stdin("dolphins\n")
+            .assert()
+            .success();
+        let bodies = mock.bodies.lock().expect("read recorded bodies");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("request body is JSON");
+        assert_eq!(body["text"], "dolphins");
+    }
+
+    #[test]
+    fn multiple_stdin_queries_emit_a_json_array() {
+        let mock = spawn_search_mock(200, SEARCH_OK_BODY);
+        let mut cmd = spice_cmd();
+        let output = cmd
+            .args(["search", "--endpoint", &mock.url, "-o", "json"])
+            .write_stdin("dolphins\nwhales\n")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("stdout must be a JSON array");
+        assert!(parsed.is_array(), "{parsed}");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+        let bodies = mock.bodies.lock().expect("read recorded bodies");
+        assert_eq!(bodies.len(), 2);
+        let first: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("request body is JSON");
+        let second: serde_json::Value =
+            serde_json::from_slice(&bodies[1]).expect("request body is JSON");
+        assert_eq!(first["text"], "dolphins");
+        assert_eq!(second["text"], "whales");
     }
 }
 
