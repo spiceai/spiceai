@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use snafu::ResultExt;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -38,4 +40,54 @@ pub trait TaskRequestChannel: Send + Sync {
     /// Starts the task request channel and returns a handle to the background task.
     #[expect(clippy::missing_errors_doc)]
     fn start(&self) -> Result<JoinHandle<Result<()>>>;
+}
+
+/// How one cycle of a timed trigger ended.
+pub(crate) enum Cycle {
+    /// The trigger sent a request, and a run ended after that.
+    Requested,
+    /// Another trigger started a run first, a run ended, and the trigger starts its wait over.
+    Reset,
+    Cancelled,
+}
+
+/// One cycle of a timed trigger: wait for `due`, send a request, and wait for the run to end.
+///
+/// The schedule notifies `reset` and then starts the run, and `task_completion` wakes only the
+/// waiters registered when the run ends. Each wait for a run's end is registered before the run
+/// it waits for can start, so a run that ends at once still ends the wait. The wait that follows
+/// a reset is registered when the sleep starts, so a run that ended during the sleep also ends it.
+pub(crate) async fn timed_request_cycle(
+    due: impl Future<Output = ()>,
+    cancellation: &CancellationToken,
+    reset: &Notify,
+    task_completion: &Notify,
+    tx: &mpsc::Sender<Arc<TaskRequest>>,
+) -> Result<Cycle> {
+    {
+        let other_run_ended = task_completion.notified();
+        tokio::pin!(other_run_ended);
+        other_run_ended.as_mut().enable();
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(Cycle::Cancelled),
+            () = reset.notified() => {
+                tokio::select! {
+                    () = cancellation.cancelled() => return Ok(Cycle::Cancelled),
+                    () = &mut other_run_ended => return Ok(Cycle::Reset),
+                }
+            }
+            () = due => {}
+        }
+    }
+
+    let run_ended = task_completion.notified();
+    tokio::pin!(run_ended);
+    run_ended.as_mut().enable();
+    tx.send(Arc::new(TaskRequest::default()))
+        .await
+        .context(crate::ChannelSendSnafu)?;
+    tokio::select! {
+        () = cancellation.cancelled() => Ok(Cycle::Cancelled),
+        () = &mut run_ended => Ok(Cycle::Requested),
+    }
 }

@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Result;
 use crate::task::TaskRequest;
 
-use super::TaskRequestChannel;
+use super::{Cycle, TaskRequestChannel, timed_request_cycle};
 pub struct CronRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     task_completion: Option<Arc<tokio::sync::Notify>>,
@@ -122,26 +122,7 @@ impl TaskRequestChannel for CronRequestChannel {
         let cron = Arc::clone(&self.cron);
 
         Ok(tokio::spawn(async move {
-            let mut first_run = true;
             loop {
-                if first_run {
-                    first_run = false;
-                } else {
-                    tokio::select! {
-                        () = cancellation.cancelled() => {
-                            tracing::debug!("Cron evaluator cancelled");
-                            return Ok(());
-                        }
-                        () = reset.notified() => {
-                            tracing::debug!("Cron evaluator reset");
-                            continue;
-                        }
-                        () = task_completion.notified() => {
-                            tracing::debug!("Cron evaluator notified");
-                        }
-                    }
-                }
-
                 let time = Local::now();
                 let next = cron
                     .find_next_occurrence(&time, false)
@@ -153,23 +134,22 @@ impl TaskRequestChannel for CronRequestChannel {
                 // .to_std() errors when the duration is less than zero - the next expression time is in the past
                 let interval = duration_till.to_std().unwrap_or(Duration::from_secs(1));
 
-                tokio::select! {
-                    () = cancellation.cancelled() => {
+                let cycle = timed_request_cycle(
+                    tokio::time::sleep(interval),
+                    &cancellation,
+                    &reset,
+                    &task_completion,
+                    &tx,
+                )
+                .await?;
+                match cycle {
+                    Cycle::Requested => tracing::debug!("Cron evaluator notified"),
+                    Cycle::Reset => tracing::debug!("Cron evaluator reset"),
+                    Cycle::Cancelled => {
                         tracing::debug!("Cron evaluator cancelled");
                         return Ok(());
                     }
-                    () = reset.notified() => {
-                        tracing::debug!("Cron evaluator reset");
-                        continue;
-                    }
-                    () = tokio::time::sleep(interval) => {
-                        tracing::debug!("Cron evaluator time elapsed");
-                    }
                 }
-
-                tx.send(Arc::new(TaskRequest::default()))
-                    .await
-                    .context(crate::ChannelSendSnafu)?;
             }
         }))
     }
@@ -290,9 +270,6 @@ mod tests {
         assert!(!request.cancel_running);
         assert!(!request.clear_queue);
 
-        // `notify_one` stores a permit when the evaluator is not yet waiting on
-        // the completion notification, so the wakeup cannot be lost to the
-        // race between its send and its next `notified()`.
         task_completion.notify_one();
 
         // Two seconds into the five-second interval is the time under test:
