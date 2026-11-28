@@ -22,9 +22,6 @@ limitations under the License.
 //! `runtime`). This module keeps the runtime-side engine implementations and
 //! re-exports the contract so existing `crate::dataaccelerator::…` paths keep resolving.
 
-pub mod arrow;
-pub mod partitioned_arrow;
-
 pub mod spice_sys;
 pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
 
@@ -43,7 +40,7 @@ mod test {
     use super::*;
     // Config types now live in `runtime-component`/`runtime-acceleration` (not re-exported
     // by the accelerator shim glob), and `Secrets` in `runtime-secrets`.
-    use crate::component::dataset::acceleration::{Acceleration, Engine, IndexType, Mode};
+    use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
     use crate::secrets::Secrets;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -296,168 +293,6 @@ mod test {
         };
 
         assert!(!cayenne_pk_conflict_detection_none(&acceleration_settings));
-    }
-
-    #[tokio::test]
-    async fn test_arrow_primary_key_enables_hash_index_and_upsert() {
-        use crate::builder::RuntimeBuilder;
-        use ::arrow::array::{Int64Array, RecordBatch, StringArray};
-        use data_components::{
-            arrow::IndexedMemTable, index_maintenance::perform_index_maintenance,
-        };
-        use datafusion::{assert_batches_eq, logical_expr::dml::InsertOp, physical_plan::collect};
-        use datafusion_table_providers::util::{column_reference::ColumnReference, test::MockExec};
-
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let acceleration_settings = Acceleration {
-            enabled: true,
-            mode: Mode::Memory,
-            engine: Engine::Arrow,
-            primary_key: Some(ColumnReference::new(vec!["id".to_string()])),
-            ..Acceleration::default()
-        };
-
-        let table = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "arrow_pk_upsert".into(),
-                Arc::clone(&schema),
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                Arc::clone(&ctx),
-            )
-            .await
-            .expect("accelerator table should be created");
-
-        let indexed = table
-            .downcast_ref::<IndexedMemTable>()
-            .expect("primary key should create an IndexedMemTable");
-        assert!(indexed.has_index());
-        assert_eq!(indexed.primary_key_columns(), &["id".to_string()]);
-
-        let initial = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec!["old"])),
-            ],
-        )
-        .expect("initial batch should be created");
-        let initial_insert = table
-            .insert_into(
-                &ctx.state(),
-                Arc::new(MockExec::new(vec![Ok(initial)], Arc::clone(&schema))),
-                InsertOp::Append,
-            )
-            .await
-            .expect("initial insert plan should be created");
-        collect(initial_insert, ctx.task_ctx())
-            .await
-            .expect("initial insert should succeed");
-
-        let update = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
-                Arc::new(StringArray::from(vec!["new", "second"])),
-            ],
-        )
-        .expect("update batch should be created");
-        let upsert = table
-            .insert_into(
-                &ctx.state(),
-                Arc::new(MockExec::new(vec![Ok(update)], Arc::clone(&schema))),
-                InsertOp::Append,
-            )
-            .await
-            .expect("upsert plan should be created");
-        collect(upsert, ctx.task_ctx())
-            .await
-            .expect("upsert should succeed");
-        perform_index_maintenance(table.as_ref())
-            .await
-            .expect("index maintenance should succeed");
-
-        ctx.register_table("arrow_pk_upsert", Arc::clone(&table))
-            .expect("table should be registered");
-        let result = ctx
-            .sql("SELECT id, name FROM arrow_pk_upsert ORDER BY id")
-            .await
-            .expect("query should plan")
-            .collect()
-            .await
-            .expect("query should succeed");
-
-        let expected = [
-            "+----+--------+",
-            "| id | name   |",
-            "+----+--------+",
-            "| 1  | new    |",
-            "| 2  | second |",
-            "+----+--------+",
-        ];
-        assert_batches_eq!(&expected, &result);
-
-        let result = ctx
-            .sql("SELECT name FROM arrow_pk_upsert WHERE id = 1")
-            .await
-            .expect("point lookup should plan")
-            .collect()
-            .await
-            .expect("point lookup should succeed");
-        let expected = ["+------+", "| name |", "+------+", "| new  |", "+------+"];
-        assert_batches_eq!(&expected, &result);
-    }
-
-    #[tokio::test]
-    async fn test_arrow_indexes_enable_hash_index() {
-        use crate::builder::RuntimeBuilder;
-        use data_components::arrow::IndexedMemTable;
-        use datafusion_table_providers::util::column_reference::ColumnReference;
-
-        let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        let ctx = Arc::clone(&runtime.df.ctx);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let acceleration_settings = Acceleration {
-            enabled: true,
-            mode: Mode::Memory,
-            engine: Engine::Arrow,
-            indexes: HashMap::from([(
-                ColumnReference::new(vec!["name".to_string()]),
-                IndexType::Unique,
-            )]),
-            ..Acceleration::default()
-        };
-
-        let table = runtime
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                "arrow_secondary_index".into(),
-                schema,
-                None,
-                &acceleration_settings,
-                Arc::new(RwLock::new(Secrets::new())),
-                None,
-                ctx,
-            )
-            .await
-            .expect("accelerator table should be created");
-
-        let indexed = table
-            .downcast_ref::<IndexedMemTable>()
-            .expect("indexes should create an IndexedMemTable");
-        assert!(!indexed.has_index());
-        assert!(indexed.has_secondary_indexes());
     }
 
     /// A store that parks on its first lookup until released, standing in for
@@ -754,19 +589,6 @@ mod accelerator_compat_tests {
             };
 
             let table = match engine {
-                Engine::Arrow => {
-                    use crate::dataaccelerator::arrow::ArrowAccelerator;
-                    match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new(), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping Arrow - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
                 Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
                     use accelerator_cayenne::CayenneAccelerator;
@@ -890,7 +712,6 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                Engine::PartitionedArrow => panic!("Unsupported engine for this test"),
             };
 
             test_fn(engine, table, mode_label.clone(), &test_env).await;
@@ -1676,27 +1497,17 @@ mod accelerator_compat_tests {
             assert_eq!(total_rows, 100, "{:?}: should have {} rows", engine, 100);
 
             // Test 2: Filter with WHERE clause (id > 50)
-            // Note: Arrow and Vortex engines don't support filter pushdown at the TableProvider
-            // level (via scan() method). Vortex supports filter pushdown at the physical plan
-            // level via DataFusion's FilterPushdown optimizer rule, but that only applies when
-            // running SQL queries, not when calling scan() directly.
+            // Note: Vortex supports filter pushdown at the physical plan level via
+            // DataFusion's FilterPushdown optimizer rule, but that only applies when running
+            // SQL queries, not when calling scan() directly, so the row count is not asserted.
             let filter = col("id").gt(lit(50_i64));
             let scan = table
                 .scan(&ctx.state(), None, &[filter], None)
                 .await
                 .expect("filtered scan should be successful");
-            let results = collect(scan, ctx.task_ctx())
+            let _results = collect(scan, ctx.task_ctx())
                 .await
                 .expect("filtered scan successful");
-            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Cayenne {
-                assert!(
-                    total_rows <= 50,
-                    "{:?}: filtered should have <= 50 rows, got {}",
-                    engine,
-                    total_rows
-                );
-            }
 
             // Test 3: Projection (select only specific columns)
             let projection = Some(vec![0_usize, 2_usize]); // id and value only
@@ -1713,30 +1524,18 @@ mod accelerator_compat_tests {
             );
 
             // Test 4: LIMIT clause
-            // Note: Arrow doesn't support limit pushdown. Vortex supports limit pushdown via
-            // FileScanConfig.limit at the TableProvider level when scan() is called with a limit.
             let limit = Some(10);
             let scan = table
                 .scan(&ctx.state(), None, &[], limit)
                 .await
                 .expect("limit scan should be successful");
-            let results = collect(scan, ctx.task_ctx())
+            let _results = collect(scan, ctx.task_ctx())
                 .await
                 .expect("limit scan successful");
-            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Cayenne {
-                assert!(
-                    total_rows <= 10,
-                    "{:?}: limit should have <= 10 rows, got {}",
-                    engine,
-                    total_rows
-                );
-            }
 
             // Test 5: Combined filter + projection + limit
-            // Note: Arrow doesn't support filter/limit pushdown at the TableProvider level.
-            // Vortex supports limit pushdown via FileScanConfig.limit but filter pushdown
-            // only works via DataFusion's physical optimizer (when running SQL queries).
+            // Note: filter pushdown only works via DataFusion's physical optimizer (when
+            // running SQL queries), so the row count is not asserted.
             let filter = col("id").lt(lit(30_i64));
             let projection = Some(vec![1_usize]); // name only
             let limit = Some(5);
@@ -1744,18 +1543,9 @@ mod accelerator_compat_tests {
                 .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
                 .await
                 .expect("combined scan should be successful");
-            let results = collect(scan, ctx.task_ctx())
+            let _results = collect(scan, ctx.task_ctx())
                 .await
                 .expect("combined scan successful");
-            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Cayenne {
-                assert!(
-                    total_rows <= 5,
-                    "{:?}: combined should have <= 5 rows, got {}",
-                    engine,
-                    total_rows
-                );
-            }
 
             // Test 6: Verify null handling (every 10th value is null)
             let scan = table
@@ -1786,8 +1576,8 @@ mod accelerator_compat_tests {
     #[tokio::test]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
-            // Skip engines that don't support deletion
-            if engine == Engine::Arrow || engine == Engine::Cayenne {
+            // Cayenne does not support deletion through this path.
+            if engine == Engine::Cayenne {
                 return;
             }
 
@@ -1958,13 +1748,6 @@ mod accelerator_compat_tests {
                 };
 
                 let bool_table: Arc<dyn TableProvider> = match engine {
-                    Engine::Arrow => {
-                        use crate::dataaccelerator::arrow::ArrowAccelerator;
-                        ArrowAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new(), None)
-                            .await
-                            .expect("Arrow table should be created")
-                    }
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use accelerator_cayenne::CayenneAccelerator; // Clean up any existing files and metadata
@@ -2042,7 +1825,6 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Vortex table should be created")
                     }
-                    Engine::PartitionedArrow => panic!("Unsupported engine: {:?}", engine),
                 };
 
                 // Insert boolean data
@@ -2162,16 +1944,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow returns everything: no filter pushdown at the TableProvider
-            // level. Cayenne holds these 10 rows in its inline tier — small
+            // Cayenne holds these 10 rows in its inline tier — small
             // writes inline on this refresh profile — and that tier evaluates the
             // predicate during the scan, so it returns exactly the matching rows.
             // Its Vortex path would return all 10; pushdown there only happens via
             // DataFusion's physical optimizer on a SQL query.
-            // (when calling scan() directly). Filter pushdown for Vortex only works via
-            // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow { 10 } else { 4 };
+            let expected_rows = 4;
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 5",
@@ -2191,13 +1970,12 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow returns everything: no filter pushdown at the TableProvider
-            // level. Cayenne holds these 10 rows in its inline tier — small
+            // Cayenne holds these 10 rows in its inline tier — small
             // writes inline on this refresh profile — and that tier evaluates the
             // predicate during the scan, so it returns exactly the matching rows.
             // Its Vortex path would return all 10; pushdown there only happens via
             // DataFusion's physical optimizer on a SQL query.
-            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
+            let expected_rows = 3;
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id < 3",
@@ -2216,13 +1994,12 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow returns everything: no filter pushdown at the TableProvider
-            // level. Cayenne holds these 10 rows in its inline tier — small
+            // Cayenne holds these 10 rows in its inline tier — small
             // writes inline on this refresh profile — and that tier evaluates the
             // predicate during the scan, so it returns exactly the matching rows.
             // Its Vortex path would return all 10; pushdown there only happens via
             // DataFusion's physical optimizer on a SQL query.
-            let expected_rows = if engine == Engine::Arrow { 10 } else { 1 };
+            let expected_rows = 1;
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} row with id = 5",
@@ -2243,13 +2020,12 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow returns everything: no filter pushdown at the TableProvider
-            // level. Cayenne holds these 10 rows in its inline tier — small
+            // Cayenne holds these 10 rows in its inline tier — small
             // writes inline on this refresh profile — and that tier evaluates the
             // predicate during the scan, so it returns exactly the matching rows.
             // Its Vortex path would return all 10; pushdown there only happens via
             // DataFusion's physical optimizer on a SQL query.
-            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
+            let expected_rows = 3;
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 3 AND id < 7",
@@ -2339,9 +2115,8 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support limit pushdown, so it returns all rows
-            // Vortex (ListingTable) and DuckDB support limit pushdown
-            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
+            // Cayenne supports limit pushdown.
+            let expected_rows = 3;
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with limit 3",
@@ -2392,32 +2167,14 @@ mod accelerator_compat_tests {
                 .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support filter or limit pushdown at the TableProvider level
             // Vortex doesn't support filter pushdown at TableProvider level (only via physical
             // optimizer when running SQL), but does support limit pushdown via FileScanConfig.limit
-            // DuckDB supports both filter and limit pushdown at TableProvider level
-            if engine == Engine::Arrow {
-                // No pushdown - returns all 10 rows
-                assert_eq!(
-                    total_rows, 10,
-                    "{:?}: should have 10 rows (no pushdown)",
-                    engine
-                );
-            } else if engine == Engine::Cayenne {
-                // Limit pushdown only - id > 3 gives 6 rows, limit 2 gives 2 rows
-                assert_eq!(
-                    total_rows, 2,
-                    "{:?}: should have 2 rows (limit pushdown only)",
-                    engine
-                );
-            } else {
-                // Both filter and limit pushdown - id > 3 gives 6 rows, limit 2 gives 2 rows
-                assert_eq!(
-                    total_rows, 2,
-                    "{:?}: should have 2 rows (filter + limit pushdown)",
-                    engine
-                );
-            }
+            // Limit pushdown only - id > 3 gives 6 rows, limit 2 gives 2 rows
+            assert_eq!(
+                total_rows, 2,
+                "{:?}: should have 2 rows (limit pushdown only)",
+                engine
+            );
             assert!(total_rows > 0, "{:?}: should have at least 1 row", engine);
 
             // Verify only name column is present
@@ -3138,10 +2895,6 @@ mod accelerator_compat_tests {
         (num_records, num_iterations)
     }
 
-    fn supports_change_delete_roundtrip(engine: Engine) -> bool {
-        !matches!(engine, Engine::Arrow)
-    }
-
     fn generate_changed_test_data(
         schema: Arc<Schema>,
         num_records: usize,
@@ -3255,7 +3008,7 @@ mod accelerator_compat_tests {
                 let is_file = mode.starts_with("file");
 
                 let (num_records, num_iterations) = benchmark_sizing(engine, is_memory, is_file);
-                let benchmarked_changes = supports_change_delete_roundtrip(engine);
+                let benchmarked_changes = true;
                 let num_change_records = if benchmarked_changes {
                     (num_records / 10).max(1).min(num_records - 1)
                 } else {

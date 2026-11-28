@@ -524,7 +524,6 @@ mod tests {
 
     use super::{DatasetInitialization, LazyConnectorBuilder};
     use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataaccelerator::arrow::ArrowAccelerator;
     use crate::dataaccelerator::{AccelerationSource, BootstrapStatus, DataAccelerator};
     use crate::dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
@@ -923,18 +922,19 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Arrow accelerator whose `init` fails a configured number of times after
-    /// `generation_lock` has already revoked the previous owner.
+    /// An accelerator whose `init` fails a configured number of times after
+    /// `generation_lock` has already revoked the previous owner, delegating
+    /// everything else to the engine it wraps.
     struct FlakyInitAccelerator {
-        inner: ArrowAccelerator,
+        inner: Arc<dyn DataAccelerator>,
         remaining_init_failures: AtomicUsize,
         init_calls: AtomicUsize,
     }
 
     impl FlakyInitAccelerator {
-        fn new() -> Self {
+        fn new(inner: Arc<dyn DataAccelerator>) -> Self {
             Self {
-                inner: ArrowAccelerator::new(),
+                inner,
                 remaining_init_failures: AtomicUsize::new(0),
                 init_calls: AtomicUsize::new(0),
             }
@@ -1081,11 +1081,16 @@ mod tests {
         name: &str,
     ) -> (Arc<crate::Runtime>, Arc<Dataset>, Arc<FlakyInitAccelerator>) {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
-        let accelerator = Arc::new(FlakyInitAccelerator::new());
+        let cayenne = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::Cayenne)
+            .await
+            .expect("the Cayenne engine is registered");
+        let accelerator = Arc::new(FlakyInitAccelerator::new(cayenne));
         runtime
             .accelerator_engine_registry()
             .register_accelerator_engine(
-                Engine::Arrow,
+                Engine::Cayenne,
                 Arc::clone(&accelerator) as Arc<dyn DataAccelerator>,
             )
             .await;
@@ -1099,7 +1104,7 @@ mod tests {
             .with_app(Arc::new(app))
             .with_runtime(Arc::clone(&runtime));
         builder.acceleration = Some(Acceleration {
-            engine: Engine::Arrow,
+            engine: Engine::Cayenne,
             ..Acceleration::default()
         });
         let dataset = Arc::new(builder.build().expect("valid dataset"));
@@ -1125,9 +1130,9 @@ mod tests {
     ) -> crate::datafusion::AcceleratorBootstrap {
         let accelerator = runtime
             .accelerator_engine_registry()
-            .get_accelerator_engine(Engine::Arrow)
+            .get_accelerator_engine(Engine::Cayenne)
             .await
-            .expect("the flaky Arrow engine is registered");
+            .expect("the flaky engine is registered");
         runtime
             .df
             .initialize_accelerator(Arc::clone(dataset), accelerator)

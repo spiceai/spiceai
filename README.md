@@ -172,7 +172,7 @@ Bootstrap accelerated datasets from S3 in **seconds, not minutes**. Cold-start e
 2. **Structural data sandboxing** — Datasets a sidecar doesn't declare in its `spicepod.yaml` are *physically absent from the catalog*, not filtered at query time. The application never holds credentials to Postgres, S3, Snowflake, or Iceberg — only a token to its sidecar. A compromised pod gets a loopback scoped to that tenant's working set, not database credentials.
 3. **Ingest once, serve everywhere** — The cluster ingests each source dataset once and produces one authoritative materialization that every sidecar pulls. Source systems see one stable connection pool, not one per pod. Pull-based refresh + acceleration snapshots in S3 mean cold starts in seconds and graceful degradation when the cluster is unreachable.
 4. **AI-Native Runtime** — Data query and AI inference live in one engine, so retrieval, ranking, and generation happen in one query plan, in one process — `vector_search`, `text_search`, `rrf`, `rerank`, NSQL, and tool calls are all SQL primitives.
-5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex, Arrow) and OLTP (PostgreSQL in Spice.ai Enterprise) engines, so you can match workload to engine instead of forcing everything into one shape.
+5. **Dual-engine acceleration** — Per-dataset choice of OLAP (Cayenne/Vortex) and OLTP (PostgreSQL in Spice.ai Enterprise) engines, so you can match workload to engine instead of forcing everything into one shape.
 6. **Edge to cloud, single binary** — Runs on a laptop, as a Kubernetes sidecar, as a microservice, or as a multi-node Ballista cluster across edge, on-prem, and public clouds. Self-hosted OSS, Spice Cloud (managed cluster), and Spice.ai Enterprise (on-prem full stack) all use identical `spicepod.yaml` manifests — no app changes to migrate.
 
 If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ballista**, Spice gives you a flexible, production-ready engine you can just use — instead of stitching them together yourself.
@@ -194,7 +194,7 @@ If you build with **DataFusion**, **DuckDB**, **Vortex**, **Iceberg**, or **Ball
 
 ### Database CDN and Query Mesh
 
-- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex) or Arrow alongside your app for sub-second query, with secondary indexes for point lookups. Bootstrap from S3 snapshots. [Spice Cayenne](https://spiceai.org/docs/components/data-accelerators/cayenne)
+- **Co-located acceleration**: Materialize working sets as Cayenne (Vortex) alongside your app for sub-second query, with secondary indexes for point lookups. Bootstrap from S3 snapshots. [Spice Cayenne](https://spiceai.org/docs/components/data-accelerators/cayenne)
 - **Resiliency**: Maintain availability with local replicas of critical datasets; recover from source outages from snapshots. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
 - **Responsive dashboards**: Sub-second BI with configurable refresh and CDC. [Sales BI Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 - **Legacy modernization**: One endpoint that federates legacy systems with modern infrastructure. [Federation Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
@@ -291,13 +291,11 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
 | `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `memory`, `file` |
-| `arrow`    | [In-Memory Arrow Records][arrow]  | Deprecated        | `memory`         |
 
 An acceleration with no `engine` uses `cayenne`.
 
-The `duckdb`, `postgres`, `sqlite` and `turso` accelerators were removed in v2.5, and a dataset or view that sets one fails to load. Every other accelerator except `cayenne` is deprecated and will be removed. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+The `arrow`, `duckdb`, `postgres`, `sqlite` and `turso` accelerators were removed in v2.5, and a dataset or view that sets one fails to load with an error naming the fix: set `engine: cayenne` (or remove `engine`), then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
-[arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
 
 ## Supported Model Providers

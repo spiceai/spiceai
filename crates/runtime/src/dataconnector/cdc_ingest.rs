@@ -45,10 +45,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::component::dataset::{
-    DatasetSpec,
-    acceleration::{Engine, RefreshMode},
-};
+use crate::component::dataset::{DatasetSpec, acceleration::RefreshMode};
 use data_connector_api::federated::FederatedTableProvider;
 
 use super::{
@@ -409,11 +406,10 @@ impl DataConnector for CdcIngest {
             .unwrap_or_default();
 
         ensure!(
-            !primary_keys.is_empty()
-                || matches!(acceleration.engine.to_unpartitioned(), Engine::Arrow),
+            !primary_keys.is_empty(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "cdc",
-                message: "The CDC ingest connector requires acceleration.primary_key (except for the Arrow engine). Configure primary_key so UPDATE and DELETE events can be applied",
+                message: "The CDC ingest connector requires `acceleration.primary_key`, so that UPDATE and DELETE events can be applied to the rows they change. Set `acceleration.primary_key` on the dataset. For details, visit: https://spiceai.org/docs/features/cdc",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

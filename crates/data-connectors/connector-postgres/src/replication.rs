@@ -521,36 +521,12 @@ pub async fn build_changes_stream(
     // UPDATE events must replace the row stored under the dataset's primary
     // key — otherwise the accelerator's write path falls through to append and
     // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row per
-    // declared `primary_key` on its own; DuckDB / SQLite / Postgres
-    // also need an `on_conflict: upsert` (or upsert-dedup) entry keyed on it.
-    // The Arrow engine genuinely can't support upsert and is documented as
-    // append-only for UPDATEs — skip the check there.
+    // declared `primary_key`, so the key must be declared on the dataset.
     let engine = dataset
         .acceleration
         .as_ref()
-        .map(|a| a.engine.to_unpartitioned())
+        .map(|a| a.engine)
         .unwrap_or_default();
-    let engine_supports_upsert = !matches!(
-        engine,
-        runtime_component::dataset::acceleration::Engine::Arrow
-            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
-    );
-    let keeps_one_row_per_key_alone =
-        engine == runtime_component::dataset::acceleration::Engine::Cayenne;
-    // The on_conflict map is keyed on a ColumnReference (same type as
-    // primary_key), so checking whether the PK has an Upsert entry is a
-    // direct lookup. This is a much tighter check than "any value is
-    // Upsert" — a misconfigured `on_conflict` targeting a non-PK column
-    // would previously pass and still let UPDATEs append duplicate rows.
-    let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
-        a.primary_key.as_ref().is_some_and(|pk| {
-            keeps_one_row_per_key_alone
-                || matches!(
-                    a.on_conflict.get(pk),
-                    Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
-                )
-        })
-    });
 
     // Map the dataset-level `on_schema_change` policy onto the replication
     // stream. `Block` (the default) preserves today's behavior verbatim; the
@@ -603,54 +579,24 @@ pub async fn build_changes_stream(
             )))?;
         }
 
-        // Now that primary_keys is resolved, report the upsert-config error
-        // with a concrete PK hint. Two cases produce this error:
-        //   1. `acceleration.primary_key` is set but `on_conflict` is missing
-        //      the Upsert entry keyed on the PK (never on Cayenne).
-        //   2. `acceleration.primary_key` is unset (we're relying on the
-        //      source table's PK), in which case the user must also set
-        //      `acceleration.primary_key` — `on_conflict` can only be keyed
-        //      on a ColumnReference, and acceleration's write path consults
-        //      only its own `primary_key` / `on_conflict` config.
-        if engine_supports_upsert && !has_upsert_on_pk {
+        // Now that primary_keys is resolved, report a key the dataset relies on
+        // the source table for with a concrete hint: acceleration's write path
+        // consults only its own `primary_key`, so the user must declare it.
+        if declared_pks.is_empty() {
             // Composite keys hint the full parenthesized column list — a
             // single-column suggestion would mis-route UPDATE/DELETE events.
             let pk_hint = match primary_keys.as_slice() {
-                [] => "<pk>".to_string(),
                 [single] => single.clone(),
                 composite => format!("({})", composite.join(", ")),
             };
-            let msg = if declared_pks.is_empty() && keeps_one_row_per_key_alone {
-                format!(
-                    "postgres replication for dataset `{dataset_name}`: the source table's \
-                     primary key (`{pk_hint}`) is not declared on the dataset. \
-                     `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
-                     UPDATE events replace rows on the `{engine}` engine — without the \
-                     declaration, the accelerator's write path falls through to append and \
-                     produces duplicate rows."
-                )
-            } else if declared_pks.is_empty() {
-                format!(
-                    "postgres replication for dataset `{dataset_name}`: the source table's \
-                     primary key (`{pk_hint}`) is not declared on the dataset. \
-                     `refresh_mode: changes` requires BOTH `acceleration.primary_key: {pk_hint}` \
-                     AND `acceleration.on_conflict: {{ {pk_hint}: upsert }}` so UPDATE events \
-                     apply as upserts on the `{engine}` engine — without the declaration, \
-                     the accelerator's write path falls through to append and produces \
-                     duplicate rows. (The `arrow` engine is exempt — documented append-only \
-                     semantics.)"
-                )
-            } else {
-                format!(
-                    "postgres replication for dataset `{dataset_name}`: `refresh_mode: changes` \
-                     requires an `acceleration.on_conflict` entry keyed on the dataset's \
-                     `primary_key` with an `upsert` (or `upsert_dedup*`) behavior so UPDATE \
-                     events apply as upserts instead of duplicate inserts. Add: \
-                     `on_conflict: {{ {pk_hint}: upsert }}` on the `{engine}` engine. \
-                     (The `arrow` engine is exempt — documented append-only semantics.)"
-                )
-            };
-            Err(StreamError::External(msg))?;
+            Err(StreamError::External(format!(
+                "postgres replication for dataset `{dataset_name}`: the source table's \
+                 primary key (`{pk_hint}`) is not declared on the dataset. \
+                 `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
+                 UPDATE events replace rows on the `{engine}` engine — without the \
+                 declaration, the accelerator's write path falls through to append and \
+                 produces duplicate rows."
+            )))?;
         }
 
         let input = ReplicationStreamInput {
@@ -1122,15 +1068,11 @@ fn accelerator_is_ephemeral(
     // explicit durability claim here: defaulting a non-persistent engine to
     // "persistent" silently skips its resume snapshot and leaves the accelerator
     // missing every row written before startup.
-    match acceleration.engine.to_unpartitioned() {
-        // Always in-memory. `to_unpartitioned` already folded `PartitionedArrow`
-        // into `Arrow`, so it cannot reach the match; it is listed only to keep
-        // the match exhaustive.
-        Engine::Arrow | Engine::PartitionedArrow => true,
+    match acceleration.engine {
         // In-memory unless file-backed; `file_create` truncates on startup,
         // which is just as empty as memory from replication's point of view.
         //
-        // Cayenne belongs here too: `mode: memory` is fully in-RAM (an in-memory
+        // `mode: memory` is fully in-RAM (an in-memory
         // `memdb` metastore and no data directory at all — see the accelerator's
         // `memory_mode` branch), so nothing about it survives a restart. Only its
         // file modes (local disk or S3 Express One Zone, both of which require a
@@ -1620,12 +1562,6 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         // requires a file mode) persists, so a plain slot resume is correct.
         assert!(!ephemeral(Engine::Cayenne, Mode::File));
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
-
-        // Arrow is in-memory whatever `mode` says; Postgres is external storage.
-        for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
-            assert!(ephemeral(Engine::Arrow, mode), "arrow {mode}");
-            assert!(ephemeral(Engine::PartitionedArrow, mode), "arrow {mode}");
-        }
     }
 
     /// `snapshot_on_resume` is only forced when snapshots are enabled at all;

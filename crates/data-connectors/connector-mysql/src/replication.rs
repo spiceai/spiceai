@@ -163,32 +163,14 @@ pub fn build_changes_stream(
 
     // UPDATE events must replace the row stored under the dataset's primary
     // key — otherwise the accelerator's write path falls through to append and
-    // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row
-    // per declared `primary_key` on its own; the other upsert engines also need
-    // an `on_conflict: upsert` entry keyed on it. The Arrow engine genuinely
-    // can't support upsert and is documented as append-only for UPDATEs — skip
-    // the check there. (Same contract as the Postgres replication connector.)
+    // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row per
+    // declared `primary_key`, so the key must be declared on the dataset.
+    // (Same contract as the Postgres replication connector.)
     let engine = dataset
         .acceleration
         .as_ref()
-        .map(|a| a.engine.to_unpartitioned())
+        .map(|a| a.engine)
         .unwrap_or_default();
-    let engine_supports_upsert = !matches!(
-        engine,
-        runtime_component::dataset::acceleration::Engine::Arrow
-            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
-    );
-    let keeps_one_row_per_key_alone =
-        engine == runtime_component::dataset::acceleration::Engine::Cayenne;
-    let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
-        a.primary_key.as_ref().is_some_and(|pk| {
-            keeps_one_row_per_key_alone
-                || matches!(
-                    a.on_conflict.get(pk),
-                    Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
-                )
-        })
-    });
 
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
@@ -204,57 +186,28 @@ pub fn build_changes_stream(
         // require one to route the change to a row. Fail fast with a clear
         // message instead of erroring cryptically later in the refresh loop.
         if primary_keys.is_empty() {
-            let on_conflict_note = if keeps_one_row_per_key_alone {
-                ""
-            } else {
-                " (and a matching `acceleration.on_conflict` entry)"
-            };
             Err(StreamError::External(format!(
                 "mysql replication for dataset `{dataset_name}`: no primary key available. \
-                 Set `acceleration.primary_key` on the dataset{on_conflict_note} — \
+                 Set `acceleration.primary_key` on the dataset — \
                  `refresh_mode: changes` cannot route UPDATE/DELETE events without one."
             )))?;
         }
 
-        if engine_supports_upsert && !has_upsert_on_pk {
+        if declared_pks.is_empty() {
             // Composite keys hint the full parenthesized column list — a
             // single-column suggestion would mis-route UPDATE/DELETE events.
             let pk_hint = match primary_keys.as_slice() {
-                [] => "<pk>".to_string(),
                 [single] => single.clone(),
                 composite => format!("({})", composite.join(", ")),
             };
-            let msg = if declared_pks.is_empty() && keeps_one_row_per_key_alone {
-                format!(
-                    "mysql replication for dataset `{dataset_name}`: the source table's \
-                     primary key (`{pk_hint}`) is not declared on the dataset. \
-                     `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
-                     UPDATE events replace rows on the `{engine}` engine — without the \
-                     declaration, the accelerator's write path falls through to append and \
-                     produces duplicate rows."
-                )
-            } else if declared_pks.is_empty() {
-                format!(
-                    "mysql replication for dataset `{dataset_name}`: the source table's \
-                     primary key (`{pk_hint}`) is not declared on the dataset. \
-                     `refresh_mode: changes` requires BOTH `acceleration.primary_key: {pk_hint}` \
-                     AND `acceleration.on_conflict: {{ {pk_hint}: upsert }}` so UPDATE events \
-                     apply as upserts on the `{engine}` engine — without the declaration, \
-                     the accelerator's write path falls through to append and produces \
-                     duplicate rows. (The `arrow` engine is exempt — documented append-only \
-                     semantics.)"
-                )
-            } else {
-                format!(
-                    "mysql replication for dataset `{dataset_name}`: `refresh_mode: changes` \
-                     requires an `acceleration.on_conflict` entry keyed on the dataset's \
-                     `primary_key` with an `upsert` (or `upsert_dedup*`) behavior so UPDATE \
-                     events apply as upserts instead of duplicate inserts. Add: \
-                     `on_conflict: {{ {pk_hint}: upsert }}` on the `{engine}` engine. \
-                     (The `arrow` engine is exempt — documented append-only semantics.)"
-                )
-            };
-            Err(StreamError::External(msg))?;
+            Err(StreamError::External(format!(
+                "mysql replication for dataset `{dataset_name}`: the source table's \
+                 primary key (`{pk_hint}`) is not declared on the dataset. \
+                 `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
+                 UPDATE events replace rows on the `{engine}` engine — without the \
+                 declaration, the accelerator's write path falls through to append and \
+                 produces duplicate rows."
+            )))?;
         }
 
         let schema_json = match arrow_tools::schema::schema_to_json(&schema) {
