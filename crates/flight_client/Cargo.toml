@@ -18,6 +18,7 @@ base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
+hyper-util = { version = "0.1.20", features = ["client-legacy", "tokio"] }
 parking_lot.workspace = true
 prost.workspace = true
 rand.workspace = true
@@ -31,7 +32,7 @@ tonic = { workspace = true, features = [
     "tls-ring",
     "tls-native-roots",
 ] }
-tower.workspace = true
+tower = { workspace = true, features = ["util"] }
 url.workspace = true
 
 [dev-dependencies]

@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use base64::{Engine as _, engine::general_purpose};
+use hyper_util::client::legacy::connect::{HttpConnector, dns::Name};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Identity};
@@ -299,6 +301,52 @@ pub(crate) async fn new_tls_flight_channel_with_scope(
     endpoint_str: &str,
     opts: &ClientTlsOptions,
 ) -> Result<(Channel, Option<[u8; 32]>)> {
+    let (endpoint, identity_scope) = flight_endpoint(endpoint_str, opts).await?;
+    let channel = endpoint
+        .connect()
+        .await
+        .context(UnableToConnectToEndpointSnafu)?;
+    Ok((channel, identity_scope))
+}
+
+/// Creates a Flight channel to `endpoint_str` whose host resolves only to `addresses`.
+///
+/// Requests still carry the authority of `endpoint_str`, and TLS still verifies the server
+/// against its host, so a caller that has checked every address the host resolves to can
+/// connect to those addresses and no others. A host that is an IP address is not resolved: the
+/// channel connects to that address, which the caller must have checked.
+///
+/// # Errors
+///
+/// Will return `Err` if it couldn't load the system TLS certificates or connect to any of
+/// `addresses`.
+pub async fn new_tls_flight_channel_to_addresses(
+    endpoint_str: &str,
+    addresses: Vec<IpAddr>,
+) -> Result<Channel> {
+    let (endpoint, _) = flight_endpoint(endpoint_str, &ClientTlsOptions::default()).await?;
+    // Port 0 takes the URI's port, or its scheme's default.
+    let addresses: Vec<SocketAddr> = addresses
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 0))
+        .collect();
+    let resolver = tower::service_fn(move |_: Name| {
+        std::future::ready(Ok::<_, std::io::Error>(addresses.clone().into_iter()))
+    });
+    let mut connector = HttpConnector::new_with_resolver(resolver);
+    connector.enforce_http(false);
+    connector.set_nodelay(true);
+    endpoint
+        .connect_with_connector(connector)
+        .await
+        .context(UnableToConnectToEndpointSnafu)
+}
+
+/// The endpoint for `endpoint_str`, with TLS configured when its scheme asks for it.
+async fn flight_endpoint(
+    endpoint_str: &str,
+    opts: &ClientTlsOptions,
+) -> Result<(Endpoint, Option<[u8; 32]>)> {
     if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
         // Use the normalized URL (https://) for tonic compatibility
         let mut endpoint = crate::configure_endpoint_for_high_throughput(
@@ -325,21 +373,13 @@ pub(crate) async fn new_tls_flight_channel_with_scope(
         endpoint = endpoint
             .tls_config(tls_config)
             .context(UnableToConnectToEndpointSnafu)?;
-
-        let channel = endpoint
-            .connect()
-            .await
-            .context(UnableToConnectToEndpointSnafu)?;
-        Ok((channel, identity_scope))
+        Ok((endpoint, identity_scope))
     } else {
         // Non-TLS endpoint, connect without TLS config
-        let channel = crate::configure_endpoint_for_high_throughput(
+        let endpoint = crate::configure_endpoint_for_high_throughput(
             Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?,
-        )
-        .connect()
-        .await
-        .context(UnableToConnectToEndpointSnafu)?;
-        Ok((channel, None))
+        );
+        Ok((endpoint, None))
     }
 }
 

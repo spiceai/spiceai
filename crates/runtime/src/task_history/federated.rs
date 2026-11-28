@@ -29,7 +29,7 @@ use arrow::compute::{SortOptions, sort_to_indices, take};
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::flightsql::FlightSqlClient;
+use data_components::flightsql::{EndpointLocationGuard, FlightSqlClient};
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
@@ -195,11 +195,16 @@ impl FederatedTaskHistoryTable {
         table_ref: String,
     ) -> Result<Vec<RecordBatch>, (String, String)> {
         let cookie_store = Arc::new(CookieStore::new());
-        let batches: Vec<RecordBatch> =
-            data_components::flightsql::query_to_stream(client, sql, cookie_store, table_ref)
-                .try_collect()
-                .await
-                .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
+        let batches: Vec<RecordBatch> = data_components::flightsql::query_to_stream(
+            client,
+            sql,
+            cookie_store,
+            table_ref,
+            EndpointLocationGuard::default(),
+        )
+        .try_collect()
+        .await
+        .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
         Ok(batches)
     }
 }
