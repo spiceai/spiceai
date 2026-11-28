@@ -214,6 +214,17 @@ impl AccelerationSource for Dataset {
         Some(self.on_schema_change)
     }
 
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        Box::pin(async move {
+            let connection = crate::dataconnector::parameters::source_identity(self).await?;
+            Ok(Some(runtime_acceleration::SourceDefinition {
+                from: self.from.clone(),
+                connection,
+                reads: Vec::new(),
+            }))
+        })
+    }
+
     fn allows_write(&self) -> bool {
         // A read-write dataset requires BOTH `access: read_write` and a ReadWrite API
         // key, and `access()` is the check that folds those together.

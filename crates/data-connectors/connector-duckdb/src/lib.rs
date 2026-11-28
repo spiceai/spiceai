@@ -302,6 +302,16 @@ impl DataConnectorFactory for DuckDBFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    fn source_identity(
+        &self,
+        params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        Ok(Some(data_connector_api::source_identity_of(
+            params,
+            &["open"],
+        )))
+    }
 }
 
 /// The name used to identify this connector in configuration.

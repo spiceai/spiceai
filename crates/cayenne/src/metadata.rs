@@ -1132,6 +1132,13 @@ pub struct VortexConfig {
     /// — `#[serde(skip)]`, never persisted and never compared.
     #[serde(skip)]
     pub settings_change: SettingsChangeAction,
+    /// The settings that define the dataset's stored rows, as the Spicepod declares
+    /// them. In a shared state location, the copy records the definition it was built
+    /// from, and a table opens only a copy built from the same one. `None` for a
+    /// table no Spicepod defines (DDL, tests): nothing is recorded or compared.
+    /// Runtime-only — `#[serde(skip)]`, never persisted in this configuration.
+    #[serde(skip)]
+    pub definition: Option<std::sync::Arc<crate::definition::DatasetDefinition>>,
     /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
@@ -1618,6 +1625,7 @@ impl Default for VortexConfig {
             scan_from_manifest: false,
             schema_evolution: SchemaEvolutionMode::default(),
             settings_change: SettingsChangeAction::default(),
+            definition: None,
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
             goal_query_latency_ms: None,

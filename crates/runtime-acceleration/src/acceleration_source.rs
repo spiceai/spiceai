@@ -24,6 +24,46 @@ use tokio::sync::RwLock;
 pub type InitializedSourcesFuture<'a> =
     Pin<Box<dyn Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>;
 
+/// Which source an acceleration's rows come from. An engine that keeps the
+/// acceleration as a copy in a shared state location records it with the copy,
+/// and never serves an instance a copy of another source.
+///
+/// Settings that shape the rows of one source (`refresh_sql`, refresh frequency,
+/// retention, credentials, tuning) are not part of it: they apply to the stored
+/// acceleration in place, as on a single instance.
+#[derive(Clone, Debug, Default)]
+pub struct SourceDefinition {
+    /// A dataset's `from`; empty for a view, whose source is what it reads.
+    pub from: String,
+    /// The connection settings that say which source the connector reads: those
+    /// its connector names (`DataConnectorFactory::source_identity`), or every
+    /// setting the Spicepod sets for a connector that names none.
+    pub connection: Vec<ConnectionSetting>,
+    /// For a view, the source of each dataset or view its SQL reads, by name.
+    pub reads: Vec<(String, SourceDefinition)>,
+}
+
+/// One connection setting of a source, as its connector reads it.
+#[derive(Clone, Debug)]
+pub struct ConnectionSetting {
+    /// The name the Spicepod gives the setting (`pg_host`).
+    pub name: String,
+    pub value: secrecy::SecretString,
+    /// Whether the connector declares the setting secret. A secret is recorded
+    /// only together with the other settings, never on its own.
+    pub secret: bool,
+}
+
+/// What [`AccelerationSource::definition`] returns.
+pub type DefinitionFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<SourceDefinition>, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 /// Represents an acceleration source component, such as a dataset or a view.
 /// Provides additional information about the source, such as its name and associated metadata.
 pub trait AccelerationSource: Send + Sync {
@@ -78,6 +118,14 @@ pub trait AccelerationSource: Send + Sync {
     /// [`Self::connector_name`]: a default would let a new source silently inherit
     /// somebody else's schema-change policy.
     fn on_schema_change(&self) -> Option<OnSchemaChange>;
+
+    /// The settings in this source's Spicepod that define the rows its acceleration
+    /// stores, or `None` for a source no Spicepod defines (a table created by DDL, an
+    /// internal table).
+    ///
+    /// Deliberately has NO default implementation: a source that silently answered
+    /// `None` would let an engine serve it another definition's copy.
+    fn definition(&self) -> DefinitionFuture<'_>;
 
     /// Whether rows can reach this source through anything other than its refresh path
     /// — `access: read_write` on a dataset, or DML against a DDL-created table.

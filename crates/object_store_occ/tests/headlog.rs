@@ -1326,3 +1326,124 @@ async fn headlog_open_overtaken_by_collection_reopens_from_the_newer_head() {
         );
     }
 }
+
+/// `backend` behind a store whose clock a test can move, with a new log at its
+/// prefix: a later write then carries a later `LastModified`, as it would after
+/// real time passed.
+async fn log_with_clock(backend: &Backend) -> Arc<GatedStore> {
+    let gated = Arc::new(GatedStore::new(Arc::clone(&backend.store)));
+    HeadLog::create(
+        Arc::clone(&gated) as Arc<dyn ObjectStore>,
+        backend.prefix.clone(),
+        config(),
+    )
+    .await
+    .expect("create");
+    gated
+}
+
+/// Writer 1 stages a checkpoint and stops before the commit that publishes it,
+/// as a writer killed after the checkpoint's `PUT` does. Later, writer 2 takes
+/// over and stages the checkpoint at the same commit with `root`. Returns the
+/// successor, the commit, and what its checkpoint returned.
+async fn checkpoint_after_a_stopped_writer(
+    backend: &Backend,
+    root: &'static [u8],
+) -> (Writer, u64, object_store_occ::headlog::Result<()>) {
+    let gated = log_with_clock(backend).await;
+    let store: Arc<dyn ObjectStore> = Arc::clone(&gated) as Arc<dyn ObjectStore>;
+    let mut first = Writer::take_over(Arc::clone(&store), backend.prefix.clone(), config(), 1)
+        .await
+        .expect("first writer");
+    for _ in 0..8 {
+        append(&mut first, Bytes::from_static(b"before the checkpoint")).await;
+    }
+    let at = *first.state().head.batches.last().expect("sealed batch");
+    first
+        .publish_checkpoint(at, Bytes::from_static(b"root"))
+        .await
+        .expect("first writer stages the checkpoint");
+    drop(first);
+    gated.advance_clock(std::time::Duration::from_secs(5));
+    let mut second = Writer::take_over(store, backend.prefix.clone(), config(), 2)
+        .await
+        .expect("successor");
+    let staged = second
+        .publish_checkpoint(at, Bytes::from_static(root))
+        .await;
+    (second, at, staged)
+}
+
+/// Regression test for #16711: a checkpoint that landed but was never published
+/// does not block the next writer's checkpoint at the same commit, which then
+/// publishes its floor on the next commit.
+#[tokio::test]
+async fn headlog_checkpoint_staged_by_a_stopped_writer_does_not_block_its_successor() {
+    for backend in backends() {
+        let (mut second, at, staged) = checkpoint_after_a_stopped_writer(&backend, b"root").await;
+        staged.expect("the successor's checkpoint has the same bytes");
+        append(&mut second, Bytes::from_static(b"publishes the floor")).await;
+        assert_eq!(second.state().head.floor, at);
+    }
+}
+
+/// The checkpoint at a commit is a function of the log: a different root there
+/// is still refused, so an equal object is never confused with a real conflict.
+#[tokio::test]
+async fn headlog_checkpoint_with_a_different_root_is_still_refused() {
+    for backend in backends() {
+        let (_, _, staged) = checkpoint_after_a_stopped_writer(&backend, b"other root").await;
+        let error = staged.expect_err("a different root at the same commit");
+        assert!(
+            error
+                .to_string()
+                .contains("immutable object already exists with different bytes"),
+            "{error}"
+        );
+    }
+}
+
+/// Regression test for #16711: the checkpoint's `PUT` lands but its response is
+/// lost, and the read that would confirm it fails too. The same writer's next
+/// attempt, after the head's store time has moved, succeeds.
+#[tokio::test]
+async fn headlog_checkpoint_retried_after_a_lost_response_succeeds() {
+    use object_store_sim::{Op, fault::Fault};
+    for backend in backends() {
+        let gated = log_with_clock(&backend).await;
+        let store: Arc<dyn ObjectStore> = Arc::clone(&gated) as Arc<dyn ObjectStore>;
+        let mut writer = Writer::take_over(store, backend.prefix.clone(), config(), 1)
+            .await
+            .expect("writer");
+        for _ in 0..8 {
+            append(&mut writer, Bytes::from_static(b"before the checkpoint")).await;
+        }
+        let at = *writer.state().head.batches.last().expect("sealed batch");
+        let checkpoint = backend
+            .prefix
+            .clone()
+            .join("checkpoints")
+            .join(format!("{at:020}"));
+        let path = checkpoint.clone();
+        gated.arm(Op::Create, move |p| p == &path, Fault::DropResponse);
+        let path = checkpoint.clone();
+        gated.arm(Op::Get, move |p| p == &path, Fault::Fail);
+        writer
+            .publish_checkpoint(at, Bytes::from_static(b"root"))
+            .await
+            .expect_err("the response was lost and the store could not be read");
+        backend
+            .store
+            .head(&checkpoint)
+            .await
+            .expect("the checkpoint landed");
+        gated.advance_clock(std::time::Duration::from_secs(5));
+        append(&mut writer, Bytes::from_static(b"moves the head's time")).await;
+        writer
+            .publish_checkpoint(at, Bytes::from_static(b"root"))
+            .await
+            .expect("the retry has the same bytes");
+        append(&mut writer, Bytes::from_static(b"publishes the floor")).await;
+        assert_eq!(writer.state().head.floor, at);
+    }
+}

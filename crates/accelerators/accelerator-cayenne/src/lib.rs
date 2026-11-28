@@ -1352,6 +1352,28 @@ fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
+/// The source `declared` describes, for app `app`: its `from`, the connection
+/// settings that identify it, and the source of each table it reads.
+fn source_definition(
+    app: &str,
+    declared: &runtime_acceleration::SourceDefinition,
+) -> cayenne::DatasetDefinition {
+    use secrecy::ExposeSecret;
+    let mut definition = cayenne::DatasetDefinition::new(app)
+        .with_setting("from", &declared.from)
+        .with_connection(declared.connection.iter().map(|setting| {
+            (
+                setting.name.as_str(),
+                setting.value.expose_secret(),
+                setting.secret,
+            )
+        }));
+    for (table, read) in &declared.reads {
+        definition = definition.with_read(table, &source_definition(app, read));
+    }
+    definition
+}
+
 /// Whether opening the dataset's stored table failed on a setting the table
 /// cannot change, which no retry with the same Spicepod can clear. The catalog
 /// error arrives wrapped by the table-provider build, so the whole chain is
@@ -1363,6 +1385,7 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
             Some(
                 cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable { .. }
                     | cayenne::CatalogError::PkConflictDetectionChangeHeld { .. }
+                    | cayenne::CatalogError::DefinitionChanged { .. }
             )
         )
     })
@@ -3015,6 +3038,44 @@ impl CayenneAccelerator {
         Ok(Some(builder))
     }
 
+    /// `source`'s definition: which source its rows come from, and the settings
+    /// that decide how its stored rows are keyed and partitioned, which cannot
+    /// change in place. `None` for a source no Spicepod defines. Every other
+    /// setting applies to the stored acceleration in place, as on one instance.
+    async fn dataset_definition(
+        source: &dyn AccelerationSource,
+        primary_keys: &[String],
+        on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+    ) -> Result<Option<cayenne::DatasetDefinition>> {
+        let declared = source
+            .definition()
+            .await
+            .map_err(|error| Error::InvalidConfiguration {
+                detail: Arc::from(format!(
+                    "Failed to load dataset '{}' (cayenne): its source settings could not be resolved. Cause: {error}",
+                    source.name()
+                )),
+            })?;
+        let Some(declared) = declared else {
+            return Ok(None);
+        };
+        let partition_by: Vec<String> = source
+            .acceleration()
+            .map(|acceleration| {
+                acceleration
+                    .partition_by
+                    .iter()
+                    .map(|partition| format!("{}\u{0}{}", partition.name, partition.expression))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(
+            source_definition(&source.app().name, &declared)
+                .with_key(primary_keys, on_conflict)
+                .with_list_setting("partition_by", &partition_by),
+        ))
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
@@ -3128,6 +3189,15 @@ impl CayenneAccelerator {
         } else if rebuild_held(acceleration) {
             vortex_config.settings_change =
                 cayenne::metadata::SettingsChangeAction::HoldUntilSourceReadable;
+        }
+
+        // A copy in the state location records the definition it was built from,
+        // and opens only for the same one (see `cayenne::DatasetDefinition`).
+        if !memory_mode && Self::vnext_enabled(source)? {
+            vortex_config.definition =
+                Self::dataset_definition(source, &primary_keys, on_conflict.as_ref())
+                    .await?
+                    .map(Arc::new);
         }
 
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
@@ -5627,6 +5697,13 @@ mod tests {
         assert!(rejects_stored_table(&wrapped(
             cayenne::CatalogError::PkConflictDetectionChangeHeld {
                 table_name: "checking".to_string(),
+            }
+        )));
+        assert!(rejects_stored_table(&wrapped(
+            cayenne::CatalogError::DefinitionChanged {
+                table_name: "checking".to_string(),
+                location: "s3://bucket/state".to_string(),
+                changes: "`pg_host` changed".to_string(),
             }
         )));
         assert!(!rejects_stored_table(&wrapped(

@@ -55,6 +55,10 @@ struct WriterLease {
     store: Arc<dyn object_store::ObjectStore>,
     /// The dataset the lease is for, named in its errors.
     dataset: Arc<str>,
+    /// Set while this instance's Spicepod defines the dataset differently from
+    /// its copy: the instance then never takes the lease, so it never becomes
+    /// the writer of a copy it does not serve.
+    declined: std::sync::atomic::AtomicBool,
 }
 
 /// What opening the catalog found, for the startup log.
@@ -362,6 +366,20 @@ pub(crate) fn took_over_message(dataset: &str, location: &str) -> String {
     )
 }
 
+/// Logged when a dataset's copy was last served by an app of another name. A
+/// renamed app keeps its copies: only the definition decides which copy it serves.
+pub(crate) fn app_changed_message(
+    dataset: &str,
+    previous_app: &str,
+    location: &str,
+    app: &str,
+) -> String {
+    format!(
+        "{} is shared with app '{previous_app}', which last used '{location}'. This Spicepod is app '{app}'; datasets whose definitions match keep their copies.",
+        subject(dataset)
+    )
+}
+
 /// The refusal a replica gives a change: another instance writes the dataset.
 pub(crate) fn replica_change_message(dataset: &str) -> String {
     format!(
@@ -376,6 +394,14 @@ mod commit_outcome_message_tests {
         fenced_message, handed_over_message, refused_change_message, took_over_message,
         unknown_outcome_message, unresolved_commit_message,
     };
+
+    #[test]
+    fn an_app_change_names_both_apps_and_the_location() {
+        assert_eq!(
+            super::app_changed_message("orders", "shop", "s3://bucket/state", "store"),
+            "Dataset 'orders' (cayenne) is shared with app 'shop', which last used 's3://bucket/state'. This Spicepod is app 'store'; datasets whose definitions match keep their copies."
+        );
+    }
 
     #[test]
     fn each_stop_names_the_dataset_what_happens_and_the_fix() {

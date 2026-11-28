@@ -123,11 +123,27 @@ steps:
   - start:
       patch:
         datasets: { t: { params: '${sources.replica.params}' } }
+    except: object-native
   - assert-log:
       contains: ['resuming from persisted GTID position']
+    except: object-native
   - query: SELECT * FROM t
     expect: { oracle: replica }
     eventually: 60s
+    except: object-native
   - query: SELECT COUNT(*) AS n FROM t
     expect: { rows: [['290']] }
     eventually: 30s
+    except: object-native
+  # In the object-native metastore a copy records which server it reads (#16246),
+  # and the replica is another server: the dataset fails, naming the setting,
+  # rather than resume the primary's copy, until a connector can tell a replica
+  # of the same data from another source.
+  - start:
+      ready: false
+      patch:
+        datasets: { t: { params: '${sources.replica.params}' } }
+    only: object-native
+  - assert-status: { dataset: t, status: Error, message-contains: "was built from a different definition (`mysql_" }
+    eventually: 60s
+    only: object-native

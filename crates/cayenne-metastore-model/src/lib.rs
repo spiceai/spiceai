@@ -10,6 +10,7 @@ mod concurrent;
 mod core;
 mod data_files;
 mod dataset_lifecycle;
+mod definitions;
 mod explorer;
 mod floors;
 mod index_runs;
@@ -349,6 +350,86 @@ pub fn runs() -> Vec<Run> {
             bound: 4,
             seed: Some(20_261_024),
             failure: "",
+        },
+        Run {
+            name: "definitions",
+            family: "definitions",
+            mode: "definitions",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "definitions-no-connection",
+            family: "definitions",
+            mode: "definitions-no-connection",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-app-name",
+            family: "definitions",
+            mode: "definitions-app-name",
+            bound: 0,
+            seed: None,
+            failure: "an instance fails only for a different definition",
+        },
+        Run {
+            name: "definitions-rebuild",
+            family: "definitions",
+            mode: "definitions-rebuild",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-no-check",
+            family: "definitions",
+            mode: "definitions-no-check",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-unrecorded",
+            family: "definitions",
+            mode: "definitions-unrecorded",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "definitions-no-recheck-after-acquire",
+            family: "definitions",
+            mode: "definitions-no-recheck-after-acquire",
+            bound: 0,
+            seed: None,
+            failure: "a copy's writer serves it",
+        },
+        Run {
+            name: "definitions-unrecorded-admits",
+            family: "definitions",
+            mode: "definitions-unrecorded-admits",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-reload-without-check",
+            family: "definitions",
+            mode: "definitions-reload-without-check",
+            bound: 0,
+            seed: None,
+            failure: "an instance reads only its own source's rows",
+        },
+        Run {
+            name: "definitions-failed-takes-lease",
+            family: "definitions",
+            mode: "definitions-failed-takes-lease",
+            bound: 0,
+            seed: None,
+            failure: "a copy's writer serves it",
         },
         Run {
             name: "source-positions",
@@ -3280,6 +3361,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         || run.seed.is_none()
             && match run.name {
                 "dataset-lifecycle"
+                | "definitions"
                 | "source-positions"
                 | "retention"
                 | "replicas"
@@ -3287,6 +3369,9 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 | "replicas-readers-source-404-only"
                 | "replicas-orphan-head-age"
                 | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
+                "definitions-unrecorded" => {
+                    name == "the other Spicepod's instance is refused the copy"
+                }
                 "commits-retry-expiry" => name == "unresolved past evidence horizon",
                 "replicas-eu-orphan-no-source-check" => {
                     name == "writer commits an upload the replica already deleted"
@@ -3511,6 +3596,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         ),
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
+        "definitions" => v.visit(definitions::Protocol::new(r.mode), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
@@ -3941,7 +4027,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 26, "{:?}", render.families);
+        assert_eq!(render.families.len(), 27, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

@@ -67,6 +67,7 @@ pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
 pub mod cte_materialization;
 pub mod dataset_storage;
+pub mod definition;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -134,6 +135,7 @@ pub use cte_materialization::{
     CTE_SCAN_NODE_NAME, CayenneCteMaterialization, CayenneCteMaterializationPlanner,
     MATERIALIZED_CTE_NODE_NAME,
 };
+pub use definition::DatasetDefinition;
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,

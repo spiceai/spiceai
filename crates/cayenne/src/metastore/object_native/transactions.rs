@@ -18,7 +18,10 @@ limitations under the License.
 
 use super::{
     Domain, invalid,
-    registry::{DROPPED, ObjectNativeCatalog, REGISTRY, TableDeletionHolds, delete_under},
+    registry::{
+        DROPPED, ObjectNativeCatalog, REGISTRY, TableDeletionHolds, delete_under,
+        registered_folders,
+    },
     replay_state,
     slot::HeldReservation,
 };
@@ -592,13 +595,12 @@ impl ObjectNativeCatalog {
         let cutoff =
             store_now - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
         let mut removed = 0;
-        let named: HashSet<String> = self
-            .registry
-            .positions_under(REGISTRY)
-            .await
-            .into_iter()
-            .filter_map(|(_, folder)| String::from_utf8(folder).ok())
-            .collect();
+        // An entry that does not decode fails the reclaim: its folders must never
+        // read as folders nothing names.
+        let mut named = HashSet::new();
+        for (dataset, entry) in self.registry.positions_under(REGISTRY).await {
+            named.extend(registered_folders(&dataset, &entry)?);
+        }
         let listed = self
             .store
             .list_with_delimiter(Some(&self.datasets))

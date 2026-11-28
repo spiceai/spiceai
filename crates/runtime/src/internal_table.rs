@@ -203,6 +203,11 @@ impl AccelerationSource for InternalAccelerationSource {
         None
     }
 
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        // No Spicepod defines an internal table: the runtime does.
+        Box::pin(std::future::ready(Ok(None)))
+    }
+
     fn allows_write(&self) -> bool {
         // The runtime writes these tables directly, so a scan must read its own writes.
         true

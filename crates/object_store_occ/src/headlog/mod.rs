@@ -158,7 +158,8 @@ pub struct Writer {
     sealed: Option<u64>,
     /// At most one batch copy runs beside the writer, off the acknowledgement.
     sealing: Option<(u64, tokio::task::JoinHandle<Result<()>>)>,
-    /// How long checkpoints keep an accepted attempt id, on the head's store time.
+    /// How long checkpoints keep an accepted attempt id, on the store time of
+    /// the batch each checkpoint ends at.
     attempt_horizon: std::time::Duration,
 }
 
@@ -247,8 +248,9 @@ impl Writer {
         })
     }
 
-    /// Keep accepted attempt ids in checkpoints for `horizon` of the head's
-    /// store time after the first checkpoint that lists them.
+    /// Keep accepted attempt ids in checkpoints for `horizon` of store time
+    /// after the first checkpoint that lists them, measured on the batch each
+    /// checkpoint ends at.
     pub fn set_attempt_horizon(&mut self, horizon: std::time::Duration) {
         self.attempt_horizon = horizon;
     }
@@ -666,7 +668,10 @@ impl Writer {
 
     /// Stage a caller checkpoint and evidence; the NEXT commit publishes its floor.
     /// Accepted attempt ids up to `at` are kept until they are older than the
-    /// attempt horizon, measured on the head's store time.
+    /// attempt horizon, measured on the store time of the batch that ends at
+    /// `at`. The checkpoint's bytes depend only on the log up to `at` and
+    /// `root`, so staging it again, by this writer or a later one, after one
+    /// that landed without being recorded, finds the same object.
     /// # Errors
     /// Returns an error for a non-boundary commit, a pending attempt, or storage failure.
     pub async fn publish_checkpoint(&mut self, at: u64, root: Bytes) -> Result<()> {
@@ -680,11 +685,24 @@ impl Writer {
         {
             return invalid("checkpoint must advance to a published batch boundary");
         }
-        // The head was last written at or after every commit up to `at`, so its
-        // store time bounds their acceptance from above.
+        // The time is the store time of the batch that ends at `at`. That batch
+        // was copied from a published head, so it was created after every commit
+        // up to `at` was accepted, and its time bounds their acceptance from
+        // above. It is created once and never rewritten, and nothing below
+        // collects a batch above the floor, so every attempt at `at`, by any
+        // writer, reads the same time and writes the same bytes: a checkpoint
+        // that landed without being recorded is then found equal, not refused.
+        let start = head
+            .batches
+            .iter()
+            .copied()
+            .take_while(|end| *end < at)
+            .last()
+            .unwrap_or(head.floor)
+            + 1;
         let now = u64::try_from(
             self.store
-                .head(&self.prefix.clone().join("head"))
+                .head(&numbered(&self.prefix, BATCHES, start))
                 .await?
                 .last_modified
                 .timestamp_millis(),

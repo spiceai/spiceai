@@ -780,6 +780,42 @@ fn build_mysql_opts(params: &Parameters) -> Result<Opts, String> {
     Ok(Opts::from(builder))
 }
 
+/// The server and database a dataset reads, named as the Spicepod names their
+/// discrete settings: `connection_string` overrides them, as for the connection.
+pub(crate) fn source_identity(params: &Parameters) -> Result<Vec<(String, String)>, String> {
+    let (host, port, db) = if let Some(connection_string) =
+        optional_string(params, "connection_string")
+    {
+        let opts = Opts::from_url(&connection_string)
+            .map_err(|e| format!("invalid `{}`: {e}", params.user_param("connection_string")))?;
+        (
+            opts.ip_or_hostname().to_string(),
+            opts.tcp_port(),
+            opts.db_name().map(str::to_string),
+        )
+    } else {
+        let port = match optional_string(params, "tcp_port") {
+            Some(raw) => raw.trim().parse::<u16>().map_err(|e| {
+                format!(
+                    "parameter `{}` must be a port number, got {raw:?}: {e}",
+                    params.user_param("tcp_port")
+                )
+            })?,
+            None => 3306,
+        };
+        (
+            optional_string(params, "host").unwrap_or_default(),
+            port,
+            optional_string(params, "db"),
+        )
+    };
+    Ok(vec![
+        (params.user_param("host").to_string(), host),
+        (params.user_param("tcp_port").to_string(), port.to_string()),
+        (params.user_param("db").to_string(), db.unwrap_or_default()),
+    ])
+}
+
 /// Same mapping as the read pool: `disabled` → no TLS; `preferred` → TLS with
 /// certificate/hostname verification disabled; `required` → verified TLS
 /// (against `sslrootcert` if provided, else system roots).
@@ -1221,5 +1257,42 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// The server and database identify the source, as discrete settings or a
+    /// connection string; credentials do not.
+    #[test]
+    fn source_identity_is_the_server_and_database() {
+        let discrete = super::source_identity(&params_with(&[
+            ("host", "db.internal"),
+            ("tcp_port", "3307"),
+            ("user", "reader"),
+            ("pass", "hunter2"),
+            ("db", "shop"),
+        ]))
+        .expect("resolves");
+        assert_eq!(
+            discrete,
+            vec![
+                ("mysql_host".to_string(), "db.internal".to_string()),
+                ("mysql_tcp_port".to_string(), "3307".to_string()),
+                ("mysql_db".to_string(), "shop".to_string()),
+            ]
+        );
+        let rotated = super::source_identity(&params_with(&[
+            ("host", "db.internal"),
+            ("tcp_port", "3307"),
+            ("user", "writer"),
+            ("pass", "correct horse"),
+            ("db", "shop"),
+        ]))
+        .expect("resolves");
+        assert_eq!(rotated, discrete);
+        let connection_string = super::source_identity(&params_with(&[(
+            "connection_string",
+            "mysql://reader:other@db.internal:3307/shop",
+        )]))
+        .expect("resolves");
+        assert_eq!(connection_string, discrete);
     }
 }

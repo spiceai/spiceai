@@ -162,6 +162,11 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         None
     }
 
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        // A table created by DDL has no Spicepod definition.
+        Box::pin(std::future::ready(Ok(None)))
+    }
+
     fn allows_write(&self) -> bool {
         // The point of the table is to be written by DML, so a scan of it must always
         // read its own writes.

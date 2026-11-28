@@ -33,7 +33,9 @@ pub mod testing;
 
 pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;
-pub use acceleration_source::AccelerationSource;
+pub use acceleration_source::{
+    AccelerationSource, ConnectionSetting, DefinitionFuture, SourceDefinition,
+};
 pub use cayenne_workload::{CayenneAccelerationDemand, CayenneWorkload};
 pub use engine::{CAYENNE_MIGRATION_DOCS, Engine, removed_engine_message};
 pub use schema_change::OnSchemaChange;

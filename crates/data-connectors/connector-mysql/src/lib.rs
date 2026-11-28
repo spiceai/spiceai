@@ -341,6 +341,15 @@ impl DataConnectorFactory for MySQLFactory {
         PARAMETERS
     }
 
+    /// The server and database, from `mysql_connection_string` or the discrete
+    /// settings, as the connection resolves them.
+    fn source_identity(
+        &self,
+        params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        replication::source_identity(params).map(Some)
+    }
+
     fn reserved_keywords(&self) -> &'static [&'static str] {
         RESERVED_KEYWORDS
     }

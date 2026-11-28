@@ -96,6 +96,14 @@ impl DataConnectorFactory for FileFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         LISTING_TABLE_PARAMETERS
     }
+
+    /// A file is identified by its path, in `from`; no setting picks another one.
+    fn source_identity(
+        &self,
+        _params: &runtime_parameters::Parameters,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        Ok(Some(Vec::new()))
+    }
 }
 
 #[async_trait]

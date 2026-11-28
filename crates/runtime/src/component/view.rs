@@ -152,6 +152,94 @@ impl View {
     }
 }
 
+/// How deep a view's definition follows views it reads. Views cannot read each
+/// other in a cycle, so this only bounds a misconfiguration.
+const MAX_VIEW_DEPTH: usize = 16;
+
+/// `view`'s source: the source of each dataset and view its SQL reads, so two
+/// views over different sources differ. The SQL itself shapes the rows of those
+/// sources, as `refresh_sql` does a dataset's, and applies in place.
+fn view_definition(
+    view: &View,
+    depth: usize,
+) -> futures::future::BoxFuture<
+    '_,
+    Result<runtime_acceleration::SourceDefinition, Box<dyn std::error::Error + Send + Sync>>,
+> {
+    Box::pin(async move {
+        let mut reads = Vec::new();
+        let names = read_table_names(&view.sql);
+        let datasets = if names.is_empty() {
+            Vec::new()
+        } else {
+            Arc::clone(&view.runtime).get_valid_datasets(&view.app, crate::LogErrors(false))
+        };
+        for name in names {
+            let read = if let Some(dataset) = datasets.iter().find(|ds| same_table(&ds.name, &name))
+            {
+                dataset.definition().await?
+            } else if let Some(spec) = view
+                .app
+                .views
+                .iter()
+                .find(|spec| same_table(&TableReference::from(spec.name.as_str()), &name))
+                && depth < MAX_VIEW_DEPTH
+            {
+                let builder = super::view::ViewBuilder::try_from(spec.clone())
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+                let read = View::new(
+                    builder.build(),
+                    Arc::clone(&view.runtime),
+                    Arc::clone(&view.app),
+                );
+                Some(view_definition(&read, depth + 1).await?)
+            } else {
+                // A table the Spicepod does not define (a catalog's): its name.
+                None
+            };
+            reads.push((
+                name.to_string(),
+                read.unwrap_or_else(|| runtime_acceleration::SourceDefinition {
+                    from: name.to_string(),
+                    ..Default::default()
+                }),
+            ));
+        }
+        reads.sort_by(|a, b| a.0.cmp(&b.0));
+        reads.dedup_by(|a, b| a.0 == b.0);
+        Ok(runtime_acceleration::SourceDefinition {
+            from: String::new(),
+            connection: Vec::new(),
+            reads,
+        })
+    })
+}
+
+/// The tables `sql` reads, or none when it does not parse (the view then fails
+/// to register on its own).
+/// Whether `a` and `b` name one table: a reference the SQL qualifies
+/// (`spice.public.orders`, `public.orders`) names the dataset the Spicepod calls
+/// `orders`, as the query planner resolves it.
+fn same_table(a: &TableReference, b: &TableReference) -> bool {
+    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+    a.clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        == b.clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+fn read_table_names(sql: &str) -> Vec<TableReference> {
+    use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+    match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+        Ok(statements) if statements.len() == 1 => {
+            statements.front().map_or_else(Vec::new, |statement| {
+                runtime_datafusion::dependent_tables::get_dependent_table_names(statement)
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl AccelerationSource for View {
     fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
         Arc::new(self.clone()) as Arc<dyn AccelerationSource>
@@ -196,6 +284,10 @@ impl AccelerationSource for View {
         // rejects every refresh mode except `full`, which is the fallback a `None`
         // resolves to.
         None
+    }
+
+    fn definition(&self) -> runtime_acceleration::DefinitionFuture<'_> {
+        Box::pin(async move { view_definition(self, 0).await.map(Some) })
     }
 
     fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
@@ -309,5 +401,49 @@ mod tests {
             message.contains("WARN forged"),
             "the name is still reported in full, only escaped: {message:?}"
         );
+    }
+
+    /// The definition of a view over `sql`, in an app whose dataset `orders` reads `from`.
+    async fn view_definition_over(sql: &str, from: &str) -> runtime_acceleration::SourceDefinition {
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: recent_orders\nsql: {sql:?}\n")).expect("yaml parses");
+        let app = std::sync::Arc::new(
+            app::AppBuilder::new("view_definition_test")
+                .with_dataset(spicepod::component::dataset::Dataset::new(from, "orders"))
+                .with_view(view.clone())
+                .build(),
+        );
+        let runtime = std::sync::Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::App::clone(&app))
+                .build()
+                .await,
+        );
+        let spec = ViewBuilder::try_from(view).expect("view builds").build();
+        super::view_definition(&super::View::new(spec, runtime, app), 0)
+            .await
+            .expect("the view's definition resolves")
+    }
+
+    /// A view that names its dataset by a qualified reference reads that dataset, so its
+    /// definition carries the dataset's source: two views over datasets of different sources
+    /// are different definitions however the SQL spells the name.
+    #[tokio::test]
+    async fn a_qualified_reference_resolves_to_the_dataset_it_names() {
+        for sql in [
+            "SELECT * FROM orders",
+            "SELECT * FROM public.orders",
+            "SELECT * FROM spice.public.orders",
+        ] {
+            for from in ["s3://bucket-a/orders/", "s3://bucket-b/orders/"] {
+                let definition = view_definition_over(sql, from).await;
+                let froms = definition
+                    .reads
+                    .iter()
+                    .map(|(_, read)| read.from.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(froms, vec![from], "`{sql}` must read the dataset `orders`");
+            }
+        }
     }
 }
