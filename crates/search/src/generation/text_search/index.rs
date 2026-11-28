@@ -512,7 +512,7 @@ impl FullTextDatabaseIndex {
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            self.reader.searcher(),
+            self.reader.clone(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -1010,7 +1010,7 @@ mod tests {
 
     use super::*;
     use arrow::{
-        array::{Array, StringArray, record_batch},
+        array::{Array, Int32Array, StringArray, record_batch},
         util::pretty::pretty_format_batches,
     };
     use arrow_schema::{ArrowError, Schema};
@@ -2250,6 +2250,118 @@ mod tests {
         );
     }
 
+    async fn ids_from_field_index(
+        idx: &FullTextSearchFieldIndex,
+        query: impl Into<String>,
+    ) -> Vec<i32> {
+        let rb: Vec<RecordBatch> = idx
+            .search(query.into(), vec![], 1000)
+            .expect("Failed to search")
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        let mut ids = Vec::new();
+        for batch in &rb {
+            let column = batch
+                .column_by_name("id")
+                .expect("search results include the primary key `id`")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("`id` is Int32");
+            ids.extend(column.iter().flatten());
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A [`FullTextSearchFieldIndex`] built before a replacing refresh must search the
+    /// index as it is after that refresh. Regression test for #15392: the field index
+    /// used to hold a `tantivy::Searcher` taken at construction (query planning), so a
+    /// reused instance — including a cached `text_search` plan — kept returning dropped
+    /// rows and missing new ones.
+    async fn assert_reused_field_index_sees_refresh(directory: Option<PathBuf>) {
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            directory,
+            &["content".to_string()],
+            false,
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        write_window(
+            &index,
+            WriteWindow::ReplaceAll,
+            batch(&[1, 2, 3, 4], &["apple", "banana", "cherry", "durian"]),
+        )
+        .await;
+
+        // Built once, before the second refresh — the cached-plan case.
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        assert_eq!(
+            ids_from_field_index(&search_index, "banana").await,
+            vec![2],
+            "the first refresh indexes banana as id 2"
+        );
+        assert_eq!(
+            ids_from_field_index(&search_index, "cherry").await,
+            vec![3],
+            "the first refresh indexes cherry as id 3"
+        );
+
+        // Delete id 2, change id 3 cherry -> walrus, insert id 5 zephyrine.
+        write_window(
+            &index,
+            WriteWindow::ReplaceAll,
+            batch(&[1, 3, 4, 5], &["apple", "walrus", "durian", "zephyrine"]),
+        )
+        .await;
+
+        assert_eq!(
+            ids_from_field_index(&search_index, "banana").await,
+            Vec::<i32>::new(),
+            "the reused field index must not return the deleted banana row"
+        );
+        assert_eq!(
+            ids_from_field_index(&search_index, "walrus").await,
+            vec![3],
+            "the reused field index must see the updated walrus row"
+        );
+        assert_eq!(
+            ids_from_field_index(&search_index, "zephyrine").await,
+            vec![5],
+            "the reused field index must see the inserted zephyrine row"
+        );
+
+        // A newly built field index is the reworded-query case: planning runs again.
+        let fresh = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        assert_eq!(
+            ids_from_field_index(&fresh, "banana").await,
+            Vec::<i32>::new(),
+            "a newly built field index must also not return the deleted banana row"
+        );
+        assert_eq!(ids_from_field_index(&fresh, "walrus").await, vec![3]);
+        assert_eq!(ids_from_field_index(&fresh, "zephyrine").await, vec![5]);
+    }
+
+    #[tokio::test]
+    async fn reused_field_index_sees_refresh_for_memory_index() {
+        assert_reused_field_index_sees_refresh(None).await;
+    }
+
+    #[tokio::test]
+    async fn reused_field_index_sees_refresh_for_file_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_reused_field_index_sees_refresh(Some(dir.path().to_path_buf())).await;
+    }
+
     /// The clear must be scoped to a replacing window. An append adds rows and says nothing
     /// about the ones it omits, so wiping on `Append` would delete live rows' documents —
     /// which is also why `InsertOp::Replace` (an upsert) maps to `WriteWindow::Append`.
@@ -2314,8 +2426,7 @@ mod tests {
             .await
             .expect("on_write_complete failed");
 
-        // A `FullTextSearchFieldIndex` snapshots the searcher when it is built, so the
-        // post-commit revision needs a freshly built one.
+        // Each search takes a searcher at the latest commit, so the clear is now visible.
         {
             let search_index = index
                 .full_text_search_field_index("content")
