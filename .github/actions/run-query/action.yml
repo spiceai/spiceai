@@ -38,10 +38,20 @@ runs:
     - name: Run query
       shell: bash
       id: query
+      env:
+        INPUT_QUERY: ${{ inputs.query }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
-        query="${{ inputs.query }}"
+        query="${INPUT_QUERY}"
         echo "Executing query: $query"
-        sql_output=$(spice sql <<EOF
+        # Query the runtime at the ports `allocate-spice-ports` exported for this job,
+        # or at spiced's defaults when the job allocated none. `spice sql` queries over
+        # Flight; SPICE_FLIGHT_ENDPOINT is a bare host:port.
+        endpoint_args=(sql)
+        if [[ -n "${SPICE_HTTP_ENDPOINT:-}" && -n "${SPICE_FLIGHT_ENDPOINT:-}" ]]; then
+          endpoint_args=(--http-endpoint "${SPICE_HTTP_ENDPOINT}" sql --endpoint "grpc://${SPICE_FLIGHT_ENDPOINT}")
+        fi
+        sql_output=$(spice "${endpoint_args[@]}" <<EOF
         $query
         .error
         EOF
@@ -53,7 +63,7 @@ runs:
 
         if [[ $sql_output != *"No previous error recorded"* ]]; then
           echo "Query failed to execute."
-          fail_on_error="${{ inputs.fail-on-error }}"
+          fail_on_error="${INPUT_FAIL_ON_ERROR}"
           if [[ "$fail_on_error" == "true" || "$fail_on_error" == "1" ]]; then
             exit 1
           fi

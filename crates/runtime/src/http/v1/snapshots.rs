@@ -35,8 +35,6 @@ use tokio::sync::RwLock;
 use crate::Runtime;
 use crate::component::dataset::snapshot_source::SnapshotSource;
 
-use super::require_write_access;
-
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
 
 #[cfg(feature = "snapshots")]
@@ -276,9 +274,6 @@ pub async fn set_current_snapshot(
 ) -> Response {
     if let Some(resp) = snapshots_feature_response() {
         return resp;
-    }
-    if let Some(response) = require_write_access().await {
-        return response;
     }
 
     let app_lock = tokio::select! {

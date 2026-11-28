@@ -1,0 +1,5 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/decimal_comparison_float_constant.rs
+expression: mysql
+---
+SELECT * FROM `m` WHERE ((`m`.`disc` > ((9223372036854775807 + 1) * 1E-19)) AND (`m`.`disc` < 0.030000000000000))

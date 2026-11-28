@@ -14,6 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/// The credential params of a Bedrock model or embedding under test: the access key pair in
+/// `AWS_BEDROCK_KEY` and `AWS_BEDROCK_SECRET` (with `AWS_BEDROCK_SESSION_TOKEN` for temporary
+/// credentials, such as those from an SSO login or an assumed role), or none when
+/// `AWS_BEDROCK_KEY` is unset, so that `spiced` resolves credentials through the AWS credential
+/// chain, as it does on EKS (IRSA, Pod Identity) or with `AWS_ROLE_ARN` and
+/// `AWS_WEB_IDENTITY_TOKEN_FILE`.
+#[cfg(feature = "bedrock")]
+fn bedrock_credential_params() -> Vec<(&'static str, &'static str)> {
+    if std::env::var_os("AWS_BEDROCK_KEY").is_none() {
+        return Vec::new();
+    }
+    let mut params = vec![
+        ("aws_access_key_id", "${env:AWS_BEDROCK_KEY}"),
+        ("aws_secret_access_key", "${env:AWS_BEDROCK_SECRET}"),
+    ];
+    if std::env::var_os("AWS_BEDROCK_SESSION_TOKEN").is_some() {
+        params.push(("aws_session_token", "${env:AWS_BEDROCK_SESSION_TOKEN}"));
+    }
+    params
+}
+
 #[cfg(feature = "bedrock")]
 pub(crate) mod embeddings {
     use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
@@ -121,14 +142,9 @@ pub(crate) mod embeddings {
     }
 
     fn with_auth(mut params: HashMap<String, Value>) -> HashMap<String, Value> {
-        params.insert(
-            "aws_access_key_id".to_string(),
-            Value::String("${env:AWS_BEDROCK_KEY}".to_string()),
-        );
-        params.insert(
-            "aws_secret_access_key".to_string(),
-            Value::String("${env:AWS_BEDROCK_SECRET}".to_string()),
-        );
+        for (key, value) in super::bedrock_credential_params() {
+            params.insert(key.to_string(), Value::String(value.to_string()));
+        }
         params
     }
 
@@ -456,25 +472,13 @@ pub(crate) mod chat {
 
     const MODEL_NAME: &str = "nova-lite";
 
-    fn create_nova_lite_model() -> Model {
-        let mut model = Model::new("bedrock:us.amazon.nova-lite-v1:0", MODEL_NAME);
+    pub(crate) fn create_nova_lite_model(name: &str) -> Model {
+        let mut model = Model::new("bedrock:us.amazon.nova-lite-v1:0", name);
         model
             .params
             .insert("aws_region".to_string(), "us-east-1".into());
-        model.params.insert(
-            "aws_access_key_id".to_string(),
-            "${env:AWS_BEDROCK_KEY}".into(),
-        );
-        model.params.insert(
-            "aws_secret_access_key".to_string(),
-            "${env:AWS_BEDROCK_SECRET}".into(),
-        );
-        // Temporary credentials, such as those from an SSO login, carry a session token.
-        if std::env::var_os("AWS_BEDROCK_SESSION_TOKEN").is_some() {
-            model.params.insert(
-                "aws_session_token".to_string(),
-                "${env:AWS_BEDROCK_SESSION_TOKEN}".into(),
-            );
+        for (key, value) in super::bedrock_credential_params() {
+            model.params.insert(key.to_string(), value.into());
         }
         model
     }
@@ -511,14 +515,16 @@ pub(crate) mod chat {
         let _tracing = init_tracing(None);
         test_request_context()
             .scope(async {
-                for secret in ["AWS_BEDROCK_KEY", "AWS_BEDROCK_SECRET"] {
-                    verify_env_secret_exists(secret)
-                        .await
-                        .unwrap_or_else(|e| panic!("{e}"));
+                if std::env::var_os("AWS_BEDROCK_KEY").is_some() {
+                    for secret in ["AWS_BEDROCK_KEY", "AWS_BEDROCK_SECRET"] {
+                        verify_env_secret_exists(secret)
+                            .await
+                            .unwrap_or_else(|e| panic!("{e}"));
+                    }
                 }
 
                 let app = AppBuilder::new("bedrock_ai_if")
-                    .with_model(create_nova_lite_model())
+                    .with_model(create_nova_lite_model(MODEL_NAME))
                     .build();
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
                 tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())

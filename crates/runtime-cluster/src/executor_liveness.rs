@@ -32,7 +32,7 @@ use crate::cluster_state::ClusterStateStore;
 
 /// How long a view outlives the scheduler that wrote it before a reader
 /// deletes it.
-const VIEW_RETENTION: Duration = Duration::from_hours(1);
+pub(crate) const VIEW_RETENTION: Duration = Duration::from_hours(1);
 
 /// One scheduler's published view.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

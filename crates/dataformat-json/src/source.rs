@@ -61,6 +61,7 @@ pub struct SpiceJsonOpener {
     json_pointer: Option<String>,
     unnest_struct: Option<String>,
     soda_metadata: bool,
+    source: Option<crate::limits::SourceLabel>,
 }
 
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
@@ -72,6 +73,7 @@ pub struct SpiceJsonSource {
     json_pointer: Option<String>,
     unnest_struct: Option<String>,
     soda_metadata: bool,
+    source: Option<crate::limits::SourceLabel>,
     table_schema: TableSchema,
     projection: SplitProjection,
 }
@@ -88,9 +90,17 @@ impl SpiceJsonSource {
             json_pointer: None,
             unnest_struct: None,
             soda_metadata: false,
+            source: None,
             table_schema,
             projection,
         }
+    }
+
+    /// The dataset and connector a refused file names and links.
+    #[must_use]
+    pub fn with_source(mut self, source: Option<crate::limits::SourceLabel>) -> Self {
+        self.source = source;
+        self
     }
 
     #[must_use]
@@ -145,6 +155,7 @@ impl FileSource for SpiceJsonSource {
             json_pointer: self.json_pointer.clone(),
             unnest_struct: self.unnest_struct.clone(),
             soda_metadata: self.soda_metadata,
+            source: self.source.clone(),
         });
 
         ProjectionOpener::try_new(self.projection.clone(), opener, file_schema)
@@ -216,7 +227,6 @@ impl FileOpener for SpiceJsonOpener {
     /// are applied to determine which lines to read:
     /// 1. The first line of the partition is the line in which the index of the first character >= `start`.
     /// 2. The last line of the partition is the line in which the byte at position `end - 1` resides.
-    #[expect(clippy::too_many_lines)]
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
         let base_flattened_schema = Arc::clone(&self.base_flattened_schema);
@@ -244,6 +254,7 @@ impl FileOpener for SpiceJsonOpener {
         let json_pointer = self.json_pointer.clone();
         let unnest_struct_separator = self.unnest_struct.clone();
         let soda_metadata = self.soda_metadata;
+        let source = self.source.clone();
         let file_range = partitioned_file.range.clone();
 
         tracing::trace!(
@@ -277,20 +288,28 @@ impl FileOpener for SpiceJsonOpener {
             match result.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(mut file, _) => {
+                    // A compressed file is refused as a compression bomb once it expands
+                    // past what real data in its codec compresses to.
+                    let location = &partitioned_file.object_meta.location;
                     let bytes = if file_range.is_none() {
-                        file_compression_type.convert_read(file)?
+                        crate::limits::decoder(file_compression_type, file)?
                     } else {
                         file.seek(SeekFrom::Start(result.range.start as _))?;
                         let limit = result.range.end - result.range.start;
-                        file_compression_type.convert_read(file.take(limit as u64))?
+                        crate::limits::decoder(file_compression_type, file.take(limit as u64))?
                     };
 
                     // Buffer the content for SODA auto-detection when Auto
                     let mut raw_buf = Vec::new();
                     let mut bytes = bytes;
-                    bytes
-                        .read_to_end(&mut raw_buf)
-                        .map_err(DataFusionError::from)?;
+                    bytes.read_to_end(&mut raw_buf).map_err(|e| {
+                        crate::limits::locate_refusal(
+                            "JSON",
+                            location,
+                            source.as_ref(),
+                            DataFusionError::from(e),
+                        )
+                    })?;
 
                     // Check SODA on raw data before json_pointer extraction.
                     let is_soda = format == Format::Soda
@@ -403,7 +422,13 @@ impl FileOpener for SpiceJsonOpener {
                         )
                     {
                         let s = s.map_err(DataFusionError::from);
-                        let decompressed = file_compression_type.convert_stream(s.boxed())?;
+                        let decompressed = crate::limits::decoded_stream(
+                            file_compression_type,
+                            s.boxed(),
+                            "JSON",
+                            &partitioned_file.object_meta.location,
+                            source.as_ref(),
+                        )?;
                         let chunks: Vec<bytes::Bytes> = decompressed.try_collect().await?;
 
                         let total_len: usize = chunks.iter().map(bytes::Bytes::len).sum();
@@ -517,7 +542,14 @@ impl FileOpener for SpiceJsonOpener {
                         let decoder = ReaderBuilder::new(Arc::clone(&projected_schema))
                             .with_batch_size(batch_size)
                             .build_decoder()?;
-                        let input = file_compression_type.convert_stream(s.boxed())?.fuse();
+                        let input = crate::limits::decoded_stream(
+                            file_compression_type,
+                            s.boxed(),
+                            "JSON",
+                            &partitioned_file.object_meta.location,
+                            source.as_ref(),
+                        )?
+                        .fuse();
 
                         Ok(deserialize_stream(
                             input,

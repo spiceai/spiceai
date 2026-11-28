@@ -53,7 +53,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
         ds.acceleration.as_ref().is_some_and(|accel| {
             matches!(accel.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                 && accel.enabled
-                && matches!(accel.engine_name(), "sqlite" | "duckdb" | "cayenne")
+                && accel.engine_name() == "cayenne"
         })
     }) {
         return Ok(());
@@ -194,7 +194,7 @@ async fn run_inner(
     // A layout run's answers are checked by `--validate` against the unaccelerated
     // oracle, and its plans legitimately differ from the default layout's (index
     // lookups, sorts), so it records no result or explain-plan snapshots.
-    let benchmark_test = if args.layout.is_some() {
+    let benchmark_test = if args.layout.is_some() || !args.snapshots {
         benchmark_test
     } else {
         benchmark_test
@@ -356,19 +356,7 @@ const IGNORED_SNAPSHOT_RESULT_QUERIES: &[(&str, &[&str])] = {
     &[
         // This scenario has refresh_sql with limit - which makes these queries non-deterministic
         (
-            "s3[parquet]-arrow-partitioned",
-            &[
-                "clickbench_q2",
-                "clickbench_q5",
-                "clickbench_q6",
-                "clickbench_q21",
-                "clickbench_q26",
-                "clickbench_q30",
-            ],
-        ),
-        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
-        (
-            "s3[parquet]-postgres",
+            "s3[parquet]-cayenne[file]-partitioned",
             &[
                 "clickbench_q2",
                 "clickbench_q5",
@@ -600,9 +588,8 @@ mod tests {
     #[test]
     fn float_source_scenarios_round_their_float_columns() {
         for scenario in [
-            "dynamodb-arrow",
             "dynamodb-federated",
-            "dynamodb-duckdb[file]",
+            "dynamodb-cayenne[file]",
             "dynamodb-scylladb-alternator-federated",
             "glue[csv]-federated",
             "iceberg[hadoop]-federated",
@@ -616,7 +603,7 @@ mod tests {
         }
         // The deny-list still wins over rounding.
         assert_eq!(
-            snapshot_predicate("dynamodb-arrow", "tpcds_q77"),
+            snapshot_predicate("dynamodb-cayenne[file]", "tpcds_q77"),
             SnapshotMode::Skip
         );
     }
@@ -629,8 +616,8 @@ mod tests {
             "glue[parquet]-federated",
             "glue[catalog]-federated",
             "iceberg[catalog]-federated",
-            "iceberg-duckdb[file]",
-            "s3[parquet]-duckdb[file]",
+            "iceberg-cayenne[file]",
+            "s3[parquet]-cayenne[file]",
         ] {
             assert_eq!(
                 snapshot_predicate(scenario, "tpch_q1"),

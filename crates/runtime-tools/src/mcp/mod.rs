@@ -22,12 +22,13 @@ limitations under the License.
 
 pub mod catalog;
 pub mod factory;
+mod http_client;
 pub mod server;
 pub mod tool;
 
 pub use catalog::attach_mcp_schema_snapshot;
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
@@ -37,7 +38,12 @@ use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid MCP directive 'from: mcp:{}'", id))]
+    /// A URL directive is shown without its credentials; the message is logged and kept as
+    /// the tool's status.
+    #[snafu(display(
+        "Invalid MCP directive 'from: mcp:{}'",
+        redact::redact_url_credentials(id)
+    ))]
     InvalidMCPDirective { id: String },
 
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
@@ -60,6 +66,18 @@ pub enum Error {
         source
     ))]
     UnderlyingInitilizationError { source: McpError },
+}
+
+impl Error {
+    /// Returns `true` when the error is a mistake in the tool's Spicepod configuration, which
+    /// no retry can clear.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -85,6 +103,34 @@ pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
     format!("{TOOL_USE_PREFIX}{exposed_name}")
 }
 
+/// Longest wait for an MCP server to finish its handshake. Model loading waits for tools, so a
+/// server that never answers must not hold it forever. A stdio server started through
+/// `npx`/`uvx` may download its package first, so this allows more than a request.
+pub const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Longest wait for a `tools/list` or `ping` answer.
+pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest wait for one `tools/call`. Tools do real work, so this is longer than
+/// [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled server cannot hold a caller forever.
+pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// Largest MCP response, in bytes, Spice accepts from an MCP server over
+/// Streamable HTTP, and the largest serialized tool result it passes on.
+///
+/// A JSON body is capped as a whole. A POST that comes back as SSE is capped
+/// as a whole too: progress notifications and the final result count together,
+/// so that stream is rejected even when every individual event is under the
+/// limit. A GET SSE stream keeps rmcp's per-event cap, set to this same value.
+/// 16 MiB is rmcp's own default event limit, and it is far above real tool
+/// output: a whole 1M-token model context is about 4 MiB of text.
+///
+/// The bound exists because one tool result is copied several times on its
+/// way to the caller (decoded, re-serialized, captured to task history, and
+/// written to the HTTP response or model context), so its size multiplies
+/// into peak memory.
+const MAX_TOOL_RESULT_SIZE: usize = crate::utils::MAX_TOOL_RESULT_BYTES;
+
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP
 /// connector's `http_headers`. If the value contains `;`, only `;` separates
@@ -105,10 +151,19 @@ impl FromStr for MCPType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match serde_json::from_str(format!("\"{s}\"").as_str()) {
-            Ok(mcp_type) => Ok(mcp_type),
-            Err(_) => Err(Error::InvalidMCPDirective { id: s.to_string() }),
+        let invalid = || Error::InvalidMCPDirective { id: s.to_string() };
+        let mcp_type: Self =
+            serde_json::from_str(format!("\"{s}\"").as_str()).map_err(|_| invalid())?;
+        // A Spicepod dependency's tool whose target starts no program is loaded
+        // without trust (`spicepod::host_program`). Such a target that is not a
+        // valid URL is refused here, never run as a command, so the trust check
+        // holds.
+        if matches!(mcp_type, Self::Stdio(_))
+            && spicepod::host_program::mcp_target_starts_no_program(s)
+        {
+            return Err(invalid());
         }
+        Ok(mcp_type)
     }
 }
 
@@ -213,6 +268,67 @@ fn parse_custom_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dependency gate (`spicepod::host_program`) and this parser decide
+    /// the same thing about a `from: mcp:<target>` tool. A target the gate
+    /// admits from an untrusted dependency because it starts no program is
+    /// connected to over HTTP or refused, and never started as a program: an
+    /// HTTP-looking target that is not a valid URL is refused, not run.
+    #[test]
+    fn a_tool_the_dependency_gate_admits_as_remote_never_starts_a_program() {
+        use spicepod::component::tool::Tool;
+        use spicepod::host_program::{ComponentRef, host_program};
+
+        // (target, whether the gate sees a program, how the runtime connects:
+        // "stdio", "http", or `None` for a refused directive)
+        let cases: &[(&str, bool, Option<&str>)] = &[
+            ("docker", true, Some("stdio")),
+            ("./bin/server", true, Some("stdio")),
+            ("https://mcp.example.com/mcp", false, Some("http")),
+            ("HTTPS://mcp.example.com/mcp", false, Some("http")),
+            (" https://mcp.example.com/mcp", false, Some("http")),
+            ("http://localhost:3000/mcp", false, Some("http")),
+            ("https://exa mple.com/mcp", false, None),
+            ("https://%zz/server", false, None),
+            ("http://[::1/mcp", false, None),
+            ("https://", false, None),
+            ("", false, None),
+            ("   ", false, None),
+        ];
+        for &(target, gate_sees_program, connects) in cases {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "from": format!("mcp:{target}"),
+                "name": "t",
+            }))
+            .expect("a tool");
+            assert_eq!(
+                host_program(ComponentRef::Tool(&tool)).is_some(),
+                gate_sees_program,
+                "the gate's decision for 'mcp:{target}'"
+            );
+            let parsed = match MCPType::from_str(target) {
+                Ok(MCPType::Stdio(_)) => Some("stdio"),
+                Ok(MCPType::StreamableHttp(_)) => Some("http"),
+                Err(_) => None,
+            };
+            assert_eq!(
+                parsed, connects,
+                "how the runtime connects to 'mcp:{target}'"
+            );
+        }
+    }
+
+    /// A directive that does not parse is named without the credentials its URL carries.
+    #[test]
+    fn invalid_directive_message_leaves_out_url_credentials() {
+        let error = MCPType::from_str(r#"https://alice:pa"ss@tools.example.com/sse?token=abc123"#)
+            .err()
+            .expect("a quote does not parse");
+        assert_eq!(
+            error.to_string(),
+            "Invalid MCP directive 'from: mcp:https://tools.example.com/sse?token=***'"
+        );
+    }
 
     #[test]
     fn mcp_type_parses_stdio_command() {

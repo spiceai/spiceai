@@ -109,6 +109,10 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.initialization()
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
+    }
+
     fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
@@ -159,6 +163,10 @@ impl DataConnector for DrasiConnector {
 
     fn supports_changes_stream(&self) -> bool {
         self.inner_connector.supports_changes_stream()
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
     }
 
     async fn changes_stream(

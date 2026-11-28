@@ -37,6 +37,7 @@ use serde_json::{Map, Value};
 use snafu::Snafu;
 
 mod check;
+pub mod conformance;
 pub mod openai;
 
 pub use check::{check_answers, is_probability, probability_sum_tolerance};
@@ -52,6 +53,13 @@ pub enum Error {
         model: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// The reply stopped at the model's output token limit. The same request stops there
+    /// again, so this is not worth a retry.
+    #[snafu(display(
+        "Evaluation model '{model}' failed: the reply was cut off at the model's output token limit before every question was answered. Raise the model's maximum output tokens, or ask fewer questions per request"
+    ))]
+    ReplyTruncated { model: String },
 
     #[snafu(display("Evaluation model '{model}' returned an unparseable response: {response}"))]
     UnparseableResponse { model: String, response: String },
@@ -106,6 +114,11 @@ impl Error {
             Self::HealthCheckFailed { .. } => "Evaluation health check failed".to_string(),
             Self::ModelCallFailed { model, .. } => {
                 format!("Evaluation of model '{model}' failed: provider call failed")
+            }
+            Self::ReplyTruncated { model } => {
+                format!(
+                    "Evaluation of model '{model}' failed: reply cut off at the output token limit"
+                )
             }
             Self::UnparseableResponse { model, .. } => {
                 format!("Evaluation of model '{model}' failed: unparseable response")

@@ -28,6 +28,11 @@ limitations under the License.
 //! first; under plain `cargo test` that call fails the test before it changes
 //! anything its neighbours would see.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 #[macro_use]
 mod common;
 #[path = "correctness/support/mod.rs"]
@@ -42,6 +47,8 @@ mod catalog_concurrency_test;
 mod catalog_selector_test;
 mod cdc_compaction_delete_race_test;
 mod checkpoint_write_sizing_test;
+mod cold_planning_cost_test;
+mod cold_promotion_warm_only_test;
 mod cold_tier_pruning_test;
 mod cold_tier_statistics_test;
 mod cold_tier_test;
@@ -50,8 +57,10 @@ mod column_stats_test;
 mod commit_overwrite_atomicity_test;
 mod cross_partition_overwrite_test;
 mod cte_materialization_query_test;
+mod data_file_lifecycle_test;
 mod data_inlining_test;
 mod datafusion_dynamic_filter_backports_test;
+mod datalake_merge_protected_snapshot_test;
 mod deletion_mode_harness;
 mod deletion_strategy_detection_test;
 mod deletion_strategy_test;
@@ -65,6 +74,8 @@ mod file_pruning_test;
 mod file_scan_statistics_source_test;
 mod filtered_delete_scan_test;
 mod fixed_offset_timezone_test;
+mod fixture_lock_test;
+mod fixture_pairing_test;
 mod float_nan_predicate_test;
 mod float_zero_predicate_test;
 mod fold_listing_cache_test;
@@ -93,7 +104,9 @@ mod maintained_aggregate_serve_soundness_test;
 mod max_column_count_test;
 mod mem_tier_budget_fallback_upsert_test;
 mod mem_tier_budget_sharded_release_test;
+mod mem_tier_durable_atomicity_test;
 mod mem_tier_overwrite_retention_test;
+mod mem_tier_seal_restart_test;
 mod memory_accounting_test;
 mod memory_mode_cdc_delete_test;
 mod memory_mode_dml_semantics_test;
@@ -102,16 +115,29 @@ mod mutation_model_test;
 mod mutation_property_test;
 mod mutation_roundtrip_test;
 mod null_equal_join_dynamic_filter_test;
+mod object_native_commit_fault_test;
+mod object_native_data_test;
+mod object_native_local_location_test;
+mod object_native_log_collection_test;
+mod object_native_mem_tier_publication_test;
+mod object_native_replica_test;
+mod object_native_source_replay_test;
+mod object_native_transaction_test;
+mod object_native_writer_lease_test;
+mod object_store_reclaim_test;
 mod on_conflict_edge_cases_test;
 mod on_conflict_test;
 mod orphan_dv_compaction_test;
+mod orphan_sweep_test;
 mod overwrite_concurrent_scan_atomicity_test;
 mod overwrite_resurrection_test;
 mod p1_subset_path_test;
 mod partition_chunking_test;
 mod partition_pruning_test;
 mod partitioned_overlay_test;
+mod per_dataset_store_test;
 mod position_based_deletion_test;
+mod position_delete_inline_test;
 mod position_mode_reclaim_test;
 mod position_mode_upsert_test;
 mod predicate_delete_ram_tier_rows;
@@ -125,10 +151,12 @@ mod result_correctness_standalone_engines_test;
 mod result_correctness_vs_duckdb_test;
 mod result_correctness_vs_sqlite_test;
 mod retention_test;
+mod rustfs_store_conformance_test;
 mod scalar_function_pushdown_test;
 mod scan_view_retention_test;
 mod selective_join_pk_probe_test;
 mod shared_metastore_concurrency_test;
+mod similar_to_semantics_test;
 mod small_file_compaction_position_mode_test;
 mod small_files_compaction_test;
 mod snapshot_cleanup_convergence_test;
@@ -139,8 +167,7 @@ mod staged_append_test;
 mod stats_edge_cases_test;
 mod string_bounds_statistics_test;
 mod timestamp_unit_roundtrip_test;
-#[cfg(feature = "turso")]
-mod turso_0_7_2_open_compat_test;
+mod uncommitted_file_adoption_test;
 mod update_test;
 mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;

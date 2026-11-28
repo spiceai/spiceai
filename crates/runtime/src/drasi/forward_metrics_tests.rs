@@ -46,8 +46,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::QUEUED_SINK_POLICY;
-use super::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore};
-use super::queue::{DeliveryQueue, QueuedBatch, now_ms};
+use runtime_drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore};
+use runtime_drasi::queue::{DeliveryQueue, QueuedBatch, now_ms};
 
 const COMPONENT: &str = "runtime.task_history";
 const ALLOWED_LABELS: &[&str] = &[LABEL_COMPONENT, LABEL_TRANSPORT, LABEL_OUTCOME];

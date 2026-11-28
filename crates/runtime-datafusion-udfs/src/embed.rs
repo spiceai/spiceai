@@ -246,15 +246,17 @@ impl ScalarUDFImpl for Embed {
             return exec_err!("{EMBED_UDF_NAME} cannot read model_store");
         };
 
-        let Some(model) = model_store.get(model_name) else {
+        let Some(model) = model_store.get(model_name).cloned() else {
             return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}");
         };
+        // Released before embedding, so a model load or reload does not wait on the provider.
+        drop(model_store);
 
         match text_arg {
             // An array representing multiple rows
             ColumnarValue::Array(arr) => {
                 let ColumnarValue::Array(embeddings) =
-                    Self::embed_multiple(&**model, string_array_iter!(arr))?
+                    Self::embed_multiple(&*model, string_array_iter!(arr))?
                 else {
                     unreachable!(
                         "{EMBED_UDF_NAME}: embed_multiple must return ColumnarValue::Array by contract"
@@ -271,28 +273,28 @@ impl ScalarUDFImpl for Embed {
             // A single text value
             ColumnarValue::Scalar(
                 ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
-            ) => Self::embed_single(&**model, text),
+            ) => Self::embed_single(&*model, text),
             // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
                 if arr.is_empty() {
                     return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
                 }
                 let inner_array = arr.value(0);
-                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&*model, string_array_iter!(&inner_array))
             }
             unsupported_text_arg @ ColumnarValue::Scalar(_) => {
                 exec_err!("Unsupported text argument: {unsupported_text_arg}")
@@ -342,21 +344,22 @@ mod tests {
     fn create_fake_model_store() -> Arc<RwLock<EmbeddingModelStore>> {
         use std::collections::HashMap;
 
+        // Loading is async; these tests call the UDF synchronously, as a query does.
+        let model = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to load the model on")
+            .block_on(Model2Vec::load(
+                "potion_2m",
+                "minishlab/potion-base-2M",
+                llms::hf::HubParams::default(),
+                llms::model2vec::Model2VecOptions::default(),
+            ))
+            .expect("Model2Vec creation should succeed");
         let mut store = HashMap::new();
         store.insert(
             "potion_2m".to_string(),
-            Arc::new(
-                Model2Vec::from_params(
-                    "minishlab/potion-base-2M",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .expect("Model2Vec creation should succeed"),
-            ) as Arc<dyn llms::embeddings::Embed>,
+            Arc::new(model) as Arc<dyn llms::embeddings::Embed>,
         );
         Arc::new(RwLock::new(store))
     }

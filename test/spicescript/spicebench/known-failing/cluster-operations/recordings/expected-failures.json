@@ -1,0 +1,12 @@
+{
+  "cayenne-catalog-recreate": [
+    {
+      "run": "cayenne-catalog-recreate",
+      "who": "default",
+      "key": "start: {}",
+      "kind": "other",
+      "signature": "spiced exited; see <path>",
+      "group": "cluster-operations"
+    }
+  ]
+}

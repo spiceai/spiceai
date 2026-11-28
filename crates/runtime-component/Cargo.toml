@@ -11,7 +11,6 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
-clap.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 opentelemetry.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
@@ -22,12 +21,19 @@ fundu = { workspace = true }
 globset.workspace = true
 logos.workspace = true
 key-index = { path = "../key-index" }
+redact = { path = "../redact" }
 runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-config = { path = "../runtime-config" }
 serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 util = { path = "../util" }
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
+yaml = { path = "../yaml" }
 
 [lints]
 workspace = true

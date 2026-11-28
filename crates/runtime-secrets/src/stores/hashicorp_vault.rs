@@ -287,7 +287,7 @@ impl std::str::FromStr for KvVersion {
         match raw {
             "v1" => Ok(Self::V1),
             "v2" => Ok(Self::V2),
-            other => Err(format!("must be one of: v1, v2. Found {other}.")),
+            _ => Err("must be one of: v1, v2.".to_string()),
         }
     }
 }
@@ -319,9 +319,7 @@ impl std::str::FromStr for AuthMethod {
             "approle" => Ok(Self::AppRole),
             "kubernetes" => Ok(Self::Kubernetes),
             "jwt" => Ok(Self::Jwt),
-            other => Err(format!(
-                "must be one of: token, approle, kubernetes, jwt. Found {other}."
-            )),
+            _ => Err("must be one of: token, approle, kubernetes, jwt.".to_string()),
         }
     }
 }
@@ -1017,7 +1015,7 @@ fn build_base_url(address: &str) -> Result<String> {
         reason: "missing host; expected something like `https://vault.example.com:8200`"
             .to_string(),
     })?;
-    if scheme == "http" && !is_loopback_host(host) {
+    if scheme == "http" && !util::net::is_loopback_host(host) {
         return InvalidAddressSnafu {
             address: raw.to_string(),
             reason: "plaintext http:// is only allowed for localhost / 127.0.0.1; use https \
@@ -1055,10 +1053,6 @@ fn build_base_url(address: &str) -> Result<String> {
     }
     let authority = &parsed[url::Position::BeforeScheme..url::Position::AfterPort];
     Ok(format!("{authority}/v1/"))
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 fn validate_auth_params(config: &HashicorpVaultConfig) -> Result<()> {

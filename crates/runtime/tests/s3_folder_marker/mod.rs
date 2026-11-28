@@ -338,8 +338,7 @@ async fn a_folder_marker_at_the_table_location_is_not_scanned() -> Result<(), an
                 assert_reads_only_the_data_objects(&rt).await
             }
             .await;
-            container.remove().await?;
-            result
+            container.remove_after(result).await
         })
         .await
 }

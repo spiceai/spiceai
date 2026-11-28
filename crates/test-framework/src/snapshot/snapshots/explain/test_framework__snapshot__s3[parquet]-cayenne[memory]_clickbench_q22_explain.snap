@@ -1,0 +1,25 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q22"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                |
+|               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS c                                                                              |
+|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), count(Int64(1))]]                                                             |
+|               |       Filter: hits.SearchPhrase != LargeUtf8("") AND hits.URL LIKE LargeUtf8("%google%")                                                          |
+|               |         TableScan: hits projection=[URL, SearchPhrase], partial_filters=[hits.SearchPhrase != LargeUtf8(""), hits.URL LIKE LargeUtf8("%google%")] |
+| physical_plan | SortPreservingMergeExec: [c@2 DESC], fetch=10                                                                                                     |
+|               |   ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), count(Int64(1))@2 as c]                                 |
+|               |     SortExec: TopK(fetch=10), expr=[count(Int64(1))@2 DESC], preserve_partitioning=[true]                                                         |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                           |
+|               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                             |
+|               |           AggregateExec: mode=Partial, gby=[SearchPhrase@1 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                |
+|               |             SchemaCastScanExec                                                                                                                    |
+|               |               CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                                                   |
+|               |                 FilterExec: SearchPhrase@1 !=  AND URL@0 LIKE %google%                                                                            |
+|               |                   BytesProcessedExec                                                                                                              |
+|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                   |
+|               |                                                                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

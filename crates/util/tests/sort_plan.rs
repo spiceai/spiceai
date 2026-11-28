@@ -18,6 +18,10 @@ limitations under the License.
 //! of them would order them, whatever shape of order its partitions arrive in
 //! and however many of them it sorts at once.
 #![cfg(feature = "datafusion")]
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
 
 use std::sync::Arc;
 
@@ -214,11 +218,13 @@ async fn single_partition_sorts_without_a_merge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_input_yields_no_rows() {
-    assert!(sort(&[], 100, &["k"]).await.is_empty());
-    assert!(
-        sort(&[Vec::new(), Vec::new()], 100, &["k"])
-            .await
-            .is_empty()
+    assert_eq!(
+        sort(&[], 100, &["k"]).await,
+        [] as [(Option<i64>, String); 0]
+    );
+    assert_eq!(
+        sort(&[Vec::new(), Vec::new()], 100, &["k"]).await,
+        [] as [(Option<i64>, String); 0]
     );
 }
 

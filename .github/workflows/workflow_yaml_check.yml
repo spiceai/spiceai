@@ -18,6 +18,20 @@ on:
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
       - '.github/scripts/test_codeql_workflow.py'
+      - '.github/scripts/docker_pull.sh'
+      - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mc_cp.sh'
+      - '.github/scripts/test_mc_cp.py'
+      - '.github/scripts/cached_fetch.sh'
+      - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
+      - '.github/ci-cache/**'
+      - 'rust-toolchain.toml'
+      - '.github/scripts/mssql_tpch_restore.sh'
+      - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   push:
     branches:
       - trunk
@@ -28,14 +42,32 @@ on:
       - '.github/scripts/check_workflow_yaml.py'
       - '.github/scripts/test_check_workflow_yaml.py'
       - '.github/scripts/test_codeql_workflow.py'
+      - '.github/scripts/docker_pull.sh'
+      - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mc_cp.sh'
+      - '.github/scripts/test_mc_cp.py'
+      - '.github/scripts/cached_fetch.sh'
+      - '.github/scripts/test_cached_fetch.py'
+      - '.github/scripts/check_ci_cache_pins.py'
+      - '.github/scripts/test_check_ci_cache_pins.py'
+      - '.github/ci-cache/**'
+      - 'rust-toolchain.toml'
+      - '.github/scripts/mssql_tpch_restore.sh'
+      - '.github/scripts/test_mssql_tpch_restore.py'
+      - '.github/scripts/extract_snapshot_archives.py'
+      - '.github/scripts/test_extract_snapshot_archives.py'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   check-workflow-yaml:
+    environment: secret-free
     name: Validate GitHub Actions definitions
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.
@@ -54,7 +86,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -65,9 +97,20 @@ jobs:
         run: |
           python .github/scripts/test_check_workflow_yaml.py -v
           python .github/scripts/test_codeql_workflow.py -v
+          python .github/scripts/test_docker_pull.py -v
+          python .github/scripts/test_mc_cp.py -v
+          python .github/scripts/test_cached_fetch.py -v
+          python .github/scripts/test_check_ci_cache_pins.py -v
+          python .github/scripts/test_mssql_tpch_restore.py -v
+          python .github/scripts/test_extract_snapshot_archives.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py
+
+      # A toolchain bump without its pin would quietly send every runner back to
+      # static.rust-lang.org; see .github/ci-cache/README.md.
+      - name: Check the CI cache pins
+        run: python .github/scripts/check_ci_cache_pins.py
 
       # `check_workflow_yaml.py` above encodes the failures this repository has
       # actually been bitten by, cell by cell, each one added after an incident.
@@ -113,4 +156,28 @@ jobs:
           # linters, which grade the contents of `run:` blocks. That is a separate
           # backlog with its own findings here; this gate is about whether GitHub
           # can schedule the definition at all. Enabling them is tracked in #14222.
+          actionlint -color -shellcheck= -pyflakes=
+
+      - name: Lint same-repository action calls (actionlint, `$/` read as `./`)
+        run: |
+          set -euo pipefail
+          # actionlint does not parse `uses: $/…` and skips those steps (see
+          # `.github/actionlint.yaml`). `$/` and `./` name the same action file, so
+          # linting a copy with `./` keeps the check of each call's `with:`
+          # against that action's inputs. actionlint finds the project by its Git
+          # root, so the copy is a repository of its own. Every `$/.github/` is
+          # rewritten, not only one right after `uses: `, so a quoted value, a
+          # quoted key, a flow-style step or a folded value can't keep its `$/`
+          # and skip the check. The copy is only linted, so rewriting the same
+          # text in a comment or a script changes nothing.
+          copy="$(mktemp -d)"
+          cp -R .github "$copy/"
+          git -C "$copy" init --quiet
+          find "$copy/.github" -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            -exec sed -i -E 's#\$/\.github/#./.github/#g' {} +
+          if grep -rqF '$/.github/' "$copy/.github"; then
+            echo "::error::A \`uses: \$/\` call was left in the copy, so its inputs would go unchecked."
+            exit 1
+          fi
+          cd "$copy"
           actionlint -color -shellcheck= -pyflakes=

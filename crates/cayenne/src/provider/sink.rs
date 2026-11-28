@@ -156,6 +156,25 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        let rows = self.write_all_uncommitted(data, context).await?;
+        // A write that returns has been acknowledged to its caller, so every
+        // metastore change it made must be committed first.
+        crate::catalog::commit_at_acknowledgement_for(
+            self.table.catalog().as_ref(),
+            self.table.table_id(),
+        )
+        .await
+        .map_err(|source| datafusion_common::DataFusionError::External(Box::new(source)))?;
+        Ok(rows)
+    }
+}
+
+impl CayenneDataSink {
+    async fn write_all_uncommitted(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<u64> {
         self.table
             .ensure_publication_outcome_known()
             .map_err(datafusion_common::DataFusionError::from)?;
@@ -215,7 +234,11 @@ impl DataSink for CayenneDataSink {
             // repeated keys are resolved before validation sees them (an APPEND's
             // validation then supersedes the resident rows its keys meet, as the
             // appended segment's own tombstones; an OVERWRITE replaces the tier).
-            let write_guard = self.table.write_lock().lock().await;
+            let write_guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock().lock().await)
+            };
             let mut raw = normalized;
             while let Some(batch) = raw.next().await {
                 let batch = batch?;
@@ -322,6 +345,12 @@ impl DataSink for CayenneDataSink {
                 .into_empty_table()
                 .write(normalized, write_guard)
                 .await?;
+            // The append published the load without feeding the maintained
+            // aggregates, which marks them stale; rebuild them from the rows it
+            // wrote before the load returns, so the queries that follow it are
+            // served from maintained state. The write lock is released, so CDC
+            // changes after the load are held as deltas, not lost.
+            self.table.rebuild_stale_maintained_aggregates().await;
             // A load too large for an exact keyset cached a filter of the keys it
             // wrote (`first_load_pk`), which this finds and keeps. Otherwise warm
             // the index the next refresh validates against now, rather than on
@@ -361,8 +390,11 @@ impl DataSink for CayenneDataSink {
                 .map_err(Into::into)
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
-            // that assume the caller already holds the write lock.
-            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            // that assume the caller already holds the write lock. When
+            // autocommit UPDATE already holds it, `acquire_or_share` must not
+            // take it again (the mutex is not reentrant).
+            let write_guard =
+                super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await;
             self.write_all_append(normalized, context, write_guard)
                 .await
                 .map_err(Into::into)
@@ -559,7 +591,11 @@ impl CayenneDataSink {
                     futures::stream::iter(segment.into_iter().map(Ok)),
                 ));
             let segment_start = std::time::Instant::now();
-            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            // Autocommit UPDATE holds `write_lock` across rematerialize +
+            // delete + insert. A second acquire deadlocks after the delete
+            // has already committed. `acquire_or_share` reuses that hold.
+            let write_guard =
+                super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await;
             let lock_wait_ms = segment_start.elapsed().as_millis();
             let segment_rows = self
                 .write_all_append(segment_stream, context, write_guard)
@@ -599,6 +635,12 @@ impl CayenneDataSink {
     /// says it would be taken.
     async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if !self.table.takes_first_load() {
+            return None;
+        }
+        // Autocommit UPDATE already holds `write_lock` across rematerialize +
+        // delete + insert. A second acquire deadlocks. First-load is an empty-
+        // table optimization; an UPDATE insert is not that path.
+        if super::write_lock_held::is_held() {
             return None;
         }
         let write_guard = self.table.write_lock_arc().lock_owned().await;

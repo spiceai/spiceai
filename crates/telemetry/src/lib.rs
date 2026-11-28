@@ -2218,8 +2218,9 @@ pub mod cayenne {
     static MAINTENANCE_OUTCOME: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Counts one non-compaction maintenance attempt and how it ended.
-    /// `dimensions` carries `table`, `op` (`orphan_dv_sweep` / `retention` /
-    /// `retired_dir_sweep`), and the same `outcome` grammar as
+    /// `dimensions` carries `table`, `op` (`orphan_dv_sweep` /
+    /// `orphan_file_sweep` / `retention` / `retired_dir_sweep`), and the same
+    /// `outcome` grammar as
     /// [`track_compaction_outcome`].
     ///
     /// Split from the compaction family so neither carries a label the other
@@ -2235,7 +2236,7 @@ pub mod cayenne {
         operational_meter()
             .u64_counter("cayenne_maintenance_outcome_total")
             .with_description(
-                "Cayenne non-compaction maintenance passes (deletion-vector sweep, retention, retired-directory sweep) by operation and outcome.",
+                "Cayenne non-compaction maintenance passes (deletion-vector sweep, orphan sweep, retention, retired-directory sweep) by operation and outcome.",
             )
             .with_unit("passes")
             .build()
@@ -2489,10 +2490,6 @@ pub mod cayenne {
     /// `tier` label (`current` / `protected` / `cold` / `delete_vector` /
     /// `inline`) splits files, bytes, and rows so the growth can be attributed
     /// to the layer producing it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one gauge family emitted per tier; splitting it would separate the label vocabulary from the values it labels"
-    )]
     pub fn track_table_storage(storage: &CayenneTableStorage, dimensions: &[KeyValue]) {
         let files = STORAGE_FILES.get_or_init(|| {
             operational_meter()

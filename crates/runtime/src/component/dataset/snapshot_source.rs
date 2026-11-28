@@ -41,7 +41,7 @@ use spicepod::acceleration::{
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::component::snapshot::{BootstrapOnFailureBehavior, Snapshots};
-use spicepod::param::{ParamValue, Params};
+use spicepod::param::Params;
 use url::Url;
 
 use super::{InvalidConfigurationSnafu, Result};
@@ -265,35 +265,11 @@ impl SnapshotSource {
             );
         }
 
-        if engine != Engine::Cayenne
-            && let Some(param) = acceleration.params.as_ref().and_then(|params| {
-                CAYENNE_PATH_PARAMS
-                    .iter()
-                    .find(|param| params.data.contains_key(**param))
-            })
-        {
-            return InvalidConfigurationSnafu {
-                config_key: "acceleration.params",
-                message: format!(
-                    "Dataset '{name}' reads snapshots from '{}' that were created with the '{engine}' engine, so `acceleration.params.{param}`, which sets where a Cayenne copy is kept, does not apply. Remove `acceleration.params.{param}`. See: {SNAPSHOT_SOURCE_DOCS}",
-                    self.location
-                ),
-            }
-            .fail();
-        }
-
         acceleration.enabled = true;
         acceleration.engine = Some(engine.to_string());
         acceleration.mode = Mode::File;
         acceleration.refresh_mode = Some(RefreshMode::Snapshot);
         acceleration.snapshots = SnapshotBehavior::BootstrapOnly;
-
-        let params = acceleration.params.get_or_insert_with(Params::default);
-        for (param, path) in local_copy_params(dataset, &self.location, engine) {
-            params
-                .data
-                .insert(param.to_string(), ParamValue::String(path));
-        }
 
         Ok(acceleration)
     }
@@ -397,69 +373,15 @@ impl SnapshotSource {
     }
 }
 
-/// The accelerator params that choose where a dataset's data lives on disk. Where a
-/// snapshot dataset keeps its local copy is Spice's choice; see [`local_copy_params`].
-/// [`CAYENNE_PATH_PARAMS`] are allowed: a Cayenne copy is per dataset, not per
-/// location, wherever it lives.
+/// The accelerator params that choose where a dataset's data lives on disk, which a
+/// snapshot dataset may not set. `cayenne_file_path` and `cayenne_metadata_dir` are
+/// allowed: a Cayenne copy is per dataset, not per location, wherever it lives.
 const LOCAL_COPY_PARAMS: &[&str] = &[
     "duckdb_file",
     "duckdb_data_dir",
     "sqlite_file",
-    "turso_file",
     "cayenne_s3_zone_ids",
 ];
-
-/// Where a Cayenne snapshot dataset keeps its copy, when it chooses. Rejected once the
-/// snapshots turn out to be another engine's.
-const CAYENNE_PATH_PARAMS: &[&str] = &["cayenne_file_path", "cayenne_metadata_dir"];
-
-/// Where a snapshot dataset keeps its local copy, for the engines that keep one file
-/// per dataset: under `.spice/data`, in a file named for the dataset and the location it
-/// reads.
-///
-/// Scoping the file to the location keeps a dataset pointed at another location from
-/// reopening the previous location's copy, which `DuckDB` would otherwise serve from the
-/// database it caches, by path, for the life of the process. It also keeps `DuckDB` and
-/// `SQLite` from putting every dataset into their shared default file, where restoring
-/// one dataset's snapshot would replace the others'.
-///
-/// Cayenne keeps its own layout: one catalog per process, in the shared metadata
-/// directory, and a data directory per dataset, both under `.spice/data` unless the
-/// dataset sets them. A snapshot dataset never serves a copy it did not restore in this
-/// process, whatever the engine; see `DataFusion::create_accelerated_table`.
-fn local_copy_params(
-    dataset: &TableReference,
-    location: &str,
-    engine: Engine,
-) -> Vec<(&'static str, String)> {
-    let path = |suffix: &str| {
-        std::path::Path::new(&data_accelerator_api::spice_data_base_path())
-            .join(format!(
-                "{}-{}.{suffix}",
-                file_stem(dataset),
-                &location_hash(location)[..12]
-            ))
-            .to_string_lossy()
-            .into_owned()
-    };
-    match engine {
-        Engine::DuckDB => vec![("duckdb_file", path("duckdb"))],
-        Engine::Sqlite => vec![("sqlite_file", path("sqlite"))],
-        Engine::Turso => vec![("turso_file", path("turso"))],
-        _ => Vec::new(),
-    }
-}
-
-/// FNV-1a of `location` as the registry keys it: a hash that does not change between
-/// builds of Spice, so a local copy keeps its name across upgrades.
-fn location_hash(location: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in registry_location(location).bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
 
 /// The engines this process has found snapshot sources were created with, keyed by
 /// dataset and location, so building a dataset — which cannot wait on the network —
@@ -529,21 +451,6 @@ impl Resolution {
 /// `location` as the registry keys it: a trailing `/` names the same prefix.
 fn registry_location(location: &str) -> String {
     location.trim_end_matches('/').to_string()
-}
-
-/// A file name for `dataset`'s local copy of its snapshot.
-fn file_stem(dataset: &TableReference) -> String {
-    dataset
-        .to_string()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn backticked(values: &[&str]) -> String {
@@ -630,6 +537,19 @@ pub(crate) fn unavailable_engine_cause(location: &str, engine: &str) -> String {
     )
 }
 
+/// The error for a snapshot dataset whose snapshots were created with `engine`, an
+/// acceleration engine removed in v2.5: no build of Spice can load them.
+pub(crate) fn removed_engine_snapshot_message(
+    dataset: &TableReference,
+    location: &str,
+    engine: &str,
+) -> String {
+    format!(
+        "Failed to load dataset '{dataset}' from its snapshots, so it cannot be queried: the snapshots at '{location}' were created with the '{engine}' engine, and {}",
+        runtime_acceleration::removed_engine_message(engine)
+    )
+}
+
 /// The line reporting which engine a snapshot dataset loads its snapshots into.
 pub(crate) fn resolved_message(dataset: &TableReference, location: &str, engine: Engine) -> String {
     format!(
@@ -640,6 +560,7 @@ pub(crate) fn resolved_message(dataset: &TableReference, location: &str, engine:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spicepod::param::ParamValue;
 
     use object_store::Error as ObjectStoreError;
     use spicepod::component::dataset::Dataset as SpicepodDataset;
@@ -812,60 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn the_local_copy_is_named_for_the_dataset_and_the_location_it_reads() {
-        let dataset = TableReference::partial("sales", "modules");
-        let source = source(&snapshot_dataset());
-        let path_of = |source: &SnapshotSource, engine: Engine, param: &str| {
-            source
-                .acceleration(&dataset, engine)
-                .expect("the acceleration is completed")
-                .params
-                .as_ref()
-                .and_then(|params| params.data.get(param))
-                .map(ParamValue::as_string)
-                .expect("Spice sets where the local copy goes")
-        };
-
-        let stem = format!(
-            "sales.modules-{}",
-            &location_hash("s3://bucket-b/snapshots/")[..12]
-        );
-        for (engine, param, suffix) in [
-            (Engine::DuckDB, "duckdb_file", "duckdb"),
-            (Engine::Sqlite, "sqlite_file", "sqlite"),
-            (Engine::Turso, "turso_file", "turso"),
-        ] {
-            let path = path_of(&source, engine, param);
-            assert!(
-                path.ends_with(&format!("{stem}.{suffix}")),
-                "unexpected {param} for {engine}: {path}"
-            );
-            assert!(path.contains(".spice"), "{path}");
-        }
-
-        let elsewhere = self::source(&dataset_at("s3://bucket-a/snapshots/"));
-        assert_ne!(
-            path_of(&source, Engine::DuckDB, "duckdb_file"),
-            path_of(&elsewhere, Engine::DuckDB, "duckdb_file"),
-            "another location never reuses this location's copy"
-        );
-        assert_eq!(
-            path_of(&source, Engine::DuckDB, "duckdb_file"),
-            path_of(
-                &self::source(&dataset_at("s3://bucket-b/snapshots")),
-                Engine::DuckDB,
-                "duckdb_file"
-            ),
-            "a trailing slash names the same location, and so the same copy"
-        );
-        assert_eq!(
-            location_hash("s3://bucket-b/snapshots/"),
-            "f2f9bec74bce392a",
-            "the hash must not change between builds, or every copy is downloaded again"
-        );
-    }
-
-    #[test]
     fn a_path_for_the_local_copy_cannot_be_set() {
         for param in LOCAL_COPY_PARAMS {
             let mut declared = snapshot_dataset();
@@ -886,22 +753,22 @@ mod tests {
         let mut tuned = snapshot_dataset();
         tuned.acceleration = Some(spicepod_acceleration::Acceleration {
             params: Some(Params::from_string_map(HashMap::from([(
-                "duckdb_memory_limit".to_string(),
-                "2GB".to_string(),
+                "busy_timeout".to_string(),
+                "5000".to_string(),
             )]))),
             ..Default::default()
         });
         let acceleration = source(&tuned)
-            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
             .expect("engine tuning params are kept");
         assert_eq!(
             acceleration
                 .params
                 .as_ref()
-                .and_then(|params| params.data.get("duckdb_memory_limit"))
+                .and_then(|params| params.data.get("busy_timeout"))
                 .map(ParamValue::as_string)
                 .as_deref(),
-            Some("2GB")
+            Some("5000")
         );
     }
 
@@ -939,40 +806,33 @@ mod tests {
             param("cayenne_metadata_dir").as_deref(),
             Some("/data/metadata/")
         );
-
-        let message = source(&declared)
-            .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
-            .expect_err("Cayenne paths do not apply to DuckDB snapshots")
-            .to_string();
-        assert!(
-            message.contains("Remove `acceleration.params.cayenne_"),
-            "{message}"
-        );
     }
 
     #[test]
     fn an_engine_the_snapshots_were_not_created_with_is_rejected() {
         let mut declared = snapshot_dataset();
         declared.acceleration = Some(spicepod_acceleration::Acceleration {
-            engine: Some("duckdb".to_string()),
+            engine: Some("arrow".to_string()),
             ..Default::default()
         });
-        let source = source(&declared);
-
-        let message = source
+        let message = source(&declared)
             .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
             .expect_err("the configured engine differs")
             .to_string();
         assert_eq!(
             message,
             format!(
-                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'duckdb'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Invalid configuration for 'acceleration.engine': Dataset 'modules' reads snapshots from 's3://bucket-b/snapshots/' that were created with the 'cayenne' engine, but `acceleration.engine` is 'arrow'. Remove `acceleration.engine`, which a snapshot dataset takes from its snapshots. See: {SNAPSHOT_SOURCE_DOCS}"
             )
         );
 
+        declared.acceleration = Some(spicepod_acceleration::Acceleration {
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        });
         assert!(
-            source
-                .acceleration(&TableReference::bare("modules"), Engine::DuckDB)
+            source(&declared)
+                .acceleration(&TableReference::bare("modules"), Engine::Cayenne)
                 .is_ok(),
             "the engine the snapshots were created with is accepted"
         );
@@ -1110,9 +970,9 @@ mod tests {
         let registry = Arc::new(SnapshotSourceRegistry::default());
         let modules = TableReference::bare("modules");
         let orders = TableReference::bare("orders");
-        registry.record(&modules, "s3://bucket/a/", Engine::DuckDB);
+        registry.record(&modules, "s3://bucket/a/", Engine::Cayenne);
         registry.record(&modules, "s3://bucket/b/", Engine::Cayenne);
-        registry.record(&orders, "s3://bucket/a/", Engine::Sqlite);
+        registry.record(&orders, "s3://bucket/a/", Engine::Cayenne);
         let resolution = registry.begin_resolution(&modules);
 
         registry.forget(&modules);
@@ -1122,7 +982,7 @@ mod tests {
         assert!(resolution.is_superseded(), "an in-flight resolution stops");
         assert_eq!(
             registry.engine(&orders, "s3://bucket/a/"),
-            Some(Engine::Sqlite),
+            Some(Engine::Cayenne),
             "other datasets are kept"
         );
     }
@@ -1180,11 +1040,16 @@ mod tests {
         assert_eq!(
             cannot_load_snapshot_message(
                 &dataset,
-                &unavailable_engine_cause("s3://bucket-b/snapshots/", "turso")
+                &unavailable_engine_cause("s3://bucket-b/snapshots/", "duckdb")
             ),
             format!(
-                "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'turso' engine, which this build of Spice does not include. Run a build that includes 'turso'. See: {SNAPSHOT_SOURCE_DOCS}"
+                "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'duckdb' engine, which this build of Spice does not include. Run a build that includes 'duckdb'. See: {SNAPSHOT_SOURCE_DOCS}"
             )
+        );
+
+        assert_eq!(
+            removed_engine_snapshot_message(&dataset, "s3://bucket-b/snapshots/", "turso"),
+            "Failed to load dataset 'modules' from its snapshots, so it cannot be queried: the snapshots at 's3://bucket-b/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
         );
     }
 }

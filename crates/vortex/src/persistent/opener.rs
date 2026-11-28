@@ -41,12 +41,15 @@ use tracing::Instrument;
 use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::expr::Expression;
-use vortex::array::expr::forms::conjuncts;
+use vortex::array::expr::col;
+use vortex::array::expr::pack;
 use vortex::array::expr::root;
-use vortex::array::expr::transform::replace_root_fields;
+use vortex::array::scalar_fn::fns::binary::Binary;
+use vortex::array::scalar_fn::fns::operators::Operator as VortexOperator;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::FieldMask;
+use vortex::dtype::Nullability;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
@@ -73,6 +76,8 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::can_cache_footer_after_open;
 use crate::persistent::deferred_projection::DeferredProjectionReader;
 use crate::persistent::key_blocks;
 use crate::persistent::reader::VortexReaderFactory;
@@ -282,14 +287,15 @@ impl FileOpener for VortexOpener {
                 .with_metrics_registry(Arc::clone(&metrics_registry))
                 .with_labels(labels);
 
-            if let Some(segment_cache) = segment_cache {
+            if let Some(segment_cache) = segment_cache.as_ref() {
                 open_opts = open_opts.with_segment_cache(segment_cache.for_path(
                     Arc::clone(&object_store_url),
                     file.object_meta.location.clone(),
                 ));
             }
 
-            if let Some(file_metadata_cache) = file_metadata_cache
+            let mut footer_cached = false;
+            if let Some(file_metadata_cache) = file_metadata_cache.as_ref()
                 && let Some(entry) = file_metadata_cache.get(file.path())
                 && entry.is_valid_for(&file.object_meta)
                 && let Some(vortex_metadata) = entry
@@ -298,12 +304,38 @@ impl FileOpener for VortexOpener {
                     .downcast_ref::<CachedVortexMetadata>()
             {
                 open_opts = open_opts.with_footer(vortex_metadata.footer().clone());
+                footer_cached = true;
             }
 
             let vxf = open_opts
                 .open_read(reader)
                 .await
                 .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
+
+            // Keep the footer this open just read, under the listing's own
+            // metadata, so the next open of the same file (another split of
+            // this scan, or a later query) skips the footer read. A file whose
+            // listing carries the recorded size and epoch mtime (see
+            // `synthetic_object_meta`) is only ever rewritten under a new
+            // path, so the size-and-mtime validity check cannot serve a stale
+            // footer; a listing with real store mtimes invalidates on change.
+            // Vortex puts complete segments covered by the initial read into a
+            // supplied segment cache before returning from `open_read`, so a
+            // cached footer can reuse those bytes. Without a segment cache,
+            // preserve the uncached open when its initial read also supplies
+            // row data that a footer-only cache entry would leave out.
+            if !footer_cached
+                && let Some(file_metadata_cache) = file_metadata_cache.as_ref()
+                && (segment_cache.is_some()
+                    || can_cache_footer_after_open(vxf.footer(), file.object_meta.size))
+            {
+                cache_footer(
+                    file_metadata_cache,
+                    file.object_meta.clone(),
+                    Arc::new(CachedVortexMetadata::new(&vxf)),
+                    "open",
+                );
+            }
 
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss
@@ -337,6 +369,7 @@ impl FileOpener for VortexOpener {
             let ProcessedProjection {
                 scan_projection,
                 leftover_projection,
+                pushed_down: projection_pushdown,
             } = if projection_pushdown {
                 expr_convertor.split_projection(
                     projection.clone(),
@@ -621,9 +654,14 @@ impl FileOpener for VortexOpener {
                     scan_builder = scan_builder.with_row_range(row_range);
                 }
 
-                if let Some(limit) = limit
-                    && filter.is_none()
-                {
+                // `DataFusion` pushes a limit into this scan only when no filter is left above
+                // it, so the limit counts the rows the scan returns. With a filter, the scan
+                // counts the rows its predicate keeps and stops starting splits once the limit
+                // is met, rather than decoding every split for the file stream to drop. Every
+                // static conjunct is in the predicate (one that is not fails the open above);
+                // a dynamic fragment left out only prunes, so the rows it would drop are rows
+                // the scan may return.
+                if let Some(limit) = limit {
                     scan_builder = scan_builder.with_limit(limit);
                 }
 
@@ -755,20 +793,16 @@ fn point_read_stream(
     target: Field,
 ) -> VortexResult<BoxStream<'static, VortexResult<RecordBatch>>> {
     let dtype = reader.dtype();
-    let conjuncts: Arc<[BoundExpression]> = conjuncts(&filter.optimize_recursive(dtype)?)
-        .iter()
-        .map(|conjunct| conjunct.bind(dtype))
-        .collect::<VortexResult<Vec<_>>>()?
-        .into();
+    let conjuncts: Arc<[BoundExpression]> =
+        bound_conjuncts(&filter.bind(dtype)?.optimize_recursive()?).into();
     // A projection of every field in file order is the root itself. The struct
     // reader rewrites a projection against its own expansion of the root before
     // partitioning it by field; handed `root()`, it has nothing to rewrite.
     let projection = if is_identity_projection(projection, dtype) {
-        root()
+        root().bind(dtype)?
     } else {
-        projection.optimize_recursive(dtype)?
-    }
-    .bind(dtype)?;
+        projection.bind(dtype)?.optimize_recursive()?
+    };
     let reads = ranges.into_iter().map(move |range| {
         read_range(
             Arc::clone(&reader),
@@ -790,9 +824,34 @@ fn point_read_stream(
 /// builds for `dtype`.
 fn is_identity_projection(projection: &Expression, dtype: &DType) -> bool {
     !dtype.is_nullable()
-        && dtype
-            .as_struct_fields_opt()
-            .is_some_and(|fields| *projection == replace_root_fields(root(), fields))
+        && dtype.as_struct_fields_opt().is_some_and(|fields| {
+            *projection
+                == pack(
+                    fields
+                        .names()
+                        .iter()
+                        .map(|name| (name.clone(), col(name.clone()))),
+                    Nullability::NonNullable,
+                )
+        })
+}
+
+/// The conjuncts of a bound filter, in order: the operands of a tree of `AND`s.
+fn bound_conjuncts(expr: &BoundExpression) -> Vec<BoundExpression> {
+    let mut conjuncts = Vec::new();
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        if expr
+            .as_scalar()
+            .and_then(|scalar_fn| scalar_fn.as_opt::<Binary>())
+            .is_some_and(|operator| *operator == VortexOperator::And)
+        {
+            pending.extend(expr.children().iter().rev());
+        } else {
+            conjuncts.push(expr.clone());
+        }
+    }
+    conjuncts
 }
 
 async fn read_range(
@@ -2102,7 +2161,7 @@ mod tests {
 
         let data = opener.open(file)?.await?.try_collect::<Vec<_>>().await?;
 
-        assert!(data.is_empty());
+        assert_eq!(data, [] as [RecordBatch; 0]);
         assert_eq!(take_scans_built(), 0);
         Ok(())
     }
@@ -2423,7 +2482,10 @@ mod tests {
             2,
             "both min/max bounds conjuncts are pushed into the scan"
         );
-        assert!(conjuncts.unpushed.is_empty());
+        assert_eq!(
+            conjuncts.unpushed,
+            [] as [Arc<dyn datafusion_physical_expr::PhysicalExpr>; 0]
+        );
         assert_eq!(
             conjuncts.skipped_dynamic.len(),
             1,
@@ -2631,6 +2693,304 @@ mod tests {
         assert_snapshot!(
             format!("dynamic_filter_casting_a_timestamp_{expected}"),
             pretty_format_batches_with_options(&batches, &format_options)?.to_string()
+        );
+        Ok(())
+    }
+
+    /// A `VortexReaderFactory` whose readers count the bytes they are asked for.
+    #[derive(Debug)]
+    struct CountingReaderFactory {
+        object_store: Arc<dyn ObjectStore>,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[derive(Clone)]
+    struct CountingReadAt {
+        inner: crate::persistent::reader::VortexReader,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl vortex::io::VortexReadAt for CountingReadAt {
+        fn uri(&self) -> Option<&Arc<str>> {
+            self.inner.uri()
+        }
+        fn coalesce_config(&self) -> Option<vortex::io::CoalesceConfig> {
+            self.inner.coalesce_config()
+        }
+        fn concurrency(&self) -> usize {
+            self.inner.concurrency()
+        }
+        fn size(&self) -> futures::future::BoxFuture<'static, vortex::error::VortexResult<u64>> {
+            self.inner.size()
+        }
+        fn read_at(
+            &self,
+            offset: u64,
+            length: usize,
+            alignment: vortex::buffer::Alignment,
+        ) -> futures::future::BoxFuture<
+            'static,
+            vortex::error::VortexResult<vortex::array::buffer::BufferHandle>,
+        > {
+            self.bytes
+                .fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_at(offset, length, alignment)
+        }
+    }
+
+    impl VortexReaderFactory for CountingReaderFactory {
+        fn create_reader(
+            &self,
+            path: &str,
+            session: &VortexSession,
+        ) -> DFResult<crate::persistent::reader::VortexReader> {
+            let inner = DefaultVortexReaderFactory::new(Arc::clone(&self.object_store))
+                .create_reader(path, session)?;
+            Ok(Arc::new(CountingReadAt {
+                inner,
+                bytes: Arc::clone(&self.bytes),
+            }))
+        }
+    }
+
+    /// The bytes a key-block point read of `key` asks for, from a file of 16,384 rows with
+    /// a ~3 KB string column written with `strategy`, and the payload it returns.
+    async fn point_read_bytes(
+        strategy: Option<vortex::file::WriteStrategyBuilder>,
+        key: i64,
+    ) -> anyhow::Result<(u64, Vec<String>)> {
+        use datafusion::arrow::array::{AsArray, Int64Array};
+
+        let rows = 16_384_usize;
+        let payload = |row: usize| {
+            use std::fmt::Write as _;
+
+            let mut p = format!("{{\"id\":{row},\"items\":[");
+            let mut x = u64::try_from(row).expect("row fits in u64") ^ 0x9e37_79b9_7f4a_7c15;
+            while p.len() < 3000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                write!(p, "{{\"sku\":\"SKU-{:08x}\",\"qty\":{}}},", x >> 32, x % 50)
+                    .expect("writing to a String cannot fail");
+            }
+            p
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    0..i64::try_from(rows).expect("row count fits in i64"),
+                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(payload))),
+            ],
+        )?;
+        let session = VortexSession::default();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "wide_point_read.vortex";
+        let array = session
+            .arrow()
+            .from_arrow_record_batch(batch.clone(), &schema)?;
+        let mut write =
+            ObjectStoreWrite::new(Arc::clone(&object_store), &Path::parse(path)?).await?;
+        let mut options = session.write_options();
+        if let Some(strategy) = strategy {
+            options = options.with_strategy(strategy.build());
+        }
+        let summary = options.write(&mut write, array.to_array_stream()).await?;
+        write.shutdown().await?;
+
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let table_schema = TableSchema::from(Arc::clone(&schema));
+        let filter = logical2physical(&col("a").eq(lit(key)), table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(&object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[1], &schema);
+        opener.key_column = Some(Arc::from("a"));
+        opener.vortex_reader_factory = Arc::new(CountingReaderFactory {
+            object_store,
+            bytes: Arc::clone(&bytes),
+        });
+        take_point_reads();
+        let batches = opener
+            .open(PartitionedFile::new(path.to_string(), summary.size()))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            take_point_reads(),
+            1,
+            "the lookup must take the key-block point read"
+        );
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch.column(0);
+            match column.as_string_view_opt() {
+                Some(view) => values.extend(view.iter().map(|v| v.expect("not null").to_string())),
+                None => values.extend(
+                    column
+                        .as_string::<i32>()
+                        .iter()
+                        .map(|v| v.expect("not null").to_string()),
+                ),
+            }
+        }
+        assert_eq!(
+            values,
+            vec![payload(usize::try_from(key).expect("key is a row index"))],
+            "the lookup must return its row"
+        );
+        Ok((bytes.load(std::sync::atomic::Ordering::Relaxed), values))
+    }
+
+    /// Reads `limit` rows of a filtered scan of a 65,536-row file, in file order when
+    /// `ordered`, and returns the bytes read and the values of `a` returned. The first
+    /// `heavy_rows` rows carry an 8,000-byte payload, and the rest an 8-byte one, so the
+    /// splits that hold them take longest to decode.
+    async fn filtered_limit_read(
+        limit: Option<u64>,
+        ordered: bool,
+        heavy_rows: i64,
+    ) -> anyhow::Result<(u64, Vec<i64>)> {
+        use datafusion::arrow::array::{AsArray, Int64Array};
+        use datafusion::arrow::datatypes::Int64Type;
+
+        let rows = 65_536_i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(StringArray::from_iter_values((0..rows).map(|row| {
+                    if heavy_rows == 0 {
+                        format!("payload-{row:08}-{}", "x".repeat(200))
+                    } else if row < heavy_rows {
+                        "x".repeat(8_000)
+                    } else {
+                        format!("{row:08}")
+                    }
+                }))),
+            ],
+        )?;
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "filtered_limit.vortex";
+        let size = write_arrow_to_vortex(Arc::clone(&object_store), path, batch).await?;
+
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let table_schema = TableSchema::from(Arc::clone(&schema));
+        // Every row past the first hundred matches.
+        let filter = logical2physical(&col("a").gt(lit(100_i64)), table_schema.table_schema());
+        let mut opener = make_opener(Arc::clone(&object_store), table_schema, Some(filter));
+        opener.projection = ProjectionExprs::from_indices(&[0, 1], &schema);
+        opener.limit = limit;
+        opener.has_output_ordering = ordered;
+        // Fewer splits in flight than the file has, as for any file larger than the scan's
+        // concurrency: the limit stops splits from starting, not ones already running.
+        opener.scan_concurrency = Some(2);
+        opener.vortex_reader_factory = Arc::new(CountingReaderFactory {
+            object_store,
+            bytes: Arc::clone(&bytes),
+        });
+        let batches = opener
+            .open(PartitionedFile::new(path.to_string(), size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        Ok((bytes.load(std::sync::atomic::Ordering::Relaxed), values))
+    }
+
+    /// A limit pushed with a filter stops the scan once enough rows match, rather than
+    /// decoding every split of the file for the file stream to drop.
+    #[tokio::test]
+    async fn a_limit_with_a_filter_stops_the_scan_once_it_is_met() -> anyhow::Result<()> {
+        let (unlimited_bytes, all) = filtered_limit_read(None, false, 0).await?;
+        assert_eq!(
+            all.len(),
+            65_536 - 101,
+            "every row past the first hundred matches"
+        );
+
+        let (limited_bytes, limited) = filtered_limit_read(Some(10), false, 0).await?;
+        assert!(
+            limited.len() >= 10,
+            "the scan returns at least the limit: {}",
+            limited.len()
+        );
+        assert!(
+            limited.iter().all(|value| *value > 100),
+            "every returned row matches the filter: {limited:?}"
+        );
+        assert!(
+            limited_bytes * 2 < unlimited_bytes,
+            "a limited scan read {limited_bytes} bytes, an unlimited one {unlimited_bytes}"
+        );
+        Ok(())
+    }
+
+    /// An ordered scan with a filter and a limit returns the first matching rows in file
+    /// order, so a sort the plan removed because the file is ordered loses no row: the limit
+    /// stops splits from starting, and the rows it keeps are the earliest ones even when later
+    /// splits finish first. The first 16,384 rows carry the heavy payload, so an unordered
+    /// scan returns rows of a later split first.
+    #[tokio::test]
+    async fn an_ordered_limit_with_a_filter_returns_the_first_matching_rows() -> anyhow::Result<()>
+    {
+        let heavy_rows = 16_384;
+        let (_, all) = filtered_limit_read(None, true, heavy_rows).await?;
+        assert_eq!(
+            all,
+            (101..65_536).collect::<Vec<i64>>(),
+            "an ordered unlimited scan returns every match in file order"
+        );
+
+        let (_, limited) = filtered_limit_read(Some(10), true, heavy_rows).await?;
+        assert!(
+            limited.len() >= 10,
+            "the scan returns at least the limit: {}",
+            limited.len()
+        );
+        assert_eq!(
+            limited,
+            (101..101 + i64::try_from(limited.len())?).collect::<Vec<i64>>(),
+            "an ordered limited scan returns the first matches, in order"
+        );
+        Ok(())
+    }
+
+    /// A point read of one row of a wide string column reads only the data block that holds
+    /// it once blocks are capped by bytes (spiceai/spiceai#15323). This needs both halves of
+    /// the fork's change: blocks over the cap are split, and a read of a row range skips the
+    /// split blocks the row selection excludes. Without either, the read asks for every
+    /// block of the 8,192-row range that holds the key.
+    #[tokio::test]
+    async fn a_point_read_of_a_wide_column_reads_one_capped_block() -> anyhow::Result<()> {
+        let key = 12_345;
+        let (default_bytes, _) = point_read_bytes(None, key).await?;
+        // The writer's default strategy with the cap: the session's compressor, restricted to
+        // the encodings its editions permit, as the writer builds it.
+        let capped = vortex::file::WriteStrategyBuilder::from_session(&SESSION)
+            .with_data_block_max_bytes(Some(4 << 20));
+        let (capped_bytes, _) = point_read_bytes(Some(capped), key).await?;
+        eprintln!("point read bytes: uncapped {default_bytes}, capped {capped_bytes}");
+        assert!(
+            capped_bytes * 4 < default_bytes,
+            "a capped point read asked for {capped_bytes} bytes, an uncapped one {default_bytes}"
         );
         Ok(())
     }

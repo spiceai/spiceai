@@ -15,7 +15,7 @@ The Spice open source project provides multiple distribution variants to support
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
-> **Note:** Open source Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively in open source builds — use WSL instead. Native Windows runtime support is available with managed enterprise deployments.
+> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) does not build for native Windows: run it under WSL or in Docker, and use the Windows CLI against it.
 
 ## Distribution Availability
 
@@ -41,7 +41,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 **Included Features:**
 
 - All standard data connectors (PostgreSQL, MySQL, DuckDB, SQLite, ClickHouse, etc.)
-- Embedded data accelerators (Spice Cayenne, DuckDB, SQLite)
+- Embedded data accelerator (Spice Cayenne)
 - AI/ML model inference (LLMs, embeddings)
 - Search capabilities (Vector and BM-25 Full-Text-Search)
 - Inline SQL user-defined scalar and table functions
@@ -52,14 +52,12 @@ The default distribution includes the standard data and AI/ML feature set. This 
 - ODBC (`odbc`), Elasticsearch (`elasticsearch`), NFS (`nfs`), and ScyllaDB (`scylladb`) data connectors
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
-- WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
-
-> **Note:** The PostgreSQL data accelerator is only available in nightly builds. The PostgreSQL data connector is included in all distributions.
+- WebAssembly user-defined functions (`wasm-functions` feature)
 
 **Installation:**
 
 ```bash
-curl https://install.spiceai.org | /bin/bash
+curl -fsSL https://install.spiceai.org | sh
 ```
 
 **Docker:**
@@ -222,9 +220,28 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | Linux aarch64                 | ✅       | Nightly         | Nightly         | ❌     | ❌               |
 | macOS aarch64 (Apple Silicon) | ✅       | Nightly         | Nightly         | ✅     | ❌               |
 | Windows (WSL)                 | ✅       | Nightly         | Nightly         | ❌     | Nightly         |
-| Windows (Native)              | ❌       | Enterprise only | Enterprise only | ❌     | Enterprise only |
+| Windows (Native)              | ❌       | ❌               | ❌               | ❌     | ❌               |
 
-> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise). Open source users on Windows should use Windows Subsystem for Linux (WSL).
+> **Note:** The Spice runtime does not run natively on Windows in any distribution. On Windows, run it under Windows Subsystem for Linux (WSL) or in Docker, and use the Windows `spice` CLI against it.
+
+## Verifying a Download
+
+Each GitHub release publishes `SHA256SUMS`, the sha256 of every other file in the release: the `spice` and `spiced` archives and the install scripts (`install.sh`, `install-spiced.sh`, `Install.ps1`). Each of those files, and `SHA256SUMS` itself, has a [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) signed by the release build, `.github/workflows/build_release.yml`, running on a `release/*` branch.
+
+To check a download, run these in the directory that holds it. Replace `v2.5.0` and the file name with the release and file you downloaded.
+
+```bash
+# Its sha256 matches the release's SHA256SUMS.
+curl -fsSLO https://github.com/spiceai/spiceai/releases/download/v2.5.0/SHA256SUMS
+grep ' spice_linux_x86_64.tar.gz$' SHA256SUMS | sha256sum --check   # macOS: shasum -a 256 --check
+
+# The release build made it. Needs the GitHub CLI, logged in.
+gh attestation verify spice_linux_x86_64.tar.gz --repo spiceai/spiceai \
+  --cert-identity-regex '^https://github\.com/spiceai/spiceai/\.github/workflows/build_release\.yml@refs/heads/release/' \
+  --deny-self-hosted-runners
+```
+
+Releases built before `SHA256SUMS` was introduced have neither file. For those, compare `sha256sum <file>` with the sha256 the release page lists next to each asset.
 
 ## Choosing a Distribution
 
@@ -258,9 +275,8 @@ The following features are available with the [Spice Cloud Platform](https://spi
 - **Acceleration Snapshots** - Bootstrap accelerated datasets from durable snapshot storage for fast cold starts, recovery after ephemeral storage loss, and controlled rollback to a previous acceleration state. Local open source builds can enable this with `snapshots`.
 - **Globally Persisted HTTP Rate-Control State** - Persist request-rate state and expiring active instance heartbeats per origin from a background worker so multiple Spice instances or clusters coordinate a shared request budget. Local open source builds can enable this with `rate-control`.
 - **Function Servers** - Run HTTP-backed user-defined scalar and table functions from `functions:` declarations. The default open source distribution supports inline SQL functions only; local builds can enable HTTP-backed function servers with `http-functions`.
-- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable precompiled modules with `wasm-functions`; compiling Rust sources to WASM at startup additionally requires `wasm-functions-compile`.
+- **WASM Functions** - Run sandboxed WebAssembly table functions from `functions:` declarations using Arrow IPC batches as the data ABI. Local open source builds can enable them with `wasm-functions`. The runtime only loads prebuilt modules (`params.module`) and never runs a compiler: build a function's module on the developer's machine with `spice build` (or `spice run`, which builds first) from its `build:` block.
 - **OIDC Token Verification** - Validate identity tokens from enterprise providers (Okta, Azure AD, Auth0, Google, etc.) for secure access to Spice runtime endpoints.
-- **Native Windows Runtime Support** - Run `spiced` natively on Windows in managed enterprise deployments. Open source users on Windows should use WSL.
 
 ### Linux arm64 Notes
 
@@ -278,16 +294,13 @@ You can build custom distributions with specific feature combinations:
 
 ```bash
 # Build with specific features
-SPICED_CUSTOM_FEATURES="duckdb,postgres,sqlite,models" make build-runtime
+SPICED_CUSTOM_FEATURES="adbc,postgres,models" make build-runtime
 
 # Build with HTTP-backed function servers
 SPICED_NON_DEFAULT_FEATURES="http-functions" make install
 
-# Build with precompiled WASM user functions
+# Build with WASM user functions (prebuilt modules)
 SPICED_NON_DEFAULT_FEATURES="wasm-functions" make install
-
-# Build with Rust source-to-WASM compilation for user functions
-SPICED_NON_DEFAULT_FEATURES="wasm-functions-compile" make install
 
 # Build with acceleration snapshots
 SPICED_NON_DEFAULT_FEATURES="snapshots" make install

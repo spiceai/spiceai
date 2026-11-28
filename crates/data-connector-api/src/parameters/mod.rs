@@ -34,7 +34,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use runtime_parameters::Parameters;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -79,6 +79,14 @@ pub trait ConnectorContext: Send + Sync {
     /// (e.g. `runtime.params`, `runtime.flight`).
     fn app(&self) -> Arc<App>;
 
+    /// The `--role` the runtime started with. A Spicepod reload cannot change it.
+    fn role(&self) -> Role;
+
+    /// The runtime's component-status tracker. A connector that skips data that
+    /// will not be retried keeps the resolved [`runtime_status::RuntimeStatus`]
+    /// after the call — never this context.
+    fn runtime_status(&self) -> Arc<runtime_status::RuntimeStatus>;
+
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry>;
@@ -99,6 +107,23 @@ pub trait ConnectorContext: Send + Sync {
     /// file-accelerated, no checkpoint has been written yet, or the stored
     /// checkpoint cannot be read.
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef>;
+
+    /// The identity of the location through which this dataset's acceleration
+    /// is shared with other instances, when it is (see
+    /// `DataAccelerator::shared_location_id`): a change source's consumer named
+    /// for it is shared by exactly those instances, and only the one writing
+    /// the dataset consumes it. `None` when this instance alone writes the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the location's identity cannot be read; the
+    /// caller fails rather than name a consumer that other instances may not
+    /// share.
+    async fn shared_location_id(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The **blob** checkpoint store over this dataset's accelerator, writing into the
     /// sidecar `table_name`.
@@ -163,4 +188,21 @@ pub struct ConnectorParams {
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub component: ConnectorComponent,
     pub io_runtime: Handle,
+}
+
+impl ConnectorParams {
+    /// The value of parameter `name` if the component's spicepod sets it, and `None` if it is
+    /// left at its default. [`Parameters`] fills in each spec's default, so whether the
+    /// parameter was set is read from the spicepod's own params.
+    #[must_use]
+    pub fn user_set(&self, name: &str) -> Option<&str> {
+        let spicepod_params = match &self.component {
+            ConnectorComponent::Dataset(dataset) => &dataset.params,
+            ConnectorComponent::Catalog(catalog) => &catalog.params,
+        };
+        spicepod_params
+            .contains_key(&self.parameters.user_param(name).0)
+            .then(|| self.parameters.get(name).expose().ok())
+            .flatten()
+    }
 }

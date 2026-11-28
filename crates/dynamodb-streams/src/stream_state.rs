@@ -108,12 +108,13 @@ impl StreamState {
         &mut self,
         shard_id: &str,
         new_iterator: Option<String>,
-        records: Vec<Record>,
+        mut records: Vec<Record>,
     ) -> Option<ShardPollResult> {
         let Some(shard) = self.active.get(shard_id) else {
             tracing::warn!("Received poll result for unknown shard {shard_id}, skipping");
             return None;
         };
+        drop_already_read(&mut records, &shard.last_checkpoint, shard_id);
         let mut current_checkpoint = shard.last_checkpoint.clone();
         let mut current_watermark = shard.current_watermark;
 
@@ -228,6 +229,25 @@ impl StreamState {
                     current_watermark: active_shard.current_watermark,
                 },
             );
+        }
+    }
+
+    /// Adds the checkpoint of every shard waiting for an iterator to a batch
+    /// checkpoint, which otherwise holds only the shards polled this round.
+    ///
+    /// A persisted checkpoint replaces the previous one, and a restart reads
+    /// only the shards it names (with their descendants): a shard missing from
+    /// it is never read again. A shard waits here after its iterator expired
+    /// and the request for a new one failed, or after its parent was
+    /// exhausted, so its checkpoint is still where reading resumes. Blocked
+    /// shards are left out: their parent is in the checkpoint and a restart
+    /// blocks them behind it again.
+    pub fn add_initializing_checkpoints(&self, checkpoint: &mut Checkpoint) {
+        for shard in self.initializing.values() {
+            checkpoint
+                .shards
+                .entry(shard.shard_id.clone())
+                .or_insert_with(|| shard.last_checkpoint.clone());
         }
     }
 
@@ -359,6 +379,66 @@ impl StreamState {
             );
         }
     }
+}
+
+/// Drops the records a shard has already read: those at or before its
+/// checkpoint's sequence number (`After`), or before it (`At`).
+///
+/// `DynamoDB` Streams stores each record once, and sequence numbers increase
+/// within a shard. The checkpoint only advances past records this process has
+/// already handed on, so a record read again after a failed request, an expired
+/// iterator, or a restart (which resumes from the persisted checkpoint) is
+/// newer than it and kept. Only an endpoint that returns a record again
+/// (`LocalStack` can return the same record on every `GetRecords`) has one
+/// removed here; re-applying it would undo later changes to its item and pin
+/// the shard's watermark to its time, so the dataset never became ready.
+/// A record whose sequence number is missing or not numeric is kept.
+fn drop_already_read(records: &mut Vec<Record>, checkpoint: &ShardCheckpoint, shard_id: &str) {
+    // `Some(true)` when the record has not been read, `None` when it cannot be
+    // ordered against the checkpoint.
+    let unread = |record: &Record| {
+        record
+            .dynamodb
+            .as_ref()
+            .and_then(|stream_record| stream_record.sequence_number.as_deref())
+            .and_then(|sequence_number| {
+                compare_sequence_numbers(sequence_number, &checkpoint.sequence_number)
+            })
+            .map(|ordering| match checkpoint.position {
+                CheckpointPosition::At => ordering.is_ge(),
+                CheckpointPosition::After => ordering.is_gt(),
+            })
+    };
+    // Records come in sequence order, so a record returned again can only lead
+    // a batch: when the first is unread, so is every other, and an ordinary
+    // batch costs one comparison.
+    if records
+        .first()
+        .is_none_or(|first| unread(first) == Some(true))
+    {
+        return;
+    }
+    let before = records.len();
+    records.retain(|record| unread(record) != Some(false));
+    let dropped = before - records.len();
+    if dropped > 0 {
+        tracing::debug!(
+            "Dropped {dropped} already-read records from shard {shard_id} (checkpoint {:?} {})",
+            checkpoint.position,
+            checkpoint.sequence_number
+        );
+    }
+}
+
+/// Orders two `DynamoDB` Streams sequence numbers, which are decimal strings of
+/// up to 40 digits, without parsing them; `None` when either is not numeric.
+fn compare_sequence_numbers(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|byte| byte.is_ascii_digit());
+    if !numeric(a) || !numeric(b) {
+        return None;
+    }
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    Some(a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
 }
 
 pub async fn initialize_state_from_checkpoint(
@@ -1389,6 +1469,86 @@ mod tests {
                 CheckpointPosition::After
             );
             assert_eq!(init_shard.current_watermark, Some(watermark));
+        }
+
+        #[test]
+        fn test_checkpoint_keeps_a_shard_whose_reinitialization_failed() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let after = |seq: &str, parent: Option<&str>| ShardCheckpoint {
+                sequence_number: seq.to_string(),
+                parent_id: parent.map(str::to_string),
+                updated_at: SystemTime::now(),
+                position: CheckpointPosition::After,
+            };
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "expired-iter".to_string(),
+                    last_checkpoint: after("100", None),
+                    current_watermark: None,
+                },
+            );
+            state.blocked.insert(
+                "shard-2".to_string(),
+                BlockedShard {
+                    shard_id: "shard-2".to_string(),
+                    parent_shard_id: Some("shard-1".to_string()),
+                    last_checkpoint: after("200", Some("shard-1")),
+                },
+            );
+            // The iterator expired; the request for a new one then fails, so
+            // the shard is not polled this round.
+            state.reinitialize_shard_with_checkpoint("shard-1");
+            let mut checkpoint = Checkpoint {
+                shards: HashMap::new(),
+            };
+
+            state.add_initializing_checkpoints(&mut checkpoint);
+
+            let shards: Vec<(&str, &str)> = checkpoint
+                .shards
+                .iter()
+                .map(|(id, c)| (id.as_str(), c.sequence_number.as_str()))
+                .collect();
+            assert_eq!(
+                shards,
+                vec![("shard-1", "100")],
+                "the waiting shard resumes from its own checkpoint, and its blocked child stays out"
+            );
+        }
+
+        #[test]
+        fn test_polled_checkpoint_wins_over_initializing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.initializing.insert(
+                "shard-1".to_string(),
+                InitializingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::At,
+                    },
+                    current_watermark: None,
+                },
+            );
+            let polled = ShardCheckpoint {
+                sequence_number: "150".to_string(),
+                parent_id: None,
+                updated_at: SystemTime::now(),
+                position: CheckpointPosition::After,
+            };
+            let mut checkpoint = Checkpoint {
+                shards: HashMap::from([("shard-1".to_string(), polled.clone())]),
+            };
+
+            state.add_initializing_checkpoints(&mut checkpoint);
+
+            assert_eq!(checkpoint.shards.get("shard-1"), Some(&polled));
         }
 
         #[test]
@@ -2952,6 +3112,192 @@ mod tests {
     // The current implementation uses unwrap_or(0) which silently converts
     // negative seconds (pre-1970 timestamps) to 0 (Jan 1, 1970).
     // ========================================
+    mod already_read_records {
+        use super::*;
+
+        fn shard_at(sequence_number: &str, position: CheckpointPosition) -> StreamState {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: sequence_number.to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position,
+                    },
+                    current_watermark: None,
+                },
+            );
+            state
+        }
+
+        fn delivered(result: Option<ShardPollResult>) -> Vec<String> {
+            match result.expect("shard is active").outcome {
+                PollOutcome::Records { records } => records
+                    .iter()
+                    .map(|r| {
+                        r.dynamodb
+                            .as_ref()
+                            .and_then(|d| d.sequence_number.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+                PollOutcome::Empty => Vec::new(),
+                PollOutcome::Failed => panic!("unexpected failed outcome"),
+            }
+        }
+
+        fn record_at(seq: &str, secs: i64) -> Record {
+            Record::builder()
+                .dynamodb(
+                    StreamRecord::builder()
+                        .sequence_number(seq)
+                        .approximate_creation_date_time(DateTime::from_secs(secs))
+                        .build(),
+                )
+                .build()
+        }
+
+        /// The `LocalStack` sequence behind #16627: the shard starts `At` its first
+        /// record, and every later `GetRecords` returns that record again. Only
+        /// the first delivery counts; the rest are empty polls, which leave the
+        /// watermark free to advance.
+        #[test]
+        fn a_record_returned_again_is_an_empty_poll() {
+            let start = "49680438400068741898430349522605178432169245990627311618";
+            let mut state = shard_at(start, CheckpointPosition::At);
+
+            let first = state.handle_poll_result(
+                "shard-1",
+                Some("iter-2".to_string()),
+                vec![record_at(start, 1000)],
+            );
+            assert_eq!(delivered(first), vec![start.to_string()]);
+
+            for next in ["iter-3", "iter-4", "iter-5"] {
+                let again = state.handle_poll_result(
+                    "shard-1",
+                    Some(next.to_string()),
+                    vec![record_at(start, 1000)],
+                );
+                let again = again.expect("shard is active");
+                assert!(matches!(again.outcome, PollOutcome::Empty));
+                assert_eq!(again.last_checkpoint.sequence_number, start);
+                assert_eq!(again.last_checkpoint.position, CheckpointPosition::After);
+            }
+            assert_eq!(state.active["shard-1"].iterator, "iter-5");
+        }
+
+        #[test]
+        fn at_keeps_the_checkpoint_record_and_after_drops_it() {
+            let mut at = shard_at("200", CheckpointPosition::At);
+            let kept = at.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("199"),
+                    create_record("200"),
+                    create_record("201"),
+                ],
+            );
+            assert_eq!(delivered(kept), vec!["200", "201"]);
+
+            let mut after = shard_at("200", CheckpointPosition::After);
+            let kept = after.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("199"),
+                    create_record("200"),
+                    create_record("201"),
+                ],
+            );
+            assert_eq!(delivered(kept), vec!["201"]);
+        }
+
+        /// Sequence numbers are compared as numbers: a longer one is later, and
+        /// leading zeros do not count.
+        #[test]
+        fn sequence_numbers_compare_numerically() {
+            let mut state = shard_at("99", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("98"),
+                    create_record("0099"),
+                    create_record("100"),
+                ],
+            );
+            assert_eq!(delivered(kept), vec!["100"]);
+        }
+
+        /// A batch whose first record is unread is kept whole: records arrive in
+        /// sequence order, so only its first record is compared. A record read
+        /// again after a failed request or a restart is newer than the
+        /// checkpoint, so it is kept too.
+        #[test]
+        fn a_batch_that_starts_unread_is_kept_whole() {
+            let mut state = shard_at("200", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("201"),
+                    create_record("202"),
+                    create_record("203"),
+                ],
+            );
+            assert_eq!(delivered(kept), vec!["201", "202", "203"]);
+
+            // The same batch again: the checkpoint is now 203, so all of it was
+            // already handed on, and it is dropped.
+            let again = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![
+                    create_record("201"),
+                    create_record("202"),
+                    create_record("203"),
+                ],
+            );
+            assert_eq!(delivered(again), Vec::<String>::new());
+        }
+
+        /// A record that cannot be ordered against the checkpoint is never
+        /// dropped: losing a change is worse than applying one twice.
+        #[test]
+        fn records_that_cannot_be_ordered_are_kept() {
+            let mut state = shard_at("200", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![create_record("abc"), create_record("")],
+            );
+            assert_eq!(delivered(kept), vec!["abc", ""]);
+
+            let mut state = shard_at("", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![create_record("1")],
+            );
+            assert_eq!(delivered(kept), vec!["1"]);
+
+            let mut state = shard_at("200", CheckpointPosition::After);
+            let kept = state.handle_poll_result(
+                "shard-1",
+                Some("next".to_string()),
+                vec![create_record_without_seq()],
+            );
+            assert_eq!(delivered(kept), vec![String::new()]);
+        }
+    }
+
     mod datetime_to_system_time_tests {
         use super::*;
 

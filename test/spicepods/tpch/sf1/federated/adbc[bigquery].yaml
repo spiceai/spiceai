@@ -29,3 +29,25 @@ datasets:
   - from: adbc:supplier
     name: supplier
     params: *adbc_bigquery_params
+
+# Seeding `spiceai-testing.tpch_sf1`
+#
+# The tables are loaded from the same TPC-H SF1 Parquet files that `s3[parquet].yaml` reads
+# (`s3://benchmarks/tpch_sf1/<table>.parquet`). Requires the `aws` and `bq` CLIs and write access
+# to the `spiceai-testing` project.
+#
+#   export AWS_ACCESS_KEY_ID=<S3_KEY> AWS_SECRET_ACCESS_KEY=<S3_SECRET>
+#   TABLES="customer lineitem nation orders part partsupp region supplier"
+#
+#   # 1. Download the Parquet files from the S3-compatible endpoint (<S3_ENDPOINT>).
+#   mkdir -p tpch_sf1 && cd tpch_sf1
+#   for t in $TABLES; do aws s3 cp --endpoint-url <S3_ENDPOINT> s3://benchmarks/tpch_sf1/$t.parquet .; done
+#
+#   # 2. Create the dataset and load each table.
+#   bq --project_id=spiceai-testing mk --dataset tpch_sf1
+#   for t in $TABLES; do
+#     bq --project_id=spiceai-testing load --source_format=PARQUET --replace tpch_sf1.$t ./$t.parquet
+#   done
+#
+#   # 3. Check the tables exist.
+#   bq --project_id=spiceai-testing ls tpch_sf1

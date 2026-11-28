@@ -44,6 +44,7 @@ pub mod access;
 pub mod catalog;
 pub mod column;
 pub mod dataset;
+pub mod vector_engine;
 pub mod view;
 
 #[derive(Debug, Snafu)]
@@ -146,6 +147,22 @@ pub fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
         (None, Some(c), None) => Some((c, 1)),
         (None, None, Some(s)) => Some((s, 1)),
         (None, None, None) => None,
+    }
+}
+
+/// `Debug` for a component's params with credentials in URL values redacted, so a
+/// spec printed in an error or log line does not leak a source URL's secrets.
+pub(crate) struct RedactedParams<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(key, value)| (key, redact::redact_source_credentials(value))),
+            )
+            .finish()
     }
 }
 
@@ -322,10 +339,4 @@ mod tests {
 }
 pub mod schema_evolution;
 
-/// Which role this runtime plays in a cluster deployment. Parsed from the CLI, so
-/// it carries clap's `ValueEnum`.
-#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
-pub enum ClusterRole {
-    Scheduler,
-    Executor,
-}
+pub use runtime_config::{ClusterRole, Role};

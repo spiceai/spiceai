@@ -45,7 +45,8 @@ limitations under the License.
 //!
 //! Like the rest of the Iceberg suite, these tests read a Glue/S3 fixture and
 //! require `AWS_ICEBERG_ACCOUNT_ID`, `AWS_ICEBERG_REGION`,
-//! `AWS_ICEBERG_ACCESS_KEY_ID`, and `AWS_ICEBERG_SECRET_ACCESS_KEY`. They skip
+//! `AWS_ICEBERG_ACCESS_KEY_ID`, and `AWS_ICEBERG_SECRET_ACCESS_KEY`, plus
+//! `AWS_ICEBERG_SESSION_TOKEN` for short-lived credentials. They skip
 //! (and pass) when `AWS_ICEBERG_ACCOUNT_ID` is unset, so a local `cargo test`
 //! without credentials is not a spurious failure; CI provides the credentials.
 
@@ -80,7 +81,7 @@ fn iceberg_account_id() -> Option<String> {
 /// S3 storage params resolved from the environment, shared by the dataset and
 /// catalog components.
 fn iceberg_s3_params() -> HashMap<String, String> {
-    HashMap::from([
+    let mut params = HashMap::from([
         (
             "iceberg_s3_region".to_string(),
             "${ env:AWS_ICEBERG_REGION }".to_string(),
@@ -93,7 +94,12 @@ fn iceberg_s3_params() -> HashMap<String, String> {
             "iceberg_s3_secret_access_key".to_string(),
             "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
         ),
-    ])
+    ]);
+    params.extend(crate::utils::aws_session_token_param(
+        "iceberg_s3_session_token",
+        "AWS_ICEBERG_SESSION_TOKEN",
+    ));
+    params
 }
 
 /// A Glue-backed Iceberg `Catalog` component scoped to the test namespaces.
@@ -149,7 +155,6 @@ where
 // scheduler fails to serialize the catalog table's `IcebergTableScan` for the
 // executor and the query errors with "unsupported plan type: IcebergTableScan".
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_iceberg_catalog_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -215,7 +220,6 @@ async fn test_distributed_iceberg_catalog_scan() -> Result<(), anyhow::Error> {
 // Guards that the data-connector path (the original PR #11378 fix) keeps
 // working through the cluster, alongside the new catalog path.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -293,7 +297,6 @@ fn ids(batches: &[RecordBatch]) -> Vec<i64> {
 // scheduler and executor share, so this runs without credentials. Pinning a
 // version older than the latest keeps the row check non-vacuous.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -354,7 +357,6 @@ async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Er
 // The same distributed scan over a table AWS Glue manages on S3, pinned to the
 // metadata file Glue records for it.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_pinned_glue_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

@@ -27,7 +27,7 @@ use arrow::util::display::array_value_to_string;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, ZeroResultsAction};
+use spicepod::acceleration::{Acceleration, Mode, ZeroResultsAction};
 use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params as DatasetParams;
@@ -35,7 +35,7 @@ use spicepod::param::Params as DatasetParams;
 use super::pushdown_roundtrip::create_table;
 use super::streams::{get_client, start_dynamodb_docker_container};
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -53,9 +53,10 @@ async fn put(client: &Client, pk: &str, sk: &str, name: &str) -> Result<(), anyh
     Ok(())
 }
 
-/// An Arrow acceleration of the table that applies `retention_sql` as rows are
-/// written. `DynamoDB` cannot evaluate `upper()`, so its keep predicate is one the
-/// source does not accept for pushdown.
+/// A Cayenne `mode: memory` acceleration of the table with a `retention_sql`, which
+/// Cayenne applies from its post-write maintenance shortly after each write commits.
+/// `DynamoDB` cannot evaluate `upper()`, so its keep predicate is one the source does
+/// not accept for pushdown.
 fn dataset(port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("dynamodb:{TABLE}"), "retained".to_string());
     dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
@@ -73,7 +74,8 @@ fn dataset(port: u16) -> Dataset {
     ])));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: Mode::Memory,
         on_zero_results: ZeroResultsAction::UseSource,
         retention_sql: Some("DELETE FROM retained WHERE upper(name) = 'DROP'".to_string()),
         retention_check_enabled: false,
@@ -144,10 +146,24 @@ async fn dynamodb_fallback_applies_a_retention_predicate_the_source_cannot_evalu
             }
             runtime_ready_check(&rt).await;
 
-            // Retention dropped `drop` as the load was written, so the
-            // acceleration answers this from the kept row alone.
+            // Retention drops `drop` shortly after the load commits, after which
+            // the acceleration answers this from the kept row alone.
+            let kept = vec![row("a", "1", "keep")];
+            let retained = wait_until_true(std::time::Duration::from_secs(30), || async {
+                run_query(&rt, "SELECT pk, sk, name FROM retained WHERE pk = 'a'")
+                    .await
+                    .ok()
+                    .and_then(|batches| rows(&batches).ok())
+                    .is_some_and(|loaded| loaded == kept)
+            })
+            .await;
             let loaded = run_query(&rt, "SELECT pk, sk, name FROM retained WHERE pk = 'a'").await?;
-            assert_eq!(rows(&loaded)?, vec![row("a", "1", "keep")]);
+            assert!(
+                retained,
+                "retention_sql never removed the `drop` row from the acceleration; it holds {:?}",
+                rows(&loaded)?
+            );
+            assert_eq!(rows(&loaded)?, kept);
 
             // Written after the load, so only the source has them.
             put(&client, "b", "1", "late").await?;
@@ -173,10 +189,7 @@ async fn dynamodb_fallback_applies_a_retention_predicate_the_source_cannot_evalu
             );
 
             rt.shutdown().await;
-            container
-                .remove()
-                .await
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            container.cleanup().await;
             Ok(())
         })
         .await

@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::common::DFSchema;
+use datafusion_common::DFSchema;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -393,7 +393,7 @@ pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     /// The schema JSON encoding is a persisted format: CDC connectors record the schema
     /// they last read into an accelerator sidecar row, and a later run has to parse what
@@ -711,6 +711,42 @@ mod tests {
         assert_eq!(*expanded.field(3).data_type(), DataType::Float64);
         assert_eq!(expanded.field(3).metadata(), &field_metadata);
         assert_eq!(expanded.metadata(), &schema_metadata);
+    }
+
+    /// Guard for RUSTSEC-2026-0442 (fixed upstream in arrow 59.3.2,
+    /// apache/arrow-rs#11740): a `RunEndEncoded` array whose logical length
+    /// extends past the last run end must not validate. Without the fix,
+    /// `build` returns Ok and a later value read indexes past the values child.
+    #[test]
+    fn run_end_encoded_past_last_run_is_rejected() {
+        use arrow::array::ArrayData;
+
+        let dt = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Float32, true)),
+        );
+        let runs = ArrayData::builder(DataType::Int32)
+            .len(2)
+            .add_buffer(vec![1_i32, 3].into())
+            .build()
+            .expect("run ends build");
+        let values = ArrayData::builder(DataType::Float32)
+            .len(2)
+            .add_buffer(vec![1.5_f32, 2.5].into())
+            .build()
+            .expect("values build");
+
+        let err = ArrayData::builder(dt)
+            .len(4)
+            .offset(0)
+            .child_data(vec![runs, values])
+            .build()
+            .expect_err("offset+len past last run end must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offset + length of array should be less or equal to last value"),
+            "unexpected error: {msg}"
+        );
     }
 
     mod cast_view_columns_tests {

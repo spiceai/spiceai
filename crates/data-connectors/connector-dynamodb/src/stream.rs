@@ -47,6 +47,29 @@ pub enum StreamError {
     ))]
     StreamBeyondRetention { source: dynamodb_streams::Error },
 
+    #[snafu(display(
+        "Failed to start reading the DynamoDB Stream of table '{table_name}', so the dataset receives no changes until Spice restarts. Check that the table's stream is enabled and reachable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
+    ))]
+    FailedToStartStream { table_name: String, source: Error },
+
+    #[snafu(display(
+        "Failed to start the initial scan of DynamoDB table '{table_name}', so the dataset has no data until Spice restarts. See https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
+    ))]
+    FailedToStartInitialScan { table_name: String, source: Error },
+
+    #[snafu(display(
+        "Failed to record that DynamoDB table '{table_name}' is being reloaded, so the dataset is not reloaded and receives no changes until Spice restarts. Check that the acceleration's files are writable; see https://spiceai.org/docs/components/data-connectors/dynamodb. Cause: {source}"
+    ))]
+    FailedToMarkReload {
+        table_name: String,
+        source: runtime_checkpoint_api::CheckpointError,
+    },
+
+    #[snafu(display(
+        "Failed to resume the DynamoDB Stream of table '{table_name}' because its last reload was interrupted, so the accelerated table may be missing rows and receives no changes. Set `dynamodb_replication_initial_snapshot` to `auto` to reload the table; see https://spiceai.org/docs/components/data-connectors/dynamodb"
+    ))]
+    ReloadInterrupted { table_name: String },
+
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 
@@ -1677,7 +1700,7 @@ mod tests {
             let result = streams_to_dynamodb_attribute(&input);
 
             if let DynamoDbAttributeValue::L(l) = result {
-                assert!(l.is_empty());
+                assert_eq!(l, [] as [aws_sdk_dynamodb::types::AttributeValue; 0]);
             } else {
                 panic!("Expected L variant");
             }
@@ -1701,7 +1724,7 @@ mod tests {
             let result = streams_to_dynamodb_attribute(&input);
 
             if let DynamoDbAttributeValue::Ss(ss) = result {
-                assert!(ss.is_empty());
+                assert_eq!(ss, [] as [String; 0]);
             } else {
                 panic!("Expected Ss variant");
             }

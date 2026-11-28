@@ -35,6 +35,23 @@ use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
+/// Discards cached plans and results when a catalog refresh replaces or removes a table,
+/// so a repeated query plans against the table the catalog lists now.
+#[cfg(any(feature = "databricks", feature = "delta_lake"))]
+pub(crate) fn clear_caches_on_catalog_change(
+    runtime: &Runtime,
+) -> data_components::unity_catalog::provider::CatalogChangeListener {
+    let df = Arc::downgrade(&runtime.df);
+    Arc::new(move || {
+        let df = std::sync::Weak::clone(&df);
+        Box::pin(async move {
+            if let Some(df) = df.upgrade() {
+                df.clear_cached_plans_and_results().await;
+            }
+        })
+    })
+}
+
 /// Render `err` together with every error in its `source()` chain, on one line.
 ///
 /// Database clients routinely keep the useful part of a failure off the outermost
@@ -150,7 +167,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// the argument count are. A backend that also answers per *call* is the
 /// exception: reach for [`stub_udf_called_with`] there, since the arguments are
 /// then part of the question.
-#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
 pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
     use datafusion::prelude::col;
 
@@ -161,7 +178,7 @@ pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Ex
 /// [`FunctionSupport`](datafusion_table_providers::util::supported_functions::FunctionSupport)
 /// answers per *call* — where a literal argument is what decides whether the
 /// dialect can render it.
-#[cfg(all(test, any(feature = "duckdb", feature = "snowflake")))]
+#[cfg(all(test, any(feature = "adbc", feature = "snowflake")))]
 pub(crate) fn stub_udf_called_with(
     name: &str,
     args: Vec<datafusion::logical_expr::Expr>,
@@ -183,12 +200,11 @@ pub(crate) fn stub_udf_called_with(
 
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
 // Only the ADBC catalog connector reads the `query_federation` parameter today,
 // because only its dataset connector offers one. The MySQL, PostgreSQL, DuckLake
@@ -212,6 +228,9 @@ pub mod postgres_accelerated;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 pub mod spice_cloud;
+#[cfg(test)]
+#[cfg(feature = "delta_lake")]
+mod storage_location_tests;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
@@ -313,7 +332,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "adbc")]
     registry.insert(
         ducklake::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -373,7 +392,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(all(not(windows), feature = "spicebench"))]
+    #[cfg(feature = "spicebench")]
     registry.insert(
         cayenne::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -451,6 +470,12 @@ pub trait CatalogConnector: Send + Sync {
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::default()
+    }
+
+    /// The OAuth client ID whose user tokens, sent with a request, load a catalog that
+    /// initializes on trigger.
+    fn user_token_client_id(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -648,7 +673,7 @@ mod tests {
                 guard.contains_key("databricks"),
                 "databricks should be registered"
             );
-            #[cfg(feature = "duckdb")]
+            #[cfg(feature = "adbc")]
             assert!(
                 guard.contains_key(ducklake::PREFIX),
                 "ducklake should be registered"
@@ -678,14 +703,14 @@ mod tests {
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
             );
-            #[cfg(all(not(windows), feature = "spicebench"))]
+            #[cfg(feature = "spicebench")]
             assert!(
                 guard.contains_key(cayenne::PREFIX),
                 "cayenne should be registered"
             );
             // Guard against accidental re-registration: by default (without the
             // `spicebench` feature) the Cayenne catalog connector must NOT be registered.
-            #[cfg(all(not(windows), not(feature = "spicebench")))]
+            #[cfg(not(feature = "spicebench"))]
             assert!(
                 !guard.contains_key(cayenne::PREFIX),
                 "cayenne should not be registered without the spicebench feature"

@@ -1,0 +1,5551 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Serves a single-node GGUF model with llama.cpp.
+//!
+//! The prompt is the one the mistral.rs engine would send: the same messages
+//! ([`message_to_mistral`], fitted to the template by [`ContentSupport`]) rendered by the
+//! same chat-template code
+//! ([`apply_chat_template_to`]), with `reasoning_effort` checked by the same
+//! [`ReasoningSupport`]. llama.cpp only runs the forward passes and samples.
+//!
+//! One thread owns the backend, the model and its context. Requests wait on a channel and
+//! run one at a time, each decoding only the part of its prompt that the KV cache does not
+//! already hold from the request before it (`PromptCache`), and their tokens stream back
+//! over a Tokio channel, so a forward pass never blocks an async worker. Dropping the model
+//! stops that thread and waits for it to free the model.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Write as _,
+    num::NonZeroU32,
+    ops::Range,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::chat::{
+        ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall,
+        ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestMessage, ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCall, FunctionCallStream, FunctionType, PromptTokensDetails, ResponseFormat, Role,
+        StopConfiguration,
+    },
+};
+use async_trait::async_trait;
+use either::Either;
+use futures::Stream;
+use indexmap::IndexMap;
+use llama_cpp::{
+    Backend, Batch, Context, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler,
+    Token, Truncation, Vocab,
+};
+use mistralrs_core::reasoning_parsers::{
+    TagReasoningContext,
+    harmony::is_harmony_template,
+    tag_based::{
+        MISTRAL_THINK_OPEN_TAG, THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template,
+        is_mistral_think_template, is_think_tag_template,
+    },
+};
+use mistralrs_core::{
+    AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice, ChatTemplateValue, MessageContent,
+    ReasoningEffort as TemplateReasoningEffort, Tool, ToolCallResponse, ToolCallingMatcher,
+    ToolChoice, apply_chat_template_to,
+};
+use tokio::sync::{mpsc, oneshot};
+
+use llms::chat::engine::LocalChatEngine;
+use llms::chat::mistral::{
+    ReasoningControls, ReasoningSupport, convert_tool, reasoning_controls, request_tool_choice,
+};
+use llms::chat::{
+    Chat, ContentSupport, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result,
+    gguf_files, message_to_mistral, nsql::SqlGeneration,
+};
+use llms::streaming_utils::generate_stream_id;
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
+
+mod batching;
+mod distributed;
+mod harmony;
+mod inkling;
+mod reply;
+
+use reply::Reply;
+
+llms::register_local_chat_engine!(
+    LLAMA_CPP,
+    LocalChatEngine {
+        name: "llama.cpp",
+        serves: serves_weights,
+        distributed: Some(llama_cpp::rpc::splits_by_tensor),
+        load: load_weights,
+        free_memory,
+    }
+);
+
+/// The memory free for a model, for choosing a quantization: on llama.cpp's GPUs, or on a
+/// machine without one, the memory this process can still use.
+fn free_memory() -> Option<u64> {
+    llama_cpp::gpu_free_memory(Backend::get()).or_else(runtime_resources::get_available_memory)
+}
+
+/// llama.cpp serves a model whose weights are all GGUF files: shards of one model, and an
+/// optional MTP draft head.
+fn serves_weights(weights: &[PathBuf]) -> bool {
+    !weights.is_empty()
+        && weights.iter().all(|w| {
+            w.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        })
+}
+
+fn load_weights<'a>(
+    weights: &'a [PathBuf],
+    options: LocalModelOptions<'a>,
+) -> futures::future::BoxFuture<'a, Result<std::sync::Arc<dyn Chat>>> {
+    Box::pin(async move {
+        if let Some(cfg) = options.distributed {
+            distributed::ensure_insecure_allowed(cfg, options.reasoning.model_name)?;
+            // A rank other than 0 lends its GPU and never reads the weights: the head sends each
+            // rank its share.
+            if cfg.node_rank > 0 {
+                return distributed::lend_gpu(cfg, options.reasoning.model_name)
+                    .await
+                    .map(|share| std::sync::Arc::new(share) as std::sync::Arc<dyn Chat>);
+            }
+        }
+        LlamaCpp::from(weights, options)
+            .await
+            .map(|model| std::sync::Arc::new(model) as std::sync::Arc<dyn Chat>)
+    })
+}
+
+/// Tokens decoded per forward pass while reading the prompt.
+const PROMPT_BATCH: usize = 512;
+
+/// The most requests one model decodes together, as llama-server's default slot count is a few:
+/// a model serves this many unless its memory holds fewer ([`concurrent_context`]). A step's
+/// batch holds each one's next token and draft, which stays well within the context's batch
+/// size (`PROMPT_BATCH`).
+const MAX_CONCURRENT: u32 = 8;
+
+/// The memory a model leaves free on its GPUs (the machine's, on a unified-memory GPU) once its
+/// context is created with room for its open requests: a ceiling that leaves less is halved,
+/// so the requests' state never takes what the machine needs to keep running.
+const MIN_FREE_AFTER_CONTEXT: u64 = 2 << 30;
+
+/// The most host memory a model's idle prompts take, as llama.cpp's server bounds its prompt cache
+/// in RAM (`--cache-ram`, 8 GiB by default). A prompt is saved out of the shared cache when
+/// another request needs its sequence, and restored when a request continues it, so a request
+/// with another prefix (a coding agent's permission check or subagent, another conversation)
+/// leaves a conversation's prompt for its next turn instead of replacing it. Saved prompts also
+/// keep within half the memory the process can still use when each is saved: on a machine whose
+/// GPU shares its memory, what the cache takes the model's own buffers no longer have.
+const HOST_CACHE_BYTES: u64 = 8 << 30;
+
+/// The context size when the model sets no `context_length`.
+const DEFAULT_CONTEXT: u32 = 8192;
+
+/// How many tokens before a prompt's end a model with a recurrent state saves a checkpoint of
+/// it, as llama.cpp's server does. A chat's next prompt usually differs from this one only from
+/// the generation prompt on, which the template renders differently for an earlier turn, so the
+/// next request restores the checkpoint instead of reading its whole prompt again; when it
+/// differs earlier, an earlier request's checkpoint still saves reading the turns before.
+const CHECKPOINT_BEFORE_END: usize = 4;
+
+/// The most checkpoints a model keeps; a newer one replaces the oldest.
+const MAX_CHECKPOINTS: usize = 4;
+
+/// The weight of the newest measurement in the smoothed checkpoint costs.
+const COST_SMOOTHING: f64 = 0.25;
+
+/// Draft tokens an MTP head proposes per step. Two measured fastest for Qwen3.8-Flash-Next
+/// on a DGX Spark: over eight prompts, 60.7 tok/s against 53.8 with one and 47.5 without a
+/// draft, and three was slower than none on a story prompt.
+const MTP_DRAFT: i32 = 2;
+
+/// Draft tokens an MTP head proposes per step for Qwen3.8-Flash-Next (`qwen4exp`) split across
+/// nodes. Split three ways over DGX Sparks, three drafted measured fastest over eight prompts:
+/// 53.6 tok/s against 51.8 with two through spiced, 55.0-56.7 against 51.2-53.2 under
+/// llama-server. GLM-5.3 split the same way ran slower with three (39-40 against 42.1-42.6), so
+/// it keeps [`MTP_DRAFT`].
+const MTP_DRAFT_SPLIT_QWEN4EXP: i32 = 3;
+
+/// Draft tokens a `DFlash` or `DSpark` drafter proposes per step. Three measured fastest on DGX
+/// Sparks over eight prompts: DeepSeek-V4.1 with `DSpark` at 35.0 tok/s on two nodes (two and
+/// four drafted 30.0 and 29.7), Qwen3.8-Flash-Next `Q2_K` with `DFlash2` at 58.7 on one (four:
+/// 53.7).
+const DFLASH_DRAFT: i32 = 3;
+
+/// How many tokens an MTP head proposes per step for `model`, which is `split` across nodes or not.
+fn mtp_draft(model: &Model, split: bool) -> i32 {
+    if split && model.architecture().as_deref() == Some("qwen4exp") {
+        MTP_DRAFT_SPLIT_QWEN4EXP
+    } else {
+        MTP_DRAFT
+    }
+}
+
+/// How many tokens a draft model of this kind proposes per step, an MTP head `mtp`.
+fn draft_len(kind: DraftKind, mtp: i32) -> i32 {
+    match kind {
+        DraftKind::Mtp => mtp,
+        DraftKind::DFlash | DraftKind::DSpark => DFLASH_DRAFT,
+    }
+}
+
+/// How many streamed tokens may wait for a slow client before decoding pauses. Tests read it
+/// to send a reply longer than a client that stops reading can buffer.
+pub const STREAM_BUFFER: usize = 64;
+
+/// The most choices one request may ask for, as `OpenAI`'s `n` allows.
+const MAX_CHOICES: u8 = 128;
+
+/// How long the decode thread waits before it retries a send to a client whose buffer is full.
+const SEND_RETRY: Duration = Duration::from_millis(1);
+
+/// How long dropping a model waits for its decode thread to stop and free it.
+const UNLOAD_WAIT: Duration = Duration::from_secs(30);
+
+/// Why a request ends early: its decode thread stopped, as when the model is unloaded.
+const DECODE_STOPPED: &str = "the llama.cpp decode thread stopped mid-response";
+
+/// The token Gemma 4 chat templates add to the prompt to turn reasoning on.
+const GEMMA_THINK_TOKEN: &str = "<|think|>";
+
+pub struct LlamaCpp {
+    decoder: DecodeThread,
+    model_name: String,
+    template: Template,
+    special: SpecialTokens,
+    /// The markers of the reply formats the templates write (Harmony, Inkling), which a reply
+    /// in one of them is read by.
+    formats: reply::Formats,
+    reasoning_support: ReasoningSupport,
+    /// Which shapes of a message's content each of the model's chat templates reads.
+    content_support: ContentSupport,
+    counter: AtomicUsize,
+    /// See [`Loaded::context_window`].
+    context_window: u32,
+    /// How many prompt tokens the last request read from the KV cache, which the decode thread
+    /// sets.
+    reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside other requests, which the
+    /// decode thread counts.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
+}
+
+/// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
+/// chooses between as on the mistral.rs engine (`tool_use` with tools, `default` without).
+type Template = Either<String, Vec<HashMap<String, String>>>;
+
+/// The token strings a chat template may refer to.
+#[derive(Debug, Clone, Default)]
+struct SpecialTokens {
+    bos: Option<String>,
+    eos: Option<String>,
+}
+
+/// What the decode thread reports once the model is loaded.
+struct Loaded {
+    template: Option<String>,
+    /// `general.architecture`, as the GGUF names it.
+    architecture: Option<String>,
+    special: SpecialTokens,
+    /// The markers of each reply format the vocabulary holds.
+    formats: reply::Formats,
+    /// The context llama.cpp created, in tokens: what one request can hold.
+    context_window: u32,
+    /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
+    reused_prompt_tokens: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step, as the thread counts them.
+    prompt_ends_in_steps: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Sampling {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    /// `OpenAI`'s frequency and presence penalties, over every token the reply generates.
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    seed: u32,
+    /// The GBNF grammar the content must match: `response_format`'s, or a required tool
+    /// call's.
+    grammar: Option<String>,
+    /// Rules out every end-of-generation token, because `tool_choice` requires a tool call
+    /// and no grammar can force one in the template's format.
+    ban_eog: bool,
+}
+
+struct Job {
+    prompt: String,
+    /// The caller's cache namespace: a request reuses only what its own caller's requests left
+    /// in the KV cache.
+    namespace: CacheNamespace,
+    limit: Option<usize>,
+    sampling: Sampling,
+    stop: Vec<String>,
+    /// Tells the reply's reasoning apart from its answer, when the chat template marks one.
+    reasoning: Option<TagReasoningContext>,
+    /// Reads tool calls out of the content, when the request offers tools.
+    tools: Option<ToolCallingMatcher>,
+    /// Reads a reply in a format read by its markers (Harmony, Inkling), which carries its
+    /// reasoning, content and tool calls in its own blocks, in place of `reasoning` and `tools`.
+    reply: Option<Reply>,
+    /// Whether `tool_choice` requires a tool call, so a reply without one fails.
+    require_tool_call: bool,
+    /// Set when the decode thread is stopping, which ends the request.
+    stopping: Arc<AtomicBool>,
+    events: mpsc::Sender<Event>,
+}
+
+/// The model's decode thread, as the model's handle holds it. Dropping it stops the thread
+/// and waits, for up to [`UNLOAD_WAIT`], until the thread has freed the model, so a model
+/// that is dropped holds no memory afterwards. On Apple GPUs that matters at exit too: ggml
+/// aborts a process that exits with Metal memory still allocated.
+struct DecodeThread {
+    /// The model's name, for the log line when it is slow to stop.
+    model: String,
+    jobs: Option<std_mpsc::Sender<Job>>,
+    stopping: Arc<AtomicBool>,
+    /// Disconnects once the thread has freed everything it held. In a mutex only so the
+    /// model's handle can be shared; only `drop` reads it.
+    freed: Option<Mutex<std_mpsc::Receiver<()>>>,
+}
+
+impl Drop for DecodeThread {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        // Closing the queue ends the thread's loop once a running request stops.
+        drop(self.jobs.take());
+        if let Some(freed) = self.freed.take()
+            && freed
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv_timeout(UNLOAD_WAIT)
+                == Err(std_mpsc::RecvTimeoutError::Timeout)
+        {
+            tracing::debug!(
+                "Model '{}' did not stop decoding within {}s of being dropped; it is freed when it does.",
+                self.model,
+                UNLOAD_WAIT.as_secs()
+            );
+        }
+    }
+}
+
+/// What the decode thread sends back for one request, in order.
+enum Event {
+    Reasoning(String),
+    Content(String),
+    /// Complete tool calls, after which generation stops.
+    ToolCalls(Vec<ToolCallResponse>),
+    Done(Outcome),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Outcome {
+    finish: FinishReason,
+    prompt_tokens: u32,
+    /// How many of the prompt's tokens were read from the cache rather than decoded.
+    cached_tokens: u32,
+    completion_tokens: u32,
+}
+
+impl LlamaCpp {
+    /// Loads a GGUF model. For a sharded GGUF, `weights` lists every shard and llama.cpp
+    /// opens the rest from the first.
+    ///
+    /// # Errors
+    ///
+    /// When a weight file is missing, llama.cpp cannot load the model or its MTP head, the
+    /// model has no chat template, or its template writes a reply format (Harmony, Inkling)
+    /// whose markers its vocabulary does not hold as single tokens, or `reasoning_effort` is one
+    /// its chat template refuses, or `options` makes this node a rank other than 0 of a
+    /// distributed model: such a rank serves no model of its own, and the engine's `load`
+    /// returns the share it holds for the head instead.
+    pub async fn from(weights: &[PathBuf], options: LocalModelOptions<'_>) -> Result<Self> {
+        if let Some(cfg) = options.distributed
+            && cfg.node_rank > 0
+        {
+            return Err(ChatError::FailedToLoadModel {
+                source: format!(
+                    "Model '{}' is a share held for the first node in `nodes` on this node (rank {}), so it loads through the engine, not as a model of its own.",
+                    options.reasoning.model_name, cfg.node_rank
+                )
+                .into(),
+            });
+        }
+        for weight in weights {
+            if !weight.exists() {
+                return Err(ChatError::LocalModelNotFound {
+                    expected_path: weight.to_string_lossy().to_string(),
+                });
+            }
+        }
+        let (first, draft) = model_and_draft(weights);
+        let first = first.ok_or_else(|| ChatError::LocalModelNotFound {
+            expected_path: String::new(),
+        })?;
+        let n_ctx = options
+            .context_length
+            .and_then(|length| u32::try_from(length).ok())
+            .and_then(NonZeroU32::new)
+            .or(NonZeroU32::new(DEFAULT_CONTEXT));
+
+        if options.paged_attention == PagedAttentionMode::Disabled {
+            tracing::info!("{}", paged_attention_note(options.reasoning.model_name));
+        }
+        // The template file is read first, so one that can't be read fails the load before the
+        // model is read.
+        let file_template = match options.chat_template_file {
+            Some(file) => template_in_file(file).await?,
+            None => None,
+        };
+        // A distributed model: the head reaches every rank's GPU and splits the model across
+        // them.
+        let devices = match options.distributed {
+            None => Vec::new(),
+            Some(cfg) => distributed::reach_ranks(cfg, options.reasoning.model_name).await?,
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (jobs_tx, jobs_rx) = std_mpsc::channel();
+        let (freed_tx, freed_rx) = std_mpsc::channel::<()>();
+        let name = options.reasoning.model_name.to_string();
+        let file = file_name(&first);
+        let concurrent = options
+            .concurrent_requests
+            .map_or(MAX_CONCURRENT, NonZeroU32::get)
+            .min(MAX_CONCURRENT);
+        thread::Builder::new()
+            .name("llama-cpp".to_string())
+            .spawn(move || {
+                serve(
+                    &name,
+                    &first,
+                    draft.as_deref(),
+                    &devices,
+                    (n_ctx, concurrent),
+                    ready_tx,
+                    &jobs_rx,
+                );
+                // Everything `serve` held is freed by now.
+                drop(freed_tx);
+            })
+            .map_err(|e| ChatError::FailedToLoadModel {
+                source: Box::new(e),
+            })?;
+        // From here on, an early return stops the thread and waits for it to free the model.
+        let decoder = DecodeThread {
+            model: options.reasoning.model_name.to_string(),
+            jobs: Some(jobs_tx),
+            stopping: Arc::new(AtomicBool::new(false)),
+            freed: Some(Mutex::new(freed_rx)),
+        };
+        let loaded = ready_rx.await.map_err(|e| ChatError::FailedToLoadModel {
+            source: Box::new(e),
+        })??;
+
+        // As on the mistral.rs path, a template file's template wins over a GGUF's own, and a
+        // GGUF's own wins over `chat_template`.
+        let template = file_template
+            .or(loaded.template.map(Either::Left))
+            .or_else(|| {
+                options
+                    .chat_template_literal
+                    .map(|literal| Either::Left(literal.to_string()))
+            })
+            .ok_or_else(|| ChatError::FailedToLoadModel {
+                source:
+                    "the GGUF file carries no chat template, and the model sets no `chat_template`"
+                        .into(),
+            })?;
+        let formats = check_reply_format(&template, loaded.architecture, loaded.formats, file)?;
+
+        let model_name = options.reasoning.model_name.to_string();
+        let reasoning_support = {
+            let template = template.clone();
+            let special = loaded.special.clone();
+            tokio::task::spawn_blocking(move || {
+                ReasoningSupport::from_renders(|enable_thinking, effort| {
+                    let message = IndexMap::from([
+                        ("role".to_string(), Either::Left("user".to_string())),
+                        ("content".to_string(), Either::Left("Hi".to_string())),
+                    ]);
+                    render(
+                        &template,
+                        &special,
+                        vec![message],
+                        enable_thinking,
+                        effort,
+                        Vec::new(),
+                        true,
+                    )
+                    .ok()
+                })
+            })
+            .await
+            .unwrap_or_default()
+        };
+        // Each template a request may render with is probed with no tools: tools choose
+        // between named templates, and a template reads content alike with or without them.
+        let content_support = {
+            let template = template.clone();
+            let special = loaded.special.clone();
+            tokio::task::spawn_blocking(move || {
+                ContentSupport::from_renders(|messages, with_tools| {
+                    let chosen = chosen_template(&template, with_tools).ok()?;
+                    render(
+                        &Either::Left(chosen.to_string()),
+                        &special,
+                        messages,
+                        None,
+                        None,
+                        Vec::new(),
+                        true,
+                    )
+                    .ok()
+                })
+            })
+            .await
+            .unwrap_or_default()
+        };
+        if let Some(effort) = options.reasoning.effort {
+            reasoning_controls(Some(effort), &reasoning_support, &model_name).map_err(
+                |message| ChatError::InvalidParamValueError {
+                    param: "reasoning_effort".to_string(),
+                    message,
+                },
+            )?;
+        }
+
+        Ok(Self {
+            decoder,
+            model_name,
+            template,
+            special: loaded.special,
+            formats,
+            reasoning_support,
+            content_support,
+            counter: AtomicUsize::new(0),
+            context_window: loaded.context_window,
+            reused_prompt_tokens: loaded.reused_prompt_tokens,
+            prompt_ends_in_steps: loaded.prompt_ends_in_steps,
+        })
+    }
+
+    /// How many prompt tokens the last request read from the KV cache the request before it
+    /// left, instead of decoding them again. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reused_prompt_tokens(&self) -> usize {
+        self.reused_prompt_tokens.load(Ordering::Relaxed)
+    }
+
+    /// How many requests read the end of their prompt in a step beside the running requests,
+    /// rather than in a decode of its own. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prompt_ends_in_steps(&self) -> usize {
+        self.prompt_ends_in_steps.load(Ordering::Relaxed)
+    }
+
+    /// The prompt `req` renders, as a request decodes it. For tests.
+    #[doc(hidden)]
+    pub fn render_prompt(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> std::result::Result<String, OpenAIError> {
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        let tools = req.tools.iter().flatten().map(convert_tool).collect();
+        self.prompt(&req.messages, reasoning, tools, true)
+    }
+
+    /// The conversation as the chat template renders it, with its generation prompt when
+    /// `generation_prompt`.
+    fn prompt(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        reasoning: ReasoningControls,
+        tools: Vec<Tool>,
+        generation_prompt: bool,
+    ) -> std::result::Result<String, OpenAIError> {
+        let mut messages = messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|part| OpenAIError::InvalidArgument(part.refusal(&self.model_name)))?;
+        self.content_support
+            .rewrite(&mut messages, !tools.is_empty());
+        render(
+            &self.template,
+            &self.special,
+            messages,
+            reasoning.enable_thinking,
+            reasoning.reasoning_effort,
+            tools,
+            generation_prompt,
+        )
+        .map_err(|e| {
+            OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}"))
+        })
+    }
+
+    /// Validates `req`, renders its prompt and queues one job per choice on the decode
+    /// thread, which decodes them in turn. The receivers are in choice order.
+    fn submit(
+        &self,
+        req: &CreateChatCompletionRequest,
+        namespace: &CacheNamespace,
+    ) -> std::result::Result<Vec<mpsc::Receiver<Event>>, OpenAIError> {
+        let choices = choice_count(req)?;
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        // Tools are rendered into the prompt and read back out of the reply with the
+        // mistral.rs engine's own conversions and parser, so both engines agree.
+        let tool_choice = request_tool_choice(req)?;
+        let tools: Vec<Tool> = req.tools.iter().flatten().map(convert_tool).collect();
+        // A required call is forced with a grammar where the template's format allows one,
+        // and otherwise only held to by refusing to end until the model makes one.
+        let obliged = obliged_tools(tool_choice.as_ref(), &tools);
+        let callable = callable_tools(tool_choice.as_ref(), &tools);
+        // The template this request renders with, for what its markup decides.
+        let template = chosen_template(&self.template, !tools.is_empty())
+            .map_err(OpenAIError::InvalidArgument)?;
+        let content = || {
+            content_grammar(
+                &self.model_name,
+                template,
+                req.response_format.as_ref(),
+                &callable,
+                &obliged,
+            )
+        };
+        // A reply is read by a format's markers only when the template this request renders
+        // with writes that format: named templates may mix one that does with one that does
+        // not.
+        let format = self.formats.of(template);
+        // A required call in such a format has a grammar of its own (below); otherwise the
+        // content's grammar holds the reply.
+        let call_held = format.is_some() && !obliged.is_empty();
+        let content = if call_held { None } else { content()? };
+        // Each choice reads its own reply, so each has its own reader.
+        let matchers = (0..choices)
+            .map(|_| {
+                if tools.is_empty() {
+                    return Ok(None);
+                }
+                ToolCallingMatcher::new_with_format(
+                    tool_choice.clone().unwrap_or(ToolChoice::Auto),
+                    Some(&tools),
+                    None,
+                )
+                .map(Some)
+                .map_err(|e| OpenAIError::InvalidArgument(format!("Invalid `tools`: {e}")))
+            })
+            .collect::<std::result::Result<Vec<_>, OpenAIError>>()?;
+        let require_tool_call = matchers
+            .first()
+            .and_then(Option::as_ref)
+            .is_some_and(ToolCallingMatcher::requires_tool_call);
+        let ban_eog = require_tool_call && !call_held && content.is_none();
+        let nameable = nameable_tools(&callable, &obliged);
+        // `OpenAI`'s default: a turn may make several calls.
+        let parallel = req.parallel_tool_calls.unwrap_or(true);
+        let held = if !obliged.is_empty() {
+            reply::Held::Call
+        } else if content.is_some() {
+            reply::Held::Reply
+        } else {
+            reply::Held::Nothing
+        };
+        let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once,
+        // from what the generation prompt adds after the conversation the template renders
+        // without it (`harmony::reply_text`, `inkling::reply_text`).
+        let reader = format.map(|format| {
+            let conversation = self
+                .prompt(&req.messages, reasoning, tools.clone(), false)
+                .ok();
+            format.reader(nameable, held, parallel, &prompt, conversation.as_deref())
+        });
+        // A grammar over a format's markers holds the whole reply by the vocabulary's markers,
+        // from where the prompt leaves it.
+        let grammar = match &reader {
+            Some(Reply::Harmony(reader)) if call_held => {
+                Some(harmony_call(reader.markers(), &obliged, reader.opened())?)
+            }
+            Some(Reply::Harmony(reader)) => {
+                content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
+            }
+            Some(Reply::Inkling(reader)) if call_held => {
+                Some(inkling_call(reader.markers(), &obliged, parallel)?)
+            }
+            Some(Reply::Inkling(reader)) => {
+                content.map(|reply| inkling_reply(reader.markers(), &reply))
+            }
+            None => content,
+        };
+        let stop = match &req.stop {
+            Some(StopConfiguration::String(s)) => vec![s.clone()],
+            Some(StopConfiguration::StringArray(s)) => s.clone(),
+            None => Vec::new(),
+        };
+        let stopped = || api_error("the llama.cpp decode thread has stopped");
+        let jobs = self.decoder.jobs.as_ref().ok_or_else(stopped)?;
+        let mut receivers = Vec::with_capacity(choices);
+        for tools in matchers {
+            let (events, rx) = mpsc::channel(STREAM_BUFFER);
+            let reply = reader.clone();
+            let job = Job {
+                // A reply read by a format's markers carries its own reasoning and calls.
+                reasoning: reasoning_parser(template, &prompt).filter(|_| reply.is_none()),
+                prompt: prompt.clone(),
+                namespace: namespace.clone(),
+                limit: completion_limit(req),
+                // Each choice samples with its own seed, so choices differ above temperature 0.
+                sampling: Sampling {
+                    temperature: req.temperature,
+                    top_p: req.top_p,
+                    frequency_penalty: req.frequency_penalty,
+                    presence_penalty: req.presence_penalty,
+                    seed: rand::random(),
+                    grammar: grammar.clone(),
+                    ban_eog,
+                },
+                stop: stop.clone(),
+                tools: tools.filter(|_| reply.is_none()),
+                reply,
+                require_tool_call,
+                stopping: Arc::clone(&self.decoder.stopping),
+                events,
+            };
+            jobs.send(job).map_err(|_| stopped())?;
+            receivers.push(rx);
+        }
+        Ok(receivers)
+    }
+
+    fn id(&self) -> String {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{n}", generate_stream_id(&self.model_name))
+    }
+}
+
+#[async_trait]
+impl Chat for LlamaCpp {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+
+    /// The context llama.cpp runs the model with: `context_length`, or the default. It caps
+    /// no answer below that.
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        llms::chat::TokenLimits {
+            context_window: (self.context_window > 0).then_some(u64::from(self.context_window)),
+            max_output_tokens: None,
+        }
+    }
+
+    async fn health(&self) -> Result<()> {
+        // A model that loaded is healthy; the decode thread lives as long as `self`.
+        Ok(())
+    }
+
+    async fn chat_stream(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
+        let choices = self.submit(&req, &caller().await)?.into();
+        let id = self.id();
+        let model = req.model;
+        let created = now();
+        let state = StreamState {
+            choices,
+            index: 0,
+            first: true,
+            prompt: None,
+            completion_tokens: 0,
+            done: false,
+        };
+        let stream = futures::stream::unfold(state, move |mut state| {
+            let id = id.clone();
+            let model = model.clone();
+            async move {
+                if state.done {
+                    return None;
+                }
+                let item = loop {
+                    let (index, first) = (state.index, state.first);
+                    match state.choices.front_mut()?.recv().await {
+                        // A fragment of nothing carries nothing, so a streamed
+                        // `reasoning_content` is never empty.
+                        Some(Event::Reasoning(reasoning)) if reasoning.is_empty() => {}
+                        Some(Event::Reasoning(reasoning)) => {
+                            state.first = false;
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                Some(Text::Reasoning(reasoning)),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
+                        Some(Event::Content(content)) => {
+                            state.first = false;
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                Some(Text::Answer(content)),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
+                        Some(Event::ToolCalls(calls)) => {
+                            state.first = false;
+                            let calls = calls
+                                .iter()
+                                .enumerate()
+                                .map(|(i, call)| tool_call_chunk(i, call))
+                                .collect();
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                None,
+                                Some(calls),
+                                None,
+                                None,
+                            ));
+                        }
+                        Some(Event::Done(outcome)) => {
+                            state.choices.pop_front();
+                            let prompt = *state.prompt.get_or_insert(outcome);
+                            state.completion_tokens = state
+                                .completion_tokens
+                                .saturating_add(outcome.completion_tokens);
+                            // The next choice starts its own message; the last choice's
+                            // final chunk carries the usage of them all.
+                            state.done = state.choices.is_empty();
+                            state.index += 1;
+                            state.first = true;
+                            let usage = state.done.then(|| usage(&prompt, state.completion_tokens));
+                            break Ok(chunk(
+                                &id,
+                                &model,
+                                created,
+                                index,
+                                first,
+                                None,
+                                None,
+                                Some(outcome.finish),
+                                usage,
+                            ));
+                        }
+                        Some(Event::Failed(message)) => {
+                            state.done = true;
+                            break Err(api_error(&message));
+                        }
+                        None => {
+                            state.done = true;
+                            break Err(api_error(DECODE_STOPPED));
+                        }
+                    }
+                };
+                Some((item, state))
+            }
+        });
+        Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = _> + Send>>)
+    }
+
+    #[expect(
+        deprecated,
+        reason = "`function_call` and `system_fingerprint` are deprecated fields of the response"
+    )]
+    async fn chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
+        let mut choices = Vec::new();
+        let (mut prompt, mut completion_tokens) = (None, 0_u32);
+        let namespace = caller().await;
+        for (index, mut rx) in (0..).zip(self.submit(&req, &namespace)?) {
+            let (mut reasoning, mut content, mut tool_calls) =
+                (String::new(), String::new(), Vec::new());
+            let outcome = loop {
+                match rx.recv().await {
+                    Some(Event::Reasoning(text)) => reasoning.push_str(&text),
+                    Some(Event::Content(text)) => content.push_str(&text),
+                    Some(Event::ToolCalls(calls)) => {
+                        tool_calls.extend(calls.iter().map(tool_call));
+                    }
+                    Some(Event::Done(outcome)) => break outcome,
+                    Some(Event::Failed(message)) => return Err(api_error(&message)),
+                    None => {
+                        return Err(api_error(DECODE_STOPPED));
+                    }
+                }
+            };
+            let message = ChatCompletionResponseMessage {
+                // With tool calls, text the model wrote beside them is the content, if any.
+                content: if tool_calls.is_empty() {
+                    Some(content)
+                } else {
+                    non_empty(content)
+                },
+                reasoning_content: non_empty(reasoning),
+                refusal: None,
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                annotations: None,
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+            };
+            // Every choice reads the same prompt, which counts once, as the first read it.
+            prompt.get_or_insert(outcome);
+            completion_tokens = completion_tokens.saturating_add(outcome.completion_tokens);
+            choices.push(ChatChoice {
+                index,
+                message,
+                finish_reason: Some(outcome.finish),
+                logprobs: None,
+            });
+        }
+        Ok(CreateChatCompletionResponse {
+            id: self.id(),
+            object: "chat.completion".to_string(),
+            created: now(),
+            model: req.model,
+            choices,
+            usage: prompt.map(|prompt| usage(&prompt, completion_tokens)),
+            service_tier: None,
+            system_fingerprint: None,
+        })
+    }
+}
+
+struct StreamState {
+    /// The choices still to stream, in order; the front one is streaming.
+    choices: VecDeque<mpsc::Receiver<Event>>,
+    /// The front choice's index.
+    index: u32,
+    /// Whether the front choice has sent nothing yet, so its next chunk names the role.
+    first: bool,
+    /// The first choice's outcome, whose prompt the usage counts.
+    prompt: Option<Outcome>,
+    /// The completion tokens of the choices streamed so far.
+    completion_tokens: u32,
+    done: bool,
+}
+
+/// A tool call as a streamed chunk carries it, whole, at position `index` among the calls.
+fn tool_call_chunk(index: usize, call: &ToolCallResponse) -> ChatCompletionMessageToolCallChunk {
+    ChatCompletionMessageToolCallChunk {
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        id: Some(call.id.clone()),
+        r#type: Some(FunctionType::Function),
+        function: Some(FunctionCallStream {
+            name: Some(call.function.name.clone()),
+            arguments: Some(call.function.arguments.clone()),
+        }),
+    }
+}
+
+/// A tool call as a non-streamed response carries it.
+fn tool_call(call: &ToolCallResponse) -> ChatCompletionMessageToolCalls {
+    ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+        id: call.id.clone(),
+        function: FunctionCall {
+            name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
+        },
+    })
+}
+
+/// Renders a conversation the way the mistral.rs engine does, with the template's generation
+/// prompt when `generation_prompt`.
+fn render(
+    template: &Template,
+    special: &SpecialTokens,
+    messages: Vec<IndexMap<String, MessageContent>>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<TemplateReasoningEffort>,
+    tools: Vec<Tool>,
+    generation_prompt: bool,
+) -> std::result::Result<String, String> {
+    apply_chat_template_to(
+        messages,
+        generation_prompt,
+        enable_thinking,
+        reasoning_effort,
+        &ChatTemplateValue(template.clone()),
+        special.bos.clone(),
+        special.eos.clone(),
+        None,
+        tools,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The decode thread: loads the model, reports readiness, then runs jobs: one at a time, in
+/// order, or up to `concurrent` together, each in its own sequence of one shared cache, with
+/// idle prompts saved to host memory for later requests to continue ([`HOST_CACHE_BYTES`]).
+fn serve(
+    name: &str,
+    path: &Path,
+    draft: Option<&Path>,
+    devices: &[llama_cpp::rpc::Device],
+    (n_ctx, concurrent): (Option<NonZeroU32>, u32),
+    ready: oneshot::Sender<std::result::Result<Loaded, ChatError>>,
+    jobs: &std_mpsc::Receiver<Job>,
+) {
+    let backend = Backend::get();
+    // On one node the model goes to this node's GPUs; split across nodes, every weight is
+    // split across `devices`, and so is a draft model's.
+    let params = ModelParams::default().with_devices(devices.to_vec());
+    // A GGUF may carry its own MTP (NextN) layers, which only load when asked for; a file
+    // without them loads as it would otherwise. A model that no longer fits with its MTP
+    // layer still loads without it, and decodes without drafting.
+    let (model, loaded_mtp) = match Model::load(backend, path, &params.clone().with_load_mtp(true))
+    {
+        Ok(model) => (model, true),
+        Err(with_mtp) => {
+            let Ok(model) = Model::load(backend, path, &params) else {
+                let _ = ready.send(Err(load_error(path, with_mtp)));
+                return;
+            };
+            tracing::info!("{}", without_mtp_note(name, &with_mtp));
+            (model, false)
+        }
+    };
+    // This engine decodes one token after another with a decoder alone. An encoder-decoder
+    // model's decoder aborts the process when no encoder pass ran, and a diffusion model
+    // decodes nothing, so both are refused while they load.
+    if model.has_encoder() || model.is_diffusion() {
+        let _ = ready.send(Err(ChatError::UnsupportedArchitecture {
+            architecture: model.architecture().unwrap_or_default(),
+            file: file_name(path),
+        }));
+        return;
+    }
+    let draft_model = match draft.map(|d| {
+        // A DFlash or DSpark drafter says so in its header; any other draft file is an MTP head.
+        let kind = DraftKind::dflash_of(d).unwrap_or(DraftKind::Mtp);
+        // A draft model goes where the target is: an MTP head drafts through the target's
+        // context, and a DFlash or DSpark drafter uses the target's own output head.
+        let params = params.clone().with_load_mtp(kind == DraftKind::Mtp);
+        let head = Model::load(backend, d, &params).map_err(|e| {
+            format!(
+                "llama.cpp could not load the draft model '{}': {e}",
+                d.display()
+            )
+        })?;
+        if kind != DraftKind::Mtp || head.n_layer_nextn() > 0 {
+            Ok((head, kind))
+        } else {
+            Err(not_a_head(d))
+        }
+    }) {
+        Some(Err(message)) => {
+            let _ = ready.send(Err(failed(message)));
+            return;
+        }
+        Some(Ok(model)) => Some(model),
+        None => None,
+    };
+    // Without a separate head, a model with its own MTP layer drafts for itself, as
+    // llama.cpp's server does. A model loaded without the layer still counts it in its
+    // header, so only one loaded with it drafts.
+    let drafts_itself = draft_model.is_none() && loaded_mtp && model.n_layer_nextn() > 0;
+    let split = devices.len() > 1;
+    let mtp_len = mtp_draft(&model, split);
+    // The model that drafts, if any, and how.
+    let head = match &draft_model {
+        Some((head, kind)) => Some((head, *kind)),
+        None => drafts_itself.then_some((&model, DraftKind::Mtp)),
+    };
+    // The contexts borrow the models, so all of them live in this frame for the thread's
+    // lifetime. With a draft model, verification rolls back up to its draft length of rejected
+    // tokens, and a hybrid model's recurrent layers can roll back only as many tokens as the
+    // context keeps state snapshots for, so it keeps that many, as llama.cpp's server sizes it.
+    let snapshots = head.map_or(0, |(_, kind)| {
+        u32::try_from(draft_len(kind, mtp_len)).unwrap_or(0)
+    });
+    let params = ContextParams::default()
+        .with_n_ctx(n_ctx)
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_n_rs_seq(snapshots);
+    let ceiling = concurrent;
+    let (context, concurrent) = match concurrent_context(&model, backend, params, ceiling) {
+        Ok(created) => created,
+        Err(e) => {
+            let _ = ready.send(Err(failed(format!(
+                "llama.cpp could not create a context: {e}"
+            ))));
+            return;
+        }
+    };
+    let layout = cache_layout(model.architecture().as_deref());
+    if ceiling > 1 {
+        tracing::info!(
+            "{}",
+            concurrency_note(name, (concurrent, ceiling), context.n_ctx(), layout)
+        );
+    }
+    let context_window = context.n_ctx();
+    let mut decoder = match head {
+        None => Decoder::Plain(context),
+        Some((head, kind)) => match mtp(head, kind, context, (mtp_len, concurrent)) {
+            Ok(spec) => Decoder::Mtp(Box::new(spec)),
+            Err(message) => {
+                let _ = ready.send(Err(failed(message)));
+                return;
+            }
+        },
+    };
+    let vocab = model.vocab();
+    let special = SpecialTokens {
+        bos: piece(&model, vocab.bos()),
+        eos: piece(&model, vocab.eos()),
+    };
+    // How far the target's cache can be cut back decides whether reusing it needs checkpoints.
+    let truncation = match &mut decoder {
+        Decoder::Plain(context) => context.truncation(),
+        Decoder::Mtp(spec) => spec.target_mut().truncation(),
+    };
+    let cache = PromptCache::new(name, truncation);
+    let loaded = Loaded {
+        template: model.chat_template(),
+        architecture: model.architecture(),
+        special,
+        formats: reply::Formats::find(vocab),
+        context_window,
+        reused_prompt_tokens: Arc::clone(&cache.reused),
+        prompt_ends_in_steps: Arc::clone(&cache.ends_in_steps),
+    };
+    // Ruled out while a required tool call is outstanding.
+    let eog = vocab.eog_tokens();
+    if ready.send(Ok(loaded)).is_err() {
+        return;
+    }
+    let mut caches = vec![cache];
+    while caches.len() < usize::try_from(concurrent).unwrap_or(usize::MAX) {
+        let mut more = PromptCache::new(name, truncation);
+        more.reused = Arc::clone(&caches[0].reused);
+        more.ends_in_steps = Arc::clone(&caches[0].ends_in_steps);
+        caches.push(more);
+    }
+    let running = usize::try_from(concurrent).unwrap_or(1);
+    batching::serve(
+        &model,
+        &mut decoder,
+        split,
+        (caches, running, layout),
+        jobs,
+        &eog,
+    );
+}
+
+/// Sends `event` to its client, waiting while the client's buffer is full, and returns whether
+/// the client took it. A stopping thread does not wait for a client that has stopped reading:
+/// it gives up as soon as it sees `stopping`, which a blocked send would never notice.
+fn send_unless_stopping(events: &mpsc::Sender<Event>, stopping: &AtomicBool, event: Event) -> bool {
+    let mut event = event;
+    loop {
+        match events.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(back)) => {
+                if stopping.load(Ordering::Relaxed) {
+                    return false;
+                }
+                event = back;
+                std::thread::sleep(SEND_RETRY);
+            }
+        }
+    }
+}
+
+/// Why a model loads without drafting: its MTP layer would not load beside it.
+fn without_mtp_note(model: &str, error: &llama_cpp::Error) -> String {
+    format!(
+        "Model '{model}' loaded without its MTP layer, so it decodes without drafting: the model did not load with it. Cause: {error}"
+    )
+}
+
+/// The error for a file named as an MTP draft head that carries no MTP layer.
+fn not_a_head(path: &Path) -> String {
+    let file = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
+    format!(
+        "'{file}' is named as an MTP draft head (it starts with `mtp-`), but it carries no MTP layer. Remove it from `files`, or rename it if it is a shard of the model."
+    )
+}
+
+/// What a model that sets `paged_attention: disabled` is told at load: llama.cpp manages its
+/// own KV cache, so the setting has nothing to turn off.
+fn paged_attention_note(model: &str) -> String {
+    format!(
+        "Model '{model}' sets `paged_attention: disabled`, which has no effect: GGUF models are served by llama.cpp, which manages its own KV cache. Remove the parameter to silence this message."
+    )
+}
+
+fn failed(message: String) -> ChatError {
+    ChatError::FailedToLoadModel {
+        source: message.into(),
+    }
+}
+
+/// The chat template in `file`: the whole of a `.jinja` file, or the `chat_template` of a
+/// `tokenizer_config.json`, which holds either one template or a list of named ones. A
+/// `tokenizer_config.json` without a `chat_template` holds none.
+async fn template_in_file(file: &Path) -> Result<Option<Template>> {
+    let unreadable = |reason: String| {
+        failed(format!(
+            "could not read the chat template in '{}': {reason}",
+            file.display()
+        ))
+    };
+    let text = tokio::fs::read_to_string(file)
+        .await
+        .map_err(|e| unreadable(e.to_string()))?;
+    if file
+        .extension()
+        .is_some_and(|extension| extension == "jinja")
+    {
+        return Ok(Some(Either::Left(text)));
+    }
+    let config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| unreadable(e.to_string()))?;
+    match config.get("chat_template") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(template)) => Ok(Some(Either::Left(template.clone()))),
+        Some(named @ serde_json::Value::Array(_)) => {
+            let named: Vec<HashMap<String, String>> = serde_json::from_value(named.clone())
+                .map_err(|_| {
+                    unreadable(
+                        "its `chat_template` list holds an entry that is not names and templates"
+                            .to_string(),
+                    )
+                })?;
+            let template = Either::Right(named);
+            chosen_template(&template, false).map_err(unreadable)?;
+            Ok(Some(template))
+        }
+        Some(_) => Err(unreadable(
+            "its `chat_template` is neither a template nor a list of named templates".to_string(),
+        )),
+    }
+}
+
+/// Every template `template` holds.
+fn templates(template: &Template) -> impl Iterator<Item = &str> {
+    let (one, named) = match template {
+        Either::Left(one) => (Some(one.as_str()), None),
+        Either::Right(named) => (None, Some(named)),
+    };
+    one.into_iter()
+        .chain(named.into_iter().flatten().flat_map(|entry| {
+            ["template", "tool_use", "default"]
+                .into_iter()
+                .filter_map(|key| entry.get(key).map(String::as_str))
+        }))
+}
+
+/// The template a request renders with, chosen as the mistral.rs engine chooses: of named
+/// templates, `tool_use` for a request with tools and `default` for one without. A request
+/// with tools fails where no template is named `tool_use`.
+fn chosen_template(template: &Template, with_tools: bool) -> std::result::Result<&str, String> {
+    let named = match template {
+        Either::Left(one) => return Ok(one),
+        Either::Right(named) => named,
+    };
+    let has_tool_use = named.iter().any(|entry| {
+        entry.get("name").is_some_and(|name| name == "tool_use") || entry.contains_key("tool_use")
+    });
+    if with_tools && !has_tool_use {
+        return Err(
+            "Tools were provided but this chat template does not handle tool usage".to_string(),
+        );
+    }
+    let mut found = None;
+    for entry in named {
+        if let Some(name) = entry.get("name") {
+            found = entry.get("template");
+            if (name == "tool_use" && with_tools) || (name == "default" && !with_tools) {
+                break;
+            }
+        } else if with_tools && entry.contains_key("tool_use") {
+            found = entry.get("tool_use");
+            break;
+        } else if !with_tools && entry.contains_key("default") {
+            found = entry.get("default");
+            break;
+        }
+    }
+    found.map(String::as_str).ok_or_else(|| {
+        "its `chat_template` list holds no template named `default` or `tool_use`".to_string()
+    })
+}
+
+/// Why `path` did not load. An architecture this release's llama.cpp does not know gets its
+/// own message, since the fix is a different model or Spice release, not a bug report.
+fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
+    const UNKNOWN: &str = "unknown model architecture: '";
+    let message = error.to_string();
+    if let Some(at) = message.find(UNKNOWN) {
+        let rest = &message[at + UNKNOWN.len()..];
+        if let Some(end) = rest.find('\'') {
+            return ChatError::UnsupportedArchitecture {
+                architecture: rest[..end].to_string(),
+                file: file_name(path),
+            };
+        }
+    }
+    ChatError::FailedToLoadModel {
+        source: Box::new(error),
+    }
+}
+
+/// A Harmony reply (gpt-oss) or an Inkling reply is read token by token, by its format's
+/// markers, so a model whose chat template writes one is served only when its vocabulary
+/// holds every one of that format's markers as one token, and refused otherwise rather than
+/// served with the format's markup in the content. Returns the markers of the formats the
+/// templates write, which their replies are read by.
+fn check_reply_format(
+    template: &Template,
+    architecture: Option<String>,
+    found: reply::Formats,
+    file: String,
+) -> Result<reply::Formats> {
+    let writes = |format: fn(&str) -> bool| templates(template).any(format);
+    // Each format a template writes, with its markers if the vocabulary holds them.
+    let harmony = writes(is_harmony_template).then_some(found.harmony);
+    let inkling = writes(inkling::is_inkling_template).then_some(found.inkling);
+    // The architecture of the models that write a format whose markers the vocabulary lacks,
+    // which the error names when the GGUF names none.
+    let lacking = match (harmony, inkling) {
+        (Some(None), _) => Some("gpt-oss"),
+        (_, Some(None)) => Some("inkling2_loop"),
+        _ => None,
+    };
+    if let Some(writer) = lacking {
+        return Err(ChatError::UnsupportedArchitecture {
+            architecture: architecture.unwrap_or_else(|| writer.to_string()),
+            file,
+        });
+    }
+    Ok(reply::Formats {
+        harmony: harmony.flatten(),
+        inkling: inkling.flatten(),
+    })
+}
+
+/// The file an error names: its name, or the whole path when it has none.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().to_string(),
+    )
+}
+
+/// The decode thread's engine: plain decoding, or decoding with an MTP draft head.
+enum Decoder<'m> {
+    Plain(Context<'m>),
+    Mtp(Box<Mtp<'m>>),
+}
+
+/// Creates an MTP draft context linked to `context`, as llama.cpp's own server does: an
+/// MTP-type context of the same size, reading the target's hidden states.
+fn mtp<'m>(
+    draft_model: &'m Model,
+    kind: DraftKind,
+    context: Context<'m>,
+    (mtp_len, concurrent): (i32, u32),
+) -> std::result::Result<Mtp<'m>, String> {
+    let params = shared_cache(
+        ContextParams::default()
+            .with_n_ctx(NonZeroU32::new(context.n_ctx()))
+            .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX)),
+        concurrent,
+    );
+    Mtp::new(
+        context,
+        draft_model,
+        &params,
+        MtpParams {
+            kind,
+            n_max: draft_len(kind, mtp_len),
+            n_min: 0,
+            p_min: 0.0,
+        },
+    )
+    .map_err(|e| format!("llama.cpp could not start drafting: {e}"))
+}
+
+/// A context for up to `ceiling` requests at once, and how many it holds: the ceiling, halved
+/// while llama.cpp cannot create the context, or creates it leaving less than
+/// [`MIN_FREE_AFTER_CONTEXT`] free, down to one request, whose context is created as it stands.
+fn concurrent_context<'m>(
+    model: &'m Model,
+    backend: &Backend,
+    params: ContextParams,
+    ceiling: u32,
+) -> llama_cpp::Result<(Context<'m>, u32)> {
+    let mut concurrent = ceiling.max(1);
+    loop {
+        match model.new_context(backend, &shared_cache(params, concurrent)) {
+            Ok(context)
+                if concurrent == 1
+                    || free_memory().is_none_or(|free| free >= MIN_FREE_AFTER_CONTEXT) =>
+            {
+                return Ok((context, concurrent));
+            }
+            Err(e) if concurrent == 1 => return Err(e),
+            // a context that leaves too little free is dropped here, so its memory is free for
+            // the smaller one
+            Ok(_) | Err(_) => concurrent /= 2,
+        }
+    }
+}
+
+/// How the cache of a model of `architecture` holds concurrent requests' sequences: llama.cpp's
+/// DeepSeek-V4 cache keeps a stream of the whole context per sequence even when asked for a
+/// unified one.
+fn cache_layout(architecture: Option<&str>) -> batching::CacheLayout {
+    match architecture {
+        Some("deepseek4" | "deepseek41") => batching::CacheLayout::PerSequence,
+        _ => batching::CacheLayout::Unified,
+    }
+}
+
+/// The line a model logs at load for how many requests it serves at once, `(serves, ceiling)`,
+/// with `n_ctx` tokens of context: shared by them, or each request's own when its cache is laid
+/// out per sequence.
+fn concurrency_note(
+    model: &str,
+    (serves, ceiling): (u32, u32),
+    n_ctx: u32,
+    layout: batching::CacheLayout,
+) -> String {
+    let per_request = layout == batching::CacheLayout::PerSequence;
+    let requests = if serves == 1 { "request" } else { "requests" };
+    let lowered = if serves < ceiling {
+        format!(", not {ceiling}")
+    } else {
+        String::new()
+    };
+    let context = if per_request {
+        format!(", each with its whole {n_ctx}-token context")
+    } else {
+        String::new()
+    };
+    let rest = if serves < ceiling {
+        ": more would not fit beside its weights, so further requests wait".to_string()
+    } else if per_request {
+        String::new()
+    } else {
+        format!(" from {n_ctx} tokens of shared context memory; one request can use all of it")
+    };
+    format!(
+        "Model '{model}' serves up to {serves} {requests} at once{lowered}{context}{rest}. See: https://spiceai.org/docs/components/models"
+    )
+}
+
+/// `params` for a context that holds `concurrent` sequences on one cache of `n_ctx` cells, so any
+/// one of them can still use the whole context; one sequence, as `params` stands, for one.
+fn shared_cache(params: ContextParams, concurrent: u32) -> ContextParams {
+    if concurrent > 1 {
+        params.with_n_seq_max(concurrent).with_kv_unified(true)
+    } else {
+        params
+    }
+}
+
+/// What prompt reading needs from either engine.
+trait Target<'m> {
+    fn context(&self) -> &Context<'m>;
+    fn context_mut(&mut self) -> &mut Context<'m>;
+    /// Removes every cache's entries from position `from` on: the target's, and a draft
+    /// model's, which holds the same positions. False when one cannot roll back that far.
+    fn truncate(&mut self, from: i32) -> bool;
+    /// Empties every cache, the target's and a draft model's.
+    fn clear(&mut self);
+    /// Called after every target decode; the MTP head reads the batch's hidden states.
+    fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String>;
+    /// Whether a draft head reads the target's hidden states, pairing each token with the state
+    /// at the position before it: a cut cache then needs the head's state for the position before
+    /// the cut (`head_state`), or the next read's first token pairs with none.
+    fn has_head(&self) -> bool;
+    /// The draft head's state that cutting the caches back does not restore, for the position
+    /// after the last one it read; `None` without a head.
+    fn head_state(&mut self) -> Option<Vec<u8>>;
+    /// Restores what `head_state` returned; false when the head does not take it.
+    fn restore_head_state(&mut self, state: &[u8]) -> bool;
+    /// The sequence of the shared cache this target reads prompts into and generates in.
+    fn seq(&self) -> i32;
+    /// The sequence's state that a truncation cannot restore (`Context::partial_state_seq`).
+    fn partial_state(&self) -> Option<Vec<u8>>;
+    /// Restores what `partial_state` returned; false when llama.cpp does not read all of it.
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool;
+}
+
+impl<'m> Target<'m> for Context<'m> {
+    fn context(&self) -> &Context<'m> {
+        self
+    }
+    fn context_mut(&mut self) -> &mut Context<'m> {
+        self
+    }
+    fn truncate(&mut self, from: i32) -> bool {
+        Context::truncate(self, from)
+    }
+    fn clear(&mut self) {
+        Context::clear(self);
+    }
+    fn decoded(&mut self, _: &Batch) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    fn has_head(&self) -> bool {
+        false
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn restore_head_state(&mut self, _: &[u8]) -> bool {
+        false
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        Context::partial_state(self)
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        Context::restore_partial_state(self, state)
+    }
+}
+
+impl<'m> Target<'m> for Mtp<'m> {
+    fn context(&self) -> &Context<'m> {
+        self.target()
+    }
+    fn context_mut(&mut self) -> &mut Context<'m> {
+        self.target_mut()
+    }
+    fn truncate(&mut self, from: i32) -> bool {
+        self.target_mut().truncate(from) && self.draft_mut().truncate(from)
+    }
+    fn clear(&mut self) {
+        self.target_mut().clear();
+        self.draft_mut().clear();
+    }
+    fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String> {
+        self.process(batch).map_err(|e| e.to_string())
+    }
+    fn has_head(&self) -> bool {
+        // Only an MTP head pairs a token with the hidden state before it and carries that state
+        // from one read to the next. A DFlash or DSpark drafter reads its features from the batch
+        // in hand, and keeps no state to save, so its prompt cache reuses what it shares.
+        self.kind() == DraftKind::Mtp
+    }
+    fn head_state(&mut self) -> Option<Vec<u8>> {
+        self.state(0).ok().flatten()
+    }
+    fn restore_head_state(&mut self, state: &[u8]) -> bool {
+        self.restore_state(0, state).is_ok()
+    }
+    fn seq(&self) -> i32 {
+        0
+    }
+    fn partial_state(&self) -> Option<Vec<u8>> {
+        self.target().partial_state()
+    }
+    fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        self.target_mut().restore_partial_state(state)
+    }
+}
+
+/// What the KV cache holds from the last request, so the next one decodes only the part of its
+/// prompt that differs, as llama.cpp's server reuses a slot's cached prompt. A chat's next turn
+/// repeats the conversation so far, so it decodes little more than the reply and the new
+/// message.
+struct PromptCache {
+    /// The model's name, for the log line.
+    model: String,
+    /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
+    /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
+    tokens: Vec<Token>,
+    /// How many of `tokens` are the last prompt; the rest are its reply's.
+    prompt: usize,
+    /// The cache namespace of the caller whose request left `tokens` and the checkpoints.
+    namespace: Option<CacheNamespace>,
+    /// For a cache that cannot be cut back to any position, as a recurrent state or a
+    /// compressed cache cannot.
+    checkpoints: Option<Checkpoints>,
+    /// For a cache that can be cut back to any position, with a draft head: the head's state
+    /// after the last prompt's first tokens, saved where a checkpoint would be, the position after
+    /// it first. The next prompt reuses the cache up to there, or up to all of it (where the head's
+    /// live state is), so its read pairs its first token with the right hidden state.
+    head_stash: Option<(usize, Vec<u8>)>,
+    /// How many prompt tokens the last request read from the cache.
+    reused: Arc<AtomicUsize>,
+    /// How many requests read their prompt's end in a step beside the running requests, which
+    /// every sequence's cache shares.
+    ends_in_steps: Arc<AtomicUsize>,
+    /// What saving a checkpoint costs against reading prompt tokens again.
+    cost: CheckpointCost,
+}
+
+impl PromptCache {
+    fn new(name: &str, truncation: Truncation) -> Self {
+        Self {
+            model: name.to_string(),
+            tokens: Vec::new(),
+            prompt: 0,
+            namespace: None,
+            checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
+            head_stash: None,
+            reused: Arc::default(),
+            ends_in_steps: Arc::default(),
+            cost: CheckpointCost::default(),
+        }
+    }
+
+    /// Readies `target` to read `tokens`, and returns how many of them its cache already holds:
+    /// the longest prefix they share with the cache, short of the last token, whose logits the
+    /// request samples from. A cache that cannot be cut back to any position is used as it
+    /// stands only when the prompt extends it; otherwise it restores its latest checkpoint within
+    /// that prefix, and failing that, the cache is emptied.
+    ///
+    /// Only a request from the caller in `namespace` whose request filled the cache reuses it:
+    /// how long a request takes must not say what another caller asked. Another caller's
+    /// request starts from an empty cache, its checkpoints dropped.
+    fn reuse<'m>(
+        &mut self,
+        target: &mut impl Target<'m>,
+        tokens: &[Token],
+        namespace: &CacheNamespace,
+    ) -> usize {
+        let mut cached = std::mem::take(&mut self.tokens);
+        let mut stash = self.head_stash.take();
+        if self.namespace.as_ref() != Some(namespace) {
+            cached.clear();
+            stash = None;
+            if let Some(checkpoints) = &mut self.checkpoints {
+                checkpoints.clear();
+            }
+            self.namespace = Some(namespace.clone());
+        }
+        let common = cached
+            .iter()
+            .zip(tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let shared = common.min(tokens.len().saturating_sub(1));
+        // A checkpoint past the shared prefix holds the state of tokens this prompt lacks.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.truncate(shared);
+        }
+        // A recurrent state is never rolled back to a prompt prefix, as llama.cpp's server never
+        // rolls one back: its rollback snapshots serve rejected drafts, and a decode refreshes only
+        // as many of them as it has tokens, so after a shorter decode a rollback can restore a
+        // snapshot that predates it.
+        let truncates = self.checkpoints.is_none() || shared == cached.len();
+        // A draft head pairs a read's first token with the target's hidden state at the position
+        // before it. It holds that state for the end of the cache, so a cut there is exact; a cut
+        // anywhere else stops where the head's state was stashed, or reads the prompt from 0.
+        let (cut, head) = if truncates && target.has_head() && shared < cached.len() {
+            match stash {
+                Some((at, state)) if at <= shared => (at, Some(state)),
+                _ => (0, None),
+            }
+        } else {
+            (shared, None)
+        };
+        let reused = if cut > 0
+            && truncates
+            && truncate_to(target, cut)
+            && head
+                .as_ref()
+                .is_none_or(|state| target.restore_head_state(state))
+        {
+            cut
+        } else if let Some(at) = self
+            .checkpoints
+            .as_ref()
+            .and_then(|checkpoints| checkpoints.restore(target))
+            && truncate_to(target, at)
+        {
+            at
+        } else {
+            target.clear();
+            if let Some(checkpoints) = &mut self.checkpoints {
+                checkpoints.clear();
+            }
+            0
+        };
+        tracing::debug!(
+            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache, which shared {shared} of them; {} read again{}.",
+            self.model,
+            tokens.len(),
+            shared - reused.min(shared),
+            if target.has_head() && reused > 0 && reused < shared {
+                ", where the draft head holds its state"
+            } else {
+                ""
+            }
+        );
+        self.reused.store(reused, Ordering::Relaxed);
+        reused
+    }
+
+    /// Where reading a prompt of `len` tokens from `start` on saves a checkpoint, if anywhere:
+    /// only where reading the tokens it covers again would cost the next request more than
+    /// saving it costs this one.
+    fn checkpoint_at(&self, start: usize, len: usize) -> Option<usize> {
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
+    }
+
+    /// Where reading a prompt of `len` tokens from `start` on stashes the draft head's state, for
+    /// a cache that can be cut anywhere and so keeps no checkpoints: where a checkpoint would be,
+    /// before the generation prompt the next turn's prompt does not repeat.
+    fn head_stash_at<'m>(
+        &self,
+        target: &impl Target<'m>,
+        start: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if self.checkpoints.is_some() || !target.has_head() {
+            return None;
+        }
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (at > start).then_some(at)
+    }
+
+    fn save_checkpoint<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) {
+        if let Some(checkpoints) = &mut self.checkpoints {
+            let started = Instant::now();
+            if let Some(bytes) = checkpoints.save(target, n_tokens) {
+                let took = started.elapsed();
+                self.cost.saved(took);
+                tracing::debug!(
+                    "Model '{}' saved a {bytes}-byte checkpoint after {n_tokens} prompt tokens in {:.1} ms.",
+                    self.model,
+                    took.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
+    /// Records that reading `tokens` prompt tokens took `took`, checkpoint saves aside.
+    fn read(&mut self, tokens: usize, took: Duration) {
+        self.cost.read(tokens, took);
+    }
+
+    /// Takes what the cache knows about its sequence's cells, leaving it empty, for cells saved
+    /// out of the shared cache; `None` when it holds nothing to reuse.
+    fn take(&mut self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: std::mem::take(&mut self.tokens),
+            prompt: std::mem::take(&mut self.prompt),
+            namespace: self.namespace.take(),
+            checkpoints: self
+                .checkpoints
+                .as_mut()
+                .map(|checkpoints| std::mem::take(&mut checkpoints.0))
+                .unwrap_or_default(),
+            head_stash: self.head_stash.take(),
+        })
+    }
+
+    /// A copy of what [`PromptCache::take`] would take, leaving the cache as it is; `None` when
+    /// it holds nothing to reuse.
+    fn copy(&self) -> Option<CachedPrompt> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        Some(CachedPrompt {
+            tokens: self.tokens.clone(),
+            prompt: self.prompt,
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .as_ref()
+                .map(|checkpoints| checkpoints.0.clone())
+                .unwrap_or_default(),
+            head_stash: self.head_stash.clone(),
+        })
+    }
+
+    /// Gives back what [`PromptCache::take`] took, for its cells restored into this cache's
+    /// sequence.
+    fn put(&mut self, prompt: CachedPrompt) {
+        self.tokens = prompt.tokens;
+        self.prompt = prompt.prompt;
+        self.namespace = prompt.namespace;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.0 = prompt.checkpoints;
+        }
+        self.head_stash = prompt.head_stash;
+    }
+
+    /// How many of `tokens` the cache would give a request from the caller in `namespace`
+    /// before reading the rest: the prefix they share, or nothing when that is less than half
+    /// of the last prompt the cache holds. Taking a cache it shares only a little with, such as
+    /// a chat template's opening tokens with another conversation, would throw away more than
+    /// the request reuses, so llama-server chooses a slot by prompt similarity too. The share is
+    /// measured against the prompt, not its reply: the next turn of a conversation shares the
+    /// prompt, while the template renders the reply again, and a reply longer than its prompt
+    /// would otherwise leave the next turn nothing.
+    fn shares(&self, tokens: &[Token], namespace: &CacheNamespace) -> usize {
+        if self.namespace.as_ref() != Some(namespace) {
+            return 0;
+        }
+        shared_prefix(&self.tokens, self.prompt, tokens)
+    }
+
+    /// Forgets everything the cache held, for a sequence whose cells were emptied: by a request
+    /// that failed, or to make room for another request's sequence.
+    fn forget(&mut self) {
+        self.tokens.clear();
+        self.head_stash = None;
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.clear();
+        }
+    }
+
+    /// Gives a request that continues all of `tokens` without reading any of them, as a preempted
+    /// request resumes with its next token already sampled, the cache as it stands: true when it
+    /// holds exactly `tokens` from the caller in `namespace`.
+    fn resume(&mut self, tokens: &[Token], namespace: &CacheNamespace) -> bool {
+        if self.namespace.as_ref() == Some(namespace) && self.tokens == tokens {
+            self.tokens.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records `tokens`, a prompt of `prompt` tokens and then its reply's, as what the caches
+    /// hold for the next request, after truncating them to `tokens`, which drops any drafts
+    /// verified after them. A cache that cannot roll back that far leaves nothing to reuse.
+    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>, prompt: usize) {
+        if truncate_to(target, tokens.len()) {
+            self.prompt = prompt.min(tokens.len());
+            self.tokens = tokens;
+        }
+    }
+}
+
+/// What a prompt cache knows about the cells its sequence held, moved out with them when they
+/// are saved to host memory ([`PromptCache::take`]).
+struct CachedPrompt {
+    tokens: Vec<Token>,
+    /// How many of `tokens` are the prompt; the rest are its reply's.
+    prompt: usize,
+    namespace: Option<CacheNamespace>,
+    checkpoints: Vec<Checkpoint>,
+    head_stash: Option<(usize, Vec<u8>)>,
+}
+
+impl CachedPrompt {
+    /// The host memory its checkpoints and draft-head state take.
+    fn bytes(&self) -> usize {
+        let checkpoints: usize = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.state.len() + checkpoint.head.as_ref().map_or(0, Vec::len))
+            .sum();
+        checkpoints + self.head_stash.as_ref().map_or(0, |(_, state)| state.len())
+    }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// A copy for a request that continues only its first `n` tokens: whatever its checkpoints
+    /// and draft-head stash past them hold, the request's read drops.
+    fn up_to(&self, n: usize) -> CachedPrompt {
+        CachedPrompt {
+            tokens: self.tokens.clone(),
+            prompt: self.prompt,
+            namespace: self.namespace.clone(),
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.n_tokens <= n)
+                .cloned()
+                .collect(),
+            head_stash: self.head_stash.clone().filter(|(at, _)| *at <= n),
+        }
+    }
+}
+
+/// How many of `tokens` a cache holding `cached`, a prompt of `prompt` tokens and then its
+/// reply's, gives a request: the prefix they share, or nothing when that is less than half of
+/// the prompt (see [`PromptCache::shares`]).
+fn shared_prefix(cached: &[Token], prompt: usize, tokens: &[Token]) -> usize {
+    let shared = cached
+        .iter()
+        .zip(tokens)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if 2 * shared >= prompt.min(cached.len()) {
+        shared
+    } else {
+        0
+    }
+}
+
+/// A model's recurrent state saved after a prompt's first tokens, oldest first, as llama.cpp's
+/// server keeps context checkpoints: the attention cache truncates to any position, but the
+/// recurrent state rolls back only to one of these.
+#[derive(Default)]
+struct Checkpoints(Vec<Checkpoint>);
+
+#[derive(Clone)]
+struct Checkpoint {
+    /// How many tokens the state follows.
+    n_tokens: usize,
+    state: Vec<u8>,
+    /// The draft head's state at the same point, if there is a head.
+    head: Option<Vec<u8>>,
+}
+
+impl Checkpoints {
+    /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
+    /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
+    fn save<'m>(&mut self, target: &mut impl Target<'m>, n_tokens: usize) -> Option<usize> {
+        let state = target.partial_state()?;
+        let head = target.head_state();
+        if self.0.len() == MAX_CHECKPOINTS {
+            self.0.remove(0);
+        }
+        let bytes = state.len() + head.as_ref().map_or(0, Vec::len);
+        self.0.push(Checkpoint {
+            n_tokens,
+            state,
+            head,
+        });
+        Some(bytes)
+    }
+
+    /// Forgets every checkpoint after the first `n_tokens` tokens.
+    fn truncate(&mut self, n_tokens: usize) {
+        self.0.retain(|checkpoint| checkpoint.n_tokens <= n_tokens);
+    }
+
+    /// Restores the latest checkpoint into `context`, and returns how many tokens it follows.
+    /// `None` when there is none, or llama.cpp could not restore it, which leaves `context`'s
+    /// cache empty.
+    fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
+        let latest = self.0.last()?;
+        let restored = target.restore_partial_state(&latest.state)
+            && latest
+                .head
+                .as_ref()
+                .is_none_or(|head| target.restore_head_state(head));
+        restored.then_some(latest.n_tokens)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// What saving a checkpoint costs against reading prompt tokens again, smoothed over requests.
+/// On one machine a save copies the state in about a millisecond and always pays; split across
+/// machines it reads every recurrent tensor back from each of them, which can cost more than
+/// reading a short prompt again.
+#[derive(Debug, Default)]
+struct CheckpointCost {
+    /// Seconds a save takes.
+    save_s: Option<f64>,
+    /// Seconds a prompt token takes to read.
+    token_s: Option<f64>,
+}
+
+impl CheckpointCost {
+    /// Whether a checkpoint covering `tokens` more prompt tokens costs less to save than they
+    /// cost to read again. Until both have been measured, a checkpoint is saved.
+    fn pays(&self, tokens: usize) -> bool {
+        match (self.save_s, self.token_s) {
+            (Some(save), Some(per_token)) => count(tokens) * per_token >= save,
+            _ => true,
+        }
+    }
+
+    fn saved(&mut self, took: Duration) {
+        self.save_s = Some(smoothed(self.save_s, took.as_secs_f64()));
+    }
+
+    fn read(&mut self, tokens: usize, took: Duration) {
+        if tokens > 0 {
+            let per_token = took.as_secs_f64() / count(tokens);
+            self.token_s = Some(smoothed(self.token_s, per_token));
+        }
+    }
+}
+
+fn smoothed(old: Option<f64>, new: f64) -> f64 {
+    old.map_or(new, |old| old + COST_SMOOTHING * (new - old))
+}
+
+/// A token count as a float; counts past `u32::MAX` saturate, which no context reaches.
+fn count(tokens: usize) -> f64 {
+    f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
+}
+
+/// A prompt [`read_prompt`] read.
+struct PromptRead {
+    tokens: Vec<Token>,
+    /// The batch of the read's last decode, whose last logits predict the token after the
+    /// decoded ones.
+    batch: Batch,
+    /// How many of the tokens the cache held.
+    cached: usize,
+    /// How many of the tokens are decoded: all of them, unless the read left their end for the
+    /// caller to decode (see [`read_tokens`]).
+    decoded: usize,
+}
+
+/// Tokenizes the prompt and decodes the part of it the cache does not already hold, but for an
+/// end of at most `defer` tokens that [`read_tokens`] may leave to the caller.
+fn read_prompt<'m>(
+    model: &Model,
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    (prompt, namespace): (&str, &CacheNamespace),
+    stopping: &AtomicBool,
+    defer: usize,
+) -> std::result::Result<PromptRead, String> {
+    let tokens = model
+        .vocab()
+        .tokenize(prompt, false, true)
+        .map_err(|e| e.to_string())?;
+    if tokens.is_empty() {
+        return Err("the rendered prompt is empty".to_string());
+    }
+    let (batch, cached, decoded) =
+        read_tokens(target, cache, (&tokens, namespace), stopping, defer)?;
+    Ok(PromptRead {
+        tokens,
+        batch,
+        cached,
+        decoded,
+    })
+}
+
+/// Decodes the part of `tokens` the cache does not already hold, returning the batch whose last
+/// logits predict the token after the decoded ones, how many of the tokens the cache held, and
+/// how many are decoded.
+///
+/// The read's last span, after any checkpoint, is left undecoded when it is at most `defer`
+/// tokens, for a caller that decodes it beside other sequences' tokens: in a decode of its own,
+/// a few tokens cost a whole pass of the model.
+fn read_tokens<'m>(
+    target: &mut impl Target<'m>,
+    cache: &mut PromptCache,
+    (tokens, namespace): (&[Token], &CacheNamespace),
+    stopping: &AtomicBool,
+    defer: usize,
+) -> std::result::Result<(Batch, usize, usize), String> {
+    let n_ctx = usize::try_from(target.context().n_ctx()).unwrap_or(usize::MAX);
+    if tokens.len() >= n_ctx {
+        return Err(format!(
+            "the prompt is {} tokens, and the model's context holds {n_ctx}. Shorten the conversation, or raise `context_length`.",
+            tokens.len()
+        ));
+    }
+    let start = cache.reuse(target, tokens, namespace);
+    let mut batch = Batch::new(PROMPT_BATCH);
+    // The prompt is read in two spans split at the checkpoint, so the state saved there
+    // follows exactly the tokens before it; without one, the first span is empty.
+    let checkpoint = cache.checkpoint_at(start, tokens.len());
+    let stash_at = cache.head_stash_at(&*target, start, tokens.len());
+    let split = checkpoint.or(stash_at).unwrap_or(start);
+    // Each span is timed to its computation's end, so the reading's cost and the save's stay
+    // apart; sampling, and the save itself, wait for that computation anyway.
+    let started = Instant::now();
+    decode_span(target, &mut batch, tokens, start..split, stopping)?;
+    target.context_mut().synchronize();
+    let mut read = started.elapsed();
+    if let Some(at) = checkpoint {
+        cache.save_checkpoint(&mut *target, at);
+    } else if let Some(at) = stash_at {
+        cache.head_stash = target.head_state().map(|state| (at, state));
+    }
+    if tokens.len() - split <= defer {
+        cache.read(split - start, read);
+        return Ok((batch, start, split));
+    }
+    let resumed = Instant::now();
+    decode_span(target, &mut batch, tokens, split..tokens.len(), stopping)?;
+    target.context_mut().synchronize();
+    read += resumed.elapsed();
+    cache.read(tokens.len() - start, read);
+    Ok((batch, start, tokens.len()))
+}
+
+/// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for
+/// logits only at the prompt's last token.
+fn decode_span<'m>(
+    target: &mut impl Target<'m>,
+    batch: &mut Batch,
+    tokens: &[Token],
+    span: Range<usize>,
+    stopping: &AtomicBool,
+) -> std::result::Result<(), String> {
+    for from in span.clone().step_by(PROMPT_BATCH) {
+        if stopping.load(Ordering::Relaxed) {
+            return Err(DECODE_STOPPED.to_string());
+        }
+        let to = (from + PROMPT_BATCH).min(span.end);
+        batch.clear();
+        for (pos, &token) in (from..to).zip(&tokens[from..to]) {
+            let last = pos + 1 == tokens.len();
+            let pos = i32::try_from(pos).map_err(|e| e.to_string())?;
+            batch
+                .add_seq(token, pos, target.seq(), last)
+                .map_err(|e| e.to_string())?;
+        }
+        target
+            .context_mut()
+            .decode(batch)
+            .map_err(|e| e.to_string())?;
+        target.decoded(batch)?;
+    }
+    Ok(())
+}
+
+/// Sends what generation produces to the client, in order: reasoning, content, and tool
+/// calls. Generation ends at an end-of-generation token, a stop sequence, the token budget,
+/// or a complete tool call.
+struct Output {
+    events: mpsc::Sender<Event>,
+    limit: Option<usize>,
+    stops: StopMatcher,
+    pending: Vec<u8>,
+    produced: u32,
+    reasoning: Option<TagReasoningContext>,
+    tools: Option<ToolSplit>,
+    reply: Option<Reply>,
+    require_tool_call: bool,
+    /// Whether tool calls were sent; nothing is sent after them.
+    called: bool,
+    /// Why reading the tool calls failed, which fails the request.
+    failure: Option<String>,
+    stopping: Arc<AtomicBool>,
+    /// How many prompt tokens the request read from the cache.
+    cached: usize,
+}
+
+impl Output {
+    fn new(job: Job) -> (String, Sampling, Self) {
+        let output = Self {
+            events: job.events,
+            limit: job.limit,
+            stops: StopMatcher::new(job.stop),
+            pending: Vec::new(),
+            produced: 0,
+            reasoning: job.reasoning,
+            tools: job.tools.map(ToolSplit::new),
+            reply: job.reply,
+            require_tool_call: job.require_tool_call,
+            called: false,
+            failure: None,
+            stopping: job.stopping,
+            cached: 0,
+        };
+        (job.prompt, job.sampling, output)
+    }
+
+    /// The reply's text the prompt wrote, for the grammar to be advanced over before the reply
+    /// goes on from where the prompt left it.
+    fn pending(&self) -> &str {
+        self.reply.as_ref().map_or("", Reply::pending)
+    }
+
+    /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
+    /// text the prompt began the opened block with first; otherwise afresh. The reader read
+    /// that text with the prompt, so it is sent as what it is rather than read again: read
+    /// twice, a structured body's JSON would be doubled and could no longer end at its marker.
+    fn begin(&mut self, goes_on: bool) {
+        if let Some(reader) = self.reply.as_mut() {
+            let begun = reader.begin(goes_on);
+            let goes_to = reader.goes_to();
+            if !self.called && !begun.is_empty() {
+                // A client that is gone is found at the next send, as it is for any other.
+                self.send_text(goes_to, begun);
+            }
+        }
+    }
+
+    /// Whether generation has left any reasoning block, so `response_format` applies. A reply
+    /// read by a format's markers is held to its grammar whole, reasoning included.
+    fn in_content(&self) -> bool {
+        match &self.reply {
+            Some(reader) => reader.in_grammar(),
+            None => !self
+                .reasoning
+                .as_ref()
+                .is_some_and(TagReasoningContext::is_in_think_block),
+        }
+    }
+
+    /// The end-of-generation tokens a required tool call rules out: all of `eog` but the one
+    /// that ends a Harmony reply with a call.
+    fn ruled_out(&self, eog: &[Token]) -> Vec<Token> {
+        let call = self.reply.as_ref().and_then(Reply::ends_with_call);
+        eog.iter().copied().filter(|&t| Some(t) != call).collect()
+    }
+
+    /// Sends one sampled token, or returns why generation ends.
+    fn token(&mut self, model: &Model, token: Token) -> Option<FinishReason> {
+        let vocab = model.vocab();
+        self.read(token, vocab.is_eog(token), || {
+            vocab.token_to_piece(token, true)
+        })
+    }
+
+    /// Sends one sampled token, which ends generation when `eog` and otherwise reads as
+    /// `piece`, or returns why generation ends.
+    fn read(
+        &mut self,
+        token: Token,
+        eog: bool,
+        piece: impl FnOnce() -> Vec<u8>,
+    ) -> Option<FinishReason> {
+        if self.stopping.load(Ordering::Relaxed) {
+            self.failure = Some(DECODE_STOPPED.to_string());
+            return Some(FinishReason::Stop);
+        }
+        // A format's marker is read before anything else, because some of them end generation
+        // and may make tool calls.
+        if self
+            .reply
+            .as_ref()
+            .is_some_and(|r| r.marks(token, self.stops.held()))
+        {
+            return self.mark(token, eog);
+        }
+        if eog {
+            return Some(FinishReason::Stop);
+        }
+        self.produced += 1;
+        let piece = piece();
+        if let Some(reader) = self.reply.as_mut()
+            && reader.in_header()
+        {
+            // A header names a channel and a recipient, or a block, which no stop sequence
+            // applies to.
+            reader.text(&String::from_utf8_lossy(&piece));
+            return self.spent();
+        }
+        self.bytes(&piece)
+    }
+
+    /// Reads a format's marker, which ends generation when `eog`.
+    fn mark(&mut self, token: Token, eog: bool) -> Option<FinishReason> {
+        // What the stop matcher and the character assembly still hold belongs to the block the
+        // marker closes.
+        let mut held = self.stops.finish();
+        held.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
+        if let Some(finish) = self.route(&held) {
+            return Some(finish);
+        }
+        let reader = self.reply.as_mut()?;
+        // A marker that does not end generation is a completion token, whatever it does.
+        if !eog {
+            self.produced += 1;
+        }
+        match reader.mark(token) {
+            reply::Mark::Next => self.spent(),
+            reply::Mark::Calls(calls) => Some(self.calls(None, calls)),
+            reply::Mark::Done => Some(FinishReason::Stop),
+        }
+    }
+
+    /// Whether the token budget is spent.
+    fn spent(&self) -> Option<FinishReason> {
+        self.limit
+            .is_some_and(|limit| self.produced as usize >= limit)
+            .then_some(FinishReason::Length)
+    }
+
+    /// Sends the text a token's bytes complete, or returns why generation ends.
+    fn bytes(&mut self, piece: &[u8]) -> Option<FinishReason> {
+        self.pending.extend_from_slice(piece);
+        let text = take_utf8(&mut self.pending);
+        let (emit, stopped) = self.stops.push(&text);
+        if stopped {
+            // The reply ends at the stop sequence, so nothing after it is sent, not even the
+            // start of a character that `finish` would otherwise send as a replacement.
+            self.pending.clear();
+        }
+        if let Some(finish) = self.route(&emit) {
+            return Some(finish);
+        }
+        if stopped {
+            return Some(FinishReason::Stop);
+        }
+        self.spent()
+    }
+
+    /// Whether the client is still there to take `event`.
+    fn send(&self, event: Event) -> bool {
+        send_unless_stopping(&self.events, &self.stopping, event)
+    }
+
+    /// Splits `text` into reasoning and content and sends them; content goes through the
+    /// tool-call reader first. Returns why generation ends, if it does.
+    fn route(&mut self, text: &str) -> Option<FinishReason> {
+        if self.called || text.is_empty() {
+            return None;
+        }
+        if let Some(reader) = self.reply.as_mut() {
+            let goes_to = reader.text(text);
+            return self.send_text(goes_to, text.to_string());
+        }
+        let (reasoning, content) = match self.reasoning.as_mut() {
+            Some(parser) => {
+                parser.process_text(text);
+                (parser.get_reasoning_delta(), parser.get_content_delta())
+            }
+            None => (None, Some(text.to_string())),
+        };
+        if let Some(reasoning) = reasoning
+            && !self.send(Event::Reasoning(reasoning))
+        {
+            return Some(FinishReason::Stop);
+        }
+        self.content(content.unwrap_or_default())
+    }
+
+    /// Sends text a reply's reader has read where the reader says it goes.
+    fn send_text(&mut self, goes_to: reply::Text, text: String) -> Option<FinishReason> {
+        match goes_to {
+            reply::Text::Reasoning => {
+                (!self.send(Event::Reasoning(text))).then_some(FinishReason::Stop)
+            }
+            reply::Text::Content => self.content(text),
+            reply::Text::Held => None,
+        }
+    }
+
+    fn content(&mut self, content: String) -> Option<FinishReason> {
+        if content.is_empty() {
+            return None;
+        }
+        let Some(tools) = self.tools.as_mut() else {
+            return (!self.send(Event::Content(content))).then_some(FinishReason::Stop);
+        };
+        match tools.push(&content) {
+            Ok(ToolPush::Hold) => None,
+            Ok(ToolPush::Content(text)) => {
+                (!text.is_empty() && !self.send(Event::Content(text))).then_some(FinishReason::Stop)
+            }
+            Ok(ToolPush::Calls(before, calls)) => Some(self.calls(before, calls)),
+            Err(message) => {
+                self.failure = Some(message);
+                Some(FinishReason::Stop)
+            }
+        }
+    }
+
+    fn calls(&mut self, before: Option<String>, calls: Vec<ToolCallResponse>) -> FinishReason {
+        if let Some(text) = before {
+            self.send(Event::Content(text));
+        }
+        self.called = true;
+        self.send(Event::ToolCalls(calls));
+        FinishReason::ToolCalls
+    }
+
+    /// Tokens the budget still allows.
+    fn remaining(&self) -> usize {
+        self.limit.map_or(usize::MAX, |limit| {
+            limit.saturating_sub(self.produced as usize)
+        })
+    }
+
+    /// Sends what is still held back, and reads any tool call out of it.
+    fn finish(
+        mut self,
+        finish: FinishReason,
+        prompt_tokens: usize,
+    ) -> std::result::Result<Outcome, String> {
+        let mut finish = finish;
+        if !self.called {
+            // A character still incomplete when generation ends is replaced, as a lossy
+            // decode of the whole reply would.
+            let mut tail = self.stops.finish();
+            tail.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
+            if self.route(&tail) == Some(FinishReason::ToolCalls) {
+                finish = FinishReason::ToolCalls;
+            }
+        }
+        if !self.called
+            && self.failure.is_none()
+            && let Some(calls) = self
+                .reply
+                .as_mut()
+                .map(Reply::finish)
+                .filter(|calls| !calls.is_empty())
+        {
+            finish = self.calls(None, calls);
+        }
+        if !self.called
+            && let Some(parser) = self.reasoning.as_mut()
+        {
+            parser.finalize();
+            let (reasoning, content) = (parser.get_reasoning_delta(), parser.get_content_delta());
+            if let Some(reasoning) = reasoning {
+                self.send(Event::Reasoning(reasoning));
+            }
+            if self.content(content.unwrap_or_default()) == Some(FinishReason::ToolCalls) {
+                finish = FinishReason::ToolCalls;
+            }
+        }
+        if !self.called
+            && self.failure.is_none()
+            && let Some(tools) = self.tools.as_mut()
+        {
+            let (content, calls) = tools.finish()?;
+            if !calls.is_empty() {
+                finish = self.calls(content, calls);
+            } else if let Some(text) = content {
+                self.send(Event::Content(text));
+            }
+        }
+        if let Some(message) = self.failure.take() {
+            return Err(message);
+        }
+        if self.require_tool_call && !self.called {
+            return Err("Tool choice was required but no tools were called.".to_string());
+        }
+        Ok(Outcome {
+            finish,
+            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+            cached_tokens: u32::try_from(self.cached).unwrap_or(u32::MAX),
+            completion_tokens: self.produced,
+        })
+    }
+}
+
+/// The texts that open a tool call in the formats the mistral.rs engine's parser reads.
+const TOOL_CALL_OPENERS: &[&str] = &[
+    "<tool_call>",
+    "<tool_calls>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+    "<|tool_call>",
+    "<|tool_call_start|>",
+    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁call▁begin｜>",
+    "<｜DSML｜",
+    "<atem:function_calls>",
+];
+
+/// Holds back content that may be the start of a tool call, and reads complete calls out of
+/// it with the mistral.rs engine's parser.
+struct ToolSplit {
+    matcher: ToolCallingMatcher,
+    held: String,
+}
+
+enum ToolPush {
+    /// Text that is not a tool call, to send now.
+    Content(String),
+    /// Text that may still become a tool call.
+    Hold,
+    /// Complete tool calls, with the text before them.
+    Calls(Option<String>, Vec<ToolCallResponse>),
+}
+
+impl ToolSplit {
+    fn new(matcher: ToolCallingMatcher) -> Self {
+        Self {
+            matcher,
+            held: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> std::result::Result<ToolPush, String> {
+        self.held.push_str(text);
+        let (possible, complete) = self
+            .matcher
+            .prefix_could_be_tool(&self.held)
+            .map_err(|e| e.to_string())?;
+        if complete {
+            let (content, calls) = self
+                .matcher
+                .get_call_with_content(&self.held)
+                .map_err(|e| e.to_string())?;
+            if !calls.is_empty() {
+                self.held.clear();
+                return Ok(ToolPush::Calls(content.filter(|c| !c.is_empty()), calls));
+            }
+        }
+        // A tool-call opener spelled across tokens (as a grammar makes a model spell it) is
+        // not a call yet, so its unfinished start stays held until it resolves either way.
+        let keep = TOOL_CALL_OPENERS
+            .iter()
+            .map(|opener| longest_suffix_prefix(&self.held, opener))
+            .max()
+            .unwrap_or(0);
+        let cut = self.held.len() - keep;
+        if possible && !complete {
+            // The engine also reports a possible call when the text only ends partway through
+            // an opener. The text before that unfinished opener is content unless it could
+            // itself start a call, so it goes out now and only the opener's start is held.
+            if keep == 0 || cut == 0 {
+                return Ok(ToolPush::Hold);
+            }
+            let (before_possible, before_complete) = self
+                .matcher
+                .prefix_could_be_tool(&self.held[..cut])
+                .map_err(|e| e.to_string())?;
+            if before_possible || before_complete {
+                return Ok(ToolPush::Hold);
+            }
+        }
+        Ok(ToolPush::Content(self.held.drain(..cut).collect()))
+    }
+
+    /// The held text at the end of generation: content, or the tool calls it completes.
+    fn finish(&mut self) -> std::result::Result<(Option<String>, Vec<ToolCallResponse>), String> {
+        let held = std::mem::take(&mut self.held);
+        if held.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let (content, calls) = self
+            .matcher
+            .get_call_with_content(&held)
+            .map_err(|e| e.to_string())?;
+        Ok(if calls.is_empty() {
+            (Some(held), calls)
+        } else {
+            (content.filter(|c| !c.is_empty()), calls)
+        })
+    }
+}
+
+/// Picks each token with the request's sampler. A `response_format` grammar constrains the
+/// content only, so it takes over when a reasoning block ends; while a required tool call is
+/// outstanding, end-of-generation tokens are ruled out. Frequency and presence penalties
+/// count every token the reply generates, reasoning included, as the mistral.rs engine does.
+struct Picker<'v> {
+    free: Sampler<'v>,
+    constrained: Option<Sampler<'v>>,
+    /// Whether each chain starts with the penalties, which then also hear of the tokens the
+    /// other chain picks.
+    penalized: bool,
+    /// Whether the grammar was advanced over all of the reply's text the prompt wrote, so the
+    /// reply goes on from where the prompt left it.
+    goes_on: bool,
+}
+
+impl<'v> Picker<'v> {
+    /// `window` is how many generated tokens the penalties remember: the context's length
+    /// covers a whole reply. The grammar is advanced over `pending`, the reply's text the
+    /// prompt wrote, when it allows each of its tokens in turn; on the first it does not, it
+    /// is built again at its root, and [`Picker::goes_on`] is false. Each token is checked
+    /// before the grammar is told of it, because llama.cpp aborts on a token a grammar
+    /// rejects.
+    fn new(
+        vocab: Vocab<'v>,
+        sampling: &Sampling,
+        eog: &[Token],
+        window: u32,
+        pending: &str,
+    ) -> std::result::Result<Self, String> {
+        let frequency = sampling.frequency_penalty.unwrap_or(0.0);
+        let presence = sampling.presence_penalty.unwrap_or(0.0);
+        if !frequency.is_finite() || !presence.is_finite() {
+            return Err(format!(
+                "`frequency_penalty` and `presence_penalty` must be finite numbers, got {frequency} and {presence}"
+            ));
+        }
+        let penalized = frequency != 0.0 || presence != 0.0;
+        let window = i32::try_from(window).unwrap_or(i32::MAX);
+        let chain = |grammar: Option<&str>| -> std::result::Result<Sampler<'v>, String> {
+            let mut samplers = Vec::new();
+            if penalized {
+                samplers.push(Sampler::penalties(&vocab, window, frequency, presence));
+            }
+            if sampling.ban_eog {
+                let ruled_out: Vec<_> = eog.iter().map(|&t| (t, f32::NEG_INFINITY)).collect();
+                samplers.push(Sampler::logit_bias(&vocab, &ruled_out));
+            }
+            if let Some(grammar) = grammar {
+                samplers.push(Sampler::grammar(&vocab, grammar).map_err(|e| e.to_string())?);
+            }
+            samplers.extend(draw(sampling));
+            Ok(Sampler::chain(samplers))
+        };
+        let mut constrained = sampling
+            .grammar
+            .as_deref()
+            .map(|g| chain(Some(g)))
+            .transpose()?;
+        let mut goes_on = true;
+        if let (Some(grammar), Some(fed)) = (sampling.grammar.as_deref(), constrained.as_mut())
+            && !pending.is_empty()
+        {
+            // The grammar follows the penalties and the end-of-generation ban in its chain.
+            let at = i32::from(penalized) + i32::from(sampling.ban_eog);
+            let tokens = vocab
+                .tokenize(pending, false, true)
+                .map_err(|e| e.to_string())?;
+            goes_on = tokens.into_iter().all(|token| {
+                let allowed = fed.allows_at(at, token);
+                if allowed {
+                    fed.accept_at(at, token);
+                }
+                allowed
+            });
+            if !goes_on {
+                constrained = Some(chain(Some(grammar))?);
+            }
+        }
+        Ok(Self {
+            free: chain(None)?,
+            constrained,
+            penalized,
+            goes_on,
+        })
+    }
+
+    /// Whether the reply goes on from where the prompt left it: false only when the grammar
+    /// would not be advanced over the reply's text the prompt wrote.
+    fn goes_on(&self) -> bool {
+        self.goes_on
+    }
+
+    /// Whether every token of the reply is the greedy sampler's pick alone: no penalties, no
+    /// end-of-generation ban and no grammar, which a context's argmax output does not apply.
+    fn picks_greedily(&self) -> bool {
+        self.free.is_greedy() && self.constrained.is_none()
+    }
+
+    /// Fails when a backend failed computing the decode, which leaves nothing to pick from.
+    fn sample(
+        &mut self,
+        context: &Context<'_>,
+        index: i32,
+        in_content: bool,
+    ) -> std::result::Result<Token, String> {
+        let (used, other) = match &mut self.constrained {
+            Some(constrained) if in_content => (constrained, Some(&mut self.free)),
+            constrained => (&mut self.free, constrained.as_mut()),
+        };
+        let token = used.sample(context, index).map_err(|e| e.to_string())?;
+        // The penalties lead each chain; the chain that did not pick still counts the token.
+        if self.penalized
+            && let Some(other) = other
+        {
+            other.accept_at(0, token);
+        }
+        Ok(token)
+    }
+}
+
+/// The samplers that pick the token from those the rest leave: greedy at temperature 0 or
+/// unset, as the mistral.rs engine's deterministic default; otherwise the mistral.rs
+/// engine's order of temperature, then top-p over the tempered probabilities, then a seeded
+/// draw.
+fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
+    match sampling.temperature {
+        Some(t) if t > 0.0 => vec![
+            Sampler::temp(t),
+            Sampler::top_p(sampling.top_p.unwrap_or(1.0), 1),
+            Sampler::dist(sampling.seed),
+        ],
+        _ => vec![Sampler::greedy()],
+    }
+}
+
+/// Truncates every cache `target` keeps to its first `n` tokens; false when one cannot roll
+/// back that far.
+fn truncate_to<'m>(target: &mut impl Target<'m>, n: usize) -> bool {
+    i32::try_from(n).is_ok_and(|from| target.truncate(from))
+}
+
+/// The GGUF the model is opened from and its draft head's, from the files it resolved to. A draft
+/// head ships as its own GGUF (an MTP head, told by the name the repository's files were
+/// resolved with, or a `DFlash` drafter); it drafts for the model, so it is loaded beside it rather
+/// than as one of its shards, and a sharded one opens from its first shard.
+fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| {
+        w.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(gguf_files::is_draft_head)
+            || DraftKind::dflash_of(w).is_some()
+    });
+    // A projector, an importance matrix or a drafter named beside the model's weights is not the
+    // model, wherever `files` lists it: the model opens from the weights, or from what is named
+    // when nothing else is.
+    let model: Vec<PathBuf> = trunk
+        .iter()
+        .filter(|w| {
+            w.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(gguf_files::is_model_weights)
+        })
+        .cloned()
+        .collect();
+    let model = if model.is_empty() { trunk } else { model };
+    (first_shard(&model), first_shard(&drafts))
+}
+
+/// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
+fn first_shard(weights: &[PathBuf]) -> Option<PathBuf> {
+    weights
+        .iter()
+        .find(|w| {
+            w.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("-00001-of-"))
+        })
+        .or_else(|| weights.first())
+        .cloned()
+}
+
+fn piece(model: &Model, token: Token) -> Option<String> {
+    if token.0 < 0 {
+        return None;
+    }
+    String::from_utf8(model.vocab().token_to_piece(token, true))
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Removes and returns the text `bytes` decode to, keeping an incomplete trailing character
+/// for the next token. Each sequence that can never become valid is replaced, as a lossy
+/// decode replaces it, so the text does not depend on where tokens split the bytes.
+fn take_utf8(bytes: &mut Vec<u8>) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    let mut kept = 0;
+    let mut chunks = bytes.utf8_chunks().peekable();
+    while let Some(chunk) = chunks.next() {
+        text.push_str(chunk.valid());
+        let invalid = chunk.invalid();
+        if invalid.is_empty() {
+            continue;
+        }
+        let incomplete = chunks.peek().is_none()
+            && std::str::from_utf8(invalid).is_err_and(|e| e.error_len().is_none());
+        if incomplete {
+            kept = invalid.len();
+        } else {
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    let consumed = bytes.len() - kept;
+    bytes.drain(..consumed);
+    text
+}
+
+/// Holds back text that could still become a stop sequence, and ends generation at the
+/// first one.
+struct StopMatcher {
+    stops: Vec<String>,
+    held: String,
+}
+
+impl StopMatcher {
+    fn new(stops: Vec<String>) -> Self {
+        Self {
+            stops: stops.into_iter().filter(|s| !s.is_empty()).collect(),
+            held: String::new(),
+        }
+    }
+
+    /// The text that can be released, and whether a stop sequence was reached.
+    fn push(&mut self, text: &str) -> (String, bool) {
+        if self.stops.is_empty() {
+            return (text.to_string(), false);
+        }
+        self.held.push_str(text);
+        if let Some(at) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.held.find(s.as_str()))
+            .min()
+        {
+            let emit = self.held[..at].to_string();
+            self.held.clear();
+            return (emit, true);
+        }
+        let keep = self
+            .stops
+            .iter()
+            .map(|s| longest_suffix_prefix(&self.held, s))
+            .max()
+            .unwrap_or(0);
+        let cut = self.held.len() - keep;
+        let emit = self.held[..cut].to_string();
+        self.held.drain(..cut);
+        (emit, false)
+    }
+
+    /// The text held back as the possible start of a stop sequence.
+    fn held(&self) -> &str {
+        &self.held
+    }
+
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// The length of the longest suffix of `text` that is a proper prefix of `pattern`, on a
+/// character boundary.
+fn longest_suffix_prefix(text: &str, pattern: &str) -> usize {
+    (1..pattern.len().min(text.len() + 1))
+        .rev()
+        .find(|&n| {
+            text.is_char_boundary(text.len() - n)
+                && pattern.is_char_boundary(n)
+                && text.ends_with(&pattern[..n])
+        })
+        .unwrap_or(0)
+}
+
+/// The parser that tells a reply's reasoning apart from its answer, chosen from the chat
+/// template and the rendered prompt as the mistral.rs engine chooses it: Gemma 4's channel
+/// tags, `<think>` tags or Mistral's `[THINK]` tokens (each starting inside the block when the
+/// prompt opens it), or the Gemma family's `<unused94>` thought tokens. A template that marks
+/// no reasoning gets none, and the whole reply is content.
+fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext> {
+    let harmony = is_harmony_template(template);
+    if is_channel_tag_template(template) && !harmony {
+        Some(if prompt.contains(GEMMA_THINK_TOKEN) {
+            TagReasoningContext::new_gemma_channel_with_implicit_thinking()
+        } else {
+            TagReasoningContext::new_gemma_channel()
+        })
+    } else if is_think_tag_template(template) && !harmony {
+        Some(if prompt.trim_end().ends_with(THINK_OPEN_TAG) {
+            TagReasoningContext::new_in_think_block()
+        } else {
+            TagReasoningContext::new_think_tags()
+        })
+    } else if is_mistral_think_template(template) && !harmony {
+        Some(if prompt.trim_end().ends_with(MISTRAL_THINK_OPEN_TAG) {
+            TagReasoningContext::new_in_mistral_think_block()
+        } else {
+            TagReasoningContext::new_mistral_think()
+        })
+    } else if is_gemma_turn_template(template) {
+        Some(TagReasoningContext::new_gemma_thought())
+    } else {
+        None
+    }
+}
+
+/// The tools `tool_choice` obliges the model to call one of: none when it need not call any.
+fn obliged_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t Tool> {
+    let named = |name: &str| tools.iter().filter(|t| t.function.name == name).collect();
+    match choice {
+        Some(ToolChoice::Required) => tools.iter().collect(),
+        Some(ToolChoice::Tool(tool)) => named(&tool.function.name),
+        Some(ToolChoice::NamedFunction(function)) => named(&function.name),
+        Some(ToolChoice::AllowedTools(allowed))
+            if matches!(allowed.mode, AllowedToolsMode::Required) =>
+        {
+            allowed_tools(allowed, tools)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The tools a reply may call under `tool_choice`: none under `none`, since a call is then only
+/// ever content; the allowed ones under `allowed_tools`; and otherwise every tool offered.
+fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t Tool> {
+    match choice {
+        Some(ToolChoice::None) => Vec::new(),
+        Some(ToolChoice::AllowedTools(allowed)) => allowed_tools(allowed, tools),
+        _ => tools.iter().collect(),
+    }
+}
+
+/// The names a call in a reply read by a format's markers may take: the tools `tool_choice`
+/// obliges a call to, when it obliges one, as a named choice does; otherwise the callable ones.
+fn nameable_tools(callable: &[&Tool], obliged: &[&Tool]) -> Vec<String> {
+    let tools = if obliged.is_empty() {
+        callable
+    } else {
+        obliged
+    };
+    tools.iter().map(|t| t.function.name.clone()).collect()
+}
+
+/// The tools among `tools` that `allowed` names.
+fn allowed_tools<'t>(allowed: &AllowedToolsToolChoice, tools: &'t [Tool]) -> Vec<&'t Tool> {
+    tools
+        .iter()
+        .filter(|t| {
+            allowed.tools.iter().any(
+                |a| matches!(a, AllowedToolChoice::Function { name } if *name == t.function.name),
+            )
+        })
+        .collect()
+}
+
+/// Whether a chat template writes tool calls as `<tool_call>{"name": ..., "arguments": ...}</tool_call>`,
+/// as Qwen and Hermes templates do: the one tool-call format this engine can force with a
+/// grammar.
+fn tags_tool_calls(template: &str) -> bool {
+    template.contains("<tool_call>") && template.contains("</tool_call>")
+}
+
+/// The grammar the content must match for one request, if any:
+/// - a required call to one of `obliged`, in a template that tags tool calls: that call;
+/// - a structured `response_format` with no tools offered: its JSON;
+/// - a structured `response_format` beside tools, in a template that tags tool calls: either
+///   a tool call or the JSON reply.
+///
+/// A required call in another tool format gets no grammar (generation instead cannot end
+/// until a call is made); a structured reply beside tools in another format is refused.
+fn content_grammar(
+    model: &str,
+    template: &str,
+    format: Option<&ResponseFormat>,
+    tools: &[&Tool],
+    obliged: &[&Tool],
+) -> std::result::Result<Option<String>, OpenAIError> {
+    let reply = match format {
+        None | Some(ResponseFormat::Text) => None,
+        Some(ResponseFormat::JsonObject) => Some(serde_json::json!({ "type": "object" })),
+        Some(ResponseFormat::JsonSchema { json_schema }) => Some(json_schema.schema.clone()),
+    };
+    let tagged = tags_tool_calls(template);
+    if !obliged.is_empty() {
+        // The turn must be a tool call, so a structured reply waits for a later turn.
+        return if tagged {
+            json_grammar(&call_schema(obliged), "tools").map(|call| Some(tagged_call(&call)))
+        } else {
+            Ok(None)
+        };
+    }
+    let Some(reply) = reply else {
+        return Ok(None);
+    };
+    let reply = json_grammar(&reply, "response_format")?;
+    if tools.is_empty() {
+        return Ok(Some(reply));
+    }
+    if !tagged {
+        return Err(OpenAIError::InvalidArgument(format!(
+            "Model '{model}' can't combine a `json_schema` or `json_object` `response_format` with `tools`: its chat template's tool-call format can't be enforced alongside a schema. Send one or the other."
+        )));
+    }
+    let call = json_grammar(&call_schema(tools), "tools")?;
+    Ok(Some(either_grammar(&call, &reply)))
+}
+
+/// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
+/// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it. The
+/// grammar goes on from where the prompt leaves the reply, `opened`.
+fn harmony_call(
+    markers: &harmony::Markers,
+    tools: &[&Tool],
+    opened: &harmony::Opened,
+) -> std::result::Result<String, OpenAIError> {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        let name = serde_json::Value::String(tool.function.name.clone());
+        calls.push(format!("{name} constrain? {message} {prefix}root"));
+    }
+    grammar.push_str("call ::= ");
+    grammar.push_str(&calls.join(" | "));
+    grammar.push('\n');
+    let call = format!("{channel} \"commentary to=functions.\" call");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {call}");
+    let root = match opened {
+        harmony::Opened::Channel => {
+            format!("\"analysis\" {message} {after_analysis} | \"commentary to=functions.\" call")
+        }
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Call(name) => match tools.iter().position(|t| t.function.name == *name) {
+            Some(i) => format!("tool{i}-root"),
+            None => format!("analysis? {call}"),
+        },
+        // The reader goes on from no other message under a required call.
+        harmony::Opened::Header | harmony::Opened::FinalHeader | harmony::Opened::Final => {
+            format!("analysis? {call}")
+        }
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    Ok(grammar)
+}
+
+/// The grammar of a whole Harmony reply held to a `response_format`: analysis messages, then
+/// a final message whose body is `reply`'s JSON, as llama.cpp's server holds one. A preamble
+/// is ruled out, since its text would be content outside the schema. The grammar goes on
+/// from where the prompt leaves the reply, `opened`.
+fn harmony_reply(markers: &harmony::Markers, reply: &str, opened: &harmony::Opened) -> String {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let whole = format!("analysis* {channel} \"final\" constrain? {message} reply-root");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {whole}");
+    let root = match opened {
+        harmony::Opened::Channel => format!(
+            "\"analysis\" {message} {after_analysis} | \"final\" constrain? {message} reply-root"
+        ),
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::FinalHeader => format!("constrain? {message} reply-root"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Final => "reply-root".to_string(),
+        // The reader goes on from no call under a `response_format`.
+        harmony::Opened::Header | harmony::Opened::Call(_) => whole,
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    grammar
+}
+
+/// The rules both Harmony grammars share: an analysis message and the role header of the
+/// message after it, and a header's optional content type.
+fn harmony_rules(markers: &harmony::Markers) -> String {
+    let [start, channel, message, end, constrain] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(
+        rules,
+        "analysis ::= {channel} \"analysis\" {message} reasoning {end} {start} \"assistant\""
+    );
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("reasoning ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n");
+    let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
+    rules
+}
+
+/// The grammar of a whole Inkling reply that must call one of `tools`: a thinking block or
+/// none, then a call block, or several when `parallel`, each naming its tool in its header and
+/// holding `{"name":NAME,"args":ARGS}` with the arguments held to the tool's schema. Each
+/// marker is its token, never text spelling it. After a call's `<|end_message|>` the grammar
+/// may be complete, which is when the end-of-generation token that ends the reply is allowed.
+///
+/// Only the call follows the thinking, as only the call follows a Harmony reply's analysis
+/// (`harmony_call`). llama.cpp's server allows any thinking and text blocks before it, and a
+/// model that would rather answer than call then writes its answer in block after block until
+/// its budget runs out without ever calling, in text blocks or, without them, in thinking.
+fn inkling_call(
+    markers: &inkling::Markers,
+    tools: &[&Tool],
+    parallel: bool,
+) -> std::result::Result<String, OpenAIError> {
+    let [header, _, _, call, end] = markers.terminals();
+    let mut grammar = inkling_rules(markers);
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        // The name, and the wrapper's opening `{"name":NAME,"args":`, as GBNF literals.
+        let name = serde_json::Value::String(tool.function.name.clone());
+        let open = serde_json::Value::String(format!("{{\"name\":{name},\"args\":"));
+        calls.push(format!("{name} {call} {open} {prefix}root \"}}\" {end}"));
+    }
+    let _ = writeln!(grammar, "call ::= {header} ({})", calls.join(" | "));
+    let more = if parallel { " call*" } else { "" };
+    let _ = writeln!(grammar, "root ::= thinking? call{more}");
+    Ok(grammar)
+}
+
+/// The grammar of a whole Inkling reply held to a `response_format`: thinking blocks, then one
+/// text block whose body is `reply`'s JSON, as llama.cpp's server holds one. Any other text
+/// would be content outside the schema. After the text block's `<|end_message|>` the grammar
+/// is complete, so only the end-of-generation token that ends the reply is left.
+fn inkling_reply(markers: &inkling::Markers, reply: &str) -> String {
+    let [header, _, text, _, end] = markers.terminals();
+    let mut grammar = inkling_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let _ = writeln!(
+        grammar,
+        "root ::= thinking* {header} {text} reply-root {end}"
+    );
+    grammar
+}
+
+/// The rules both Inkling grammars share: a thinking block after its header, and the body of a
+/// block that holds text.
+fn inkling_rules(markers: &inkling::Markers) -> String {
+    let [header, thinking, _, _, end] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(rules, "thinking ::= {header} {thinking} body {end}");
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("body ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n");
+    rules
+}
+
+/// A tool's arguments schema: its parameters, or any object.
+fn arguments_schema(tool: &Tool) -> serde_json::Value {
+    tool.function.parameters.as_ref().map_or_else(
+        || serde_json::json!({ "type": "object" }),
+        |p| serde_json::Value::Object(p.clone().into_iter().collect()),
+    )
+}
+
+/// The JSON schema of a call to one of `tools`, with the arguments held to the tool's schema.
+fn call_schema(tools: &[&Tool]) -> serde_json::Value {
+    let calls: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            let arguments = arguments_schema(tool);
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "const": tool.function.name },
+                    "arguments": arguments,
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": false,
+            })
+        })
+        .collect();
+    match calls.as_slice() {
+        [one] => one.clone(),
+        _ => serde_json::json!({ "oneOf": calls }),
+    }
+}
+
+/// llama.cpp's grammar for `schema`, its start rule `root`; `param` names the request field
+/// it came from, for the error.
+fn json_grammar(
+    schema: &serde_json::Value,
+    param: &str,
+) -> std::result::Result<String, OpenAIError> {
+    llama_cpp::json_schema_to_grammar(&schema.to_string())
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Invalid `{param}`: {e}")))
+}
+
+/// A tool call's JSON grammar wrapped in the `<tool_call>` tags.
+fn tagged_call(call: &str) -> String {
+    let mut grammar = prefix_rules(call, "call-");
+    grammar.push_str("root ::= \"<tool_call>\\n\" call-root \"\\n</tool_call>\"\n");
+    grammar
+}
+
+/// Either a tagged tool call or the reply's JSON.
+fn either_grammar(call: &str, reply: &str) -> String {
+    let mut grammar = prefix_rules(call, "call-");
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    grammar.push_str("root ::= \"<tool_call>\\n\" call-root \"\\n</tool_call>\" | reply-root\n");
+    grammar
+}
+
+/// Renames every rule of a GBNF `grammar` with `prefix`, in its definitions and its
+/// references, so two grammars can be joined without their shared rule names (`space`,
+/// `string`, ...) colliding. Quoted literals, character classes and repetition counts are
+/// left alone.
+fn prefix_rules(grammar: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(grammar.len() * 2);
+    for line in grammar.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, body) = match line.split_once("::=") {
+            Some((name, body)) => (Some(name.trim()), body),
+            None => (None, line),
+        };
+        if let Some(name) = name {
+            out.push_str(prefix);
+            out.push_str(name);
+            out.push_str(" ::=");
+        }
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' | '[' => {
+                    let close = if c == '"' { '"' } else { ']' };
+                    out.push(c);
+                    while let Some(inner) = chars.next() {
+                        out.push(inner);
+                        if inner == '\\' {
+                            if let Some(escaped) = chars.next() {
+                                out.push(escaped);
+                            }
+                        } else if inner == close {
+                            break;
+                        }
+                    }
+                }
+                '{' => {
+                    out.push(c);
+                    for inner in chars.by_ref() {
+                        out.push(inner);
+                        if inner == '}' {
+                            break;
+                        }
+                    }
+                }
+                c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => {
+                    out.push_str(prefix);
+                    out.push(c);
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii_alphanumeric() || next == '-' || next == '_' {
+                            out.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// How many choices `req` asks for: its `n`, one when unset.
+fn choice_count(req: &CreateChatCompletionRequest) -> std::result::Result<usize, OpenAIError> {
+    match req.n.unwrap_or(1) {
+        n @ 1..=MAX_CHOICES => Ok(usize::from(n)),
+        _ => Err(OpenAIError::InvalidArgument(format!(
+            "`n` must be between 1 and {MAX_CHOICES}, the number of choices to generate."
+        ))),
+    }
+}
+
+#[expect(deprecated)]
+fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
+    req.max_completion_tokens
+        .or(req.max_tokens)
+        .and_then(|limit| usize::try_from(limit).ok())
+}
+
+/// The text one streamed chunk carries: a fragment of the reasoning or of the answer, never both,
+/// in `reasoning_content` or `content`.
+enum Text {
+    Reasoning(String),
+    Answer(String),
+}
+
+#[expect(
+    deprecated,
+    reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one chunk's fields, each optional by the OpenAI stream shape"
+)]
+fn chunk(
+    id: &str,
+    model: &str,
+    created: u32,
+    index: u32,
+    first: bool,
+    text: Option<Text>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    finish_reason: Option<FinishReason>,
+    usage: Option<CompletionUsage>,
+) -> CreateChatCompletionStreamResponse {
+    let (reasoning_content, content) = match text {
+        Some(Text::Reasoning(reasoning)) => (Some(reasoning), None),
+        Some(Text::Answer(answer)) => (None, Some(answer)),
+        None => (None, None),
+    };
+    let delta = ChatCompletionStreamResponseDelta {
+        content,
+        reasoning_content,
+        function_call: None,
+        tool_calls,
+        role: first.then_some(Role::Assistant),
+        refusal: None,
+    };
+    CreateChatCompletionStreamResponse {
+        id: id.to_string(),
+        choices: vec![ChatChoiceStream {
+            index,
+            delta,
+            finish_reason,
+            logprobs: None,
+        }],
+        created,
+        model: model.to_string(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage,
+    }
+}
+
+/// A reply's usage: its prompt, which counts once however many choices read it, with how many
+/// of its tokens the first choice read from the cache, and the completion tokens of every
+/// choice.
+fn usage(prompt: &Outcome, completion_tokens: u32) -> CompletionUsage {
+    CompletionUsage {
+        prompt_tokens: prompt.prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt.prompt_tokens.saturating_add(completion_tokens),
+        prompt_tokens_details: Some(PromptTokensDetails {
+            audio_tokens: None,
+            cached_tokens: Some(prompt.cached_tokens),
+        }),
+        completion_tokens_details: None,
+    }
+}
+
+fn non_empty(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
+}
+
+fn now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u32::try_from(d.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+/// The cache namespace of the caller this request runs for: its authenticated principal's, or
+/// the shared one of an unauthenticated or internal request, as the runtime scopes each request.
+async fn caller() -> CacheNamespace {
+    RequestContext::current(AsyncMarker::new().await).cache_namespace()
+}
+
+fn api_error(message: &str) -> OpenAIError {
+    OpenAIError::ApiError(ApiError {
+        message: message.to_string(),
+        r#type: None,
+        param: None,
+        code: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The load line for how many requests a model serves at once, in each of its forms.
+    #[test]
+    fn the_concurrency_line_says_how_many_requests_and_what_context() {
+        assert_eq!(
+            concurrency_note("glm", (8, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'glm' serves up to 8 requests at once from 131072 tokens of shared context memory; one request can use all of it. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note("qwen", (4, 8), 131_072, batching::CacheLayout::Unified),
+            "Model 'qwen' serves up to 4 requests at once, not 8: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (8, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 8 requests at once, each with its whole 131072-token context. See: https://spiceai.org/docs/components/models"
+        );
+        assert_eq!(
+            concurrency_note(
+                "deepseek",
+                (1, 8),
+                131_072,
+                batching::CacheLayout::PerSequence
+            ),
+            "Model 'deepseek' serves up to 1 request at once, not 8, each with its whole 131072-token context: more would not fit beside its weights, so further requests wait. See: https://spiceai.org/docs/components/models"
+        );
+    }
+
+    /// An MTP head named in upper case is a draft head here as in the repository's files: a
+    /// sharded one is opened as the draft, from its first shard, and never as the model ahead of
+    /// the model's own file (Copilot's case on #15590).
+    #[test]
+    fn an_upper_case_mtp_head_drafts_for_the_model() {
+        let weights: Vec<PathBuf> = [
+            "MTP/MTP-Model-Q8_0-00002-of-00002.gguf",
+            "MTP/MTP-Model-Q8_0-00001-of-00002.gguf",
+            "Model-Q4_K_M.gguf",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            model_and_draft(&weights),
+            (
+                Some(PathBuf::from("Model-Q4_K_M.gguf")),
+                Some(PathBuf::from("MTP/MTP-Model-Q8_0-00001-of-00002.gguf"))
+            )
+        );
+    }
+
+    /// A projector, an importance matrix or a drafter named beside the model's weights is never
+    /// opened as the model, before or after them in `files`, sharded or not; named alone, it is.
+    #[test]
+    fn a_file_named_beside_the_weights_is_not_opened_as_the_model() {
+        let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        for beside in [
+            "mmproj-F16.gguf",
+            "Model-mmproj-Q6_K.gguf",
+            "Model-Q5_K_M-mmproj-00001-of-00001.gguf",
+            "Model-imatrix.gguf",
+            "eagle3-Model-Q8_0-00001-of-00001.gguf",
+        ] {
+            for weights in [
+                paths(&[beside, "Model-Q4_K_M.gguf"]),
+                paths(&["Model-Q4_K_M.gguf", beside]),
+            ] {
+                assert_eq!(
+                    model_and_draft(&weights),
+                    (Some(PathBuf::from("Model-Q4_K_M.gguf")), None),
+                    "weights {weights:?}"
+                );
+            }
+        }
+        assert_eq!(
+            model_and_draft(&paths(&[
+                "Q4_K_M/Model-Q4_K_M-00002-of-00002.gguf",
+                "mmproj-F16.gguf",
+                "Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf",
+            ])),
+            (
+                Some(PathBuf::from("Q4_K_M/Model-Q4_K_M-00001-of-00002.gguf")),
+                None
+            )
+        );
+        assert_eq!(
+            model_and_draft(&paths(&["Model-imatrix.gguf"])),
+            (Some(PathBuf::from("Model-imatrix.gguf")), None)
+        );
+    }
+
+    /// A shard is told by its file's name, not by the folders above it, as the load line tells
+    /// it: a cache directory named like a shard does not make every file in it one.
+    #[test]
+    fn a_shard_is_told_by_its_file_name() {
+        let root = Path::new("/data/hf-00001-of-02/hub");
+        assert_eq!(
+            first_shard(&[
+                root.join("mtp-Model-Q8_0.gguf"),
+                root.join("dflash-Model-Q8_0-00001-of-00002.gguf"),
+            ]),
+            Some(root.join("dflash-Model-Q8_0-00001-of-00002.gguf"))
+        );
+    }
+
+    /// A cache root whose path is not UTF-8 changes nothing: the file's own name decides
+    /// whether it is the model's weights.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_root_that_is_not_utf8_still_opens_the_model_from_its_weights() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/home/op\xff/hub"));
+        let weights = vec![root.join("mmproj-F16.gguf"), root.join("Model-Q4_K_M.gguf")];
+        assert_eq!(
+            model_and_draft(&weights),
+            (Some(root.join("Model-Q4_K_M.gguf")), None)
+        );
+    }
+
+    /// Measured on three DGX Sparks (GLM-5.3, the PR build): a 29-token prompt read in 270 ms,
+    /// and a checkpoint saved in 300 ms. A checkpoint is worth saving only over a prefix that
+    /// would take longer to read again than the save takes.
+    #[test]
+    fn a_checkpoint_is_saved_only_where_reading_its_tokens_again_costs_more() {
+        let mut cost = CheckpointCost::default();
+        assert!(cost.pays(1), "unmeasured, a checkpoint is saved");
+        cost.saved(Duration::from_millis(300));
+        assert!(
+            cost.pays(1),
+            "with the read cost unmeasured, a checkpoint is saved"
+        );
+        cost.read(29, Duration::from_millis(270));
+        assert!(
+            !cost.pays(25),
+            "25 tokens read again in 233 ms, under the 300 ms save"
+        );
+        assert!(cost.pays(33), "33 tokens read again in 307 ms, over it");
+        // A newer measurement moves the estimate a quarter of the way.
+        cost.saved(Duration::from_millis(100));
+        let save_s = cost.save_s.expect("a save was measured");
+        assert!((save_s - 0.25).abs() < 1e-9, "smoothed save {save_s} s");
+        assert!(cost.pays(27), "27 tokens in 251 ms, over the 250 ms save");
+        assert!(!cost.pays(26), "26 tokens in 242 ms, under it");
+    }
+
+    fn weather_tool() -> Tool {
+        let parameters = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+        }))
+        .expect("the schema is an object");
+        Tool {
+            tp: mistralrs_core::ToolType::Function,
+            function: mistralrs_core::Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: Some(parameters),
+                strict: None,
+            },
+        }
+    }
+
+    /// An `Output` for a request offering the weather tool under `choice`, and what it sends.
+    fn output(
+        choice: ToolChoice,
+        reasoning: Option<TagReasoningContext>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = [weather_tool()];
+        let matcher = ToolCallingMatcher::new_with_format(choice, Some(&tools), None)
+            .expect("a matcher for one tool");
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning,
+            require_tool_call: matcher.requires_tool_call(),
+            tools: Some(matcher),
+            reply: None,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// What the output sent, as text: `r:` reasoning, `c:` content, `t:` a tool call.
+    fn sent(mut rx: mpsc::Receiver<Event>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::Reasoning(text) => out.push(format!("r:{text}")),
+                Event::Content(text) => out.push(format!("c:{text}")),
+                Event::ToolCalls(calls) => out.extend(
+                    calls
+                        .iter()
+                        .map(|c| format!("t:{}({})", c.function.name, c.function.arguments)),
+                ),
+                Event::Done(_) | Event::Failed(_) => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_tool_call_split_across_tokens_is_held_back_until_generation_ends() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        let pieces = [
+            "Let me check.\n",
+            "<tool_call>\n{\"name\": \"get_wea",
+            "ther\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+        ];
+        // A Qwen call stays open while a parallel call could follow it.
+        let finishes: Vec<_> = pieces.iter().map(|p| out.route(p)).collect();
+        assert_eq!(finishes, [None, None, None]);
+        let outcome = out
+            .finish(FinishReason::Stop, 7)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            sent(rx),
+            [
+                "c:Let me check.\n".to_string(),
+                "t:get_weather({\"city\":\"Paris\"})".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_after_a_complete_call_ends_generation_with_the_call() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
+        assert_eq!(out.route(call), None);
+        assert_eq!(out.route("\nDone."), Some(FinishReason::ToolCalls));
+        // Nothing after the call reaches the client.
+        assert_eq!(out.route(" More."), None);
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 3)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            sent(rx),
+            [
+                "c:Done.".to_string(),
+                "t:get_weather({\"city\":\"Oslo\"})".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_opener_spelled_across_tokens_is_held_until_it_resolves() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        for piece in [
+            "Sure. <",
+            "tool",
+            "_call",
+            ">",
+            "\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Rome\"}}\n</tool_call>",
+        ] {
+            assert_eq!(out.route(piece), None, "{piece:?}");
+        }
+        let outcome = out
+            .finish(FinishReason::Stop, 3)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            sent(rx),
+            [
+                "c:Sure. ".to_string(),
+                "t:get_weather({\"city\":\"Rome\"})".to_string()
+            ]
+        );
+        // Text that only looked like an opener is sent once it can't be one.
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.route("a <"), None);
+        assert_eq!(out.route("b"), None);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx).concat(), "c:a c:<b");
+        // The same holds for the openers the engine's parser added later (DeepSeek DSML).
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.route("a <｜DS"), None);
+        assert_eq!(out.route("x"), None);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx).concat(), "c:a c:<｜DSx");
+    }
+
+    #[test]
+    fn a_call_cut_off_by_the_end_of_generation_is_content() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        let cut = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}";
+        assert_eq!(out.route(cut), None);
+        let outcome = out
+            .finish(FinishReason::Length, 3)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::Length);
+        assert_eq!(sent(rx), [format!("c:{cut}")]);
+    }
+
+    #[test]
+    fn reasoning_is_not_read_for_tool_calls() {
+        let (mut out, rx) = output(
+            ToolChoice::Auto,
+            Some(TagReasoningContext::new_in_think_block()),
+        );
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>";
+        assert_eq!(out.route(&format!("I could call {call}</think>")), None);
+        assert_eq!(out.route("The answer."), None);
+        let outcome = out
+            .finish(FinishReason::Stop, 3)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::Stop);
+        assert_eq!(
+            sent(rx),
+            [
+                format!("r:I could call {call}"),
+                "c:The answer.".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_choice_none_sends_a_call_as_content() {
+        let (mut out, rx) = output(ToolChoice::None, None);
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>";
+        assert_eq!(out.route(call), None);
+        let outcome = out
+            .finish(FinishReason::Stop, 3)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::Stop);
+        assert_eq!(sent(rx), [format!("c:{call}")]);
+    }
+
+    #[test]
+    fn a_required_call_that_never_comes_fails_the_request() {
+        let (mut out, rx) = output(ToolChoice::Required, None);
+        assert_eq!(out.route("I won't call anything."), None);
+        assert_eq!(
+            out.finish(FinishReason::Length, 3).err().as_deref(),
+            Some("Tool choice was required but no tools were called.")
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn only_a_required_or_named_choice_obliges_a_call() {
+        let mut other = weather_tool();
+        other.function.name = "get_time".to_string();
+        let tools = [weather_tool(), other.clone()];
+        let names = |choice: Option<ToolChoice>| -> Vec<String> {
+            obliged_tools(choice.as_ref(), &tools)
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect()
+        };
+        assert_eq!(names(None), Vec::<String>::new());
+        assert_eq!(names(Some(ToolChoice::Auto)), Vec::<String>::new());
+        assert_eq!(names(Some(ToolChoice::None)), Vec::<String>::new());
+        assert_eq!(
+            names(Some(ToolChoice::Required)),
+            ["get_weather", "get_time"]
+        );
+        assert_eq!(names(Some(ToolChoice::Tool(other))), ["get_time"]);
+    }
+
+    const TAGGED: &str = "{{ '<tool_call>' }}{{ '</tool_call>' }}";
+
+    fn answer_schema() -> ResponseFormat {
+        ResponseFormat::JsonSchema {
+            json_schema: async_openai::types::chat::ResponseFormatJsonSchema {
+                description: None,
+                name: "answer".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "n": { "type": "integer" } },
+                    "required": ["n"],
+                    "additionalProperties": false,
+                }),
+                strict: Some(true),
+            },
+        }
+    }
+
+    #[test]
+    fn the_load_notes_name_the_model_and_what_to_do() {
+        assert_eq!(
+            paged_attention_note("qwen"),
+            "Model 'qwen' sets `paged_attention: disabled`, which has no effect: GGUF models are served by llama.cpp, which manages its own KV cache. Remove the parameter to silence this message."
+        );
+        let cause = llama_cpp::Error::LoadModel {
+            path: "/models/glm.gguf".to_string(),
+            reason: "out of memory".to_string(),
+        };
+        assert_eq!(
+            without_mtp_note("glm", &cause),
+            "Model 'glm' loaded without its MTP layer, so it decodes without drafting: the model did not load with it. Cause: llama.cpp could not load the model '/models/glm.gguf': out of memory"
+        );
+        assert_eq!(
+            not_a_head(Path::new("/models/mtp-shard.gguf")),
+            "'mtp-shard.gguf' is named as an MTP draft head (it starts with `mtp-`), but it carries no MTP layer. Remove it from `files`, or rename it if it is a shard of the model."
+        );
+    }
+
+    #[test]
+    fn rules_are_prefixed_in_definitions_and_references_but_not_in_literals() {
+        let grammar = "root ::= \"{\" space ab-kv \"}\" space\nspace ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\nab-kv ::= \"\\\"a-b\\\"\" space \":\" space [0-9]{1,3}\n";
+        assert_eq!(
+            prefix_rules(grammar, "p-"),
+            "p-root ::= \"{\" p-space p-ab-kv \"}\" p-space\np-space ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\np-ab-kv ::= \"\\\"a-b\\\"\" p-space \":\" p-space [0-9]{1,3}\n"
+        );
+    }
+
+    #[test]
+    fn a_required_call_is_forced_in_a_template_that_tags_calls() {
+        let tool = weather_tool();
+        let grammar = content_grammar("m", TAGGED, None, &[&tool], &[&tool])
+            .expect("the tool's schema converts")
+            .expect("a required call in a tagged template has a grammar");
+        assert!(
+            grammar.ends_with("root ::= \"<tool_call>\\n\" call-root \"\\n</tool_call>\"\n"),
+            "{grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "{grammar}"
+        );
+        assert!(grammar.contains("call-root ::="), "{grammar}");
+        assert!(
+            grammar.contains("get_weather"),
+            "the name is held to the tool's: {grammar}"
+        );
+        assert_eq!(
+            content_grammar("m", "{{ '[TOOL_CALLS]' }}", None, &[&tool], &[&tool])
+                .expect("no conversion"),
+            None,
+            "another template format has no grammar; end-of-generation is held off instead"
+        );
+    }
+
+    #[test]
+    fn a_structured_reply_beside_tools_is_either_a_call_or_the_reply() {
+        let tool = weather_tool();
+        let grammar = content_grammar("m", TAGGED, Some(&answer_schema()), &[&tool], &[])
+            .expect("both convert")
+            .expect("a grammar");
+        assert!(
+            grammar.ends_with(
+                "root ::= \"<tool_call>\\n\" call-root \"\\n</tool_call>\" | reply-root\n"
+            ),
+            "{grammar}"
+        );
+        assert!(grammar.contains("reply-root ::="), "{grammar}");
+        assert!(
+            !grammar.lines().any(|l| l.starts_with("space ::=")),
+            "no rule is left unprefixed to collide: {grammar}"
+        );
+        let refused = content_grammar(
+            "qwen",
+            "{{ '[TOOL_CALLS]' }}",
+            Some(&answer_schema()),
+            &[&tool],
+            &[],
+        )
+        .expect_err("another template format can't combine the two");
+        assert_eq!(
+            refused.to_string(),
+            "invalid args: Model 'qwen' can't combine a `json_schema` or `json_object` `response_format` with `tools`: its chat template's tool-call format can't be enforced alongside a schema. Send one or the other."
+        );
+    }
+
+    #[test]
+    fn a_json_schema_becomes_a_grammar_and_json_object_any_object() {
+        let grammar = content_grammar("m", TAGGED, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        assert!(grammar.contains("root ::="), "{grammar}");
+        assert!(
+            grammar.contains("\\\"n\\\""),
+            "the grammar names the property: {grammar}"
+        );
+        assert!(
+            content_grammar("m", TAGGED, Some(&ResponseFormat::JsonObject), &[], &[])
+                .expect("json_object converts")
+                .is_some_and(|g| g.contains("root ::="))
+        );
+        assert_eq!(
+            content_grammar("m", TAGGED, Some(&ResponseFormat::Text), &[], &[]).expect("text"),
+            None
+        );
+        assert_eq!(
+            content_grammar("m", TAGGED, None, &[], &[]).expect("no format"),
+            None
+        );
+    }
+
+    /// What a reply of `chunks` sends, read with the parser chosen for `template` and
+    /// `prompt`.
+    fn split(template: &str, prompt: &str, chunks: &[&str]) -> Vec<String> {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: reasoning_parser(template, prompt),
+            tools: None,
+            reply: None,
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, mut out) = Output::new(job);
+        for chunk in chunks {
+            assert_eq!(out.route(chunk), None);
+        }
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        sent(rx)
+    }
+
+    const THINKS: &str = "{{ '<think>' }}{{ '</think>' }}";
+    /// The reasoning markers of a Gemma 4 chat template.
+    const GEMMA4: &str = "{{ '<|think|>' }}{{ '<|channel>thought' }}{{ '<channel|>' }}";
+
+    #[test]
+    fn a_split_tag_is_held_until_it_completes() {
+        assert_eq!(
+            split(THINKS, "<think>\n", &["plan</th", "ink>\n\nanswer"]),
+            ["r:plan", "c:\n\nanswer"]
+        );
+    }
+
+    #[test]
+    fn a_reply_that_opens_its_own_block_is_split_too() {
+        assert_eq!(
+            split(THINKS, "", &["<think>why</think>42"]),
+            ["r:why", "c:42"]
+        );
+    }
+
+    #[test]
+    fn gemma_4_reasoning_closes_at_its_channel_tag() {
+        // regression: a Gemma 4 reply's answer was read as reasoning to the end
+        let prompt = "<|think|>user\nHi";
+        assert_eq!(
+            split(GEMMA4, prompt, &["<|channel>thought\nplan<chan", "nel|>42"]),
+            ["r:plan", "c:42"]
+        );
+        assert_eq!(
+            split(GEMMA4, prompt, &["thought\nplan<channel|>42"]),
+            ["r:plan", "c:42"]
+        );
+        assert_eq!(split(GEMMA4, "user\nHi", &["42"]), ["c:42"]);
+    }
+
+    /// The reasoning markers of a Mistral reasoning model's chat template: Magistral's, and
+    /// Mistral Large 4's, which writes earlier turns' reasoning as `[THINK]...[/THINK]`.
+    const MISTRAL_THINK: &str = "{{- '[THINK]' ~ block['thinking'] -}}{{- '[/THINK]' -}}";
+
+    #[test]
+    fn mistral_reasoning_is_split_at_its_think_tokens() {
+        // regression: Mistral Large 4's reasoning came back as content, its tags included
+        assert_eq!(
+            split(
+                MISTRAL_THINK,
+                "[INST]Hi[/INST]",
+                &["[TH", "INK]why[/THI", "NK]42"]
+            ),
+            ["r:why", "c:42"]
+        );
+        // a prompt that opens the block starts the reply inside it
+        assert_eq!(
+            split(MISTRAL_THINK, "[INST]Hi[/INST][THINK]", &["why[/THINK]42"]),
+            ["r:why", "c:42"]
+        );
+    }
+
+    #[test]
+    fn a_template_that_marks_no_reasoning_keeps_the_reply_as_content() {
+        assert_eq!(
+            split("{{ messages }}", "<think>", &["<think>why</think>42"]),
+            ["c:<think>why</think>42"]
+        );
+    }
+
+    const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
+    const HARMONY_MARKERS: harmony::Markers = harmony::TEST_MARKERS;
+    /// The formats of a vocabulary that holds Harmony's markers alone.
+    const HARMONY_FORMATS: reply::Formats = reply::Formats {
+        harmony: Some(HARMONY_MARKERS),
+        inkling: None,
+    };
+
+    /// Named templates may mix a Harmony template with one that is not: a request rendered
+    /// with the other reads its reply as text, which a Harmony reader would hold as a header.
+    #[test]
+    fn only_a_request_whose_template_writes_harmony_reads_harmony() {
+        assert_eq!(
+            HARMONY_FORMATS.of(HARMONY),
+            Some(reply::Format::Harmony(HARMONY_MARKERS))
+        );
+        let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}";
+        assert_eq!(HARMONY_FORMATS.of(chatml), None);
+        assert_eq!(reply::Formats::default().of(HARMONY), None);
+    }
+
+    /// An `Output` reading a Harmony reply that may call `tools`, with `stop` sequences and a
+    /// token `limit`, and what it sends.
+    fn harmony_output(
+        tools: &[&str],
+        stop: &[&str],
+        limit: Option<usize>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = tools.iter().map(ToString::to_string).collect();
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit,
+            sampling: Sampling::default(),
+            stop: stop.iter().map(ToString::to_string).collect(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Harmony(harmony::Reader::new(
+                HARMONY_MARKERS,
+                tools,
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// Generates `reply`: each marker as its token, which ends generation if it is
+    /// `<|return|>` or `<|call|>`, and other text a character per token. Returns why generation
+    /// ended, and after how many tokens.
+    fn generate_harmony(out: &mut Output, reply: &str) -> (Option<FinishReason>, usize) {
+        let ending = [Token(5), Token(6)];
+        let mut tokens = Vec::new();
+        for (marker, text) in harmony::spell(reply) {
+            match marker {
+                Some(token) => tokens.push((token, text)),
+                None => tokens.extend(text.chars().map(|c| (Token(100), c.to_string()))),
+            }
+        }
+        for (n, (token, text)) in tokens.into_iter().enumerate() {
+            if let Some(finish) = out.read(token, ending.contains(&token), || text.into_bytes()) {
+                return (Some(finish), n + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    /// `sent`, with each run of one kind of event as one.
+    fn joined(sent: Vec<String>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for event in sent {
+            match out.last_mut() {
+                Some(last)
+                    if last.starts_with("r:") && event.starts_with("r:")
+                        || last.starts_with("c:") && event.starts_with("c:") =>
+                {
+                    last.push_str(&event[2..]);
+                }
+                _ => out.push(event),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_harmony_reply_sends_its_reasoning_then_its_answer() {
+        let (mut out, rx) = harmony_output(&[], &[], None);
+        let reply = "<|channel|>analysis<|message|>Add them.<|end|><|start|>assistant<|channel|>final<|message|>2 + 2 = 4<|return|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let outcome = out
+            .finish(FinishReason::Stop, 9)
+            .expect("the request succeeds");
+        // every token but the `<|return|>` that ends the reply
+        assert_eq!(outcome.completion_tokens as usize, n - 1);
+        assert_eq!(
+            joined(sent(rx)),
+            ["r:Add them.".to_string(), "c:2 + 2 = 4".to_string()]
+        );
+    }
+
+    /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
+    /// `OPENS`, as a custom template may. An earlier turn's reply is a final message, closed
+    /// with `<|end|>`, as gpt-oss's own template renders one.
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistantOPENS{% endif %}";
+
+    /// The engine serving `template`, and the job it queues for a request with the fields
+    /// `request` sets (a question about France's capital, by default), and what that job sends.
+    fn harmony_job(
+        template: String,
+        request: serde_json::Value,
+    ) -> (LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>) {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "gpt-oss".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "gpt-oss".to_string(),
+            template: Either::Left(template),
+            special: SpecialTokens::default(),
+            formats: HARMONY_FORMATS,
+            reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
+            counter: AtomicUsize::new(0),
+            context_window: 0,
+            reused_prompt_tokens: Arc::default(),
+            prompt_ends_in_steps: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "gpt-oss",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama
+            .submit(&req, &CacheNamespace::Public)
+            .expect("the request is queued");
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        (llama, prompt, sampling, out, rx)
+    }
+
+    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
+    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
+    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
+    /// request is queued as the engine queues it, so the reply is read from where the engine
+    /// starts reading it.
+    fn harmony_reply_after(
+        opens: &str,
+        request: serde_json::Value,
+        reply: &str,
+    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
+        let (_llama, prompt, sampling, mut out, rx) =
+            harmony_job(HARMONY_OPENS.replace("OPENS", opens), request);
+        // These cases leave the grammar nothing to be advanced over, which the decode thread
+        // would do before the reply starts.
+        assert_eq!(out.pending(), "", "{opens:?}");
+        out.begin(true);
+        assert!(
+            prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
+            "the generation prompt goes on with {opens:?}: {prompt:?}"
+        );
+        let root = sampling.grammar.as_deref().and_then(|grammar| {
+            grammar
+                .lines()
+                .find_map(|line| line.strip_prefix("root ::= "))
+                .map(ToString::to_string)
+        });
+        let finish = generate_harmony(&mut out, reply)
+            .0
+            .expect("the reply ends at `<|return|>` or `<|call|>`");
+        let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+        (sent, root)
+    }
+
+    /// A stock gpt-oss template ends its generation prompt at `<|start|>assistant`, so the
+    /// reply writes its first message's header. A custom one may go on to name that message's
+    /// channel or to open its body, as `<|start|>assistant<|channel|>final<|message|>` does,
+    /// and the reply goes on from there.
+    #[test]
+    fn a_harmony_reply_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let rest = "Recall it.<|end|><|start|>assistant<|channel|>final<|message|>Paris<|return|>";
+        let read = [
+            ("", format!("<|channel|>analysis<|message|>{rest}")),
+            ("<|channel|>final<|message|>", "Paris<|return|>".to_string()),
+            ("<|channel|>analysis<|message|>", rest.to_string()),
+            ("<|channel|>analysis", format!("<|message|>{rest}")),
+        ]
+        .map(|(opens, reply)| {
+            harmony_reply_after(opens, serde_json::json!({}), &reply)
+                .0
+                .expect("the request succeeds")
+        });
+        let answer = || vec!["r:Recall it.".to_string(), "c:Paris".to_string()];
+        assert_eq!(
+            read,
+            [answer(), vec!["c:Paris".to_string()], answer(), answer()]
+        );
+    }
+
+    /// A grammar that holds a reply, to a `response_format` or to a required call, goes on from
+    /// where the generation prompt leaves the reply rather than making it write a header
+    /// inside a message the prompt opened. A message the grammar cannot go on from, such as a
+    /// final message before a required call, keeps the grammar of a whole reply, and the reply
+    /// is read from its first header.
+    #[test]
+    fn a_harmony_grammar_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        // a second turn, after an earlier structured reply
+        let mut second_turn = structured.clone();
+        second_turn["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is the capital of France?" },
+            { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+            { "role": "user", "content": "And of Italy?" },
+        ]);
+        let json = "{\"capital\":\"Paris\"}";
+        let final_json = format!("<|channel|>final<|message|>{json}<|return|>");
+        let call =
+            "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        let cases = [
+            ("", &structured, final_json.clone()),
+            (
+                "<|channel|>final<|message|>",
+                &structured,
+                format!("{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis<|message|>",
+                &structured,
+                format!("Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            (
+                "<|channel|>",
+                &structured,
+                format!("final<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>final",
+                &structured,
+                format!("<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis",
+                &structured,
+                format!("<|message|>Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            ("<|channel|>commentary<|message|>", &structured, final_json),
+            ("", &required, call.to_string()),
+            (
+                "<|channel|>analysis<|message|>",
+                &required,
+                format!("Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            (
+                "<|channel|>commentary to=functions.get_weather<|message|>",
+                &required,
+                "{\"city\":\"Paris\"}<|call|>".to_string(),
+            ),
+            (
+                "<|channel|>",
+                &required,
+                call["<|channel|>".len()..].to_string(),
+            ),
+            (
+                "<|channel|>analysis",
+                &required,
+                format!("<|message|>Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            ("<|channel|>final<|message|>", &required, call.to_string()),
+            (
+                "<|channel|>final<|message|>",
+                &second_turn,
+                format!("{json}<|return|>"),
+            ),
+        ];
+        let read: Vec<_> = cases
+            .iter()
+            .map(|(opens, request, reply)| harmony_reply_after(opens, (*request).clone(), reply))
+            .collect();
+        let structured_root = "analysis* <[2]> \"final\" constrain? <[3]> reply-root";
+        let after_analysis = format!("<[4]> <[1]> \"assistant\" {structured_root}");
+        let call_root = "<[2]> \"commentary to=functions.\" call";
+        let answer = || vec![format!("c:{json}")];
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        let expected = [
+            (answer(), structured_root.to_string()),
+            (answer(), "reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("reasoning {after_analysis}"),
+            ),
+            (
+                answer(),
+                format!(
+                    "\"analysis\" <[3]> reasoning {after_analysis} | \"final\" constrain? <[3]> reply-root"
+                ),
+            ),
+            (answer(), "constrain? <[3]> reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("<[3]> reasoning {after_analysis}"),
+            ),
+            (answer(), structured_root.to_string()),
+            (called(), format!("analysis? {call_root}")),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), "tool0-root".to_string()),
+            (
+                called(),
+                format!(
+                    "\"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\" {call_root} | \"commentary to=functions.\" call"
+                ),
+            ),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("<[3]> reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), format!("analysis? {call_root}")),
+            (answer(), "reply-root".to_string()),
+        ];
+        assert_eq!(
+            read,
+            expected
+                .into_iter()
+                .map(|(sent, root)| (Ok(sent), Some(root)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reply goes on from what the template's generation prompt adds after the
+    /// conversation, whose messages the template closes: an earlier turn's final message ends
+    /// there, and the markers a prefill's JSON spells, `<|end|><|start|>` included, are the
+    /// prefill's, for a structured reply and a required call alike. A template that adds its
+    /// opened message whether or not a generation prompt is asked for is read whole.
+    #[test]
+    fn a_harmony_prefill_after_earlier_turns_keeps_the_markers_its_json_spells() {
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        let prefill = "<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"capital\":\"Ro";
+        let call = "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"<|end|><|start|>Ro";
+        let pending = |template: String, request: serde_json::Value| {
+            let (_llama, _, _, out, _) = harmony_job(template, request);
+            out.pending().to_string()
+        };
+        let opens = |opened: &str| HARMONY_OPENS.replace("OPENS", opened);
+        // always adds `<|start|>assistant` and the prefill
+        let ignores_generation_prompt = |opened: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{opened}"
+            )
+        };
+        assert_eq!(
+            [
+                pending(opens(prefill), second_turn(structured.clone())),
+                pending(opens(call), second_turn(required)),
+                pending(ignores_generation_prompt(prefill), structured),
+            ],
+            [prefill, call, prefill]
+        );
+    }
+
+    /// A template may write the reply's role header whatever is asked for and add the rest of
+    /// the generation prompt only when asked, so what the generation prompt adds starts no
+    /// message: the reply then goes on from the message the conversation leaves open, after
+    /// an earlier turn's closed final message, with and without a grammar. A `<|start|>` the
+    /// body of that message spells is the body's, whether the generation prompt adds it or the
+    /// template writes it whatever is asked for, and so are the markers an earlier message
+    /// spells.
+    #[test]
+    fn a_harmony_header_split_across_the_generation_prompt_is_read_whole() {
+        let split = |always: &str, added: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}{{% if m.role == 'assistant' %}}<|channel|>final{{% endif %}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{always}{{% if add_generation_prompt %}}{added}{{% endif %}}"
+            )
+        };
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let read = |template: String, request: serde_json::Value, reply: &str| {
+            let (_llama, _, sampling, mut out, rx) = harmony_job(template, request);
+            let root = sampling.grammar.as_deref().and_then(|grammar| {
+                grammar
+                    .lines()
+                    .find_map(|line| line.strip_prefix("root ::= "))
+                    .map(ToString::to_string)
+            });
+            let pending = out.pending().to_string();
+            out.begin(true);
+            let finish = generate_harmony(&mut out, reply)
+                .0
+                .expect("the reply ends at `<|return|>`");
+            let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+            (sent, root, pending)
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let spelled_pair = serde_json::json!({
+            "messages": [{ "role": "user", "content": "Say <|end|><|start|> verbatim." }],
+        });
+        let opened = "<|channel|>final<|message|>";
+        let rome = |content: &str| -> (
+            std::result::Result<Vec<String>, String>,
+            Option<String>,
+            String,
+        ) { (Ok(vec![content.to_string()]), None, String::new()) };
+        assert_eq!(
+            [
+                read(split("", opened), serde_json::json!({}), "Rome<|return|>"),
+                read(
+                    split("", opened),
+                    second_turn(structured),
+                    "{\"capital\":\"Rome\"}<|return|>"
+                ),
+                // a `<|start|>` in the body the generation prompt adds
+                read(
+                    split("", "<|channel|>final<|message|>Note: <|start|>!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // a `<|start|>` in the body the template writes whatever is asked for
+                read(
+                    split("<|channel|>final<|message|>Note: <|start|>", "!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // the pair an earlier message spells
+                read(split("", opened), spelled_pair, "Rome<|return|>"),
+            ],
+            [
+                rome("c:Rome"),
+                (
+                    Ok(vec!["c:{\"capital\":\"Rome\"}".to_string()]),
+                    Some("reply-root".to_string()),
+                    String::new()
+                ),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Rome"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_the_reply_with_its_arguments() {
+        let (mut out, rx) = harmony_output(&["get_weather"], &[], None);
+        let reply = "<|channel|>analysis<|message|>Look it up.<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 9)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            joined(sent(rx)),
+            [
+                "r:Look it up.".to_string(),
+                "t:get_weather({\"city\":\"Paris\"})".to_string()
+            ]
+        );
+    }
+
+    /// `<|end|>` can close a call whose arguments are complete JSON, and it does not end
+    /// generation in the vocabulary, so it is a completion token like any other marker; only
+    /// the `<|return|>` or `<|call|>` that ends a reply is not counted.
+    #[test]
+    fn an_end_that_closes_a_harmony_call_counts_as_a_completion_token() {
+        let (mut out, rx) = harmony_output(&["f"], &[], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(
+            outcome.completion_tokens as usize, n,
+            "every token, `<|end|>` included"
+        );
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_sequence_applies_to_a_harmony_body_but_not_its_header() {
+        let (mut out, rx) = harmony_output(&[], &["final"], None);
+        let reply = "<|channel|>analysis<|message|>r<|end|><|start|>assistant<|channel|>final<|message|>the final word<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:r".to_string(), "c:the ".to_string()]);
+    }
+
+    #[test]
+    fn text_a_stop_sequence_holds_back_goes_out_before_the_next_harmony_message() {
+        // `x` may start the stop sequence, so it is held until the marker closes its message
+        let (mut out, rx) = harmony_output(&[], &["xyz"], None);
+        let reply = "<|channel|>analysis<|message|>abx<|end|><|start|>assistant<|channel|>final<|message|>c<|return|>";
+        generate_harmony(&mut out, reply);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:abx".to_string(), "c:c".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_reply_counts_its_markers_against_the_budget() {
+        // `<|channel|>`, the five tokens of `final` and `<|message|>` leave two of nine
+        let (mut out, rx) = harmony_output(&[], &[], Some(9));
+        let reply = "<|channel|>final<|message|>abcdef<|return|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 9)
+        );
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_call_cut_off_after_complete_arguments_is_still_made() {
+        // `<|channel|>`, `commentary to=functions.f` (25 characters), `<|message|>` and `{}`
+        let (mut out, rx) = harmony_output(&["f"], &[], Some(29));
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 29)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_named_tool_choice_is_the_only_name_a_harmony_call_may_take() {
+        let tool = |name: &str| {
+            let mut tool = weather_tool();
+            tool.function.name = name.to_string();
+            tool
+        };
+        let (f, g) = (tool("f"), tool("g"));
+        assert_eq!(nameable_tools(&[&f, &g], &[&f]), ["f".to_string()]);
+        assert_eq!(
+            nameable_tools(&[&f, &g], &[]),
+            ["f".to_string(), "g".to_string()]
+        );
+        // a call to the other tool is dropped, so a required call is not made
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Harmony(harmony::Reader::new(
+                HARMONY_MARKERS,
+                nameable_tools(&[&f, &g], &[&f]),
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|channel|>commentary to=functions.g<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool], &harmony::Opened::Header)
+            .expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 1 to 7, matched as tokens
+        assert!(
+            grammar.ends_with("root ::= analysis? <[2]> \"commentary to=functions.\" call\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with(
+                "analysis ::= <[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\"\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call ::= \"get_weather\" constrain? <[3]> tool0-root\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("constrain ::= \" \" <[7]>? [A-Za-z0-9_-]+\n"),
+            "{grammar}"
+        );
+        // reasoning text spells no `<|`, not even after another `<`
+        assert!(
+            grammar.contains("\nreasoning ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n"),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // nor does a Harmony template make one without its markers
+        assert_eq!(
+            content_grammar("m", HARMONY, None, &[&tool], &[&tool]).expect("no grammar"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_structured_harmony_reply_is_held_from_its_first_header() {
+        let reply = content_grammar("m", HARMONY, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = harmony_reply(&HARMONY_MARKERS, &reply, &harmony::Opened::Header);
+        // analysis messages, then the final one: no preamble, whose text would be content
+        assert!(
+            grammar.ends_with("root ::= analysis* <[2]> \"final\" constrain? <[3]> reply-root\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("commentary"), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_where_its_arguments_do_though_a_stop_sequence_holds_their_end() {
+        // `}x` may begin at the closing `}`, which is held back when `<|end|>` comes
+        let (mut out, rx) = harmony_output(&["f"], &["}x"], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|><|start|>assistant<|channel|>final<|message|>no<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        out.finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_required_harmony_call_leaves_only_its_call_marker_possible() {
+        let (out, _rx) = harmony_output(&["f"], &[], None);
+        assert_eq!(
+            out.ruled_out(&[Token(5), Token(6), Token(99)]),
+            [Token(5), Token(99)]
+        );
+        let (out, _rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.ruled_out(&[Token(6)]), [Token(6)]);
+    }
+
+    #[test]
+    fn a_harmony_model_is_refused_only_when_its_vocabulary_lacks_the_markers() {
+        let refused = check_reply_format(
+            &Either::Left(HARMONY.to_string()),
+            Some("gpt-oss".to_string()),
+            reply::Formats::default(),
+            "gpt-oss-20b-mxfp4.gguf".to_string(),
+        )
+        .expect_err("a Harmony template without its markers is refused");
+        assert_eq!(
+            refused.to_string(),
+            "Architecture 'gpt-oss' in gpt-oss-20b-mxfp4.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+        );
+        assert!(reasoning_parser(HARMONY, "").is_none());
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(HARMONY.to_string()),
+                Some("gpt-oss".to_string()),
+                HARMONY_FORMATS,
+                "gpt-oss-20b-mxfp4.gguf".to_string(),
+            )
+            .expect("a Harmony template with its markers"),
+            HARMONY_FORMATS
+        );
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(THINKS.to_string()),
+                None,
+                HARMONY_FORMATS,
+                "qwen.gguf".to_string(),
+            )
+            .expect("a think-tag template"),
+            reply::Formats::default(),
+            "only a Harmony template's replies are read by the markers"
+        );
+        check_reply_format(
+            &Either::Left(GEMMA4.to_string()),
+            None,
+            reply::Formats::default(),
+            "gemma.gguf".to_string(),
+        )
+        .expect("a Gemma 4 template");
+    }
+
+    /// Named templates are chosen as the mistral.rs engine chooses them, and a Harmony template
+    /// among them is read as a lone one is.
+    #[test]
+    fn named_templates_are_chosen_as_mistral_rs_chooses() {
+        let entry = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        let named = Either::Right(vec![
+            entry(&[("name", "default"), ("template", "D")]),
+            entry(&[("name", "tool_use"), ("template", "T")]),
+        ]);
+        assert_eq!(chosen_template(&named, false), Ok("D"));
+        assert_eq!(chosen_template(&named, true), Ok("T"));
+        let keyed = Either::Right(vec![
+            entry(&[("default", "D")]),
+            entry(&[("tool_use", "T")]),
+        ]);
+        assert_eq!(chosen_template(&keyed, false), Ok("D"));
+        assert_eq!(chosen_template(&keyed, true), Ok("T"));
+        let default_only = Either::Right(vec![entry(&[("name", "default"), ("template", "D")])]);
+        assert_eq!(
+            chosen_template(&default_only, true),
+            Err(
+                "Tools were provided but this chat template does not handle tool usage".to_string()
+            )
+        );
+        let harmony = Either::Right(vec![
+            entry(&[("name", "default"), ("template", THINKS)]),
+            entry(&[("name", "tool_use"), ("template", HARMONY)]),
+        ]);
+        assert!(matches!(
+            check_reply_format(
+                &harmony,
+                None,
+                reply::Formats::default(),
+                "gpt-oss.gguf".to_string()
+            ),
+            Err(ChatError::UnsupportedArchitecture { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stop_sequence_ends_the_text_before_it() {
+        let mut stops = StopMatcher::new(vec!["\n\nUser:".to_string()]);
+        assert_eq!(stops.push("1, 2, 3\n"), ("1, 2, 3".to_string(), false));
+        assert_eq!(stops.push("\nUser: hi"), (String::new(), true));
+    }
+
+    #[test]
+    fn a_multibyte_stop_sequence_is_cut_on_character_boundaries() {
+        let mut stops = StopMatcher::new(vec!["日本".to_string(), "é!".to_string()]);
+        assert_eq!(
+            stops.push("こんにちは日"),
+            ("こんにちは".to_string(), false)
+        );
+        assert_eq!(stops.push("本語"), (String::new(), true));
+        let mut stops = StopMatcher::new(vec!["é!".to_string()]);
+        // No prefix of `é!` ends inside `é`, so none is tried against the text.
+        assert_eq!(stops.push("ab"), ("ab".to_string(), false));
+        assert_eq!(stops.push("café"), ("caf".to_string(), false));
+        assert_eq!(stops.push("é"), ("é".to_string(), false));
+        assert_eq!(stops.finish(), "é");
+    }
+
+    #[test]
+    fn an_incomplete_character_waits_for_the_next_token() {
+        let mut bytes = "é".as_bytes()[..1].to_vec();
+        assert_eq!(take_utf8(&mut bytes), "");
+        bytes.extend(&"é".as_bytes()[1..]);
+        assert_eq!(take_utf8(&mut bytes), "é");
+    }
+
+    /// The text `tokens` decode to, token by token.
+    fn decoded(tokens: &[&[u8]]) -> String {
+        let mut bytes = Vec::new();
+        let mut text = String::new();
+        for token in tokens {
+            bytes.extend_from_slice(token);
+            text.push_str(&take_utf8(&mut bytes));
+        }
+        assert!(bytes.is_empty(), "left {bytes:x?}");
+        text
+    }
+
+    #[test]
+    fn an_invalid_byte_does_not_take_the_character_after_it() {
+        // regression: replacing the invalid `ff` also replaced the `c3` that `a9` completes
+        assert_eq!(decoded(&[&[0xff, 0xc3], &[0xa9]]), "\u{fffd}é");
+        assert_eq!(decoded(&[&[0xc3], &[0xc3], &[0xa9]]), "\u{fffd}é");
+        // Every split of the same bytes decodes as a lossy decode of all of them does.
+        let bytes = [
+            0x61, 0xff, 0xe2, 0x82, 0xac, 0xc3, 0xc3, 0xa9, 0xf0, 0x9f, 0x98, 0x80,
+        ];
+        let whole = String::from_utf8_lossy(&bytes);
+        for cut in 0..=bytes.len() {
+            for second in cut..=bytes.len() {
+                let parts = [&bytes[..cut], &bytes[cut..second], &bytes[second..]];
+                assert_eq!(decoded(&parts), whole, "split at {cut} and {second}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_character_cut_off_by_the_end_of_generation_is_replaced() {
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        out.pending = vec![0xe2, 0x82];
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx), ["c:\u{fffd}"]);
+    }
+
+    /// The content a reply of `pieces` sends when the request stops at `STOP`.
+    fn stopped_at(pieces: &[&[u8]]) -> String {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: vec!["STOP".to_string()],
+            reasoning: None,
+            tools: None,
+            reply: None,
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, mut out) = Output::new(job);
+        let finish = pieces
+            .iter()
+            .find_map(|piece| out.bytes(piece))
+            .unwrap_or(FinishReason::Length);
+        out.finish(finish, 1).expect("the request succeeds");
+        sent(rx)
+            .into_iter()
+            .map(|event| {
+                event
+                    .strip_prefix("c:")
+                    .map(ToString::to_string)
+                    .expect("only content is sent")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_after_a_stop_sequence_is_sent() {
+        // regression: an incomplete character after the stop sequence was sent as U+FFFD
+        let reply = "beforeSTOPéafter".as_bytes();
+        assert_eq!(stopped_at(&[reply]), "before");
+        for cut in 0..=reply.len() {
+            assert_eq!(
+                stopped_at(&[&reply[..cut], &reply[cut..]]),
+                "before",
+                "split at byte {cut}"
+            );
+        }
+    }
+
+    /// The tokens nucleus sampling leaves from `logits` at `temperature` and `top_p`: the
+    /// smallest most-likely set whose probability reaches `top_p`.
+    fn nucleus(logits: &[f32], temperature: f32, top_p: f32) -> Vec<Token> {
+        let scaled: Vec<f64> = logits
+            .iter()
+            .map(|&l| f64::from(l) / f64::from(temperature))
+            .collect();
+        let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = scaled.iter().map(|l| (l - max).exp()).sum();
+        let mut ranked: Vec<(usize, f64)> = scaled
+            .iter()
+            .enumerate()
+            .map(|(id, l)| (id, (l - max).exp() / total))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut kept = Vec::new();
+        let mut mass = 0.0;
+        for (id, p) in ranked {
+            kept.push(Token(i32::try_from(id).expect("a small vocabulary")));
+            mass += p;
+            if mass >= f64::from(top_p) {
+                break;
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn top_p_keeps_the_nucleus_of_the_tempered_distribution() {
+        // regression: top-p ran before temperature, on the untempered distribution
+        let logits = [0.0, -1.0, -2.0, -3.0];
+        for (temperature, top_p) in [(2.0, 0.6), (0.5, 0.9), (1.5, 0.8), (3.0, 0.95)] {
+            let sampling = Sampling {
+                temperature: Some(temperature),
+                top_p: Some(top_p),
+                seed: 7,
+                ..Sampling::default()
+            };
+            let mut chain = Sampler::chain(draw(&sampling));
+            assert_eq!(
+                chain.apply(&logits),
+                nucleus(&logits, temperature, top_p),
+                "temperature {temperature}, top_p {top_p}"
+            );
+        }
+        // The first case tells the orders apart: untempered, top-p keeps only the first token.
+        assert_eq!(nucleus(&logits, 1.0, 0.6), [Token(0)]);
+        assert_eq!(nucleus(&logits, 2.0, 0.6), [Token(0), Token(1)]);
+    }
+
+    #[test]
+    fn n_asks_for_one_to_128_choices() {
+        let count = |n: Option<u8>| {
+            let mut req: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{ "role": "user", "content": "Hi" }],
+            }))
+            .expect("a request");
+            req.n = n;
+            choice_count(&req).map_err(|e| e.to_string())
+        };
+        let refused = Err(
+            "invalid args: `n` must be between 1 and 128, the number of choices to generate."
+                .to_string(),
+        );
+        assert_eq!(count(None), Ok(1));
+        assert_eq!(count(Some(1)), Ok(1));
+        assert_eq!(count(Some(128)), Ok(128));
+        assert_eq!(count(Some(0)), refused);
+        assert_eq!(count(Some(129)), refused);
+    }
+
+    /// An Inkling chat template: the model's blocks, each closed by `<|end_message|>`, an
+    /// assistant's calls as call blocks whose arguments the template requires to be an object
+    /// (it raises on a string, as Inkling's own does), and no generation prompt, so the prompt
+    /// ends after the last message.
+    const INKLING: &str = r#"{%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>", "tool": "<|message_tool|>"} -%}
+{%- if tools -%}<|message_system|>tool_declare<|content_xml|>{{ tools | tojson }}<|end_message|>{%- endif -%}
+{%- for message in messages -%}
+{%- if message.content is string and message.content -%}{{ role_token[message.role] }}<|content_text|>{{ message.content }}<|end_message|>{%- endif -%}
+{%- if message.content is not string -%}{{ role_token[message.role] }}<|content_image|><|end_message|>{%- endif -%}
+{%- if message.role == "assistant" -%}
+{%- for tc in message.tool_calls or [] -%}
+{%- set args = tc.function.arguments -%}
+{%- if args is string -%}{{ raise_exception("tool call arguments must be a parsed object, not a JSON string; canonicalize upstream") }}{%- endif -%}
+<|message_model|>{{ tc.function.name }}<|content_invoke_tool_json|>{"name":{{ tc.function.name | tojson }},"args":{
+{%- for key, value in args | dictsort -%}{{ key | tojson }}:{{ value | tojson }}{%- if not loop.last -%},{%- endif -%}{%- endfor -%}
+}}<|end_message|>
+{%- endfor -%}
+<|content_model_end_sampling|>
+{%- endif -%}
+{%- endfor -%}"#;
+    const INKLING_MARKERS: inkling::Markers = inkling::TEST_MARKERS;
+    /// The formats of a vocabulary that holds Inkling's markers alone.
+    const INKLING_FORMATS: reply::Formats = reply::Formats {
+        harmony: None,
+        inkling: Some(INKLING_MARKERS),
+    };
+
+    /// Named templates may mix an Inkling template with one that is not: a request rendered
+    /// with the other reads its reply as text.
+    #[test]
+    fn only_a_request_whose_template_writes_inkling_reads_inkling() {
+        assert_eq!(
+            INKLING_FORMATS.of(INKLING),
+            Some(reply::Format::Inkling(INKLING_MARKERS))
+        );
+        assert_eq!(INKLING_FORMATS.of(THINKS), None);
+        assert_eq!(INKLING_FORMATS.of(HARMONY), None);
+        assert_eq!(HARMONY_FORMATS.of(INKLING), None);
+    }
+
+    #[test]
+    fn an_inkling_model_is_refused_only_when_its_vocabulary_lacks_the_markers() {
+        let check = |template: &str, found: reply::Formats| {
+            check_reply_format(
+                &Either::Left(template.to_string()),
+                Some("inkling2_loop".to_string()),
+                found,
+                "inkling-2-mini.gguf".to_string(),
+            )
+        };
+        for found in [reply::Formats::default(), HARMONY_FORMATS] {
+            assert_eq!(
+                check(INKLING, found)
+                    .expect_err("an Inkling template without its markers is refused")
+                    .to_string(),
+                "Architecture 'inkling2_loop' in inkling-2-mini.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
+            );
+        }
+        assert_eq!(
+            check(INKLING, INKLING_FORMATS).expect("an Inkling template with its markers"),
+            INKLING_FORMATS
+        );
+        assert_eq!(
+            check(THINKS, INKLING_FORMATS).expect("a think-tag template"),
+            reply::Formats::default(),
+            "only an Inkling template's replies are read by the markers"
+        );
+    }
+
+    /// An `Output` reading an Inkling reply that may call `tools`, with `stop` sequences and a
+    /// token `limit`, and what it sends.
+    fn inkling_output(
+        tools: &[&str],
+        stop: &[&str],
+        limit: Option<usize>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = tools.iter().map(ToString::to_string).collect();
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit,
+            sampling: Sampling::default(),
+            stop: stop.iter().map(ToString::to_string).collect(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Inkling(inkling::Reader::new(
+                INKLING_MARKERS,
+                tools,
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// Generates `reply`: each marker as its token, which ends generation if it is
+    /// `<|content_model_end_sampling|>`, and other text a character per token. Returns why
+    /// generation ended, and after how many tokens.
+    fn generate_inkling(out: &mut Output, reply: &str) -> (Option<FinishReason>, usize) {
+        let ending = Token(18);
+        let mut tokens = Vec::new();
+        for (marker, text) in inkling::spell(reply) {
+            match marker {
+                Some(token) => tokens.push((token, text)),
+                None => tokens.extend(text.chars().map(|c| (Token(100), c.to_string()))),
+            }
+        }
+        for (n, (token, text)) in tokens.into_iter().enumerate() {
+            if let Some(finish) = out.read(token, token == ending, || text.into_bytes()) {
+                return (Some(finish), n + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    /// What the output sent, an event at a time: `r:` reasoning, `c:` content, and the calls
+    /// of one `t:` event.
+    fn events(mut rx: mpsc::Receiver<Event>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(match event {
+                Event::Reasoning(text) => format!("r:{text}"),
+                Event::Content(text) => format!("c:{text}"),
+                Event::ToolCalls(calls) => format!(
+                    "t:{}",
+                    calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.function.name, c.function.arguments))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                Event::Done(_) | Event::Failed(_) => continue,
+            });
+        }
+        joined(out)
+    }
+
+    #[test]
+    fn an_inkling_reply_sends_its_reasoning_then_its_answer() {
+        let (mut out, rx) = inkling_output(&[], &[], None);
+        let reply = "<|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>2 + 2 = 4<|end_message|><|content_model_end_sampling|>";
+        let (finish, n) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let outcome = out
+            .finish(FinishReason::Stop, 9)
+            .expect("the request succeeds");
+        // every token but the `<|content_model_end_sampling|>` that ends the reply
+        assert_eq!(outcome.completion_tokens as usize, n - 1);
+        assert_eq!(
+            events(rx),
+            ["r:Add them.".to_string(), "c:2 + 2 = 4".to_string()]
+        );
+    }
+
+    /// A call block does not end an Inkling reply: the reply's calls go out together, in one
+    /// event, when it ends.
+    #[test]
+    fn inkling_calls_go_out_together_when_the_reply_ends() {
+        let (mut out, rx) = inkling_output(&["get_weather", "get_time"], &[], None);
+        let reply = "<|message_model|><|content_thinking|>Look both up.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        let (finish, n) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 9)
+            .expect("the request succeeds");
+        assert_eq!(
+            (outcome.finish, outcome.completion_tokens as usize),
+            (FinishReason::ToolCalls, n - 1)
+        );
+        assert_eq!(
+            events(rx),
+            [
+                "r:Look both up.".to_string(),
+                "t:get_weather({\"city\":\"Paris\"}) get_time({})".to_string()
+            ]
+        );
+    }
+
+    /// A reply cut off by the token budget makes the calls it made, and the one whose JSON is
+    /// complete though its `<|end_message|>` never came.
+    #[test]
+    fn an_inkling_call_cut_off_after_complete_json_is_still_made() {
+        // `<|message_model|>`, `f`, `<|content_invoke_tool_json|>` and the 22 characters of
+        // `{"name":"f","args":{}}`
+        let (mut out, rx) = inkling_output(&["f"], &[], Some(25));
+        let reply = "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut out, reply),
+            (Some(FinishReason::Length), 25)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(events(rx), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn an_inkling_reply_counts_its_markers_against_the_budget() {
+        // `<|message_model|>` and `<|content_text|>` leave two of four
+        let (mut out, rx) = inkling_output(&[], &[], Some(4));
+        let reply =
+            "<|message_model|><|content_text|>abcdef<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut out, reply),
+            (Some(FinishReason::Length), 4)
+        );
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_sequence_applies_to_an_inkling_body_but_not_its_header() {
+        let (mut out, rx) = inkling_output(&[], &["final"], None);
+        let reply = "<|message_model|><|content_thinking|>r<|end_message|><|message_model|>final<|content_text|>the final word<|end_message|><|content_model_end_sampling|>";
+        let (finish, _) = generate_inkling(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["r:r".to_string(), "c:the ".to_string()]);
+    }
+
+    #[test]
+    fn text_a_stop_sequence_holds_back_goes_out_before_the_next_inkling_block() {
+        // `x` may start the stop sequence, so it is held until the marker closes its block
+        let (mut out, rx) = inkling_output(&[], &["xyz"], None);
+        let reply = "<|message_model|><|content_thinking|>abx<|end_message|><|message_model|><|content_text|>c<|end_message|><|content_model_end_sampling|>";
+        generate_inkling(&mut out, reply);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(events(rx), ["r:abx".to_string(), "c:c".to_string()]);
+    }
+
+    /// A call to a tool other than the one `tool_choice` names is dropped, so a required call
+    /// is not made.
+    #[test]
+    fn a_required_inkling_call_to_another_tool_fails_the_request() {
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            reply: Some(Reply::Inkling(inkling::Reader::new(
+                INKLING_MARKERS,
+                vec!["f".to_string()],
+                reply::Held::Nothing,
+            ))),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|message_model|>g<|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{}}<|end_message|><|content_model_end_sampling|>";
+        assert_eq!(
+            generate_inkling(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    /// An Inkling reply makes its calls at the end-of-generation token that ends any reply, so
+    /// none is left possible beside the others; a required call's grammar holds it instead.
+    #[test]
+    fn an_inkling_reply_leaves_no_end_of_generation_token_for_its_calls() {
+        let (out, _rx) = inkling_output(&["f"], &[], None);
+        assert_eq!(
+            out.ruled_out(&[Token(18), Token(99)]),
+            [Token(18), Token(99)]
+        );
+    }
+
+    #[test]
+    fn a_required_inkling_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar =
+            inkling_call(&INKLING_MARKERS, &[&tool], true).expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 11 to 18, matched as tokens
+        // a thinking block or none, then the calls: no text block or second thinking block, in
+        // which a model could answer instead of calling
+        assert!(
+            grammar.ends_with("root ::= thinking? call call*\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with("thinking ::= <[11]> <[12]> body <[17]>\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("<[13]>"), "{grammar}");
+        // text spells no `<|`, not even after another `<`
+        assert!(
+            grammar.contains("\nbody ::= ([^<] | \"<\"+ [^|<])* \"<\"*\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains(
+                "\ncall ::= <[11]> (\"get_weather\" <[14]> \"{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":\" tool0-root \"}\" <[17]>)\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // one call only, when the request asks for no parallel calls
+        let single = inkling_call(&INKLING_MARKERS, &[&tool], false).expect("one call");
+        assert!(single.ends_with("root ::= thinking? call\n"), "{single}");
+    }
+
+    #[test]
+    fn a_structured_inkling_reply_is_held_to_one_text_block() {
+        let reply = content_grammar("m", INKLING, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = inkling_reply(&INKLING_MARKERS, &reply);
+        // thinking blocks, then one text block: no other text, which would be content outside
+        // the schema
+        assert!(
+            grammar.ends_with("root ::= thinking* <[11]> <[13]> reply-root <[17]>\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("\ntext ::="), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    /// The engine serving an Inkling `template`, and the job it queues for a request with the
+    /// fields `request` sets (a question about France's capital, by default), and what that
+    /// job sends; or why the request is refused.
+    fn inkling_job(
+        template: &str,
+        request: serde_json::Value,
+    ) -> std::result::Result<(LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>), OpenAIError>
+    {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "inkling".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "inkling".to_string(),
+            template: Either::Left(template.to_string()),
+            special: SpecialTokens::default(),
+            formats: INKLING_FORMATS,
+            reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
+            counter: AtomicUsize::new(0),
+            context_window: 0,
+            reused_prompt_tokens: Arc::default(),
+            prompt_ends_in_steps: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "inkling",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama.submit(&req, &CacheNamespace::Public)?;
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        Ok((llama, prompt, sampling, out, rx))
+    }
+
+    fn weather_tools(tool_choice: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": tool_choice,
+        })
+    }
+
+    /// Inkling's template has no generation prompt, so the reply starts between blocks, with
+    /// nothing for a grammar to be advanced over: a plain reply, a call, a required call and
+    /// a structured reply are each read from there, and held by their grammars from the root.
+    #[test]
+    fn an_inkling_reply_is_read_from_the_end_of_a_prompt_with_no_generation_prompt() {
+        let call = "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|>";
+        let mut not_parallel = weather_tools("required");
+        not_parallel["parallel_tool_calls"] = serde_json::json!(false);
+        let cases = [
+            (
+                serde_json::json!({}),
+                "<|message_model|><|content_thinking|>Recall it.<|end_message|><|message_model|><|content_text|>Paris<|end_message|><|content_model_end_sampling|>".to_string(),
+            ),
+            (weather_tools("auto"), call.to_string()),
+            (weather_tools("required"), call.to_string()),
+            (not_parallel, call.to_string()),
+            (
+                serde_json::json!({ "response_format": { "type": "json_object" } }),
+                "<|message_model|><|content_text|>{\"capital\":\"Paris\"}<|end_message|><|content_model_end_sampling|>".to_string(),
+            ),
+        ];
+        let read: Vec<_> = cases
+            .into_iter()
+            .map(|(request, reply)| {
+                let (_llama, prompt, sampling, mut out, rx) =
+                    inkling_job(INKLING, request).expect("the request is queued");
+                assert!(
+                    prompt.ends_with("<|message_user|><|content_text|>What is the capital of France?<|end_message|>"),
+                    "the prompt ends after the last message: {prompt:?}"
+                );
+                assert_eq!(out.pending(), "");
+                out.begin(true);
+                let root = sampling.grammar.as_deref().and_then(|grammar| {
+                    grammar
+                        .lines()
+                        .find_map(|line| line.strip_prefix("root ::= "))
+                        .map(ToString::to_string)
+                });
+                let finish = generate_inkling(&mut out, &reply)
+                    .0
+                    .expect("the reply ends at `<|content_model_end_sampling|>`");
+                let outcome = out.finish(finish, 1).expect("the request succeeds");
+                (events(rx), outcome.finish, root, sampling.ban_eog)
+            })
+            .collect();
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        assert_eq!(
+            read,
+            [
+                (
+                    vec!["r:Recall it.".to_string(), "c:Paris".to_string()],
+                    FinishReason::Stop,
+                    None,
+                    false
+                ),
+                (called(), FinishReason::ToolCalls, None, false),
+                (
+                    called(),
+                    FinishReason::ToolCalls,
+                    Some("thinking? call call*".to_string()),
+                    false
+                ),
+                (
+                    called(),
+                    FinishReason::ToolCalls,
+                    Some("thinking? call".to_string()),
+                    false
+                ),
+                (
+                    vec!["c:{\"capital\":\"Paris\"}".to_string()],
+                    FinishReason::Stop,
+                    Some("thinking* <[11]> <[13]> reply-root <[17]>".to_string()),
+                    false
+                ),
+            ]
+        );
+    }
+
+    /// With `parallel_tool_calls` off, an Inkling reply ends at its first call's
+    /// `<|end_message|>`, under every `tool_choice`, so no token after it is read; with them on,
+    /// as by default, the reply goes on and makes every call.
+    #[test]
+    fn without_parallel_calls_an_inkling_reply_ends_at_its_first_call() {
+        let first = "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>";
+        let reply = format!(
+            "{first}<|message_model|>get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":{{\"city\":\"Rome\"}}}}<|end_message|><|content_model_end_sampling|>"
+        );
+        // the tokens `generate_inkling` makes of `text`: a marker is one, other text one a
+        // character
+        let tokens = |text: &str| -> usize {
+            inkling::spell(text)
+                .iter()
+                .map(|(marker, text)| marker.map_or_else(|| text.chars().count(), |_| 1))
+                .sum()
+        };
+        let named =
+            serde_json::json!({ "type": "function", "function": { "name": "get_weather" } });
+        let read = |tool_choice: serde_json::Value, parallel: Option<bool>| {
+            let mut request = weather_tools("auto");
+            request["tool_choice"] = tool_choice;
+            if let Some(parallel) = parallel {
+                request["parallel_tool_calls"] = serde_json::json!(parallel);
+            }
+            let (_llama, _, _, mut out, rx) =
+                inkling_job(INKLING, request).expect("the request is queued");
+            out.begin(true);
+            let (finish, read) = generate_inkling(&mut out, &reply);
+            let finish = finish.expect("the reply ends");
+            let outcome = out.finish(finish, 1).expect("the request succeeds");
+            (outcome.finish, read, events(rx))
+        };
+        let paris = "get_weather({\"city\":\"Paris\"})";
+        for tool_choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            named,
+        ] {
+            assert_eq!(
+                read(tool_choice.clone(), Some(false)),
+                (
+                    FinishReason::ToolCalls,
+                    tokens(first),
+                    vec![format!("t:{paris}")]
+                ),
+                "{tool_choice}"
+            );
+        }
+        let both = vec![format!("t:{paris} get_weather({{\"city\":\"Rome\"}})")];
+        for parallel in [None, Some(true)] {
+            assert_eq!(
+                read(serde_json::json!("auto"), parallel),
+                (FinishReason::ToolCalls, tokens(&reply), both.clone()),
+                "{parallel:?}"
+            );
+        }
+    }
+
+    /// A structured reply beside tools needs a grammar that allows either, which no tool-call
+    /// format but tagged calls has here, so it is refused rather than left unenforced.
+    #[test]
+    fn an_inkling_request_for_a_structured_reply_beside_tools_is_refused() {
+        let mut request = weather_tools("auto");
+        request["response_format"] = serde_json::json!({ "type": "json_object" });
+        let refused = inkling_job(INKLING, request).map(|_| ());
+        assert!(
+            matches!(
+                &refused,
+                Err(OpenAIError::InvalidArgument(message))
+                    if message == "Model 'inkling' can't combine a `json_schema` or `json_object` `response_format` with `tools`: its chat template's tool-call format can't be enforced alongside a schema. Send one or the other."
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// An assistant's earlier call reaches an Inkling template with its arguments as an object,
+    /// which the template requires: the request carries them as `OpenAI`'s JSON string.
+    #[test]
+    fn an_inkling_prompt_renders_an_earlier_calls_arguments_as_an_object() {
+        let request = |arguments: &str| {
+            let mut request = weather_tools("auto");
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "Weather in Paris?" },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": arguments },
+                    }],
+                },
+                { "role": "tool", "tool_call_id": "call-1", "content": "21C" },
+            ]);
+            request
+        };
+        let (_llama, prompt, ..) =
+            inkling_job(INKLING, request("{\"unit\":\"c\",\"city\":\"Paris\"}"))
+                .expect("the request is queued");
+        assert!(
+            prompt.contains("<|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>21C<|end_message|>"),
+            "{prompt:?}"
+        );
+    }
+}

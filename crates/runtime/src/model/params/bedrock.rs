@@ -55,10 +55,7 @@ impl FromStr for IamRoleSource {
             "auto" => Ok(Self::Auto),
             "metadata" => Ok(Self::Metadata),
             "env" => Ok(Self::Env),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -94,10 +91,7 @@ impl FromStr for GuardrailTraceMode {
             "enabled" => Ok(Self::Enabled),
             "disabled" => Ok(Self::Disabled),
             "enabled_full" => Ok(Self::EnabledFull),
-            other => Err(format!(
-                "must be one of: {}. Found {other}",
-                Self::VALUES.join(", ")
-            )),
+            _ => Err(format!("must be one of: {}", Self::VALUES.join(", "))),
         }
     }
 }
@@ -185,18 +179,10 @@ mod tests {
 
     #[test]
     fn iam_role_source_rejects_values_outside_the_spec() {
-        // The message names the value as parsed: trimmed and lowercased.
-        for (raw, found) in [
-            ("", ""),
-            ("role", "role"),
-            ("instance", "instance"),
-            (" Role ", "role"),
-        ] {
+        for raw in ["", "role", "instance", " Role "] {
             assert_eq!(
                 raw.parse::<IamRoleSource>(),
-                Err(format!(
-                    "must be one of: auto, metadata, env. Found {found}"
-                )),
+                Err("must be one of: auto, metadata, env".to_string()),
                 "{raw:?} should be rejected"
             );
         }
@@ -220,19 +206,55 @@ mod tests {
 
     #[test]
     fn guardrail_trace_mode_rejects_values_outside_the_spec() {
-        // The message names the value as parsed: trimmed and lowercased.
-        for (raw, found) in [
-            ("", ""),
-            ("verbose", "verbose"),
-            ("true", "true"),
-            (" Verbose ", "verbose"),
-        ] {
+        for raw in ["", "verbose", "true", " Verbose "] {
             assert_eq!(
                 raw.parse::<GuardrailTraceMode>(),
-                Err(format!(
-                    "must be one of: enabled, disabled, enabled_full. Found {found}"
-                )),
+                Err("must be one of: enabled, disabled, enabled_full".to_string()),
                 "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_derived_iam_role_source_does_not_echo_padded_or_mixed_case() {
+        use runtime_parameters_typed::TypedParams;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        const SOURCE: &str = "${ env:IAM_SRC }";
+        let secrets = Arc::new(RwLock::new(runtime_secrets::Secrets::new()));
+        for raw in [" Secret123 ", "Secret123"] {
+            let result = BedrockModelParams::try_from_params_with_secret_sources(
+                "model bedrock",
+                HashMap::from([(
+                    "aws_iam_role_source".to_string(),
+                    SecretString::from(raw.to_string()),
+                )]),
+                &secrets,
+                &HashMap::from([("aws_iam_role_source".to_string(), SOURCE.to_string())]),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("padded/mixed-case secret must fail validation");
+            };
+            let message = err.to_string();
+            assert!(
+                !message.contains("Secret123"),
+                "must not echo the raw secret: {message}"
+            );
+            assert!(
+                !message.contains("secret123"),
+                "must not echo the normalized secret: {message}"
+            );
+            assert!(
+                !message.contains("Found"),
+                "must not surface parser text: {message}"
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "invalid value for `aws_iam_role_source` from {SOURCE}; expected a valid value"
+                )
             );
         }
     }

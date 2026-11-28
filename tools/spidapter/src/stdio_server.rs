@@ -48,8 +48,9 @@ mod sources;
 mod provision;
 
 use provision::{
-    launch_ec2_debezium, launch_mongodb_ec2, launch_postgres_ec2, provision_local_single_node,
-    provision_local_spiced_cluster, provision_scp_app, teardown_local_run, terminate_ec2_instance,
+    Ec2Cluster, launch_ec2_debezium, launch_mongodb_ec2, launch_postgres_ec2,
+    provision_ec2_spiced_cluster, provision_local_single_node, provision_local_spiced_cluster,
+    provision_scp_app, teardown_local_run, terminate_ec2_instance,
 };
 use sources::cayenne::generate_cayenne_sink_spicepod;
 use sources::dynamodb::{
@@ -140,6 +141,8 @@ enum LocalProcesses {
         scheduler_child: Child,
         executor_children: Vec<Child>,
     },
+    /// Nodes on EC2 instances this run launched; dropping it terminates them.
+    Ec2Cluster(Ec2Cluster),
 }
 
 impl Drop for LocalRunState {
@@ -157,6 +160,7 @@ impl Drop for LocalRunState {
                 }
                 let _ = scheduler_child.start_kill();
             }
+            LocalProcesses::Ec2Cluster(_) => {}
         }
     }
 }
@@ -661,6 +665,26 @@ impl SpidapterHandler {
         }
     }
 
+    async fn provision_ec2(
+        &self,
+        run_id: Uuid,
+        setup_config: &SetupConfig,
+        datasets: &HashMap<String, DatasetConfig>,
+    ) -> anyhow::Result<RunState> {
+        let Some(ComputeConfig::Ec2(config)) = &self.scenario.compute else {
+            anyhow::bail!("EC2 compute requires a scenario with `compute: ec2:`");
+        };
+        provision_ec2_spiced_cluster(
+            run_id,
+            Duration::from_secs(self.args.ready_wait),
+            setup_config,
+            datasets,
+            &self.args,
+            config,
+        )
+        .await
+    }
+
     /// Resolve the acceleration engine from the scenario.
     fn acceleration(&self) -> AccelerationEngine {
         self.scenario
@@ -688,6 +712,7 @@ impl SpidapterHandler {
     fn compute(&self) -> SpiceCompute {
         match &self.scenario.compute {
             Some(ComputeConfig::Scp(_)) => SpiceCompute::Scp,
+            Some(ComputeConfig::Ec2(_)) => SpiceCompute::Ec2,
             Some(ComputeConfig::Local) | None => SpiceCompute::Local,
         }
     }
@@ -732,6 +757,7 @@ impl SpidapterHandler {
                 )
                 .await
             }
+            SpiceCompute::Ec2 => self.provision_ec2(run_id, &setup_config, &datasets).await,
             SpiceCompute::Local => match deployment_mode {
                 DeploymentMode::SingleNode => {
                     provision_local_single_node(
@@ -1174,6 +1200,7 @@ impl Handler for SpidapterHandler {
                     )
                     .await
                 }
+                SpiceCompute::Ec2 => self.provision_ec2(run_id, &setup_config, &datasets).await,
                 SpiceCompute::Local => {
                     provision_local_spiced_cluster(
                         run_id,
@@ -1289,6 +1316,7 @@ impl Handler for SpidapterHandler {
                     )
                     .await
                 }
+                SpiceCompute::Ec2 => self.provision_ec2(run_id, &setup_config, &datasets).await,
                 SpiceCompute::Local => match deployment_mode {
                     DeploymentMode::SingleNode => {
                         provision_local_single_node(

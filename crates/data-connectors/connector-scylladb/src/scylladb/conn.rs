@@ -322,7 +322,6 @@ impl<'a> AsyncDbConnection<Arc<Session>, &'a dyn Sync> for ScyllaDbConnection {
 }
 
 /// Convert rows of `Option<CqlValue>` to an Arrow `RecordBatch`.
-#[expect(clippy::too_many_lines, reason = "Large function due to API upgrade")]
 fn convert_cqlvalue_rows_to_record_batch(
     rows: &[Vec<Option<CqlValue>>],
     schema: &SchemaRef,
@@ -1104,7 +1103,7 @@ mod tests {
             .expect("should be BinaryArray");
 
         assert_eq!(bin_col.value(0), &[0x00, 0x01, 0x02, 0xFF]);
-        assert!(bin_col.value(1).is_empty());
+        assert_eq!(bin_col.value(1), [] as [u8; 0]);
         assert!(bin_col.is_null(2));
     }
 

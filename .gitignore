@@ -19,6 +19,7 @@ spicepod.yaml
 !examples/cosmosdb-connector/spicepod.yaml
 !examples/cdc-debezium-ingest/spicepod.yaml
 !test/spicepods/chbench/local-writeback/spicepod.yaml
+!.cursor/skills/verify-integer-overflow/spicepod.yaml
 
 target/
 
@@ -89,8 +90,10 @@ cluster_logs/
 # Insta snapshot artifacts
 *.pending-snap
 
-# Claude worktrees
-.claude/
+# Claude Code local state (worktrees, local settings). `.claude/skills` is
+# tracked: it links to `.agents/skills` so Claude Code loads the repo's skills.
+.claude/*
+!.claude/skills
 
 # Distributed helper script working directory
 .distributed/

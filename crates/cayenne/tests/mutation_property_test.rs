@@ -51,25 +51,26 @@ limitations under the License.
 
 use crate::common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
 use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, col, lit};
 use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use futures::StreamExt;
 
 /// Slot advancer that arms `cdc_durability: memory` deferral in tests (the
 /// runtime installs the real one on the first replayable committer). Without it
@@ -294,6 +295,27 @@ async fn create_table(
     pk_keyset_cache_mb: Option<usize>,
     cold: bool,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    create_table_with_retention(
+        fixture,
+        name,
+        mode,
+        durability,
+        pk_keyset_cache_mb,
+        cold,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn create_table_with_retention(
+    fixture: &TestFixture,
+    name: &str,
+    mode: Mode,
+    durability: Durability,
+    pk_keyset_cache_mb: Option<usize>,
+    cold: bool,
+    retention: Vec<Expr>,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     // Local `file://` cold store per table (no object-store config needed —
     // the default local store resolves it).
     let cold_url = if cold {
@@ -314,15 +336,21 @@ async fn create_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
             "id".to_string(),
         ]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(name),
         partition_column: None,
         vortex_config: config(mode, durability, pk_keyset_cache_mb, cold_url),
     };
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create_with(catalog, ctx.runtime_env(), opts, |builder| {
+                builder.with_retention_filters(retention)
+            })
+            .await?,
+    );
     if durability == Durability::Memory {
         // Arm mem-mode deferral (the runtime does this on the first replayable
         // committer); without it mem-mode CDC writes take the durable path.
@@ -345,8 +373,9 @@ async fn reopen_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-            .open(name)
+        fixture
+            .data_store
+            .open(catalog, ctx.runtime_env(), name)
             .await?,
     );
     ctx.register_table(name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
@@ -407,27 +436,39 @@ async fn upsert(
 
 /// Delete a single key. File uses the durable `DELETE`; memory uses the in-RAM
 /// CDC delete path (`write_cdc_delete_keys_in_memory`).
+/// Delete one key; returns the rows-affected count a file-durability DELETE
+/// reports (`None` for the in-memory CDC path, which reports none).
 async fn delete_key(
     table: &Arc<CayenneTableProvider>,
     key: i64,
     durability: Durability,
-) -> TestResult<()> {
+) -> TestResult<Option<u64>> {
     match durability {
-        Durability::File => delete_filter(table, col("id").eq(lit(key))).await?,
+        Durability::File => Ok(Some(delete_filter(table, col("id").eq(lit(key))).await?)),
         Durability::Memory => {
             table
                 .write_cdc_delete_keys_in_memory(&id_batch(&[key]))
                 .await?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
-async fn delete_filter(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<()> {
+/// Run `DELETE ... WHERE filter`; returns the rows-affected count it reports.
+async fn delete_filter(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
     let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
-    datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
-    Ok(())
+    let batches = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    batches
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .ok_or_else(|| "DELETE returned no rows-affected count".into())
 }
 
 /// Delete every live key. File uses `DELETE WHERE true`; memory deletes the
@@ -438,7 +479,9 @@ async fn delete_all(
     durability: Durability,
 ) -> TestResult<()> {
     match durability {
-        Durability::File => delete_filter(table, lit(true)).await?,
+        Durability::File => {
+            delete_filter(table, lit(true)).await?;
+        }
         Durability::Memory => {
             if !live_keys.is_empty() {
                 table
@@ -469,12 +512,25 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
 /// away and every memory workload fails with rows the model deleted still served
 /// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
 /// `mode: memory`, which never checkpoints, is still uncovered).
-async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
+async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<u64> {
     delete_filter(
         table,
         col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
     )
     .await
+}
+
+/// The rows-affected count a DELETE op must report against `model` (the state
+/// before it), or `None` for an op that is not a filtered DELETE.
+fn expected_delete_count(model: &Model, op: &Op) -> Option<u64> {
+    let rows = match op {
+        Op::Delete { key } => usize::from(model.contains_key(key)),
+        Op::DeletePredicate { lo, hi } => {
+            model.values().filter(|v| **v >= *lo && **v < *hi).count()
+        }
+        _ => return None,
+    };
+    u64::try_from(rows).ok()
 }
 
 /// One "settle" pass. File compacts small files; memory additionally checkpoints
@@ -512,11 +568,9 @@ async fn settle_protected_maintenance_only(
     Ok(())
 }
 
-/// Prepare enough warm-tier files for a cold-promotion.
-async fn materialize_warm_files_for_cold_promotion(
-    table: &Arc<CayenneTableProvider>,
-    durability: Durability,
-) -> TestResult<()> {
+/// Makes every write so far durable in files: a memory-tier checkpoint, or the
+/// post-write maintenance of a durable write. A cold promotion needs these files.
+async fn checkpoint(table: &Arc<CayenneTableProvider>, durability: Durability) -> TestResult<()> {
     table.flush_pending_maintenance().await?;
     if durability == Durability::Memory {
         table.checkpoint_mem_tier().await?;
@@ -529,6 +583,21 @@ async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
         .sql(&format!("SELECT id, value FROM {name} ORDER BY id"))
         .await?;
     let mut model = Model::new();
+    for (id, value) in df.collect().await?.iter().flat_map(batch_rows) {
+        if model.insert(id, value).is_some() {
+            model.insert(id, i64::MIN); // duplicate sentinel
+        }
+    }
+    Ok(model)
+}
+
+/// Every `(id, value)` row, sorted, duplicates kept: the whole content of a
+/// table without a key, which [`read_rows`] would fold by key.
+async fn read_row_multiset(ctx: &SessionContext, name: &str) -> TestResult<Vec<(i64, i64)>> {
+    let df = ctx
+        .sql(&format!("SELECT id, value FROM {name} ORDER BY id, value"))
+        .await?;
+    let mut rows = Vec::new();
     for b in &df.collect().await? {
         let ids = b
             .column(0)
@@ -540,13 +609,9 @@ async fn read_rows(ctx: &SessionContext, name: &str) -> TestResult<Model> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("value");
-        for i in 0..b.num_rows() {
-            if model.insert(ids.value(i), vals.value(i)).is_some() {
-                model.insert(ids.value(i), i64::MIN); // duplicate sentinel
-            }
-        }
+        rows.extend((0..b.num_rows()).map(|i| (ids.value(i), vals.value(i))));
     }
-    Ok(model)
+    Ok(rows)
 }
 
 fn assert_converged(live: &Model, model: &Model, ctx_msg: &str) {
@@ -829,7 +894,12 @@ fn apply_model(model: &mut Model, op: &Op) {
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_sequential(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -850,20 +920,33 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for step in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
+        // The datalake walks also check every DELETE's rows-affected count
+        // against the model: a key whose datalake copy is superseded or retained
+        // behind tombstones must count once if live and never if not.
+        let expected_deleted = if w.cold && w.durability == Durability::File {
+            expected_delete_count(&model, &op)
+        } else {
+            None
+        };
+        let mut reported_deleted = None;
         match &op {
             Op::Upsert { rows } => upsert(&table, rows, w.durability).await?,
-            Op::Delete { key } => delete_key(&table, *key, w.durability).await?,
+            Op::Delete { key } => {
+                reported_deleted = delete_key(&table, *key, w.durability).await?;
+            }
             Op::DeleteAll => {
                 // Pre-op live keys (memory deletes them by key; file uses WHERE true).
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 delete_all(&table, &live_keys, w.durability).await?;
             }
-            Op::DeletePredicate { lo, hi } => delete_predicate(&table, *lo, *hi).await?,
+            Op::DeletePredicate { lo, hi } => {
+                reported_deleted = Some(delete_predicate(&table, *lo, *hi).await?);
+            }
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
             Op::Compact => {
                 settle(&table, w.durability).await?;
@@ -892,11 +975,13 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             }
             Op::MoveToColdTier => {
                 // Durable warm files must exist for the trigger to fire.
-                materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
+                checkpoint(&table, w.durability).await?;
                 // `Ok(false)` (warm tier below threshold) is fine.
                 let _ = table.promote_warm_to_cold().await?;
-                // GC serialized after promote, same task — the production
-                // promotion-tick order (out-of-band GC is unsupported).
+                // Then the datalake merge and GC, serialized in the same task —
+                // the production promotion-tick order (out-of-band GC is
+                // unsupported). `Ok(false)` (no tier qualifies) is fine.
+                let _ = table.compact_cold_tier().await?;
                 table.run_cold_tier_gc_tick().await;
             }
         }
@@ -909,6 +994,13 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             w.mode, w.durability,
         );
         assert_converged(&live, &model, &step_msg);
+        if let Some(expected) = expected_deleted {
+            assert_eq!(
+                reported_deleted,
+                Some(expected),
+                "DELETE rows-affected count; {step_msg}"
+            );
+        }
 
         // Retiring rows is when a maintained count drifts and when deletion
         // vectors leave holes for a stale min/max to prune around. The
@@ -939,7 +1031,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
 /// Returns whether the table was seen on key deletes after it opened on position
 /// deletes (see [`Mode::Auto`]).
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
+async fn run_concurrent(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+    history: &mut Vec<Op>,
+) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -1010,7 +1107,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 
     // Foreground stream. `compact` is driven by the background loop (a foreground
     // Compact op is a no-op here); `restart` reopens under the write lock.
-    let mut history: Vec<Op> = Vec::with_capacity(w.ops);
+    history.reserve(w.ops);
     for _ in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
@@ -1067,8 +1164,9 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 // serialized after promote (production order); see the
                 // sequential arm.
                 let t = handle.read().await;
-                materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
+                checkpoint(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
+                let _ = t.compact_cold_tier().await?;
                 t.run_cold_tier_gc_tick().await;
             }
             Op::Compact => continue,
@@ -1101,12 +1199,37 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    // `auto` adapts only a table on a local directory: a table whose data files
+    // are in an object store, a local-directory location included, stays on key
+    // deletes (`resolve_pk_deletion_mode`), so the crossing from position deletes
+    // exists only on the SQLite metastore's local files. The runtime never places
+    // a dataset with a datalake tier in the object-native location, so a cold walk
+    // runs on local data files too. Those tests run on SQLite only.
+    assert!(
+        matches!(fixture.backend_type, BackendType::Sqlite)
+            || !(matches!(w.mode, Mode::AutoCrossing) || w.cold),
+        "AutoCrossing and cold walks need local data files: register the test on SQLite"
+    );
     let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        let left_positions = match w.concurrency {
-            Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
-            Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
+        let mut history = Vec::new();
+        let outcome = match w.concurrency {
+            Concurrency::Sequential => run_sequential(&fixture, &w, seed, &mut history).await,
+            Concurrency::ConcurrentWithCompaction => {
+                run_concurrent(&fixture, &w, seed, &mut history).await
+            }
         };
+        // A divergence panics with the seed and history; an error from an
+        // operation or a read carries them here, so either replays from the seed.
+        let left_positions = outcome.map_err(|error| {
+            format!(
+                "walk failed mode={:?} durability={:?} concurrency={:?} seed={seed} after {} op(s): {error}\nhistory={history:?}",
+                w.mode,
+                w.durability,
+                w.concurrency,
+                history.len(),
+            )
+        })?;
         seeds_that_left_positions += usize::from(left_positions);
     }
     match w.mode {
@@ -1355,6 +1478,34 @@ fn sequential_cold() -> Workload {
         cold: true,
     }
 }
+// Sequential cold upsert replay: upserts that keep re-inserting keys already in
+// the datalake (often several generations deep), deletes of datalake-resident
+// keys, and promotions and restarts in between, model-checked after every op.
+// Each promotion leaves every earlier datalake file in place, so superseded
+// copies accumulate across generations and only the tombstones hide them.
+fn sequential_cold_upsert_replay() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::File,
+        concurrency: Concurrency::Sequential,
+        weights: OpWeights {
+            upsert: 55,
+            delete: 10,
+            delete_all: 0,
+            delete_predicate: 5,
+            overwrite: 0,
+            compact: 5,
+            restart: 5,
+            move_to_cold_tier: 20,
+        },
+        population: 24,
+        batch_size: 3,
+        ops: scaled_ops(80),
+        seeds: scaled_seeds(12),
+        pk_keyset_cache_mb: None,
+        cold: true,
+    }
+}
 // Concurrent cold: foreground mixed delete/upsert + promotions + restarts with
 // a background maintenance loop.
 fn concurrent_cold() -> Workload {
@@ -1416,7 +1567,7 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
     descend(63);
     Ok(())
 }
-test_with_backends!(prop_harness_stack_headroom_impl);
+test_on_data_store!(prop_harness_stack_headroom_impl);
 
 // --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
 //
@@ -1500,6 +1651,8 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     );
     Ok(())
 }
+// SQLite only: only a table on a local directory starts on position deletes; see
+// `run_workload`.
 test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
 
 // --- Sequential convergence (GREEN) ---
@@ -1515,9 +1668,9 @@ async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::AutoCrossing)).await
 }
-test_with_backends!(prop_sequential_key_impl);
-test_with_backends!(prop_sequential_position_impl);
-test_with_backends!(prop_sequential_auto_impl);
+test_on_data_store!(prop_sequential_key_impl);
+test_on_data_store!(prop_sequential_position_impl);
+test_on_data_store!(prop_sequential_auto_impl);
 test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
@@ -1531,7 +1684,7 @@ test_with_backends!(prop_sequential_auto_crossing_impl);
 async fn prop_sequential_memory_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_memory()).await
 }
-test_with_backends!(prop_sequential_memory_impl);
+test_on_data_store!(prop_sequential_memory_impl);
 
 /// [`assert_converged`] plus a physical row count, which catches a duplicate
 /// row that `read_rows` would fold into the key/value map.
@@ -1576,7 +1729,7 @@ async fn prop_mixed_memory_and_durable_upserts_impl(f: TestFixture) -> TestResul
     }
     Ok(())
 }
-test_with_backends!(prop_mixed_memory_and_durable_upserts_impl);
+test_on_data_store!(prop_mixed_memory_and_durable_upserts_impl);
 
 // A durable upsert of keys first written through the mem tier must hide the
 // old rows whether a checkpoint moves them into a file before the upsert or
@@ -1613,12 +1766,12 @@ async fn durable_upsert_after_mem_tier_checkpoint_impl(f: TestFixture) -> TestRe
 async fn mem_tier_checkpoint_after_durable_upsert_impl(f: TestFixture) -> TestResult<()> {
     durable_upsert_of_mem_tier_keys(f, "mem_tier_checkpoint_after_durable_upsert", false).await
 }
-test_with_backends!(durable_upsert_after_mem_tier_checkpoint_impl);
-test_with_backends!(mem_tier_checkpoint_after_durable_upsert_impl);
+test_on_data_store!(durable_upsert_after_mem_tier_checkpoint_impl);
+test_on_data_store!(mem_tier_checkpoint_after_durable_upsert_impl);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_memory_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_memory() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_memory())
     })
     .await
@@ -1638,6 +1791,11 @@ async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_cold()).await
 }
 test_with_backends!(prop_sequential_cold_impl);
+
+async fn prop_sequential_cold_upsert_replay_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_cold_upsert_replay()).await
+}
+test_with_backends!(prop_sequential_cold_upsert_replay_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1674,20 +1832,704 @@ async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> Test
     }
     Ok(())
 }
-test_with_backends!(reupsert_after_overwrite_delete_is_visible_impl);
+test_on_data_store!(reupsert_after_overwrite_delete_is_visible_impl);
+
+// --- Focused regression: a change-stream write staged before an overwrite ---
+//
+// A change-stream append stages, then publishes later; a keyed one publishes
+// without the write lock. An overwrite that starts in between is ordered after
+// the staged write: it waits for the publish, then replaces it. Published after
+// the overwrite instead, the keyed write's deletes would still target the
+// replaced snapshot, so a key both writes hold (50) would be served twice.
+// Covers both deletion modes and a table without a key.
+async fn staged_cdc_write_is_ordered_before_overwrite_impl(f: TestFixture) -> TestResult<()> {
+    for (label, keyed, mode) in [
+        ("key", true, Mode::Key),
+        ("position", true, Mode::Position),
+        ("unkeyed", false, Mode::Key),
+    ] {
+        let name = format!("staged_before_overwrite_{label}");
+        let opts = CreateTableOptions {
+            table_name: name.clone(),
+            schema: schema(),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: f.data_store.base_path(&name),
+            partition_column: None,
+            vortex_config: config(mode, Durability::File, None, None),
+        };
+        let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            f.data_store
+                .create(catalog, ctx.runtime_env(), opts)
+                .await?,
+        );
+        ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+        upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+        let staged = table
+            .write_cdc_append_stream(
+                batch_to_stream(rows_to_batch(&[(1, 11), (50, 500), (51, 510)])),
+                &ctx.task_ctx(),
+            )
+            .await?;
+        assert!(
+            staged.has_pending_finalize(),
+            "{label}: the change-stream write must stage before it publishes"
+        );
+
+        let replacement = [(50, 5000), (100, 1000), (101, 1010)];
+        let mut overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // Time is what is under test: the overwrite must still be waiting for
+        // the staged write after a window far longer than it takes to run.
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut overwrite_task).await;
+        let overwrite_waited = early.is_err();
+        let published = staged.finish().await?;
+        match early {
+            Ok(overwritten) => overwritten??,
+            Err(_) => overwrite_task.await??,
+        }
+
+        let model: Model = replacement.into_iter().collect();
+        let message = format!(
+            "{label}: the overwrite replaces the staged write (published {published} rows, \
+             overwrite waited for it: {overwrite_waited})"
+        );
+        assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+        assert_eq!(published, 3, "{message}");
+        assert!(overwrite_waited, "{message}");
+
+        let (table, ctx) = reopen_table(&f, &name).await?;
+        assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, reopened"))
+            .await?;
+
+        // The next change-stream write resolves its keys against the replacement.
+        let next = [(50, 5001), (102, 1020)];
+        upsert(&table, &next, Durability::Memory).await?;
+        let mut model = model;
+        if keyed {
+            model.extend(next);
+            assert_converged_no_duplicates(&ctx, &name, &model, &format!("{message}, next write"))
+                .await?;
+        } else {
+            // A table without a key keeps both rows of key 50.
+            let mut expected: Vec<(i64, i64)> = replacement.into_iter().chain(next).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                read_row_multiset(&ctx, &name).await?,
+                expected,
+                "{message}, next write appends"
+            );
+        }
+    }
+    Ok(())
+}
+test_on_data_store!(staged_cdc_write_is_ordered_before_overwrite_impl);
+
+// A change-stream batch applied as one metastore record publishes each group
+// only when the record commits, after its last group. An overwrite that starts
+// between two groups waits for that record, so the later groups must still be
+// able to stage and delete: otherwise the batch and the overwrite each wait for
+// the other until the overwrite times out. Only the object-native metastore
+// commits a batch as one record, so this runs on it on every lane.
+async fn overwrite_lets_a_waiting_batch_finish_its_groups_impl(f: TestFixture) -> TestResult<()> {
+    let name = "overwrite_waits_for_batch_record".to_string();
+    let opts = CreateTableOptions {
+        table_name: name.clone(),
+        schema: schema(),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: f.data_store.base_path(&name),
+        partition_column: None,
+        vortex_config: config(Mode::Key, Durability::File, None, None),
+    };
+    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&f.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        f.data_store
+            .create(catalog, ctx.runtime_env(), opts)
+            .await?,
+    );
+    ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    upsert(&table, &[(1, 10), (2, 20)], Durability::File).await?;
+
+    let replacement = [(100, 1000), (101, 1010)];
+    let started = std::time::Instant::now();
+    let (overwritten, after_commit) = cayenne::catalog::with_same_record_commits(async {
+        let first = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(3, 30)])), &ctx.task_ctx())
+            .await?;
+        first.finish().await?;
+        let overwrite_task = tokio::spawn({
+            let table = Arc::clone(&table);
+            async move {
+                overwrite(&table, &replacement)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+        // The later groups must start only once the overwrite holds admission
+        // while it waits for this batch's record.
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !table.append_admission_held_exclusively() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waiting.is_ok(),
+            "the overwrite starts waiting for the batch's record"
+        );
+        let second = table
+            .write_cdc_append_stream(batch_to_stream(rows_to_batch(&[(4, 40)])), &ctx.task_ctx())
+            .await?;
+        second.finish().await?;
+        let deleted = table.delete_from_cdc_fast(&[col("id").eq(lit(1))]).await?;
+        assert_eq!(
+            deleted,
+            Some(1),
+            "the batch's delete group runs as a key delete"
+        );
+        TestResult::Ok((overwrite_task, started.elapsed()))
+    })
+    .await;
+    let (overwrite_task, second_group_after) = overwritten?;
+    assert!(
+        !overwrite_task.is_finished(),
+        "the overwrite waits for the batch's record"
+    );
+    table.catalog().commit_pending_for(table.table_id()).await?;
+    after_commit.run().await;
+    let overwrite_result = overwrite_task.await?;
+    let message = format!(
+        "later groups ran after {second_group_after:?}, overwrite result {overwrite_result:?}"
+    );
+    assert!(
+        second_group_after < std::time::Duration::from_secs(10),
+        "{message}"
+    );
+    overwrite_result?;
+    let model: Model = replacement.into_iter().collect();
+    assert_converged_no_duplicates(&ctx, &name, &model, &message).await?;
+    Ok(())
+}
+#[test]
+fn overwrite_lets_a_waiting_batch_finish_its_groups() -> Result<(), String> {
+    common::run_with_backend_blocking(
+        BackendType::ObjectNative,
+        overwrite_lets_a_waiting_batch_finish_its_groups_impl,
+    )
+}
+
+// --- Focused regression: a re-upsert survives a bake, a merge and a reload ---
+//
+// A key is deleted and upserted again, so two key deletion vectors name it: the
+// delete, and the upsert's supersede carrying the re-insert sequence. The
+// seq-prefix bake folds both into its output and prunes them from the in-memory
+// index, but they stay durable until the orphaned-vector sweep reclaims them. The
+// protected-snapshot merge that follows runs with an empty index, and must still
+// tag its output at or above those vectors: a protected snapshot applies every
+// deletion above its tag to its rows, ignoring re-inserts, and both a reopen and
+// a retention pass reload the vectors from the catalog. The concurrent walks
+// reach this only by timing; here each maintenance pass runs at a fixed point.
+#[derive(Clone, Copy, Debug)]
+enum DeletionReload {
+    /// Open the table again from the catalog.
+    Reopen,
+    /// A retention pass that deletes a row reloads the index in place.
+    RetentionPass,
+}
+
+/// The retention filter of the [`DeletionReload::RetentionPass`] table: no row
+/// the test writes matches it except [`RETENTION_ROW`].
+fn negative_values() -> Expr {
+    col("value").lt(lit(0_i64))
+}
+const RETENTION_ROW: (i64, i64) = (1_000, -1);
+
+/// Upsert `row` and run the maintenance it triggers to completion. Not
+/// `settle`: that also runs the test-only full current-snapshot rewrite, which
+/// would fold the protected snapshots the merge-fence tests depend on.
+async fn upsert_and_drain(table: &Arc<CayenneTableProvider>, row: (i64, i64)) -> TestResult<()> {
+    upsert(table, &[row], Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+
+async fn reupsert_survives_bake_merge_and_reload(
+    f: TestFixture,
+    reload: DeletionReload,
+) -> TestResult<()> {
+    let name = format!("reupsert_bake_merge_{reload:?}");
+    let retention = match reload {
+        DeletionReload::Reopen => Vec::new(),
+        DeletionReload::RetentionPass => vec![negative_values()],
+    };
+    let (table, ctx) = create_table_with_retention(
+        &f,
+        &name,
+        Mode::Key,
+        Durability::File,
+        None,
+        false,
+        retention,
+    )
+    .await?;
+    let table_id = table.metadata().table_id.clone();
+
+    upsert_and_drain(&table, (1, 100)).await?;
+    delete_key(&table, 1, Durability::File).await?;
+    upsert_and_drain(&table, (1, 200)).await?;
+    for key in 2..6 {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+    }
+    assert!(
+        table.bake_seq_prefix_protected_snapshots().await?,
+        "the seq-prefix bake must commit"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the bake must prune both deletion vectors naming key 1 from the in-memory index"
+    );
+    let key_1_vectors: Vec<i64> = f
+        .catalog
+        .get_table_delete_files(&table_id)
+        .await?
+        .iter()
+        .map(|file| file.sequence_number)
+        .collect();
+    assert_eq!(
+        key_1_vectors.len(),
+        2,
+        "both deletion vectors naming key 1 stay durable after the bake"
+    );
+
+    // Write until the size-tier merge folds every protected snapshot into one.
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    let mut model: Model = std::iter::once((1, 200))
+        .chain((2..6).map(|key| (key, key * 10)))
+        .collect();
+    for key in 6..6 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the merge must run on an index the bake emptied"
+    );
+    let merged_threshold = *thresholds.values().next().expect("one protected snapshot");
+    let newest_vector = *key_1_vectors.iter().max().expect("two vectors");
+    assert!(
+        merged_threshold >= newest_vector,
+        "the merged snapshot is tagged {merged_threshold}, below the deletion vector at \
+         {newest_vector} its rows already reflect"
+    );
+    assert_converged(&read_rows(&ctx, &name).await?, &model, "before the reload");
+
+    match reload {
+        DeletionReload::Reopen => {
+            let (reopened, reopened_ctx) = reopen_table(&f, &name).await?;
+            assert_converged(
+                &read_rows(&reopened_ctx, &name).await?,
+                &model,
+                "after reopen",
+            );
+            reopened.drain_in_flight_maintenance().await?;
+        }
+        DeletionReload::RetentionPass => {
+            upsert_and_drain(&table, RETENTION_ROW).await?;
+            assert_eq!(
+                f.catalog.get_table_delete_files(&table_id).await?.len(),
+                3,
+                "the retention pass must delete its row, which reloads the deletion index"
+            );
+            assert_converged(
+                &read_rows(&ctx, &name).await?,
+                &model,
+                "after a retention pass",
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn reupsert_survives_bake_merge_and_reopen_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::Reopen).await
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_reopen_impl);
+
+async fn reupsert_survives_bake_merge_and_retention_pass_impl(f: TestFixture) -> TestResult<()> {
+    reupsert_survives_bake_merge_and_reload(f, DeletionReload::RetentionPass).await
+}
+test_on_data_store!(reupsert_survives_bake_merge_and_retention_pass_impl);
+
+// A prune at a cutoff above every recorded deletion (`i64::MAX`) must not lift
+// the merge tag above deletions written after it: a protected snapshot applies
+// only the deletions above its tag, so a delete of a merged row would never
+// apply. The delete runs after the merge; one before it would drop the row from
+// the merged output and pass either way.
+async fn delete_after_max_cutoff_prune_and_merge_applies_impl(f: TestFixture) -> TestResult<()> {
+    let name = "delete_after_max_cutoff_prune_and_merge";
+    let (table, ctx) = create_table(&f, name, Mode::Key, Durability::File, None, false).await?;
+    let table_id = table.metadata().table_id.clone();
+
+    let mut model = Model::new();
+    for key in 1..4 {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    // A key no row holds: its tombstone hides nothing, so pruning it leaves
+    // every row as the model has it.
+    let absent_key = col("id").in_list(vec![lit(99_i64)], false);
+    assert!(
+        table.delete_from_cdc_fast(&[absent_key]).await?.is_some(),
+        "the key-delete path must record the tombstone"
+    );
+    assert_eq!(
+        table.deletion_index_len(),
+        1,
+        "premise: the prune must run on a nonempty deletion index"
+    );
+    table.prune_deletion_index_at_or_below(i64::MAX);
+    assert_eq!(
+        table.deletion_index_len(),
+        0,
+        "the prune must empty the index"
+    );
+
+    let merge_trigger = VortexConfig::default().compaction_trigger_protected_snapshots;
+    let protected = f.catalog.get_all_snapshot_sequences(&table_id).await?.len();
+    for key in 4..4 + i64::try_from(merge_trigger - protected)? {
+        upsert_and_drain(&table, (key, key * 10)).await?;
+        model.insert(key, key * 10);
+    }
+    let thresholds = f.catalog.get_all_snapshot_sequences(&table_id).await?;
+    assert_eq!(
+        thresholds.len(),
+        1,
+        "the size-tier merge must fold every protected snapshot into one"
+    );
+
+    delete_key(&table, 2, Durability::File).await?;
+    model.remove(&2);
+    assert_converged(
+        &read_rows(&ctx, name).await?,
+        &model,
+        "after deleting a merged row",
+    );
+
+    let (reopened, reopened_ctx) = reopen_table(&f, name).await?;
+    assert_converged(
+        &read_rows(&reopened_ctx, name).await?,
+        &model,
+        "after reopen",
+    );
+    reopened.drain_in_flight_maintenance().await?;
+    Ok(())
+}
+test_on_data_store!(delete_after_max_cutoff_prune_and_merge_applies_impl);
+
+// --- Older readers across delete and reinsert of the same keys ---
+//
+// A scan reads the table as it was when it was planned. Readers are held while
+// a history deletes keys, checkpoints, reinserts the same keys with new values,
+// checkpoints again, runs the compaction passes and a full rewrite, and sweeps
+// retired files within the retention. Each reader must then return exactly the
+// rows of its snapshot, while a new query, and a reopened table, return the rows
+// after the history.
+
+/// The rows of a batch of `SELECT id, value`.
+fn batch_rows(batch: &RecordBatch) -> Vec<(i64, i64)> {
+    let column = |index: usize| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an Int64 column")
+    };
+    let (ids, values) = (column(0), column(1));
+    (0..batch.num_rows())
+        .map(|row| (ids.value(row), values.value(row)))
+        .collect()
+}
+
+/// Two readers of one snapshot: a planned query that has not started, and a
+/// started one that has returned its first batch.
+struct HeldReaders {
+    /// The rows of the snapshot.
+    expected: Vec<(i64, i64)>,
+    ctx: SessionContext,
+    plan: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+    stream: SendableRecordBatchStream,
+    first_batch: Vec<(i64, i64)>,
+}
+
+impl HeldReaders {
+    async fn start(
+        table: &Arc<CayenneTableProvider>,
+        name: &str,
+        model: &Model,
+    ) -> TestResult<Self> {
+        // One partition and small batches, so the started query still has
+        // batches to read after its first one.
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(64),
+        );
+        ctx.register_table(name, Arc::clone(table) as Arc<dyn TableProvider>)?;
+        let query = ctx.sql(&format!("SELECT id, value FROM {name}")).await?;
+        let plan = query.clone().create_physical_plan().await?;
+        let mut stream = query.execute_stream().await?;
+        let first = stream
+            .next()
+            .await
+            .ok_or("the started query returned no batch")??;
+        Ok(Self {
+            expected: model.iter().map(|(&k, &v)| (k, v)).collect(),
+            ctx,
+            plan,
+            stream,
+            first_batch: batch_rows(&first),
+        })
+    }
+
+    /// Runs both readers to the end and checks each returned exactly the rows
+    /// of its snapshot.
+    async fn finish(mut self, label: &str) -> TestResult<()> {
+        let expected = self.expected;
+        assert!(
+            !self.first_batch.is_empty() && self.first_batch.len() < expected.len(),
+            "{label}: the started query must have rows left to read after its first batch \
+             ({} of {})",
+            self.first_batch.len(),
+            expected.len()
+        );
+        let mut planned: Vec<(i64, i64)> =
+            datafusion_physical_plan::collect(self.plan, self.ctx.task_ctx())
+                .await?
+                .iter()
+                .flat_map(batch_rows)
+                .collect();
+        planned.sort_unstable();
+        assert_eq!(planned, expected, "{label}: the planned query's rows");
+        let mut started = self.first_batch;
+        while let Some(batch) = self.stream.next().await {
+            started.extend(batch_rows(&batch?));
+        }
+        started.sort_unstable();
+        assert_eq!(started, expected, "{label}: the started query's rows");
+        Ok(())
+    }
+}
+
+/// `count` distinct keys of `model`, including every key of `always`.
+fn pick_keys(rng: &mut Rng, model: &Model, count: usize, always: &[i64]) -> BTreeSet<i64> {
+    let keys: Vec<i64> = model.keys().copied().collect();
+    let mut picked: BTreeSet<i64> = always.iter().copied().collect();
+    while picked.len() < count {
+        let index = rng.below(u64::try_from(keys.len()).expect("key count fits u64"));
+        picked.insert(keys[usize::try_from(index).expect("index fits usize")]);
+    }
+    picked
+}
+
+async fn delete_keys(
+    table: &Arc<CayenneTableProvider>,
+    keys: &BTreeSet<i64>,
+    durability: Durability,
+) -> TestResult<()> {
+    match durability {
+        Durability::File => {
+            let deleted = delete_filter(
+                table,
+                col("id").in_list(keys.iter().map(|&k| lit(k)).collect(), false),
+            )
+            .await?;
+            assert_eq!(
+                deleted,
+                u64::try_from(keys.len()).expect("key count fits u64"),
+                "rows deleted"
+            );
+        }
+        Durability::Memory => {
+            let keys: Vec<i64> = keys.iter().copied().collect();
+            table
+                .write_cdc_delete_keys_in_memory(&id_batch(&keys))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The passes a compaction trigger can run, then a retired-file sweep that keeps
+/// each retired file for the retention. Each pass applies its own trigger, so
+/// on files this small only the seq-prefix bake of a key-delete table commits.
+async fn maintain(table: &Arc<CayenneTableProvider>) -> TestResult<()> {
+    table.bake_seq_prefix_protected_snapshots().await?;
+    table.maybe_compact_small_files().await?;
+    table.compact_protected_snapshots_subset(usize::MAX).await?;
+    table.sweep_retired_files_now().await;
+    Ok(())
+}
+
+async fn older_readers_across_delete_and_reinsert(
+    f: &TestFixture,
+    mode: Mode,
+    durability: Durability,
+    seed: u64,
+) -> TestResult<()> {
+    const KEYS: i64 = 1_200;
+    const LOADS: i64 = 3;
+    let name = format!("older_readers_{mode:?}_{durability:?}_{seed}").to_lowercase();
+    let label = format!("mode={mode:?} durability={durability:?} seed={seed}");
+    let (table, ctx) = create_table(f, &name, mode, durability, None, false).await?;
+    let mut rng = Rng::new(seed);
+    let mut model = Model::new();
+
+    // Three loads; on the memory tier the last stays in memory, so the first
+    // readers hold rows from files and from the memory tier.
+    for load in 0..LOADS {
+        let rows: Vec<(i64, i64)> = (load * KEYS / LOADS..(load + 1) * KEYS / LOADS)
+            .map(|id| (id, rng.below_i64(VALUE_SPACE)))
+            .collect();
+        upsert(&table, &rows, durability).await?;
+        model.extend(rows);
+        if load + 1 < LOADS {
+            checkpoint(&table, durability).await?;
+        }
+    }
+    let first_readers = HeldReaders::start(&table, &name, &model).await?;
+
+    // Delete keys from a file and from the last load, checkpoint, reinsert them
+    // with new values, checkpoint and maintain.
+    let deleted = pick_keys(&mut rng, &model, 40, &[7, KEYS - 7]);
+    delete_keys(&table, &deleted, durability).await?;
+    for key in &deleted {
+        model.remove(key);
+    }
+    checkpoint(&table, durability).await?;
+    let reinserted: Vec<(i64, i64)> = deleted
+        .iter()
+        .map(|&k| (k, VALUE_SPACE + rng.below_i64(VALUE_SPACE)))
+        .collect();
+    upsert(&table, &reinserted, durability).await?;
+    model.extend(reinserted.iter().copied());
+    checkpoint(&table, durability).await?;
+    maintain(&table).await?;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after round 1")).await?;
+
+    let second_readers = HeldReaders::start(&table, &name, &model).await?;
+
+    // Delete reinserted keys and others again, checkpoint, reinsert some of them
+    // and new keys, checkpoint and maintain.
+    let mut deleted: BTreeSet<i64> = deleted.into_iter().step_by(2).collect();
+    deleted.extend(pick_keys(&mut rng, &model, 20, &[7, KEYS - 7]));
+    delete_keys(&table, &deleted, durability).await?;
+    for key in &deleted {
+        model.remove(key);
+    }
+    checkpoint(&table, durability).await?;
+    let mut keys: BTreeSet<i64> = deleted
+        .iter()
+        .copied()
+        .filter(|&k| k != KEYS - 7)
+        .step_by(2)
+        .collect();
+    keys.extend([7, KEYS + 1, KEYS + 2]);
+    let reinserted: Vec<(i64, i64)> = keys
+        .into_iter()
+        .map(|k| (k, 2 * VALUE_SPACE + rng.below_i64(VALUE_SPACE)))
+        .collect();
+    upsert(&table, &reinserted, durability).await?;
+    model.extend(reinserted.iter().copied());
+    checkpoint(&table, durability).await?;
+    maintain(&table).await?;
+    // The table's files are too small for the triggered passes to rewrite them,
+    // so a full rewrite replaces every file both sets of readers hold.
+    assert!(
+        table.force_full_compaction().await?,
+        "{label}: the full rewrite must commit while the readers are held"
+    );
+    table.sweep_retired_files_now().await;
+
+    first_readers
+        .finish(&format!("{label}: readers before round 1"))
+        .await?;
+    second_readers
+        .finish(&format!("{label}: readers before round 2"))
+        .await?;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after round 2")).await?;
+
+    table.elapse_data_file_retention();
+    table.sweep_retired_files_now().await;
+    assert_converged_no_duplicates(&ctx, &name, &model, &format!("{label}: after the sweep"))
+        .await?;
+
+    table.quiesce().await;
+    let (_reopened, reopened_ctx) = reopen_table(f, &name).await?;
+    assert_converged_no_duplicates(&reopened_ctx, &name, &model, &format!("{label}: reopened"))
+        .await?;
+    Ok(())
+}
+
+async fn older_readers(f: &TestFixture, mode: Mode, durability: Durability) -> TestResult<()> {
+    for seed in [16_139, 2] {
+        older_readers_across_delete_and_reinsert(f, mode, durability, seed).await?;
+    }
+    Ok(())
+}
+async fn older_readers_key_file_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Key, Durability::File).await
+}
+async fn older_readers_key_memory_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Key, Durability::Memory).await
+}
+async fn older_readers_auto_file_impl(f: TestFixture) -> TestResult<()> {
+    older_readers(&f, Mode::Auto, Durability::File).await
+}
+test_on_data_store!(older_readers_key_file_impl);
+test_on_data_store!(older_readers_key_memory_impl);
+test_on_data_store!(older_readers_auto_file_impl);
 
 // --- Concurrent pure-upsert convergence (GREEN control: loss needs deletes) ---
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Key))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Position))
     })
     .await
@@ -1706,16 +2548,16 @@ async fn prop_concurrent_upsert_only_position_sqlite() -> TestResult<()> {
 // by publishing every deletion-index update through `ArcSwap::rcu` (no lost
 // updates), so these now converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Key))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Position))
     })
     .await
@@ -1728,16 +2570,16 @@ async fn prop_concurrent_mixed_position_sqlite() -> TestResult<()> {
 // over-budget bloom existence filter (`pk_keyset_cache_mb = Some(0)`), since the
 // re-insert-over-tombstone handling differs between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, None))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, None))
     })
     .await
@@ -1745,16 +2587,16 @@ async fn prop_concurrent_mixed_dense_position_sqlite() -> TestResult<()> {
 }
 // Same dense stress, but forcing the bloom existence-filter conflict path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Key, Some(0)))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Position, Some(0)))
     })
     .await
@@ -1765,16 +2607,16 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
 // reclaims that run alongside the writers, and (crossing) the switch to key
 // deletes under them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_upsert_only_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_upsert_only(Mode::Auto))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed(Mode::Auto))
     })
     .await
@@ -1789,8 +2631,8 @@ async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
     })
     .await
@@ -1805,8 +2647,8 @@ async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| {
+async fn prop_concurrent_mixed_dense_bloom_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| {
         run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
     })
     .await
@@ -1899,26 +2741,228 @@ async fn run_concurrent_reads_mode(fixture: &TestFixture, mode: Mode) -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_key() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Key).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_position() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
-    common::run_with_backend(BackendType::Sqlite, |f| async move {
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto() -> TestResult<()> {
+    common::run_with_backend(BackendType::for_data_store(), |f| async move {
         run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+// --- Negative control: the walk notices a lost write ---
+
+/// An in-memory store that answers one data-file (`.vortex`) write as done and
+/// keeps nothing: the `nth` such write, counting from 0, single-part or multipart.
+#[derive(Debug)]
+struct DropsOneDataPut {
+    inner: object_store::memory::InMemory,
+    /// Data-file writes still to pass through before the dropped one.
+    remaining: std::sync::atomic::AtomicI64,
+    dropped: AtomicBool,
+}
+
+impl DropsOneDataPut {
+    fn new(nth: i64) -> Self {
+        Self {
+            inner: object_store::memory::InMemory::new(),
+            remaining: std::sync::atomic::AtomicI64::new(nth),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this write to `location` is the one to drop.
+    fn drop_this(&self, location: &object_store::path::Path) -> bool {
+        location.as_ref().ends_with(".vortex")
+            && self.remaining.fetch_sub(1, Ordering::SeqCst) == 0
+            && !self.dropped.swap(true, Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for DropsOneDataPut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DropsOneDataPut")
+    }
+}
+
+/// A multipart upload whose parts and completion succeed and store nothing.
+#[derive(Debug)]
+struct DiscardedUpload;
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for DiscardedUpload {
+    fn put_part(&mut self, _data: object_store::PutPayload) -> object_store::UploadPart {
+        Box::pin(async { Ok(()) })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        Ok(object_store::PutResult {
+            e_tag: None,
+            version: None,
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DropsOneDataPut {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.drop_this(location) {
+            return Ok(object_store::PutResult {
+                e_tag: None,
+                version: None,
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        if self.drop_this(location) {
+            return Ok(Box::new(DiscardedUpload));
+        }
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+/// The fuzz lane turns red when the store loses one acknowledged data-file write,
+/// and its failure names the seed and the history to replay. A lane that stays
+/// green here would also stay green over a store that drops writes.
+#[test]
+fn a_dropped_data_file_put_turns_the_fuzz_walk_red() {
+    let outcome = std::thread::Builder::new()
+        .stack_size(common::TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(common::TEST_STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("build the test runtime");
+            runtime.block_on(async {
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(DropsOneDataPut::new(2));
+                let fixture = TestFixture::with_data_store(BackendType::ObjectNative, Some(store))
+                    .await
+                    .expect("fixture");
+                let walk = Workload {
+                    seeds: 1,
+                    ..sequential(Mode::Key)
+                };
+                // A divergence panics; a failed operation or read is an error.
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_workload(
+                    fixture, walk,
+                )))
+                .await
+                {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(panic) => Some(
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+                            .unwrap_or_default(),
+                    ),
+                }
+            })
+        })
+        .expect("spawn the test thread")
+        .join()
+        .expect("join the test thread");
+    let failure = outcome.expect("the walk must fail when the store drops a data-file write");
+    assert!(
+        failure.contains("seed=0") && failure.contains("history=["),
+        "the failure names the seed and the history: {failure}"
+    );
 }

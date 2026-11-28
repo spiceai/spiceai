@@ -486,6 +486,11 @@ impl DynamoDBTableProvider {
         }
     }
 
+    /// The `DynamoDB` table this provider reads.
+    pub(crate) fn table_name(&self) -> &str {
+        self.table_schema.table_name()
+    }
+
     /// Fetches the latest global checkpoint (current shard positions) for the stream.
     ///
     /// # Errors
@@ -1153,7 +1158,6 @@ fn build_stream_from_plan(
             scan_index_forward,
             residual,
             sort_key,
-            sort_key_reading,
         }) => {
             let request = client
                 .query()
@@ -1183,9 +1187,9 @@ fn build_stream_from_plan(
                         .as_ref()
                         .and_then(|sk| item.get(sk))
                         .is_some_and(|v| {
-                            residual.iter().all(|p| {
-                                crate::filter::satisfies(v, p, sort_key_reading) == Some(true)
-                            })
+                            residual
+                                .iter()
+                                .all(|p| crate::filter::satisfies(v, p) == Some(true))
                         }),
                     _ => true,
                 };

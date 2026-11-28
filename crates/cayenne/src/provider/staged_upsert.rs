@@ -189,9 +189,14 @@ impl CayenneStagedUpsert {
         // `apply_prepared_on_conflict_in_txn` — so re-enable just the in-memory
         // promotion, which `finish` performs via `publish_prepared_on_conflict_deletions`.
         publish.publish_as_protected_snapshot = true;
+        let manifest = self
+            .table
+            .new_protected_snapshot_manifest(&self.new_snapshot_id, publish.snapshot_sequence)
+            .await?;
         Ok(PreparedTxnCommit {
             table: self.table,
             new_snapshot_id: self.new_snapshot_id,
+            manifest,
             validated_keys: self.validated_keys,
             stats: self.stats,
             row_count: self.row_count,
@@ -247,6 +252,7 @@ impl CayenneStagedUpsert {
             context: Arc::clone(self.table.context()),
             table: self.table,
             _write_guard: write_guard,
+            _held_write_lock: super::write_lock_held::held_guard(),
             _checkpoint_guard: None,
             snapshot_id: self.new_snapshot_id,
             rows: self.row_count,
@@ -297,13 +303,36 @@ pub struct PreparedTxnCommit {
     /// transaction by [`Self::apply_in_txn`]. Its `Drop` cleans up the staged
     /// deletion-vector files unless [`Self::mark_committed`] disarms it.
     publish: super::on_conflict::PreparedOnConflictDeletionPublish,
+    /// The staged snapshot's manifest, named in the shared commit that makes
+    /// the snapshot live, so no crash leaves its files named but never live.
+    /// Empty for a table outside the object-native location.
+    manifest: Vec<crate::metadata::SnapshotFile>,
 }
 
 impl PreparedTxnCommit {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication<'_>> {
+        self.publish.catalog_publication().map(|mut publication| {
+            publication.files = &self.manifest;
+            if self.table.is_durable_write_back() {
+                publication.dirty_pk_bytes = self
+                    .validated_keys
+                    .iter()
+                    .map(|key| key.as_ref().to_vec())
+                    .collect();
+            }
+            publication
+        })
+    }
+
     /// The written table's id (participants are committed in canonical id order).
     #[must_use]
     pub fn table_id(&self) -> &str {
         self.table.table_id()
+    }
+
+    /// Whether the written table's data is in the object-native location.
+    pub(crate) fn data_in_object_native_location(&self) -> bool {
+        self.table.data_in_object_native_location()
     }
 
     /// The written table's provider — the multi-table orchestrator holds its
@@ -382,6 +411,7 @@ impl PreparedTxnCommit {
     /// post-commit `mark_catalog_committed`).
     pub(crate) fn mark_committed(&mut self) {
         self.publish.mark_catalog_committed();
+        self.table.uncommitted_files().forget(&self.new_snapshot_id);
     }
 
     /// Flip in-memory visibility after the shared transaction committed. Must run
@@ -411,7 +441,8 @@ impl PreparedTxnCommit {
         // retraction+insert deltas for incremental maintenance is a follow-up.
         self.table.feed_staged_ivm_under_fence(None);
         // The rows are visible now, so the claim survives from here.
-        let published_live_rows_delta = reserved_live_rows_delta.published();
+        let published_live_rows_delta =
+            reserved_live_rows_delta.published(self.table.statistics_epoch());
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)
@@ -566,11 +597,23 @@ impl CayenneTableProvider {
 /// Best-effort removal of an unreferenced staged snapshot directory.
 ///
 /// The catalog never referenced the directory (no `cayenne_snapshot_sequence`
-/// row, `current_snapshot_id` unchanged), so leaving it is safe; object stores
-/// (S3) have no atomic "remove dir" and are left to the next successful
-/// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
+/// row, `current_snapshot_id` unchanged), so leaving it is safe. A table in the
+/// object-native location deletes the staged files by name: its writer holds
+/// them from the orphan sweep until a commit names them or they are discarded.
+/// Other object stores (S3) have no atomic "remove dir" and are left to the next
+/// successful snapshot-cleanup cycle, mirroring
+/// [`super::overwrite::PreparedOverwrite::rollback`].
 pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
-    if table.table_path().starts_with("s3://") {
+    if table.data_in_object_native_location() {
+        if let Err(e) = table.clear_snapshot_dir(snapshot_id).await {
+            tracing::warn!(
+                "Failed to delete the files of a discarded write to dataset '{}', so they stay in storage until the dataset is next loaded. Cause: {e}",
+                table.table_name()
+            );
+        }
+        return;
+    }
+    if table.data_in_store() {
         return;
     }
     let snapshot_dir = table.snapshot_dir_path_for(snapshot_id);

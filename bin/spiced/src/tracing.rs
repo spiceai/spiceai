@@ -90,11 +90,16 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "secrets",
     "data_components",
     "connector_graphql",
+    // Which identity signs a GitHub App's JWTs when its private key is in a key service.
+    "connector_github",
     "cayenne",
     "cache",
     "extensions",
     "spice_cloud",
     "llms",
+    // Downloads from the Hugging Face Hub: what is downloaded, its progress, and a load that
+    // falls back to the cache.
+    "huggingface_hub",
     "tpc_extension",
     "workers",
     "search",
@@ -957,6 +962,33 @@ mod tests {
         );
         assert!(
             !output.contains("graphql debug detail that stays hidden"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn default_filter_shows_the_github_connectors_authentication_line() {
+        let probe = ProbeWriter::default();
+        let env_filter: EnvFilter = LogVerbosity::Default.into();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer(false, probe.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "connector_github",
+                "Authenticated dataset 'issues' (github) as a GitHub App"
+            );
+            tracing::debug!(target: "connector_github", "github debug detail that stays hidden");
+        });
+
+        let output = probe.contents();
+        assert!(
+            output.contains("Authenticated dataset 'issues' (github) as a GitHub App"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("github debug detail that stays hidden"),
             "{output}"
         );
     }

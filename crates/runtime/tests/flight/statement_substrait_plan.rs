@@ -70,6 +70,54 @@ fn substrait_command(plan_bytes: Bytes) -> CommandStatementSubstraitPlan {
 }
 
 #[tokio::test]
+async fn substrait_results_cache_requires_plan_keys() -> anyhow::Result<()> {
+    use super::start_spice_test_app_with_cache;
+    use spicepod::component::caching::{CacheKeyType, SQLResultsCacheConfig};
+
+    test_request_context()
+        .scope(async {
+            for kind in [CacheKeyType::Plan, CacheKeyType::Sql] {
+                let (channel, _df) = start_spice_test_app_with_cache(
+                    None,
+                    SQLResultsCacheConfig {
+                        cache_key_type: kind,
+                        item_ttl: Some("1h".into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let mut client = create_flight_client(channel, None)?;
+                let bytes = substrait_plan_bytes("SELECT 11 AS value").await?;
+                let cmd = substrait_command(bytes);
+                let descriptor = FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec());
+                let info = client.get_flight_info(descriptor).await?;
+                let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+                for expected in if kind == CacheKeyType::Plan {
+                    [Some("MISS"), Some("HIT")]
+                } else {
+                    [None, None]
+                } {
+                    let stream = client.do_get(ticket.clone()).await?;
+                    assert_eq!(
+                        stream
+                            .headers()
+                            .get("results-cache-status")
+                            .map(|value| value.to_str().expect("status")),
+                        expected
+                    );
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    assert_eq!(
+                        arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+                        "+-------+\n| value |\n+-------+\n| 11    |\n+-------+"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
 async fn test_substrait_plan_round_trip() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

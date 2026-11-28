@@ -25,7 +25,7 @@ use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{register_test_connectors, test_request_context},
+    utils::{aws_session_token_param, register_test_connectors, test_request_context},
 };
 
 pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
@@ -40,6 +40,10 @@ pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
             ),
         ]
         .into_iter()
+        .chain(aws_session_token_param(
+            "glue_session_token",
+            "AWS_GLUE_SESSION_TOKEN",
+        ))
         .collect(),
     ));
     dataset
@@ -82,7 +86,7 @@ async fn glue_federation() -> Result<(), anyhow::Error> {
                 batches.push(batch?);
             }
 
-            assert!(!batches.is_empty());
+            assert_ne!(batches, [] as [arrow::array::RecordBatch; 0]);
 
             let schema = batches[0].schema();
             let record = concat_batches(&schema, &batches).expect("concat batches");

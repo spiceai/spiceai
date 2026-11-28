@@ -41,7 +41,7 @@ use crate::{
     parameters::ParameterSpec,
 };
 
-use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator};
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
 use runtime_checkpoint_api::CheckpointError;
 
@@ -137,6 +137,21 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 #[async_trait]
 impl DataAccelerator for PartitionedArrowAccelerator {
+    async fn writer_role(
+        &self,
+        _source: &dyn data_accelerator_api::AccelerationSource,
+    ) -> Option<data_accelerator_api::WriterRole> {
+        // Only this instance writes this engine's accelerations.
+        None
+    }
+
+    async fn shared_location_id(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -191,7 +206,6 @@ impl DataAccelerator for PartitionedArrowAccelerator {
     async fn sidecar(
         &self,
         _source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         _open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // In-memory: there is no database to keep sidecar tables in, and nothing would

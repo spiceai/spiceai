@@ -19,7 +19,9 @@ use evaluate_chat::ChatEvaluator;
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
 use llms::chat::DistributedBackendSetting;
+
 use llms::evaluate::Evaluate;
+use llms::workload_identity;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -35,10 +37,6 @@ use snafu::ResultExt;
 #[cfg(feature = "models")]
 use spicepod::component::model::ModelFileType;
 use spicepod::component::model::{Model, ModelSource};
-#[cfg(feature = "models")]
-use std::path::PathBuf;
-#[cfg(feature = "models")]
-use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::RwLock;
@@ -57,8 +55,12 @@ use super::params::openai::OpenAiModelParams;
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
+use super::wrapper::defaults::{RequestDefaults, ToolOffer};
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use crate::{
     Runtime,
     tools::{
@@ -69,20 +71,36 @@ use crate::{
 use runtime_parameters_typed::TypedParams;
 use runtime_secrets::Secrets;
 use runtime_tools::options::SpiceToolsOptions;
+use tools::SpiceModelTool;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
-/// uses it.
+/// A loaded chat model, as `/v1/chat/completions` serves it, as `/v1/decisions` uses it, and
+/// as `/v1/messages` runs Spice's tools for it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
     pub chat: Arc<dyn Chat>,
     /// The same model — same provider client, system prompt and parameter defaults — with
     /// no runtime tools.
     without_tools: Arc<dyn Chat>,
+    /// The runtime tools its Spicepod `tools` param enables, and the most rounds of calls to
+    /// them one request may run.
+    tools: Vec<Arc<dyn SpiceModelTool>>,
+    tool_recursion_limit: usize,
 }
 
 impl LoadedChatModel {
+    /// The same model with no runtime tools.
+    pub(crate) fn without_tools(&self) -> Arc<dyn Chat> {
+        Arc::clone(&self.without_tools)
+    }
+
+    /// The runtime tools the model's Spicepod `tools` param enables, and the most rounds of
+    /// calls to them one request may run.
+    pub(crate) fn tools(&self) -> (&[Arc<dyn SpiceModelTool>], usize) {
+        (&self.tools, self.tool_recursion_limit)
+    }
+
     /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
@@ -114,7 +132,14 @@ pub async fn try_to_chat_model(
     rt: Arc<Runtime>,
 ) -> Result<LoadedChatModel, LlmError> {
     let secrets = rt.secrets();
-    let model = construct_model(component, params, &secrets, rt.token_provider_registry()).await?;
+    let model = construct_model(
+        component,
+        params,
+        &secrets,
+        rt.token_provider_registry(),
+        rt.df.cluster_config.allow_insecure_connections(),
+    )
+    .await?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -138,7 +163,7 @@ pub async fn try_to_chat_model(
 
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
-    let tool_model = match spice_tool_opt {
+    let (tool_model, tool_offer, tools) = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
@@ -150,18 +175,36 @@ pub async fn try_to_chat_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Arc::new(ToolUsingChat::new(
-                Arc::clone(&model),
-                tools,
-                spice_recursion_limit,
-            ))
+            let tool_model =
+                ToolUsingChat::new(Arc::clone(&model), tools.clone(), spice_recursion_limit);
+            let tool_offer = tool_model.tool_offer();
+            (Arc::new(tool_model) as Arc<dyn Chat>, tool_offer, tools)
         }
-        Some(_) | None => Arc::clone(&model),
+        Some(_) | None => (Arc::clone(&model), ToolOffer::RequestOnly, Vec::new()),
     };
+
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let without_tools = RequestDefaults::new(
+        model,
+        &component.name,
+        request_defaults(component)?,
+        ToolOffer::RequestOnly,
+    );
     Ok(LoadedChatModel {
-        chat: tool_model,
-        without_tools: model,
+        chat: Arc::new(without_tools.over(tool_model, tool_offer)),
+        without_tools: Arc::new(without_tools),
+        tools,
+        tool_recursion_limit: spice_recursion_limit.unwrap_or(DEFAULT_SPICE_TOOL_RECURSION_LIMIT),
     })
+}
+
+/// The request defaults that `component`'s params set, such as `temperature` or `tool_choice`.
+fn request_defaults(component: &Model) -> Result<Vec<(String, Value)>, LlmError> {
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(get_openai_request_overrides(component, source.short_name()))
 }
 
 /// Deserializes the source's typed params from the (already secret-resolved)
@@ -181,11 +224,21 @@ pub(crate) async fn typed_params<P: TypedParams>(
         })
 }
 
+/// `allow_insecure_connections` is spiced's `--allow-insecure-connections`, which a local model
+/// split across nodes over unauthenticated connections needs.
+#[cfg_attr(
+    not(feature = "models"),
+    expect(
+        unused_variables,
+        reason = "only a local model, which needs the `models` feature, is split across nodes"
+    )
+)]
 pub async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
     token_registry: Arc<TokenProviderRegistry>,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -201,7 +254,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<HuggingFaceModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            huggingface(model_id, component, &p).await
+            huggingface(model_id, component, &p, allow_insecure_connections).await
         }
         #[cfg(not(feature = "models"))]
         ModelSource::HuggingFace => Err(LlmError::UnknownModelSource {
@@ -211,7 +264,7 @@ pub async fn construct_model(
         ModelSource::File => {
             let p =
                 typed_params::<FileModelParams>(component, params, source.clone(), secrets).await?;
-            file(component, &p).await
+            file(component, &p, allow_insecure_connections).await
         }
         #[cfg(not(feature = "models"))]
         ModelSource::File => Err(LlmError::UnknownModelSource {
@@ -221,7 +274,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<AnthropicModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            anthropic(model_id.as_deref(), &p)
+            anthropic(&component.name, model_id.as_deref(), params, &p).await
         }
         ModelSource::Google => {
             let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
@@ -231,7 +284,7 @@ pub async fn construct_model(
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p)
+            azure(model_id, component.name.as_str(), &p).await
         }
         ModelSource::Xai => {
             let p =
@@ -241,19 +294,31 @@ pub async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p)
+            openai(&component.name, model_id, params, &p).await
         }
         ModelSource::Databricks => {
             let p =
                 typed_params::<DatabricksModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            databricks(model_id, &p, Arc::clone(&token_registry)).await
+            let key_in_spicepod = workload_identity::key_in_spicepod(
+                params,
+                &["databricks_token", "databricks_client_secret"],
+            );
+            databricks(
+                &component.name,
+                model_id,
+                params,
+                &p,
+                key_in_spicepod,
+                Arc::clone(&token_registry),
+            )
+            .await
         }
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => {
             let p = typed_params::<BedrockModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            bedrock(model_id, &p).await
+            bedrock(&component.name, model_id, &p).await
         }
         #[cfg(not(feature = "bedrock"))]
         ModelSource::Bedrock => Err(LlmError::UnknownModelSource {
@@ -276,12 +341,7 @@ pub async fn construct_model(
         }
         None => None,
     };
-    let mut wrapper = ChatWrapper::new(
-        model,
-        component.name.as_str(),
-        system_prompt,
-        get_openai_request_overrides(component, source.short_name()),
-    );
+    let mut wrapper = ChatWrapper::new(model, component.name.as_str(), system_prompt);
 
     if let Some(Value::String(s)) = component.params.get("parameterized_prompt")
         && matches!(s.as_str(), "enabled")
@@ -294,6 +354,7 @@ pub async fn construct_model(
 
 #[cfg(feature = "bedrock")]
 async fn bedrock(
+    model_name: &str,
     model_id: Option<String>,
     params: &BedrockModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
@@ -303,9 +364,13 @@ async fn bedrock(
         });
     };
 
-    let client = super::util::create_bedrock_client(&params.runtime_params(), "bedrock-chat")
-        .await
-        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+    let client = super::util::create_bedrock_client(
+        &format!("model '{model_name}' (bedrock)"),
+        &params.runtime_params(),
+        "bedrock-chat",
+    )
+    .await
+    .map_err(super::util::bedrock_client_error)?;
 
     let id = params.guardrail_identifier.as_deref();
     let version = params.guardrail_version.as_deref();
@@ -332,21 +397,65 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Chat>,
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
 }
 
-fn anthropic(
+async fn anthropic(
+    model_name: &str,
     model_id: Option<&str>,
+    raw_params: &HashMap<String, SecretString>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(
+        Arc::new(anthropic_client(model_name, model_id, raw_params, params).await?)
+            as Arc<dyn Chat>,
+    )
+}
+
+/// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
+/// and, natively, the Messages API.
+pub(crate) async fn anthropic_client(
+    model_name: &str,
+    model_id: Option<&str>,
+    raw_params: &HashMap<String, SecretString>,
+    params: &AnthropicModelParams,
+) -> Result<Anthropic, LlmError> {
     let api_base = params.endpoint.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
 
-    let auth = match (api_key, auth_token) {
-        (Some(s), None) => GenericAuthMechanism::from_api_key(s),
-        (None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
-        (None, None) => return Err(LlmError::FailedToLoadModel {
-            source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+    let key_param = match (api_key, auth_token) {
+        (Some(_), _) => Some("anthropic_api_key"),
+        (None, Some(_)) => Some("anthropic_auth_token"),
+        (None, None) => None,
+    };
+    // `ANTHROPIC_WORKSPACE_ID`, as the Anthropic SDKs read it, names the workspace of a federation
+    // rule enabled for more than one; it never applies to an API key.
+    let workspace_from_env = std::env::var("ANTHROPIC_WORKSPACE_ID")
+        .ok()
+        .filter(|workspace| !workspace.trim().is_empty());
+    let federated = workload_identity::anthropic_token_provider(
+        &format!("model '{model_name}' (anthropic)"),
+        &params.federation(
+            raw_params,
+            key_param.is_some(),
+            workspace_from_env.as_deref(),
+        ),
+        key_param,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?;
+
+    let auth = match (federated, api_key, auth_token) {
+        (Some(token), _, _) => GenericAuthMechanism::from_bearer_token_provider(token),
+        (None, Some(s), None) => GenericAuthMechanism::from_api_key(s),
+        (None, None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report: this is a
+        // credential the configuration does not give.
+        (None, None, None) => return Err(LlmError::FailedToAuthenticate {
+            source: workload_identity::anthropic_no_credential_message(&format!(
+                "model '{model_name}' (anthropic)"
+            ))
+            .into(),
         }),
-        (Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
+        (None, Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
             source: "Only one of following `model.params` is allowed: `anthropic_api_key` or `anthropic_auth_token`.".into(),
         }),
     };
@@ -360,7 +469,7 @@ fn anthropic(
             source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
         })?;
 
-    Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+    Ok(anthropic)
 }
 
 async fn google(
@@ -398,6 +507,7 @@ async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &HuggingFaceModelParams,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(id) = model_id else {
         return Err(LlmError::FailedToLoadModel {
@@ -406,66 +516,95 @@ async fn huggingface(
     };
 
     let model_type = params.model_type.as_deref();
-    let hf_token = params.hf_token.as_ref();
+    let hub = llms::hf::HubParams {
+        token: params.hf_token.as_ref(),
+        // A chat model's `hf_token` is never loaded from a secret store.
+        token_in_spicepod: true,
+        endpoint: params.hf_endpoint.as_deref(),
+    };
 
-    // For GGUF models, we require user specify via `.files[].path`
-    let gguf_path = component
-        .find_all_file_path(ModelFileType::Weights)
-        .iter()
-        .find_map(|p| {
-            let path = PathBuf::from_str(p.as_str());
-            if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension())
-                && ext.eq_ignore_ascii_case("gguf")
-            {
-                return PathBuf::from_str(p.as_str()).ok();
-            }
-            None
-        });
-
-    if let Some(ref path) = gguf_path {
-        tracing::debug!(
-            "For Huggingface model {}, the GGUF model {} will be downloaded and used.",
-            component.name,
-            path.display()
-        );
-    }
+    // The model's GGUF files, or a GGUF quantization or its folder by name; the download
+    // resolves them against the repository, and with none chooses a GGUF repository's
+    // quantization.
+    let files = component.gguf_selectors();
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let chat_template_literal = params.chat_template.as_deref();
     let distributed = parse_distributed_config(
         params.distributed_backend,
-        params.node_rank.as_deref(),
-        params.nodes.as_deref(),
+        DistributedParams {
+            node_rank: params.node_rank.as_deref(),
+            nodes: params.nodes.as_deref(),
+            head_url: params.head_url.as_deref(),
+        },
+        allow_insecure_connections,
     )?;
+
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::HuggingFace.short_name());
 
     llms::chat::create_hf_model(
         &id,
         model_type,
-        gguf_path,
-        hf_token,
+        &files,
+        hub,
         chat_template_literal,
         distributed,
+        llms::chat::ReasoningDefault {
+            model_name: &component.name,
+            effort: default_reasoning_effort.as_ref(),
+        },
     )
     .await
 }
 
+/// The model's `reasoning_effort` default from its `params`, in any accepted spelling, for
+/// the loader to check against the chat template. A value that doesn't parse is left to the
+/// request path, which reports it.
+#[cfg(feature = "models")]
+fn default_reasoning_effort(
+    component: &spicepod::component::model::Model,
+    prefix: &str,
+) -> Option<async_openai::types::chat::ReasoningEffort> {
+    get_openai_request_overrides(component, prefix)
+        .into_iter()
+        .find(|(key, _)| key == "reasoning_effort")
+        .and_then(|(_, value)| serde_json::from_value(value).ok())
+}
+
+/// The multi-node topology params of a local model, as the Spicepod gives them.
+#[cfg(feature = "models")]
+#[derive(Clone, Copy, Default)]
+struct DistributedParams<'a> {
+    node_rank: Option<&'a str>,
+    nodes: Option<&'a str>,
+    head_url: Option<&'a str>,
+}
+
 /// Parse the optional multi-node distributed-inference params (`distributed_backend`,
-/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`].
+/// `node_rank`, `nodes`, `head_url`) of a local model into a
+/// [`llms::chat::DistributedConfig`], with spiced's `--allow-insecure-connections`.
 /// Returns `Ok(None)` when distributed mode is not requested.
 #[cfg(feature = "models")]
 fn parse_distributed_config(
     distributed_backend: DistributedBackendSetting,
-    node_rank: Option<&str>,
-    nodes: Option<&str>,
+    params: DistributedParams<'_>,
+    allow_insecure_connections: bool,
 ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
+    let DistributedParams {
+        node_rank,
+        nodes,
+        head_url,
+    } = params;
     let backend = match distributed_backend {
         DistributedBackendSetting::None => {
             // Distributed is off: reject orphan topology params so forgetting (or
             // mistyping) `distributed_backend` doesn't silently run single-node
             // while `nodes`/`node_rank` look configured.
-            if nodes.is_some() || node_rank.is_some() {
+            if nodes.is_some() || node_rank.is_some() || head_url.is_some() {
                 return Err(LlmError::InvalidParamValueError {
                     param: "distributed_backend".to_string(),
-                    message: "`nodes`/`node_rank` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
+                    message: "`nodes`/`node_rank`/`head_url` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`/`head_url`.".to_string(),
                 });
             }
             return Ok(None);
@@ -501,10 +640,18 @@ fn parse_distributed_config(
         });
     }
 
+    let head_url = head_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(parse_head_url)
+        .transpose()?;
+
     let config = llms::chat::DistributedConfig {
         backend,
         node_rank,
         nodes,
+        allow_insecure_connections,
+        head_url,
     };
     config
         .validate()
@@ -515,9 +662,29 @@ fn parse_distributed_config(
     Ok(Some(config))
 }
 
+/// `head_url`, checked to be an `http` or `https` URL with a host, so a refusal never names
+/// something a client cannot request.
+#[cfg(feature = "models")]
+fn parse_head_url(raw: &str) -> Result<String, LlmError> {
+    match url::Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {
+            Ok(raw.to_string())
+        }
+        _ => Err(LlmError::InvalidParamValueError {
+            param: "head_url".to_string(),
+            message: format!(
+                "Must be the http or https URL clients reach the head at, such as 'http://192.168.1.100:8090', got '{raw}'"
+            ),
+        }),
+    }
+}
+
 async fn databricks(
+    model_name: &str,
     model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
     params: &DatabricksModelParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     // Required parameters
@@ -534,7 +701,11 @@ async fn databricks(
 
     // Optional parameters.
     let token_opt = params.token.as_ref().map(ExposeSecret::expose_secret);
-    let client_id = params.client_id.as_deref();
+    let client_id = crate::token_providers::databricks::component_client_id(
+        raw_params,
+        params.client_id.as_ref(),
+        params.client_secret.as_ref(),
+    );
     let client_secret = params
         .client_secret
         .as_ref()
@@ -545,17 +716,53 @@ async fn databricks(
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
 
+    if let Some(identity) = params
+        .federation(
+            raw_params,
+            crate::token_providers::databricks::in_github_actions(),
+        )
+        .workload_identity(
+            key_in_spicepod,
+            params.token.is_some() || params.client_secret.is_some(),
+        )
+        .map_err(model_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("model '{model_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(model_error)?;
+        return Ok(Arc::new(llms::databricks::from_token_provider(
+            endpoint,
+            model_id.as_str(),
+            token_provider,
+            user_agent,
+            HealthCheck::Required,
+        )) as Arc<dyn Chat>);
+    }
+
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
             Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
         }
-        (Some(_), Some(_), None) | (None, None, None) => {
+        (Some(_), Some(_), None) => {
             Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
             })
         }
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report.
+        (None, None, None) => Err(LlmError::FailedToAuthenticate {
+            source: format!(
+                "Found no credential for model '{model_name}' (databricks). {}. See: https://spiceai.org/docs/components/models/databricks",
+                crate::token_providers::databricks::NO_CREDENTIAL_MESSAGE
+            )
+            .into(),
+        }),
         (None, None, Some(_client_secret)) => {
             Err(LlmError::FailedToLoadModel {
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
@@ -654,7 +861,8 @@ fn spiceai(
     )) as Arc<dyn Chat>)
 }
 
-fn openai(
+async fn openai(
+    model_name: &str,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -668,8 +876,30 @@ fn openai(
 
     validate_temperature(raw_params, "openai")?;
 
+    let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    let label = format!("model '{model_name}' (openai)");
+    if let Some(client) = workload_identity::openai_federated_client(
+        &label,
+        &model,
+        &params.federation(),
+        workload_identity::openai_api_key_in_spicepod(raw_params),
+        chat_backend,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(Arc::new(client) as Arc<dyn Chat>);
+    }
+    if let Some(message) =
+        workload_identity::openai_missing_credential(&label, api_key, params.endpoint.as_str())
+    {
+        return Err(LlmError::FailedToAuthenticate {
+            source: message.into(),
+        });
+    }
+
     Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
-        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+        model,
         api_base,
         api_key,
         org_id,
@@ -704,24 +934,29 @@ fn validate_temperature(
     Ok(())
 }
 
-fn azure(
+/// An Azure model's client, for chat or responses: the one workload identity federation builds
+/// when the model is configured for it, or else the one its `azure_api_key` or
+/// `azure_entra_token` builds. `component_name` is the model's name in the Spicepod.
+pub(crate) enum AzureClient {
+    Federated(llms::openai::Openai<llms::openai::AzureTokenConfig>),
+    Key(llms::openai::Openai<llms::openai::AzureConfig>),
+}
+
+pub(crate) async fn azure_client(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &AzureModelParams,
-) -> Result<Arc<dyn Chat>, LlmError> {
+) -> Result<AzureClient, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
+    "Azure model '{component_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     };
     let api_base = params.endpoint.as_deref();
-    let api_version = params.api_version.as_deref();
-    let deployment_name = params.deployment_name.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-    let chat_backend = params.responses_api;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -740,30 +975,53 @@ fn azure(
         });
     }
 
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
-            source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
-            )
-            .into(),
-        });
+    let key_param = params.key_param();
+    if let Some(client) = workload_identity::azure_federated_client(
+        &format!("model '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_param,
+        key_param.is_some(),
+        &workload_identity::AzureEnvironment::from_process(),
+        params.responses_api,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(AzureClient::Federated(client));
     }
 
-    Ok(Arc::new(llms::openai::new_azure_client_with_chat_backend(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-        chat_backend,
-    )) as Arc<dyn Chat>)
+    Ok(AzureClient::Key(
+        llms::openai::new_azure_client_with_chat_backend(
+            model_name,
+            api_base,
+            params.api_version.as_deref(),
+            params.deployment_name.as_deref(),
+            entra_token,
+            api_key,
+            params.responses_api,
+        ),
+    ))
+}
+
+async fn azure(
+    model_id: Option<String>,
+    component_name: &str,
+    params: &AzureModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(
+        match azure_client(model_id, component_name, params).await? {
+            AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Chat>,
+            AzureClient::Key(client) => Arc::new(client) as Arc<dyn Chat>,
+        },
+    )
 }
 
 #[cfg(feature = "models")]
 async fn file(
     component: &spicepod::component::model::Model,
     params: &FileModelParams,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_weights = component.find_all_file_path(ModelFileType::Weights);
     if model_weights.is_empty() {
@@ -786,13 +1044,19 @@ async fn file(
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
     let distributed = parse_distributed_config(
         params.distributed_backend,
-        params.node_rank.as_deref(),
-        params.nodes.as_deref(),
+        DistributedParams {
+            node_rank: params.node_rank.as_deref(),
+            nodes: params.nodes.as_deref(),
+            head_url: params.head_url.as_deref(),
+        },
+        allow_insecure_connections,
     )?;
     let context_length = parse_context_length(params)?;
     let paged_attention = params.paged_attention;
 
     let chat_template_literal = params.chat_template.as_deref();
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::File.short_name());
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
@@ -805,6 +1069,11 @@ async fn file(
             chat_template_literal,
             context_length,
             paged_attention,
+            reasoning: llms::chat::ReasoningDefault {
+                model_name: &component.name,
+                effort: default_reasoning_effort.as_ref(),
+            },
+            ..llms::chat::LocalModelOptions::default()
         },
     )
     .await
@@ -830,14 +1099,25 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
 
 // Get OpenAI compatible request parameter overrides.
 // Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
+/// The model's `params` value for the request default `key`, by the documented spelling
+/// first: unprefixed for `OpenAI`, `{prefix}_` for every other provider. The other spellings
+/// are deprecated aliases, read only when it is absent. Chat completions and the Responses
+/// API both read their defaults through this, so the two agree on which value applies.
+pub(crate) fn request_default<'a>(model: &'a Model, prefix: &str, key: &str) -> Option<&'a Value> {
+    let prefixed = format!("{prefix}_{key}");
+    let legacy = format!("openai_{key}");
+    let spellings = if prefix == ModelSource::OpenAi.short_name() {
+        [key, legacy.as_str(), legacy.as_str()]
+    } else {
+        [prefixed.as_str(), key, legacy.as_str()]
+    };
+    spellings.iter().find_map(|name| model.params.get(*name))
+}
+
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
-        if let Some(v) = model.params.get(key) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
-            request_overrides.insert(key.to_string(), v.clone());
-        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+        if let Some(v) = request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), v.clone());
         }
     }
@@ -956,6 +1236,62 @@ mod test {
     }
 
     #[test]
+    fn a_prefixed_override_takes_precedence_over_its_bare_alias() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "hf_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "hf"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("low".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_bare_override_applies_when_its_prefixed_form_is_absent() {
+        let mut model = Model::new("file:/models/qwen3.gguf", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("none".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "file"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("none".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn openai_reads_the_bare_override_before_its_deprecated_prefixed_form() {
+        let mut model = Model::new("openai:gpt-5", "test_model");
+        model.params.insert(
+            "reasoning_effort".to_string(),
+            Value::String("high".to_string()),
+        );
+        model.params.insert(
+            "openai_reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+        assert_eq!(
+            get_openai_request_overrides(&model, "openai"),
+            vec![(
+                "reasoning_effort".to_string(),
+                Value::String("high".to_string())
+            )]
+        );
+    }
+
+    #[test]
     fn test_get_openai_request_overrides_with_model_prefix() {
         let mut model = Model::new("hf:test_model", "test_model");
         model.params.insert(
@@ -1047,7 +1383,15 @@ mod test {
         pairs: &[(&str, &str)],
     ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
         let get = |k: &str| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| *v);
-        parse_distributed_config(backend, get("node_rank"), get("nodes"))
+        parse_distributed_config(
+            backend,
+            DistributedParams {
+                node_rank: get("node_rank"),
+                nodes: get("nodes"),
+                head_url: get("head_url"),
+            },
+            false,
+        )
     }
 
     #[cfg(feature = "models")]
@@ -1099,6 +1443,65 @@ mod test {
         assert!(matches!(
             err,
             LlmError::InvalidParamValueError { ref param, .. } if param == "node_rank"
+        ));
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_ring_keeps_the_head_url_clients_reach() {
+        let cfg = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[
+                ("nodes", "10.42.9.100,10.42.9.101"),
+                ("node_rank", "1"),
+                ("head_url", " http://192.168.1.100:8090 "),
+            ],
+        )
+        .expect("valid ring config")
+        .expect("ring config is Some");
+        assert_eq!(cfg.head_url.as_deref(), Some("http://192.168.1.100:8090"));
+        let unset = parse_dist(
+            DistributedBackendSetting::Ring,
+            &[("nodes", "10.42.9.100,10.42.9.101"), ("node_rank", "1")],
+        )
+        .expect("valid ring config")
+        .expect("ring config is Some");
+        assert_eq!(unset.head_url, None);
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_refuses_a_head_url_that_is_not_an_http_url() {
+        for raw in ["192.168.1.100:8090", "ftp://192.168.1.100", "http://"] {
+            let err = parse_dist(
+                DistributedBackendSetting::Ring,
+                &[("nodes", "10.0.0.1,10.0.0.2"), ("head_url", raw)],
+            )
+            .expect_err("not an http URL");
+            let LlmError::InvalidParamValueError { param, message } = err else {
+                panic!("expected an invalid param error for {raw}");
+            };
+            assert_eq!(param, "head_url");
+            assert_eq!(
+                message,
+                format!(
+                    "Must be the http or https URL clients reach the head at, such as 'http://192.168.1.100:8090', got '{raw}'"
+                )
+            );
+        }
+    }
+
+    #[cfg(feature = "models")]
+    #[test]
+    fn distributed_rejects_an_orphan_head_url_without_backend() {
+        let err = parse_dist(
+            DistributedBackendSetting::None,
+            &[("head_url", "http://192.168.1.100:8090")],
+        )
+        .expect_err("head_url without the ring backend is invalid");
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. } if param == "distributed_backend"
         ));
     }
 

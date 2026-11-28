@@ -54,7 +54,9 @@ datasets:
     acceleration:
       enabled: true
 
-  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/test/0.parquet
+  # Judgments for the dev split (6,980 queries, binary grades), the split MTEB reports for MSMARCO.
+  # `test_queries` holds every split's queries; the harness sends only the judged ones.
+  - from: https://huggingface.co/api/datasets/mteb/msmarco/parquet/default/dev/0.parquet
     name: relevance_data
     params:
       file_format: parquet
@@ -82,6 +84,7 @@ views:
         s3_vectors_aws_region: us-east-2
         s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
         s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
+        s3_vectors_aws_session_token: ${env:AWS_S3_VECTORS_SESSION_TOKEN}
     columns:
       - name: text
         embeddings:

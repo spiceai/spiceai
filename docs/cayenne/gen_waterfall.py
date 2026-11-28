@@ -2,13 +2,14 @@
 import html
 import os
 
-# Run from this script's directory so waterfall.svg / waterfall_ls.pdf are always
-# written next to it, regardless of the caller's working directory.
+# Run from this script's directory so waterfall.svg is always written next to it,
+# regardless of the caller's working directory.
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 DARK="#1e293b"; BORDER="#312e81"; ACCENT="#6366f1"; SUB="#475569"; SEQ="#6366f1"; FAINT="#94a3b8"
 def esc(s): return html.escape(s, quote=True)
 
-def box(x,y,w,h,title,sub,seq):
+def box(rect,title,sub,seq):
+    x,y,w,h=rect
     cx=x+w/2
     t=f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="#ffffff" stroke="{BORDER}" stroke-width="2"/>'
     t+=f'<text x="{cx}" y="{y+21}" text-anchor="middle" font-size="15" font-weight="700" fill="{DARK}">{esc(title)}</text>'
@@ -84,11 +85,11 @@ svg.append(f'<text x="{cxDB}" y="14" text-anchor="middle" font-size="11" fill="#
 svg.append(f'<path d="M{cxDB},18 L{cxDB},33" fill="none" stroke="{DARK}" stroke-width="2" marker-end="url(#ah)"/>')
 
 # generation boxes
-svg.append(box(*n1,"Changes stream",["ordered change events","from the CDC connector"],"seq 12,601–12,650"))
-svg.append(box(*n2,"Level-0 / tier-0",["inline blobs / mem-tier (RAM)"],"seq 12,501–12,600"))
-svg.append(box(*n3,"Published snapshots",["one current + protected tail","(all visible to scans)"],"seq 10,001–12,500"))
-svg.append(box(*n4,"Compacted base",["merged target-sized files"],"seq 2,001–10,000"))
-svg.append(box(*n5,"Cold object-store tier",["Hilbert-clustered Vortex,","read-optimized (optional)"],"seq ≤ 2,000"))
+svg.append(box(n1,"Changes stream",["ordered change events","from the CDC connector"],"seq 12,601–12,650"))
+svg.append(box(n2,"Level-0 / tier-0",["inline blobs / mem-tier (RAM)"],"seq 12,501–12,600"))
+svg.append(box(n3,"Published snapshots",["one current + protected tail","(all visible to scans)"],"seq 10,001–12,500"))
+svg.append(box(n4,"Compacted base",["merged target-sized files"],"seq 2,001–10,000"))
+svg.append(box(n5,"Cold object-store tier",["Hilbert-clustered Vortex,","read-optimized (optional)"],"seq ≤ 2,000"))
 
 # transition arrows (down-left)
 svg.append(arrow(1000,DBy+DBh,975,152,"CDC connector emits ordered changes",1072,172,wrap=18))
@@ -111,12 +112,3 @@ SVG = "\n".join(svg)
 with open("waterfall.svg", "w", encoding="utf-8") as f:
     f.write(SVG)
 print(f"wrote waterfall.svg ({len(SVG)} bytes)")
-# Optional landscape preview PDF — only if WeasyPrint's native deps are present.
-# waterfall.svg is the committed artifact referenced by cayenne.md; the preview
-# is a convenience and its absence never blocks regenerating the figure.
-try:
-    from weasyprint import HTML
-    HTML(string=f"<html><head><style>@page{{size:A4 landscape; margin:8mm}}</style></head><body style='margin:0'>{SVG}</body></html>").write_pdf("waterfall_ls.pdf")
-    print("wrote waterfall_ls.pdf preview")
-except Exception as e:  # noqa: BLE001 — preview is best-effort
-    print(f"skipped waterfall_ls.pdf preview ({e})")

@@ -290,17 +290,26 @@ async fn test_tls_hot_reload_all_endpoints() -> Result<(), anyhow::Error> {
                 .await
             });
 
-            // 3. Wait for the servers to come up by handshaking against HTTP.
+            // 3. Wait for every endpoint to come up by handshaking against it.
+            //    `start_servers` binds the HTTP, metrics and Flight listeners
+            //    independently, so HTTP answering does not mean the other two
+            //    are listening yet.
             tracing::info!("waiting for servers...");
-            assert!(
-                wait_for(Duration::from_secs(10), || async {
-                    fetch_server_leaf_fingerprint("127.0.0.1", http_port, &pki_v1.ca_pem)
-                        .await
-                        .is_ok()
-                })
-                .await,
-                "HTTP server did not become reachable"
-            );
+            for (name, port) in [
+                ("http", http_port),
+                ("metrics", metrics_port),
+                ("flight", flight_port),
+            ] {
+                assert!(
+                    wait_for(Duration::from_secs(10), || async {
+                        fetch_server_leaf_fingerprint("127.0.0.1", port, &pki_v1.ca_pem)
+                            .await
+                            .is_ok()
+                    })
+                    .await,
+                    "{name} server did not become reachable"
+                );
+            }
 
             // 4. Verify each endpoint serves the v1 leaf.
             for (name, port) in [
@@ -468,6 +477,99 @@ async fn test_tls_hot_reload_rejects_malformed_pem() -> Result<(), anyhow::Error
             assert_eq!(
                 after, pki.leaf_fingerprint_hex,
                 "server downgraded to a different cert after rejecting malformed PEM"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verify that a rotation which replaces the cert but not the key is
+/// rejected: the new cert doesn't belong to the served private key, so
+/// swapping it in would fail every handshake. The old cert keeps serving and
+/// the `key_mismatch` metric ticks.
+#[tokio::test]
+async fn test_tls_hot_reload_rejects_cert_that_does_not_match_key() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    install_crypto_provider();
+
+    test_request_context()
+        .scope(async {
+            let pki = generate_ca_and_leaf("spiced-stable");
+            let dir = TempDir::new()?;
+            let cert_path = dir.path().join("server.crt");
+            let key_path = dir.path().join("server.key");
+            std::fs::write(&cert_path, &pki.leaf_cert_pem)?;
+            std::fs::write(&key_path, &pki.leaf_key_pem)?;
+
+            let control = runtime_tls::TlsControl::new()?;
+            let tls_config = Arc::new(
+                TlsConfig::try_new_from_paths(cert_path.clone(), key_path.clone(), &control)
+                    .map_err(|e| anyhow::anyhow!("build TlsConfig: {e}"))?,
+            );
+
+            let mut rng = rand::rng();
+            let http_port: u16 = rng.random_range(50000..60000);
+            let flight_port: u16 = http_port + 1;
+            let metrics_port: u16 = http_port + 2;
+
+            let api_config = Config::new()
+                .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
+            let registry = prometheus::Registry::new();
+            let app = app::AppBuilder::new("test_app").build();
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+                    .with_app(app)
+                    .build()
+                    .await,
+            );
+            let rt_for_servers = Arc::clone(&rt);
+            let tls_for_servers = Arc::clone(&tls_config);
+            tokio::spawn(async move {
+                Box::pin(rt_for_servers.start_servers(
+                    api_config,
+                    Some(tls_for_servers),
+                    EndpointAuth::no_auth(),
+                ))
+                .await
+            });
+
+            assert!(
+                wait_for(Duration::from_secs(10), || async {
+                    fetch_server_leaf_fingerprint("127.0.0.1", http_port, &pki.ca_pem)
+                        .await
+                        .is_ok()
+                })
+                .await,
+                "HTTP server did not become reachable"
+            );
+
+            let baseline =
+                fetch_server_leaf_fingerprint("127.0.0.1", http_port, &pki.ca_pem).await?;
+            assert_eq!(baseline, pki.leaf_fingerprint_hex);
+
+            // Replace only the cert with one for a different key. Server
+            // should keep serving the old cert.
+            let other = generate_ca_and_leaf("spiced-other");
+            let reload_before = reload_count_for_tests(ReloadScope::Public, "key_mismatch");
+            atomic_write(&cert_path, &other.leaf_cert_pem);
+
+            // Wait for the public-scope `key_mismatch` bucket to tick.
+            assert!(
+                wait_for(Duration::from_secs(15), || async {
+                    reload_count_for_tests(ReloadScope::Public, "key_mismatch") > reload_before
+                })
+                .await,
+                "public `key_mismatch` bucket never incremented after writing a mismatched cert"
+            );
+
+            // Old cert should still serve.
+            let after = fetch_server_leaf_fingerprint("127.0.0.1", http_port, &pki.ca_pem).await?;
+            assert_eq!(
+                after, pki.leaf_fingerprint_hex,
+                "server swapped in a cert that does not match its private key"
             );
 
             Ok(())

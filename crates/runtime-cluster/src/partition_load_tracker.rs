@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn acked_tables_lists_tables_with_recorded_acks() {
         let tracker = PartitionLoadTracker::new();
-        assert!(tracker.acked_tables().await.is_empty());
+        assert_eq!(tracker.acked_tables().await, [] as [TableReference; 0]);
 
         let table = TableReference::parse_str("t");
         // An empty ack (zero-partition dataset) still counts as an ack.
@@ -374,7 +374,7 @@ mod tests {
 
         // Dropping the only acking executor leaves the table without acks.
         tracker.drop_executor("exec-1").await;
-        assert!(tracker.acked_tables().await.is_empty());
+        assert_eq!(tracker.acked_tables().await, [] as [TableReference; 0]);
     }
 
     #[tokio::test]

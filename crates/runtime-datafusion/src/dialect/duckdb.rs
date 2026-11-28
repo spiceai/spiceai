@@ -819,7 +819,12 @@ pub(crate) fn inner_product_to_sql(
 
 /// Wraps `value` so that a non-finite result renders as NULL, binding it to a
 /// lambda parameter so it is evaluated once:
-/// `list_extract(list_transform([<value>], v -> CASE WHEN isfinite(v) THEN v END), 1)`.
+/// `list_extract(list_transform([<value>], lambda v : CASE WHEN isfinite(v) THEN v END), 1)`.
+///
+/// The lambda uses `DuckDB`'s `lambda v : …` syntax, which the bundled 1.4
+/// and every supported installed release (1.5 and 2.0) accept. The older
+/// `v -> …` arrow is deprecated in 1.5, where it warns, and 2.0 rejects it
+/// with a binder error.
 ///
 /// **The one-element list is what makes the screen sound, not decoration.** The
 /// direct spelling — `CASE WHEN isfinite(<value>) THEN <value> END` — writes
@@ -878,7 +883,7 @@ fn finite_or_null(value: ast::Expr) -> ast::Expr {
                     data_type: None,
                 }),
                 body: Box::new(screen),
-                syntax: ast::LambdaSyntax::Arrow,
+                syntax: ast::LambdaSyntax::LambdaKeyword,
             }),
         ],
     );
@@ -1362,7 +1367,7 @@ mod tests {
         let result = inner_product_to_sql(&unparser, &args)
             .expect("should execute successfully")
             .expect("should return expression");
-        let expected = r#"list_extract(list_transform([array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])], v -> CASE WHEN isfinite(v) THEN v END), 1)"#;
+        let expected = r#"list_extract(list_transform([array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])], lambda v : CASE WHEN isfinite(v) THEN v END), 1)"#;
         let rendered = result.to_string();
         assert_eq!(rendered, expected);
         assert_eq!(

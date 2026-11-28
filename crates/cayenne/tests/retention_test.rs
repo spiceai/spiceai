@@ -26,7 +26,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use cayenne::metadata::CreateTableOptions;
 
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::MetadataCatalog;
 
 use common::TestFixture;
 
@@ -38,18 +38,15 @@ use datafusion_common::{DFSchema, DataFusionError};
 
 use std::sync::Arc;
 
-test_with_backends!(test_retention_filters_apply_on_insert_impl);
-test_with_backends!(test_retention_filters_skip_when_no_matches_impl);
-test_with_backends!(test_time_retention_filter_scan_expiry_impl);
-test_with_backends!(test_time_retention_with_user_filter_impl);
-test_with_backends!(test_time_retention_cdc_stages_before_finalize_impl);
+test_on_data_store!(test_retention_filters_apply_on_insert_impl);
+test_on_data_store!(test_retention_filters_skip_when_no_matches_impl);
+test_on_data_store!(test_time_retention_filter_scan_expiry_impl);
+test_on_data_store!(test_time_retention_with_user_filter_impl);
+test_on_data_store!(test_time_retention_cdc_stages_before_finalize_impl);
 
 async fn test_retention_filters_apply_on_insert_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("retention_apply");
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -60,7 +57,7 @@ async fn test_retention_filters_apply_on_insert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("retention_apply"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -69,13 +66,12 @@ async fn test_retention_filters_apply_on_insert_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog_arc,
-            table_options,
-            vec![retention_expr],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_retention_filters(vec![retention_expr])
+            })
+            .await?,
     );
 
     // Insert rows with values 1..=5; retention should mark rows with value < 3 as deleted.
@@ -111,8 +107,8 @@ async fn test_retention_filters_apply_on_insert_impl(
         "Expected two rows to be marked as deleted"
     );
 
-    let file = std::fs::File::open(&delete_file.path)?;
-    let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
+    let file = fixture.data_store.read(&delete_file.path).await?;
+    let reader = arrow::ipc::reader::FileReader::try_new(std::io::Cursor::new(file), None)?;
     let mut deleted_row_ids = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -159,9 +155,6 @@ async fn test_retention_filters_apply_on_insert_impl(
 async fn test_retention_filters_skip_when_no_matches_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("retention_skip");
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -172,7 +165,7 @@ async fn test_retention_filters_skip_when_no_matches_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("retention_skip"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -180,13 +173,12 @@ async fn test_retention_filters_skip_when_no_matches_impl(
     let retention_expr = col("value").lt(lit(0i64));
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
-    let table_provider = CayenneTableProvider::create_table_with_retention(
-        catalog_arc,
-        table_options,
-        vec![retention_expr],
-        ctx.runtime_env(),
-    )
-    .await?;
+    let table_provider = fixture
+        .data_store
+        .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+            builder.with_retention_filters(vec![retention_expr])
+        })
+        .await?;
 
     // Insert rows that do not match the retention predicate.
     let batch = RecordBatch::try_new(
@@ -215,9 +207,6 @@ async fn test_retention_filters_skip_when_no_matches_impl(
 async fn test_time_retention_cdc_stages_before_finalize_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("time_retention_cdc");
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -232,7 +221,7 @@ async fn test_time_retention_cdc_stages_before_finalize_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("time_retention_cdc"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig {
             inline_max_rows: 0,
@@ -247,9 +236,11 @@ async fn test_time_retention_cdc_stages_before_finalize_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     );
 
@@ -307,9 +298,6 @@ async fn test_time_retention_cdc_stages_before_finalize_impl(
 async fn test_time_retention_filter_scan_expiry_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("time_retention");
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -324,7 +312,7 @@ async fn test_time_retention_filter_scan_expiry_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("time_retention"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -335,9 +323,11 @@ async fn test_time_retention_filter_scan_expiry_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     );
 
@@ -432,9 +422,6 @@ async fn test_time_retention_filter_scan_expiry_impl(
 async fn test_time_retention_with_user_filter_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("retention_user_filter");
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -449,7 +436,7 @@ async fn test_time_retention_with_user_filter_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("retention_user_filter"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -461,9 +448,11 @@ async fn test_time_retention_with_user_filter_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     );
 
@@ -646,9 +635,6 @@ async fn test_time_retention_with_user_filter_impl(
 async fn test_time_retention_keeps_null_timestamps_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join("time_retention_null");
-    std::fs::create_dir_all(&table_dir)?;
-
     // `event_time` is NULLABLE (true) so a NULL timestamp can be inserted.
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -664,7 +650,7 @@ async fn test_time_retention_keeps_null_timestamps_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("time_retention_null"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -679,9 +665,11 @@ async fn test_time_retention_keeps_null_timestamps_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, ctx.runtime_env())
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     );
 
@@ -737,7 +725,7 @@ async fn test_time_retention_keeps_null_timestamps_impl(
     Ok(())
 }
 
-test_with_backends!(test_time_retention_keeps_null_timestamps_impl);
+test_on_data_store!(test_time_retention_keeps_null_timestamps_impl);
 
 /// Parse a `retention_sql` predicate containing `now()`, matching the
 /// expression stored on the table at open (not folded).
@@ -784,9 +772,6 @@ async fn now_retention_sql_deletes_expired_impl(
     table_name: &str,
     primary_key: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join(table_name);
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -804,7 +789,7 @@ async fn now_retention_sql_deletes_expired_impl(
         schema: Arc::clone(&schema),
         primary_key,
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig {
             inline_max_rows: 0,
@@ -816,13 +801,12 @@ async fn now_retention_sql_deletes_expired_impl(
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table_provider = Arc::new(
-        CayenneTableProvider::create_table_with_retention(
-            catalog_arc,
-            table_options,
-            vec![retention_expr],
-            ctx.runtime_env(),
-        )
-        .await?,
+        fixture
+            .data_store
+            .create_with(catalog_arc, ctx.runtime_env(), table_options, |builder| {
+                builder.with_retention_filters(vec![retention_expr])
+            })
+            .await?,
     );
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -875,5 +859,5 @@ async fn test_now_retention_sql_deletes_expired_pk_impl(
     now_retention_sql_deletes_expired_impl(fixture, "now_ret_pk", vec!["id".to_string()]).await
 }
 
-test_with_backends!(test_now_retention_sql_deletes_expired_no_pk_impl);
-test_with_backends!(test_now_retention_sql_deletes_expired_pk_impl);
+test_on_data_store!(test_now_retention_sql_deletes_expired_no_pk_impl);
+test_on_data_store!(test_now_retention_sql_deletes_expired_pk_impl);

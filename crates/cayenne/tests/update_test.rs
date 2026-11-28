@@ -39,13 +39,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_physical_plan::collect;
 
-test_with_backends!(test_update_single_row_by_pk_impl);
-test_with_backends!(test_update_with_expression_impl);
-test_with_backends!(test_update_multi_column_impl);
-test_with_backends!(test_update_set_null_impl);
-test_with_backends!(test_update_zero_match_impl);
-test_with_backends!(test_update_no_filter_all_rows_impl);
-test_with_backends!(test_update_preserves_inline_append_path_impl);
+test_on_data_store!(test_update_single_row_by_pk_impl);
+test_on_data_store!(test_update_with_expression_impl);
+test_on_data_store!(test_update_multi_column_impl);
+test_on_data_store!(test_update_set_null_impl);
+test_on_data_store!(test_update_zero_match_impl);
+test_on_data_store!(test_update_no_filter_all_rows_impl);
+test_on_data_store!(test_update_preserves_inline_append_path_impl);
+test_on_data_store!(test_concurrent_same_key_updates_keep_the_row_impl);
 
 /// Build a `CayenneTableProvider` with schema (id, name, value) and `id` as PK.
 async fn make_test_table(
@@ -63,15 +64,17 @@ async fn make_test_table(
         schema,
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+    let table = fixture
+        .data_store
+        .create(catalog_arc, ctx.runtime_env(), table_options)
+        .await?;
     Ok(Arc::new(table))
 }
 
@@ -404,5 +407,63 @@ async fn test_update_preserves_inline_append_path_impl(
             .is_empty()
     );
 
+    Ok(())
+}
+
+async fn test_concurrent_same_key_updates_keep_the_row_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const UPDATES: i64 = 16;
+    let table = make_test_table(&fixture, "upd_concurrent").await?;
+    let ctx = SessionContext::new();
+    ctx.register_table("upd_concurrent", Arc::clone(&table) as _)?;
+
+    ctx.sql("INSERT INTO upd_concurrent VALUES (7, 'k', 10)")
+        .await?
+        .collect()
+        .await?;
+    let mut joins = Vec::with_capacity(usize::try_from(UPDATES)?);
+    for _ in 0..UPDATES {
+        let table = Arc::clone(&table);
+        joins.push(tokio::spawn(async move {
+            let ctx = SessionContext::new();
+            let plan = table
+                .update(
+                    &ctx.state(),
+                    vec![("value".to_string(), col("value") + lit(1_i64))],
+                    vec![col("id").eq(lit(7_i64))],
+                )
+                .await
+                .expect("update plan");
+            let results = collect(plan, ctx.task_ctx())
+                .await
+                .expect("update executed");
+            let count = extract_u64_count(&results).expect("update count");
+            assert_eq!(
+                count, 1,
+                "an UPDATE of an existing key must report count=1, not a silent 0"
+            );
+        }));
+    }
+    for join in joins {
+        join.await.expect("update task");
+    }
+
+    let batches = ctx
+        .sql("SELECT id, value FROM upd_concurrent WHERE id = 7")
+        .await?
+        .collect()
+        .await?;
+    let value = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value col")
+        .value(0);
+    assert_eq!(
+        value,
+        10 + UPDATES,
+        "every successful same-key increment must apply and the row must remain"
+    );
     Ok(())
 }

@@ -45,6 +45,9 @@ pub struct HuggingFaceModelParams {
     // one from the secret stores.
     #[param(runtime, alias = "huggingface_token")]
     pub hf_token: Option<SecretString>,
+    /// The Hugging Face Hub endpoint to download the model from, to read through a mirror or proxy of the Hub. Defaults to `HF_ENDPOINT`, then `https://huggingface.co`.
+    #[param(runtime)]
+    pub hf_endpoint: Option<String>,
     /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
     #[param(runtime, default = "none")]
     pub distributed_backend: DistributedBackendSetting,
@@ -54,4 +57,7 @@ pub struct HuggingFaceModelParams {
     /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.
     #[param(runtime)]
     pub nodes: Option<String>,
+    /// Where clients reach the head (rank 0) for a model in `nodes`, such as `http://192.168.1.100:8090`. A node other than the head names it when it refuses a request: `nodes` holds the addresses the nodes reach each other at, which a client may not reach. When unset, the refusal names the head's address in `nodes`.
+    #[param(runtime)]
+    pub head_url: Option<String>,
 }

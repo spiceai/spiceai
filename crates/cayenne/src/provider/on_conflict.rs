@@ -94,6 +94,8 @@ pub struct PreparedOnConflictDeletionPublish {
     /// and the later durable flip target precisely THIS tombstone — never a
     /// later-staged tombstone for the same PK.
     pub(crate) inlined_delete_id: Option<String>,
+    /// How the inline tombstone, if any, becomes active.
+    pub(crate) tombstone_activation: TombstoneActivation,
     /// Count of existing rows superseded by this upsert, captured from
     /// [`OnConflictDeletions::total_superseded`] at validation time. This is the
     /// authoritative live-row-delta input: it must NOT be recomputed from the
@@ -101,6 +103,19 @@ pub struct PreparedOnConflictDeletionPublish {
     /// SAME `Int64Pk` deletions in two encodings (i64 + committed byte keys), so
     /// summing their lengths double-counts, and neither captures `position_deletions`.
     pub(crate) superseded: usize,
+}
+
+/// How a staged upsert's inline tombstone becomes active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TombstoneActivation {
+    /// It commits inactive; the publish activates it in memory and queues its
+    /// durable flip.
+    AtPublish,
+    /// It commits active, in the record that makes the replacement live (a
+    /// keyed write into a new protected snapshot at final keys), and its id is
+    /// in the table's `inlined_tombstones_awaiting_publish` until the publish,
+    /// which then neither activates it in memory nor queues a flip.
+    Committed,
 }
 
 pub(crate) struct PreparedOnConflictDurablePayload {
@@ -112,6 +127,23 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication<'_>> {
+        self.durable_payload
+            .as_ref()
+            .map(|payload| crate::catalog::CatalogPublication {
+                table_id: &payload.table_id,
+                snapshot_id: &self.target_snapshot_id,
+                snapshot_sequence: self.snapshot_sequence,
+                insert_sequence: self.insert_sequence,
+                delete_files: &payload.delete_files,
+                insert_pk_bytes: &payload.insert_pk_bytes,
+                inline_tombstone: payload.inline_tombstone.as_ref(),
+                pending_durable_flips: &payload.pending_durable_flips,
+                dirty_pk_bytes: std::borrow::Cow::Borrowed(&[]),
+                files: &[],
+            })
+    }
+
     /// The commit sequence this staged upsert publishes under. An on-conflict
     /// append carries no `append_sequence`, so this is the value its validated
     /// primary keys must be stamped with for per-key optimistic concurrency.
@@ -205,13 +237,19 @@ impl Drop for PreparedOnConflictDeletionPublish {
         if paths.is_empty() {
             return;
         }
+        let storage = self.table.dataset_storage().cloned();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+                super::delete::cleanup_uncommitted_delete_paths(&paths, storage.as_deref()).await;
             });
         } else {
             std::thread::spawn(move || {
                 for path in paths {
+                    // Object-store files are removed through the store, never as
+                    // a local path; without a runtime they are left for the sweep.
+                    if crate::is_object_store_path(&path.to_string_lossy()) {
+                        continue;
+                    }
                     match std::fs::remove_file(path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -375,6 +413,9 @@ pub(crate) struct InlinedDataRewrite {
     pub(crate) updated_data: Vec<InlinedData>,
     pub(crate) deleted_inlined_ids: Vec<String>,
     pub(crate) removed_rows: usize,
+    /// The entries `updated_data` and `deleted_inlined_ids` replace, as readers
+    /// see them until the rewrite is published.
+    pub(crate) replaced: Vec<Arc<InlinedData>>,
 }
 
 impl InlinedDataRewrite {
@@ -394,10 +435,13 @@ impl InlinedDataRewrite {
 /// frozen at build time. How far that freeze can drift from the delete depends on
 /// who builds the sink and when.
 pub(crate) enum DeletionSinkSource {
-    /// Built by the caller immediately before it drives the sink itself
-    /// (`delete_from_cdc_fast`, the CDC apply loop's own delete path). Its window
-    /// is whatever separates those two statements; this is its pre-existing shape,
-    /// neither widened nor narrowed here.
+    /// Built by the caller immediately before it drives the sink itself.
+    /// Prefer [`Self::BuildAtExecution`] for any path that can interleave a
+    /// writer between construction and `delete_from`.
+    #[expect(
+        dead_code,
+        reason = "kept so a caller that already holds a built sink can still drive it; user DELETE and CDC fast now use BuildAtExecution"
+    )]
     Prebuilt(Box<CayenneDeletionSink>),
     /// Built inside the execution-time `write_lock` hold, after the in-memory CDC
     /// tier is checkpointed in that same hold.
@@ -520,13 +564,17 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // (`pk_deletion_strategy` is `PositionBased` exactly then), so without this
         // a `mode: memory` table could neither be emptied nor filtered.
         //
-        // `apply_mem_tier_delete` needs the table `write_lock`, which the inner
-        // sink takes and releases internally, so acquire it here rather than
-        // nesting. Before the `deleted > 0` bookkeeping below: on a table whose
-        // rows are ONLY in the mem-tier the inner count is 0, and the cached scan
-        // statistics still need invalidating once this changes the visible count.
+        // `apply_mem_tier_delete` needs the table `write_lock`. The inner sink
+        // takes and releases it internally, so this is a new acquire — unless
+        // autocommit UPDATE already holds the same non-reentrant mutex across
+        // rematerialize + delete + insert (`write_lock_held`). Nesting then
+        // deadlocks after the files are already unlinked.
         {
-            let _guard = self.table.write_lock.lock().await;
+            let _guard = if super::write_lock_held::is_held() {
+                None
+            } else {
+                Some(self.table.write_lock.lock().await)
+            };
             deleted = deleted.saturating_add(
                 apply_mem_tier_delete(&self.table, &self.filters)
                     .await
@@ -630,9 +678,27 @@ impl DeletionSink for InlineAwareDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let _write_guard = self.table.write_lock.lock().await;
+        let position_based = self.table.pk_deletion_strategy.is_position_based();
+        // A key delete of an upserting table is ordered after the appends staged
+        // before it (`key_tombstones_wait_for_staged_appends`).
+        let _write_guard = if super::write_lock_held::is_held() {
+            None
+        } else if self.table.key_tombstones_wait_for_staged_appends() {
+            Some(
+                self.table
+                    .lock_write_after_staged_appends("the delete or update")
+                    .await?,
+            )
+        } else {
+            Some(self.table.write_lock_arc().lock_owned().await)
+        };
         self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
+        if position_based {
+            // As `PkKeysetInvalidatingDeletionSink` does before a delete it cannot
+            // enumerate by key: a filter delete leaves no per-key stamps to trust.
+            self.table.mark_pk_keyset_occ_degraded();
+        }
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
         // THIS hold, so no apply lands between the capture and the delete it is
@@ -663,11 +729,26 @@ impl DeletionSink for InlineAwareDeletionSink {
         let file_deleted = prepared_file_delete
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
+        // A table with no primary key writes each touched file's whole deletion
+        // vector, which replaces the file's earlier ones in the same commit.
+        let replaced_vectors = match &prepared_file_delete {
+            Some(prepared) if prepared.replaces_earlier_deletion_vectors() => {
+                file_sink
+                    .position_deletion_vectors_replaced_by(prepared.delete_files())
+                    .await?
+            }
+            _ => Vec::new(),
+        };
 
         if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            // The catalog serves the rewrite from when it is applied; readers
+            // keep the entries it replaces as they were until the publish.
+            let awaiting_publish = self
+                .table
+                .hold_replaced_inlined_entries(&inline_rewrite.replaced);
             if let Err(error) = self
                 .table
                 .metadata_catalog()
@@ -676,19 +757,53 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
+                    replaced_vectors
+                        .iter()
+                        .map(|row| row.delete_file_id.clone())
+                        .collect(),
                 )
                 .await
             {
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
                 return Err(Box::new(error));
             }
             if let Some(prepared) = &mut prepared_file_delete {
                 prepared.mark_catalog_committed();
             }
-            if let Some(prepared) = prepared_file_delete {
-                prepared.publish()?;
-            }
-            if !inline_rewrite.is_empty() {
-                self.table.publish_inlined_rewrite(&inline_rewrite);
+            if crate::catalog::commit_left_to_scope_owner() {
+                // Buffered: the scope's owner commits the record, then runs this
+                // publish, so no reader sees the delete before it is durable.
+                // The vectors it replaces go only after that commit. Until the
+                // publish, a later upsert treats the deleted keys as tombstoned.
+                let table = self.table.clone_for_write();
+                let unpublished_deletes = prepared_file_delete.as_ref().and_then(|prepared| {
+                    self.table
+                        .hold_unpublished_key_deletes(prepared.tombstoned_keys())
+                });
+                self.table
+                    .publish_when_committed(async move {
+                        table
+                            .publish_delete(
+                                prepared_file_delete,
+                                &inline_rewrite,
+                                &awaiting_publish,
+                            )
+                            .await;
+                        drop(unpublished_deletes);
+                        table.remove_dropped_deletion_vector_files(replaced_vectors);
+                    })
+                    .await;
+            } else {
+                if let Some(prepared) = prepared_file_delete {
+                    prepared.publish()?;
+                }
+                self.table
+                    .release_replaced_inlined_entries(&awaiting_publish);
+                if !inline_rewrite.is_empty() {
+                    self.table.publish_inlined_rewrite(&inline_rewrite);
+                }
+                file_sink.remove_replaced_deletion_vector_files(replaced_vectors);
             }
         }
 
@@ -727,7 +842,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             } else {
                 self.table.clear_cached_pk_keyset();
             }
-            if file_deleted > 0 && self.table.pk_deletion_strategy.is_position_based() {
+            // A table with no primary key answers counts from per-file statistics
+            // that a position delete changes; drop them on any delete, as
+            // `PkKeysetInvalidatingDeletionSink` does, since inline and mem-tier rows
+            // count toward the visible total too.
+            if position_based {
                 self.table.clear_scan_file_statistics_cache();
             }
         }

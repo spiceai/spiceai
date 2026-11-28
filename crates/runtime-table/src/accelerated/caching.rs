@@ -14,25 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
-use arrow::array::StringArray;
 use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
-use arrow::compute::cast;
+use arrow::array::{BooleanArray, StringArray};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use data_components::http::provider::HttpTableProvider;
+use data_components::http::provider::{
+    DEFAULT_MAX_REQUEST_PARTITIONS, HttpTableProvider, RequestPages,
+};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{Expr, dml::InsertOp, not};
+use datafusion::logical_expr::{Expr, Operator, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -96,6 +100,8 @@ pub struct InFlightFetch {
     limit: Option<usize>,
     /// The leader's published [`FetchState`].
     state: watch::Receiver<FetchState>,
+    /// When the leader published its result; unset while it is still fetching.
+    published_at: Arc<OnceLock<tokio::time::Instant>>,
 }
 
 impl InFlightFetch {
@@ -114,6 +120,58 @@ impl InFlightFetch {
             (Some(_), None) => false,
             (Some(fetched), Some(wanted)) => wanted <= fetched,
         }
+    }
+
+    /// Whether a lookup that started at `lookup_started_at`, under a
+    /// `caching_ttl` of `max_age`, may replay this fetch rather than ask the
+    /// origin itself: only if the fetch's result was published no earlier than
+    /// `max_age` before the lookup started.
+    ///
+    /// A fetch still in flight, or one that published while the lookup was
+    /// already under way, is shared at any TTL: its answer is no older than the
+    /// lookup, and lookups made together ask the origin once. A result published
+    /// before the lookup started is a stored answer by then, and is replayed
+    /// only while it is within the TTL, as a cached entry would be. The map keeps
+    /// a published result until the leader's write lands, which cache-write
+    /// batching can defer for hundreds of milliseconds; without this, a
+    /// `caching_ttl: 0s` lookup in that window would serve an answer fetched
+    /// before it was made, which the origin may have changed since (#16148).
+    fn replayable_for(&self, lookup_started_at: tokio::time::Instant, max_age: Duration) -> bool {
+        self.published_at.get().is_none_or(|published_at| {
+            published_at
+                .checked_add(max_age)
+                .is_none_or(|fresh_until| fresh_until >= lookup_started_at)
+        })
+    }
+
+    /// Waits until the leader's claim on `key` is released, or until
+    /// `deadline`. A leader that writes nothing removes the key and then drops
+    /// its sender. A queued write gives up the sender when it is enqueued but
+    /// keeps the key until it has landed, which on the batched writer is the
+    /// next flush, so this also waits for this fetch's entry to leave
+    /// `in_flight`.
+    async fn released(
+        mut self,
+        in_flight: &InFlightRevalidations,
+        key: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let _ = tokio::time::timeout_at(deadline, async {
+            while self.state.changed().await.is_ok() {}
+            while self.holds(in_flight, key) {
+                tokio::time::sleep(RELEASE_POLL_INTERVAL).await;
+            }
+        })
+        .await;
+    }
+
+    /// Whether `key`'s entry in `in_flight` is still this fetch, rather than
+    /// gone or a later leader's.
+    fn holds(&self, in_flight: &InFlightRevalidations, key: &str) -> bool {
+        in_flight
+            .lock()
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.published_at, &self.published_at))
     }
 }
 
@@ -184,6 +242,8 @@ pub struct CacheKeyClaim {
     queued: bool,
     input_charge: Option<Arc<RetainedBufferCharge>>,
     proven_fresh: bool,
+    /// The map entry's publish time, set when a result is published.
+    published_at: Arc<OnceLock<tokio::time::Instant>>,
 }
 
 impl CacheKeyClaim {
@@ -208,7 +268,15 @@ impl CacheKeyClaim {
             return ClaimOutcome::Follower(fetch);
         }
         let (sender, state) = watch::channel(FetchState::Pending);
-        guard.insert(key.clone(), InFlightFetch { limit, state });
+        let published_at = Arc::new(OnceLock::new());
+        guard.insert(
+            key.clone(),
+            InFlightFetch {
+                limit,
+                state,
+                published_at: Arc::clone(&published_at),
+            },
+        );
         drop(guard);
         ClaimOutcome::Leader(Self {
             key,
@@ -218,6 +286,7 @@ impl CacheKeyClaim {
             queued: false,
             input_charge: None,
             proven_fresh: false,
+            published_at,
         })
     }
 
@@ -241,6 +310,8 @@ impl CacheKeyClaim {
         charge: Option<Arc<RetainedBufferCharge>>,
     ) {
         self.input_charge.clone_from(&charge);
+        // Before the result, so a follower that sees it also sees when it came.
+        let _ = self.published_at.set(tokio::time::Instant::now());
         self.sender.send_replace(FetchState::Ready(batches, charge));
         self.published = true;
     }
@@ -294,6 +365,12 @@ impl Drop for CacheKeyClaim {
 /// [`FetchState::Failed`] on drop, waking followers at once); timing out only
 /// costs the extra origin call the follower would have made anyway.
 const FOLLOWER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`InFlightFetch::released`] checks whether a queued write has
+/// landed and released its key. The batched writer flushes every
+/// [`CACHE_WRITE_FLUSH_INTERVAL_MS`], so this adds at most this much to a
+/// background refresh that waits for it.
+const RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The terminal outcome a follower observes while waiting on a leader's fetch.
 enum FollowerResult {
@@ -463,6 +540,362 @@ pub const CACHE_NAMESPACE_COLUMN: &str = "__spice_cache_namespace";
 #[must_use]
 pub fn is_reserved_caching_column(name: &str) -> bool {
     name.eq_ignore_ascii_case(CACHE_NAMESPACE_COLUMN)
+        || name.eq_ignore_ascii_case(CACHE_REQUEST_COLUMN)
+}
+
+/// Storage-only column naming the request a cached row was fetched for, so
+/// every row of one response shares a value even when pagination stored each
+/// page under its own path and query. Eviction, retention and the scheduled
+/// refresh treat the rows that share it as one entry, so none of them can
+/// leave part of a response to be served as though it were whole.
+///
+/// It holds the request's key as [`encode_request_key`] writes it. Nullable:
+/// a row written by a runtime that does not stamp it reads as NULL, and is
+/// kept and evicted as before. Hidden from the user-facing schema, like
+/// [`CACHE_NAMESPACE_COLUMN`].
+pub const CACHE_REQUEST_COLUMN: &str = "__spice_cache_request";
+
+/// The request-key predicates in `filters`, `column = 'value'` or
+/// `column IS NULL` over [`REQUEST_KEY_COLUMNS`], encoded as a JSON object
+/// with the columns in a fixed order and `null` for `IS NULL`. `None` when a
+/// filter is anything else, so such a write stores no key.
+#[must_use]
+pub fn encode_request_key(filters: &[Expr]) -> Option<String> {
+    let mut key = BTreeMap::<&str, Option<String>>::new();
+    for filter in filters {
+        let (column, value) = match filter {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (
+                        Expr::Column(column),
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                            | ScalarValue::LargeUtf8(Some(value))
+                            | ScalarValue::Utf8View(Some(value)),
+                            _,
+                        ),
+                    ) => (column, Some(value.clone())),
+                    _ => return None,
+                }
+            }
+            Expr::IsNull(inner) => match inner.as_ref() {
+                Expr::Column(column) => (column, None),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name = REQUEST_KEY_COLUMNS
+            .into_iter()
+            .find(|name| *name == column.name)?;
+        if let Some(previous) = key.insert(name, value.clone())
+            && previous != value
+        {
+            return None;
+        }
+    }
+    if key.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&key).ok()
+}
+
+/// The entry identity shared by cache admission and lookup. Omitted path and
+/// query dimensions remain omitted; an omitted body identifies a GET.
+fn request_entry_key(filters: &[Expr]) -> Option<String> {
+    let mut canonical = writer::canonical_request_filters(filters)?;
+    if !canonical
+        .iter()
+        .flat_map(Expr::column_refs)
+        .any(|c| c.name == REQUEST_BODY_COLUMN)
+    {
+        canonical.push(col(REQUEST_BODY_COLUMN).eq(lit("")));
+    }
+    encode_request_key(&canonical)
+}
+
+// OR branches must enumerate actual connector values: a NULL or reversed
+// equality branch is not represented by request_filter_values.
+fn enumerable_request_predicate(expr: &Expr, under_or: bool) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                datafusion::logical_expr::Operator::And | datafusion::logical_expr::Operator::Or
+            ) =>
+        {
+            let under_or = under_or || binary.op == datafusion::logical_expr::Operator::Or;
+            enumerable_request_predicate(&binary.left, under_or)
+                && enumerable_request_predicate(&binary.right, under_or)
+        }
+        Expr::InList(list) if !list.negated => list.list.iter().all(|value| {
+            matches!(value, Expr::Literal(ScalarValue::Utf8(Some(_)), _))
+                && writer::canonical_request_filters(&[list
+                    .expr
+                    .as_ref()
+                    .clone()
+                    .eq(value.clone())])
+                .is_some()
+        }),
+        _ => {
+            writer::canonical_request_filters(std::slice::from_ref(expr)).is_some()
+                && (!under_or
+                    || REQUEST_KEY_COLUMNS.iter().any(|name| {
+                        !HttpTableProvider::request_filter_values(std::slice::from_ref(expr), name)
+                            .is_empty()
+                    }))
+        }
+    }
+}
+
+/// Canonical requests represented by a lookup, excluding response predicates.
+#[cfg(test)]
+fn lookup_entry_keys(filters: &[Expr]) -> Option<Vec<String>> {
+    lookup_entry_keys_bounded(filters, DEFAULT_MAX_REQUEST_PARTITIONS).0
+}
+
+fn lookup_entry_keys_bounded(filters: &[Expr], bound: usize) -> (Option<Vec<String>>, bool, bool) {
+    let request: Vec<_> = filters
+        .iter()
+        .flat_map(flatten_and_conjuncts)
+        .filter(expr_names_request_key)
+        .collect();
+    if bound == 0 {
+        return (None, true, false);
+    }
+    if request.is_empty() {
+        return (None, false, false);
+    }
+    if let Some(key) = request_entry_key(&request) {
+        return (Some(vec![key]), false, true);
+    }
+    // Expansion must not discard a noncanonical predicate on a request key.
+    if !request
+        .iter()
+        .all(|expr| enumerable_request_predicate(expr, false))
+    {
+        return (None, false, false);
+    }
+    // Enumerate at most bound + 1 combinations, and encode none until the
+    // entire set fits. The extra combination distinguishes overflow from a
+    // request exactly at the connector's limit.
+    let Some(keys) = requested_cache_keys_bounded(&request, bound.saturating_add(1)) else {
+        return (None, false, false);
+    };
+    if keys.len() > bound {
+        return (None, true, false);
+    }
+    (
+        keys.iter()
+            .map(|key| key.entry_key_with_predicates(&request))
+            .collect(),
+        false,
+        false,
+    )
+}
+
+/// Restrict candidate rows to the responses fetched for this lookup's requests.
+/// Noncanonical request scans accept any tagged entry; scans without request
+/// predicates and legacy tables without entry tags retain every row.
+pub(super) struct RequestEntryRestriction {
+    keys: Option<HashSet<String>>,
+    requires_tag: bool,
+    over_bound: bool,
+    claim_filters: Vec<Expr>,
+    claim_entry: Option<String>,
+    canonical: bool,
+}
+
+impl RequestEntryRestriction {
+    #[cfg(test)]
+    pub(super) fn new(filters: &[Expr]) -> Self {
+        Self::with_bound(filters, DEFAULT_MAX_REQUEST_PARTITIONS)
+    }
+
+    pub(super) fn for_lookup(filters: &[Expr], source: &dyn TableProvider) -> Self {
+        let bound = (source as &dyn std::any::Any)
+            .downcast_ref::<HttpTableProvider>()
+            .map_or(
+                DEFAULT_MAX_REQUEST_PARTITIONS,
+                HttpTableProvider::max_request_partitions,
+            );
+        Self::with_bound(filters, bound)
+    }
+
+    fn with_bound(filters: &[Expr], bound: usize) -> Self {
+        let headers = HttpTableProvider::request_filter_values(filters, "request_headers")
+            .len()
+            .max(1);
+        let (keys, over_bound, canonical) = lookup_entry_keys_bounded(filters, bound / headers);
+        // Only an entirely canonical request may reuse the entry as its claim.
+        let claim_entry = keys
+            .as_ref()
+            .filter(|keys| keys.len() == 1)
+            .and_then(|keys| keys.first())
+            .cloned();
+        Self {
+            keys: keys.map(|keys| keys.into_iter().collect()),
+            over_bound,
+            claim_filters: filters.to_vec(),
+            claim_entry,
+            canonical,
+            requires_tag: filters.iter().flat_map(Expr::column_refs).any(|column| {
+                REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                    || column.name == "request_headers"
+            }),
+        }
+    }
+
+    fn claim_key(&self, filters: &[Expr], namespace: &str) -> String {
+        if self.canonical
+            && filters == self.claim_filters
+            && self
+                .claim_filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .all(|column| REQUEST_KEY_COLUMNS.contains(&column.name.as_str()))
+            && let Some(entry) = &self.claim_entry
+        {
+            return format!("{entry}|__ns={namespace}");
+        }
+        compute_cache_key_from_filters_and_namespace(filters, namespace)
+    }
+
+    // Nonempty batches have already passed this restriction, so one matching
+    // entry proves that no request in a single-entry lookup is missing.
+    fn single_tagged_entry(&self, batches: &[RecordBatch]) -> bool {
+        self.keys.as_ref().is_some_and(|keys| keys.len() == 1)
+            && batches.iter().all(|batch| {
+                batch
+                    .schema()
+                    .column_with_name(CACHE_REQUEST_COLUMN)
+                    .is_some()
+            })
+    }
+
+    pub(super) fn is_active(&self, schema: &arrow::datatypes::Schema) -> bool {
+        (self.keys.is_some() || self.requires_tag)
+            && schema.column_with_name(CACHE_REQUEST_COLUMN).is_some()
+    }
+
+    /// Narrow the storage scan while retaining the post-scan restriction.
+    pub(super) fn scan_filter(&self, schema: &arrow::datatypes::Schema) -> Option<Expr> {
+        if !self.is_active(schema) {
+            return None;
+        }
+        let keys = self.keys.as_ref().filter(|keys| !keys.is_empty())?;
+        let mut keys: Vec<_> = keys.iter().collect();
+        keys.sort_unstable();
+        Some(if keys.len() == 1 {
+            col(CACHE_REQUEST_COLUMN).eq(lit(keys[0].as_str()))
+        } else {
+            col(CACHE_REQUEST_COLUMN).in_list(
+                keys.into_iter().map(|key| lit(key.as_str())).collect(),
+                false,
+            )
+        })
+    }
+
+    fn apply(&self, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+        if !self.is_active(&batch.schema()) {
+            return Ok(batch);
+        }
+        let Some(column) = batch.column_by_name(CACHE_REQUEST_COLUMN) else {
+            return Ok(batch);
+        };
+        let keys = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("{CACHE_REQUEST_COLUMN} must be Utf8"))
+            })?;
+        let mask = BooleanArray::from_iter(keys.iter().map(|key| {
+            Some(
+                !self.over_bound
+                    && key.is_some_and(|key| {
+                        self.keys.as_ref().is_none_or(|keys| keys.contains(key))
+                    }),
+            )
+        }));
+        if mask.true_count() == batch.num_rows() {
+            return Ok(batch);
+        }
+        Ok(filter_record_batch(&batch, &mask)?)
+    }
+
+    fn restrict_stream(
+        self: &Arc<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let restriction = Arc::clone(self);
+        let schema = stream.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.map(move |batch| restriction.apply(batch?)),
+        ))
+    }
+}
+
+/// The predicates [`encode_request_key`] encoded, or `None` for a value it
+/// did not write.
+#[must_use]
+pub fn decode_request_key(encoded: &str) -> Option<Vec<Expr>> {
+    let key: BTreeMap<String, Option<String>> = serde_json::from_str(encoded).ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    key.into_iter()
+        .map(|(name, value)| {
+            let name = REQUEST_KEY_COLUMNS
+                .into_iter()
+                .find(|known| *known == name)?;
+            Some(match value {
+                Some(value) => col(name).eq(lit(value)),
+                None => col(name).is_null(),
+            })
+        })
+        .collect()
+}
+
+/// Appends [`CACHE_REQUEST_COLUMN`] to a caching accelerator's storage schema,
+/// after any [`CACHE_NAMESPACE_COLUMN`].
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` if `schema` already defines a column whose name
+/// matches [`CACHE_REQUEST_COLUMN`] ignoring case.
+pub fn extend_schema_with_cache_request(
+    dataset_name: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<arrow::datatypes::Schema> {
+    use arrow::datatypes::Field;
+    if schema
+        .fields()
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(CACHE_REQUEST_COLUMN))
+    {
+        return Err(DataFusionError::Plan(format!(
+            "dataset `{dataset_name}` declares a column named `{CACHE_REQUEST_COLUMN}` (case-insensitive match), which is reserved by the caching accelerator. Rename the source column to avoid this name.",
+        )));
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(
+        Field::new(CACHE_REQUEST_COLUMN, arrow::datatypes::DataType::Utf8, true).with_metadata(
+            HashMap::from([
+                (
+                    arrow_tools::metadata_keys::OPTIONAL_TRAILING_COLUMN_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+        ),
+    );
+    Ok(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Returns a copy of `batch` with [`CACHE_NAMESPACE_COLUMN`] appended,
@@ -651,6 +1084,578 @@ fn is_empty_request_body_predicate(filter: &Expr) -> bool {
         )
 }
 
+/// A discrete `(request_path, request_query, request_body)` combination named
+/// by a query. `None` on a field means that field was not constrained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestedCacheKey {
+    path: Option<String>,
+    query: Option<String>,
+    body: Option<String>,
+}
+
+fn canonical_request_conjuncts(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .flat_map(flatten_and_conjuncts)
+        .filter_map(|expr| writer::canonical_request_filters(&[expr]))
+        .flatten()
+        .collect()
+}
+
+impl RequestedCacheKey {
+    fn entry_key_with_predicates(&self, filters: &[Expr]) -> Option<String> {
+        let mut request: Vec<_> = self.to_filter_expr().into_iter().collect();
+        // Enumeration extracts connector values. Retain canonical conjuncts
+        // too, including explicit NULLs and literal-on-the-left equalities.
+        request.extend(canonical_request_conjuncts(filters));
+        request_entry_key(&request)
+    }
+
+    fn matches(&self, cached: &Self) -> bool {
+        dim_matches(self.path.as_deref(), cached.path.as_deref())
+            && dim_matches(self.query.as_deref(), cached.query.as_deref())
+            && dim_matches(self.body.as_deref(), cached.body.as_deref())
+    }
+
+    fn to_filter_expr(&self) -> Option<Expr> {
+        let mut parts = Vec::new();
+        if let Some(path) = &self.path {
+            parts.push(col("request_path").eq(lit(path.as_str())));
+        }
+        if let Some(query) = &self.query {
+            parts.push(col("request_query").eq(lit(query.as_str())));
+        }
+        if let Some(body) = &self.body {
+            parts.push(col("request_body").eq(lit(body.as_str())));
+        }
+        combine_exprs_balanced(parts, Expr::and)
+    }
+}
+
+fn dim_matches(requested: Option<&str>, cached: Option<&str>) -> bool {
+    match requested {
+        None => true,
+        Some(value) => cached == Some(value),
+    }
+}
+
+fn has_negated_request_key_in_list(expr: &Expr) -> bool {
+    match expr {
+        Expr::InList(in_list) if in_list.negated => matches!(
+            in_list.expr.as_ref(),
+            Expr::Column(column)
+                if REQUEST_KEY_COLUMNS
+                    .iter()
+                    .any(|name| *name == column.name)
+        ),
+        Expr::BinaryExpr(binary) => {
+            has_negated_request_key_in_list(binary.left.as_ref())
+                || has_negated_request_key_in_list(binary.right.as_ref())
+        }
+        Expr::Not(inner) => has_negated_request_key_in_list(inner),
+        _ => false,
+    }
+}
+
+fn owned_request_filter_values(filters: &[Expr], column: &str) -> Vec<String> {
+    HttpTableProvider::request_filter_values(filters, column)
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Discrete request-key combinations named by `filters`.
+///
+/// `None` when the filters do not name a complete-able set: no request-key
+/// predicates, a negated `IN`, or an `OR` whose subtrees together name more
+/// than one HTTP request column — the same case [`HttpTableProvider`] rejects.
+/// A paired `OR` such as `(path = '/a' AND query = 'p') OR (path = '/b' AND
+/// query = 'q')` is skipped: expanding each column independently would invent
+/// the cross product `('/a','q')` and `('/b','p')`.
+fn requested_cache_keys(filters: &[Expr]) -> Option<Vec<RequestedCacheKey>> {
+    requested_cache_keys_bounded(filters, usize::MAX)
+}
+
+fn requested_cache_keys_bounded(filters: &[Expr], bound: usize) -> Option<Vec<RequestedCacheKey>> {
+    if filters.iter().any(|filter| {
+        rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
+    }) {
+        return None;
+    }
+
+    let paths = owned_request_filter_values(filters, "request_path");
+    let queries = owned_request_filter_values(filters, "request_query");
+    let bodies = owned_request_filter_values(filters, "request_body");
+    if paths.is_empty() && queries.is_empty() && bodies.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<Option<String>> = if paths.is_empty() {
+        vec![None]
+    } else {
+        paths.into_iter().map(Some).collect()
+    };
+    let queries: Vec<Option<String>> = if queries.is_empty() {
+        vec![None]
+    } else {
+        queries.into_iter().map(Some).collect()
+    };
+    let bodies: Vec<Option<String>> = if bodies.is_empty() {
+        vec![None]
+    } else {
+        bodies.into_iter().map(Some).collect()
+    };
+
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for path in &paths {
+        for query in &queries {
+            for body in &bodies {
+                let key = RequestedCacheKey {
+                    path: path.clone(),
+                    query: query.clone(),
+                    body: body.clone(),
+                };
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                    if keys.len() >= bound {
+                        return Some(keys);
+                    }
+                }
+            }
+        }
+    }
+    Some(keys)
+}
+
+/// Whether `filters` name a request key that no row of `cached_batches` holds.
+///
+/// Decided without expanding the key combinations: the number of combinations
+/// is the product of each request-key column's distinct values, and each
+/// cached row matches at most one of them. `false` when the filters do not name
+/// a discrete request-key set, the same cases [`requested_cache_keys`] skips.
+fn names_uncached_request_key(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
+) -> bool {
+    if cached_batches.iter().any(|batch| {
+        batch
+            .schema()
+            .column_with_name(CACHE_REQUEST_COLUMN)
+            .is_some()
+    }) && restriction.keys.is_some()
+    {
+        return missing_requested_cache_keys(filters, cached_batches, restriction).is_some();
+    }
+    if filters.iter().any(|filter| {
+        rejects_http_cross_column_or(filter) || has_negated_request_key_in_list(filter)
+    }) {
+        return false;
+    }
+
+    let requested: Vec<HashSet<&str>> = REQUEST_KEY_COLUMNS
+        .iter()
+        .map(|column| {
+            HttpTableProvider::request_filter_values(filters, column)
+                .into_iter()
+                .collect()
+        })
+        .collect();
+    if requested.iter().all(HashSet::is_empty) {
+        return false;
+    }
+    // An overflowing product names more keys than any cache holds.
+    let Some(requested_count) = requested.iter().try_fold(1_usize, |count, values| {
+        count.checked_mul(values.len().max(1))
+    }) else {
+        return true;
+    };
+
+    let mut present = HashSet::new();
+    for cached in cached_request_keys(cached_batches) {
+        let dims = [
+            cached.path.as_deref(),
+            cached.query.as_deref(),
+            cached.body.as_deref(),
+        ];
+        let named = requested
+            .iter()
+            .zip(dims)
+            .all(|(values, value)| values.is_empty() || value.is_some_and(|v| values.contains(v)));
+        if named {
+            let projected: Vec<Option<String>> = requested
+                .iter()
+                .zip(dims)
+                .map(|(values, value)| {
+                    if values.is_empty() {
+                        None
+                    } else {
+                        value.map(ToOwned::to_owned)
+                    }
+                })
+                .collect();
+            present.insert(projected);
+        }
+    }
+    requested_count > present.len()
+}
+
+fn cached_request_key(batch: &RecordBatch, row_idx: usize) -> RequestedCacheKey {
+    RequestedCacheKey {
+        path: utf8_cell(batch, "request_path", row_idx),
+        query: utf8_cell(batch, "request_query", row_idx),
+        body: utf8_cell(batch, "request_body", row_idx),
+    }
+}
+
+fn utf8_cell(batch: &RecordBatch, column: &str, row_idx: usize) -> Option<String> {
+    let (idx, _) = batch.schema().column_with_name(column)?;
+    match ScalarValue::try_from_array(batch.column(idx), row_idx).ok()? {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::LargeUtf8(Some(value))
+        | ScalarValue::Utf8View(Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn cached_request_keys(batches: &[RecordBatch]) -> Vec<RequestedCacheKey> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let key = cached_request_key(batch, row_idx);
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+enum CachedLookupKeys {
+    Entries(HashSet<String>),
+    Dimensions(Vec<RequestedCacheKey>),
+}
+
+impl CachedLookupKeys {
+    fn of(restriction: &RequestEntryRestriction, batches: &[RecordBatch]) -> Self {
+        if batches.iter().any(|batch| {
+            batch
+                .schema()
+                .column_with_name(CACHE_REQUEST_COLUMN)
+                .is_some()
+        }) && restriction.keys.is_some()
+        {
+            let keys = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows())
+                        .filter_map(|row| utf8_cell(batch, CACHE_REQUEST_COLUMN, row))
+                })
+                .collect();
+            Self::Entries(keys)
+        } else {
+            Self::Dimensions(cached_request_keys(batches))
+        }
+    }
+
+    fn contains(&self, requested: &RequestedCacheKey, filters: &[Expr]) -> bool {
+        match self {
+            Self::Entries(keys) => requested
+                .entry_key_with_predicates(filters)
+                .is_some_and(|key| keys.contains(&key)),
+            Self::Dimensions(keys) => keys.iter().any(|cached| requested.matches(cached)),
+        }
+    }
+}
+
+fn missing_requested_cache_keys(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    restriction: &RequestEntryRestriction,
+) -> Option<Vec<RequestedCacheKey>> {
+    let requested = requested_cache_keys(filters)?;
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
+    let missing: Vec<RequestedCacheKey> = requested
+        .into_iter()
+        .filter(|requested_key| !cached.contains(requested_key, filters))
+        .collect();
+    (!missing.is_empty()).then_some(missing)
+}
+
+fn dim_unique_values(values: &[Option<String>]) -> Vec<Option<String>> {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            unique.push(value.clone());
+        }
+    }
+    unique
+}
+
+fn dim_has_mixed_none(values: &[Option<String>]) -> bool {
+    let unique = dim_unique_values(values);
+    unique.iter().any(Option::is_none) && unique.iter().any(Option::is_some)
+}
+
+/// Equality or `IN` for one request-key column. `None` means every key left
+/// the column unconstrained.
+fn equality_or_in(column: &str, values: &[Option<String>]) -> Option<Expr> {
+    let mut present: Vec<String> = dim_unique_values(values).into_iter().flatten().collect();
+    present.sort();
+    match present.as_slice() {
+        [] => None,
+        [one] => Some(col(column).eq(lit(one.as_str()))),
+        many => Some(col(column).in_list(
+            many.iter().map(|value| lit(value.as_str())).collect(),
+            false,
+        )),
+    }
+}
+
+/// Factor `keys` into one HTTP-connector-safe predicate: shared dimensions
+/// become equalities and at most one varying dimension becomes an `IN` list.
+/// `None` when two or more dimensions vary (a cross-product or a cross-column
+/// `OR`) or when a varying dimension mixes constrained and unconstrained
+/// values.
+fn try_factor_keys(keys: &[RequestedCacheKey]) -> Option<Expr> {
+    if keys.is_empty() {
+        return None;
+    }
+    if keys.len() == 1 {
+        return keys[0].to_filter_expr();
+    }
+
+    let paths: Vec<Option<String>> = keys.iter().map(|key| key.path.clone()).collect();
+    let queries: Vec<Option<String>> = keys.iter().map(|key| key.query.clone()).collect();
+    let bodies: Vec<Option<String>> = keys.iter().map(|key| key.body.clone()).collect();
+
+    let path_varies = dim_unique_values(&paths).len() > 1;
+    let query_varies = dim_unique_values(&queries).len() > 1;
+    let body_varies = dim_unique_values(&bodies).len() > 1;
+    let varying = usize::from(path_varies) + usize::from(query_varies) + usize::from(body_varies);
+    if varying > 1
+        || (path_varies && dim_has_mixed_none(&paths))
+        || (query_varies && dim_has_mixed_none(&queries))
+        || (body_varies && dim_has_mixed_none(&bodies))
+    {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(expr) = equality_or_in("request_path", &paths) {
+        parts.push(expr);
+    }
+    if let Some(expr) = equality_or_in("request_query", &queries) {
+        parts.push(expr);
+    }
+    if let Some(expr) = equality_or_in("request_body", &bodies) {
+        parts.push(expr);
+    }
+    combine_exprs_balanced(parts, Expr::and)
+}
+
+fn connector_safe_missing_key_exprs(keys: &[RequestedCacheKey]) -> Vec<Expr> {
+    if let Some(expr) = try_factor_keys(keys) {
+        return vec![expr];
+    }
+
+    let mut by_path_body: HashMap<(Option<String>, Option<String>), Vec<RequestedCacheKey>> =
+        HashMap::new();
+    for key in keys {
+        by_path_body
+            .entry((key.path.clone(), key.body.clone()))
+            .or_default()
+            .push(key.clone());
+    }
+
+    let mut result = Vec::new();
+    let mut leftover = Vec::new();
+    let mut group_ids: Vec<(Option<String>, Option<String>)> =
+        by_path_body.keys().cloned().collect();
+    group_ids.sort();
+    for group_id in group_ids {
+        let group = by_path_body.remove(&group_id).unwrap_or_default();
+        match try_factor_keys(&group) {
+            Some(expr) => result.push(expr),
+            None => leftover.extend(group),
+        }
+    }
+    if leftover.is_empty() {
+        return result;
+    }
+
+    leftover.sort_by(|left, right| {
+        (&left.path, &left.query, &left.body).cmp(&(&right.path, &right.query, &right.body))
+    });
+    for key in leftover {
+        if let Some(expr) = key.to_filter_expr() {
+            result.push(expr);
+        }
+    }
+    result
+}
+
+fn collect_http_request_columns(expr: &Expr, columns: &mut HashSet<&'static str>) {
+    for column in expr.column_refs() {
+        if let Some(name) = REQUEST_KEY_COLUMNS
+            .iter()
+            .copied()
+            .chain(std::iter::once("request_headers"))
+            .find(|candidate| *candidate == column.name)
+        {
+            columns.insert(name);
+        }
+    }
+}
+
+/// `true` when `expr` contains an `OR` that names more than one HTTP request
+/// column — the same case [`HttpTableProvider`] rejects.
+fn rejects_http_cross_column_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+            let mut columns = HashSet::new();
+            collect_http_request_columns(binary.left.as_ref(), &mut columns);
+            collect_http_request_columns(binary.right.as_ref(), &mut columns);
+            if columns.len() > 1 {
+                return true;
+            }
+            rejects_http_cross_column_or(binary.left.as_ref())
+                || rejects_http_cross_column_or(binary.right.as_ref())
+        }
+        Expr::BinaryExpr(binary) => {
+            rejects_http_cross_column_or(binary.left.as_ref())
+                || rejects_http_cross_column_or(binary.right.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn flatten_and_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            let mut parts = flatten_and_conjuncts(binary.left.as_ref());
+            parts.extend(flatten_and_conjuncts(binary.right.as_ref()));
+            parts
+        }
+        other => vec![other.clone()],
+    }
+}
+
+fn expr_names_request_key(expr: &Expr) -> bool {
+    expr.column_refs()
+        .iter()
+        .any(|column| REQUEST_KEY_COLUMNS.iter().any(|name| *name == column.name))
+}
+
+/// Conjuncts that are not request-key predicates. `AND` trees are split so a
+/// filter such as `request_query IN (...) AND request_headers = '...'` keeps
+/// the header when the query conjunct is replaced by the missing-key fetch.
+fn non_request_key_filters(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .flat_map(flatten_and_conjuncts)
+        .filter(|expr| !expr_names_request_key(expr))
+        .collect()
+}
+
+fn per_key_equality_exprs(keys: &[RequestedCacheKey]) -> Vec<Expr> {
+    let mut keys = keys.to_vec();
+    keys.sort_by(|left, right| {
+        (&left.path, &left.query, &left.body).cmp(&(&right.path, &right.query, &right.body))
+    });
+    keys.into_iter()
+        .filter_map(|key| key.to_filter_expr())
+        .collect()
+}
+
+/// Connector-safe filter sets that fetch the request keys named by `filters`
+/// but absent from `cached_batches`. Each inner `Vec<Expr>` is one origin
+/// scan. The HTTP connector rejects an `OR` whose subtrees mention more than
+/// one request-key column, so multiple missing keys that share a path become
+/// `path = X AND query IN (...)` rather than
+/// `(path = X AND query = q) OR (path = X AND query = r)` — unless
+/// `complete_fetch` is set, in which case each missing key is its own equality
+/// scan so [`writer::prepare_source_fetch`] can mark the fetch complete and
+/// the sink-backed writer can store it. Keys that cannot be factored without
+/// extra combinations become separate scans.
+/// `None` when every named key is present, or when the filters do not name a
+/// discrete request-key set.
+fn missing_request_key_filter_groups(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
+) -> Option<Vec<Vec<Expr>>> {
+    let missing = missing_requested_cache_keys(filters, cached_batches, restriction)?;
+    let groups = request_key_filter_groups(filters, &missing, complete_fetch, restriction);
+    (!groups.is_empty()).then_some(groups)
+}
+
+/// Connector-safe filter sets that revalidate only the request keys named by
+/// `filters` that `cached_batches` holds, built the way
+/// [`missing_request_key_filter_groups`] builds the fetch of the absent ones.
+/// On a partial hit, revalidating the full `filters` would ask the origin for
+/// the missing keys a second time, under a claim key that does not coalesce
+/// with the miss path's fetch.
+fn present_request_key_filter_groups(
+    filters: &[Expr],
+    cached_batches: &[RecordBatch],
+    complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
+) -> Vec<Vec<Expr>> {
+    let Some(requested) = requested_cache_keys(filters) else {
+        return Vec::new();
+    };
+    let cached = CachedLookupKeys::of(restriction, cached_batches);
+    let present: Vec<RequestedCacheKey> = requested
+        .into_iter()
+        .filter(|requested_key| cached.contains(requested_key, filters))
+        .collect();
+    request_key_filter_groups(filters, &present, complete_fetch, restriction)
+}
+
+/// One filter set per origin scan for `keys`: the non-key conjuncts of
+/// `filters` (headers included) plus the conjuncts of one connector-safe key
+/// predicate.
+fn request_key_filter_groups(
+    filters: &[Expr],
+    keys: &[RequestedCacheKey],
+    complete_fetch: bool,
+    restriction: &RequestEntryRestriction,
+) -> Vec<Vec<Expr>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut non_key = non_request_key_filters(filters);
+    if complete_fetch && restriction.keys.is_some() {
+        // Keep canonical dimensions the connector's value enumeration omits.
+        non_key.extend(canonical_request_conjuncts(filters));
+    }
+    let key_exprs = if complete_fetch {
+        per_key_equality_exprs(keys)
+    } else {
+        connector_safe_missing_key_exprs(keys)
+    };
+    key_exprs
+        .into_iter()
+        .map(|key_expr| {
+            // Top-level conjuncts, the shape a point lookup's filters arrive in,
+            // so a generated scan and that lookup compute the same claim key and
+            // coalesce.
+            let mut group = non_key.clone();
+            for predicate in flatten_and_conjuncts(&key_expr) {
+                if !group.contains(&predicate) {
+                    group.push(predicate);
+                }
+            }
+            group
+        })
+        .collect()
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -685,9 +1690,28 @@ pub struct CacheWriteRequest {
     /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
     /// `__spice_cache_namespace` on every row before storage and added to the
     /// upsert filter set so concurrent writers in different namespaces never
-    /// overwrite each other's rows for the same `(request_path, query, body)`
-    /// key.
+    /// overwrite each other's rows for the same request entry.
     pub namespace_id: Arc<str>,
+    /// Whether the source paginates and whether this fetch followed another page.
+    /// With request grouping, paginated writes select pages matching the request
+    /// predicates and stamp every selected row with the request's entry key.
+    /// Without it, only a single-page response can use its row dimensions as scope.
+    pub pages: RequestPages,
+}
+
+/// Selects request scoping supported by the destination. Without request grouping,
+/// only responses that stayed on one page can use the row's dimensions as scope.
+fn cache_write_pages(pages: RequestPages, stores_request_groups: bool) -> Option<RequestPages> {
+    match (pages, stores_request_groups) {
+        (
+            RequestPages::Paginated {
+                followed_pages: true,
+            },
+            false,
+        ) => None,
+        (_, false) => Some(RequestPages::Single),
+        (_, true) => Some(pages),
+    }
 }
 
 /// Receiver half of the cache write channel
@@ -1269,7 +2293,13 @@ fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
 /// trigger SWR for the same SQL, both must actually fetch and write
 /// independently into their own namespaces.
 fn compute_cache_key_from_filters_and_namespace(filters: &[Expr], namespace_id: &str) -> String {
-    let mut key = compute_cache_key_from_filters(filters);
+    // A decoded GET key includes the empty body that the original lookup
+    // omits. Both must own the same claim through delete and publication.
+    let mut key = if filters.is_empty() {
+        compute_cache_key_from_filters(filters)
+    } else {
+        request_entry_key(filters).unwrap_or_else(|| compute_cache_key_from_filters(filters))
+    };
     key.push_str("|__ns=");
     key.push_str(namespace_id);
     key
@@ -1293,6 +2323,11 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
 struct StaleCacheEntry {
     filters: Vec<Expr>,
     namespace: Option<String>,
+    /// The stored [`CACHE_REQUEST_COLUMN`] value the filters were decoded
+    /// from: the entry is every row carrying it, possibly several pages. `None`
+    /// for rows stored without it, whose entry is their own path, query and
+    /// body.
+    request_key: Option<String>,
 }
 
 /// What a revalidation learned about the source.
@@ -1334,6 +2369,7 @@ enum CacheFallback {
     Loaded(Vec<RecordBatch>),
     Deferred {
         input: CachingScanInput,
+        restriction: Arc<RequestEntryRestriction>,
         partition: usize,
         context: Arc<TaskContext>,
     },
@@ -1342,25 +2378,37 @@ enum CacheFallback {
 impl CacheFallback {
     async fn read(self) -> Option<Vec<RecordBatch>> {
         let batches = match self {
-            Self::Loaded(batches) => batches,
+            Self::Loaded(batches) => return (!batches.is_empty()).then_some(batches),
             Self::Deferred {
                 input,
+                restriction,
                 partition,
                 context,
-            } => input
-                .into_plan()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
-                .ok()?
-                .execute(partition, context)
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
-                .ok()?
-                .try_collect()
-                .await
-                .inspect_err(|error| tracing::debug!(%error, "Cache fallback collection failed"))
-                .ok()?,
+            } => (
+                restriction,
+                input
+                    .into_plan()
+                    .await
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback planning failed"))
+                    .ok()?
+                    .execute(partition, context)
+                    .inspect_err(|error| tracing::debug!(%error, "Cache fallback execution failed"))
+                    .ok()?
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .inspect_err(
+                        |error| tracing::debug!(%error, "Cache fallback collection failed"),
+                    )
+                    .ok()?,
+            ),
         };
+        let (restriction, batches) = batches;
         let batches: Vec<RecordBatch> = batches
+            .into_iter()
+            .map(|batch| restriction.apply(batch))
+            .collect::<DataFusionResult<Vec<_>>>()
+            .inspect_err(|error| tracing::debug!(%error, "Cache fallback restriction failed"))
+            .ok()?
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
             .collect();
@@ -1380,9 +2428,29 @@ fn charged_response_stream(
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
+/// Where a fetch's response may be stored: the memory pool its batches are
+/// charged to, and whether the table can group the pages of a paginated
+/// response. The default stores nothing.
+#[derive(Clone, Copy, Default)]
+struct PopulationTarget<'a> {
+    memory_pool: Option<&'a Arc<dyn MemoryPool>>,
+    stores_paginated_responses: bool,
+}
+
+impl<'a> PopulationTarget<'a> {
+    fn of(writer: &'a CacheWriteSender) -> Self {
+        Self {
+            memory_pool: writer.memory_pool(),
+            stores_paginated_responses: writer.stores_paginated_responses(),
+        }
+    }
+}
+
 struct CacheFetch {
     batches: Vec<RecordBatch>,
-    complete: bool,
+    /// The pages of a complete fetch, or `None` when the fetch may have
+    /// stopped short of the whole response (or its memory was not charged).
+    complete: Option<RequestPages>,
     charge: Option<Arc<RetainedBufferCharge>>,
 }
 
@@ -1422,6 +2490,7 @@ impl NativeCacheWrite {
         let batches = self.request.batches.clone();
         let filters = self.request.filters.clone();
         let namespace_id = Arc::clone(&self.request.namespace_id);
+        let pages = self.request.pages;
 
         // Admission follows registry acquisition. Initialization can therefore
         // flush every write that observed its old list, while a job waiting for
@@ -1495,6 +2564,7 @@ impl NativeCacheWrite {
                 cache_key: claim.key().to_string(),
                 replaces_existing: true,
                 namespace_id: Arc::clone(&namespace_id),
+                pages,
             };
             let result = if child.writer.requires_complete_fetch() {
                 child.writer.send_claimed_and_wait(request, claim).await
@@ -1595,6 +2665,7 @@ impl CacheRefreshHelper {
             let StaleCacheEntry {
                 filters: row_filters,
                 namespace,
+                request_key: _,
             } = entry;
 
             async move {
@@ -1631,7 +2702,7 @@ impl CacheRefreshHelper {
                     &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
-                    cache_write_tx.memory_pool(),
+                    PopulationTarget::of(&cache_write_tx),
                 )
                 .await?;
 
@@ -1666,15 +2737,16 @@ impl CacheRefreshHelper {
                     return Ok(0);
                 }
                 if cache_write_tx.requires_complete_fetch() {
-                    if !complete {
+                    let Some(pages) = complete else {
                         return Ok(0);
-                    }
+                    };
                     let request = CacheWriteRequest {
                         batches,
                         filters: row_filters,
                         cache_key: claim.key().to_string(),
                         namespace_id: namespace_id.into(),
                         replaces_existing: true,
+                        pages,
                     };
                     cache_write_tx.send_claimed_and_wait(request, claim).await?;
                     return Ok(refreshed_rows);
@@ -1772,7 +2844,7 @@ impl CacheRefreshHelper {
             filters,
             None,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await?;
 
@@ -1798,7 +2870,7 @@ impl CacheRefreshHelper {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
             return Ok(RevalidationOutcome::Empty);
         }
-        if batch_write_tx.requires_complete_fetch() && !complete {
+        if batch_write_tx.requires_complete_fetch() && complete.is_none() {
             return Ok(RevalidationOutcome::NotPopulated);
         }
 
@@ -1812,6 +2884,8 @@ impl CacheRefreshHelper {
             cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
             replaces_existing: true,
+            // Native admission requires proof that every page was fetched.
+            pages: complete.unwrap_or(RequestPages::Single),
         };
 
         batch_write_tx.send_claimed(request, claim).await?;
@@ -1874,9 +2948,27 @@ impl CacheRefreshHelper {
 
         for batch in batches {
             let namespaces = batch.column_by_name(CACHE_NAMESPACE_COLUMN);
+            let request_keys = batch.column_by_name(CACHE_REQUEST_COLUMN);
 
             for row_idx in 0..batch.num_rows() {
-                let filters = Self::extract_filters_from_row(batch, row_idx)?;
+                // A response's rows share the request they were fetched for,
+                // which may span pages stored under their own path and query;
+                // replay that request once rather than each page's.
+                let stored_key = match request_keys {
+                    Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
+                        ScalarValue::Utf8(Some(value))
+                        | ScalarValue::LargeUtf8(Some(value))
+                        | ScalarValue::Utf8View(Some(value)) => {
+                            decode_request_key(&value).map(|filters| (value, filters))
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let (request_key, filters) = match stored_key {
+                    Some((key, filters)) => (Some(key), filters),
+                    None => (None, Self::extract_filters_from_row(batch, row_idx)?),
+                };
                 let namespace = match namespaces {
                     Some(array) => match ScalarValue::try_from_array(array, row_idx)? {
                         ScalarValue::Utf8(Some(value))
@@ -1897,7 +2989,11 @@ impl CacheRefreshHelper {
                     None => compute_cache_key_from_filters(&filters),
                 };
                 if seen_filter_keys.insert(cache_key) {
-                    entries.push(StaleCacheEntry { filters, namespace });
+                    entries.push(StaleCacheEntry {
+                        filters,
+                        namespace,
+                        request_key,
+                    });
                 }
             }
         }
@@ -2041,7 +3137,7 @@ impl CacheRefreshHelper {
     /// `DELETE` against the accelerator and appending, instead of reading the
     /// whole table back, filtering it in memory and overwriting it.
     ///
-    /// `DuckDB` and Cayenne — and `SQLite`, Turso and the in-memory accelerator —
+    /// `DuckDB` and Cayenne — and `SQLite` and the in-memory accelerator —
     /// implement `TableProvider::delete_from`, so the engine removes the
     /// superseded rows itself and the cost of replacing one cache entry is
     /// proportional to that entry rather than to everything cached.
@@ -2316,7 +3412,7 @@ impl CacheRefreshHelper {
         dataset_name: &str,
         filters: &[Expr],
         batches: &[RecordBatch],
-        complete: bool,
+        complete: Option<RequestPages>,
         input_charge: Option<Arc<RetainedBufferCharge>>,
         namespace_id: &str,
     ) {
@@ -2334,7 +3430,7 @@ impl CacheRefreshHelper {
         );
 
         for (idx, child) in children.iter().enumerate() {
-            if (child.writer.requires_complete_fetch() && !complete)
+            if (child.writer.requires_complete_fetch() && complete.is_none())
                 || (!child.writer.requires_complete_fetch()
                     && batches.iter().all(|batch| batch.num_rows() == 0))
             {
@@ -2364,6 +3460,7 @@ impl CacheRefreshHelper {
                 namespace_id: namespace_id.into(),
                 // The parent's cache miss does not establish that the child is empty.
                 replaces_existing: true,
+                pages: complete.unwrap_or(RequestPages::Single),
             };
             if let Err(e) = child.writer.send_claimed(request, claim).await {
                 tracing::warn!(
@@ -2492,6 +3589,16 @@ impl CacheRefreshHelper {
                 {
                     filters.push(namespace_filter_expr(namespace_id));
                 }
+                // The group is the rows stored for one request, which other
+                // entries' predicates may also select.
+                if let Some(key) = &entry.request_key
+                    && batches[0]
+                        .schema()
+                        .column_with_name(CACHE_REQUEST_COLUMN)
+                        .is_some()
+                {
+                    filters.push(col(CACHE_REQUEST_COLUMN).eq(lit(key.as_str())));
+                }
                 let predicate = combine_exprs_balanced(filters, Expr::and).ok_or_else(|| {
                     DataFusionError::Plan("A cached group requires a replacement predicate".into())
                 })?;
@@ -2507,6 +3614,15 @@ impl CacheRefreshHelper {
                 cache_key: claim.key().to_string(),
                 namespace_id: namespace_id.into(),
                 replaces_existing: true,
+                // A group stored under a request key may span pages; one
+                // stored without it is one path, query and body.
+                pages: if entry.request_key.is_some() {
+                    RequestPages::Paginated {
+                        followed_pages: true,
+                    }
+                } else {
+                    RequestPages::Single
+                },
             };
             child.writer.send_claimed_and_wait(request, claim).await?;
         }
@@ -2520,8 +3636,10 @@ impl CacheRefreshHelper {
         request: &[Expr],
         namespace_id: &str,
         context: Arc<TaskContext>,
+        restriction: &Arc<RequestEntryRestriction>,
     ) -> DataFusionResult<bool> {
         let mut filters = request.to_vec();
+        filters.extend(request_identity_filters(request, &accelerator.schema()));
         if accelerator
             .schema()
             .column_with_name(CACHE_NAMESPACE_COLUMN)
@@ -2529,10 +3647,12 @@ impl CacheRefreshHelper {
         {
             filters.push(namespace_filter_expr(namespace_id));
         }
-        let plan = TableScanParams::new(session_state, None, &filters, Some(1))
+        // A candidate from another entry must not consume a scan limit before
+        // the entry restriction can see the remaining rows.
+        let plan = TableScanParams::new(session_state, None, &filters, None)
             .scan_and_optimize(accelerator.as_ref(), &filters)
             .await?;
-        let mut stream = plan.execute(0, context)?;
+        let mut stream = restriction.restrict_stream(plan.execute(0, context)?);
         while let Some(batch) = stream.try_next().await? {
             if batch.num_rows() > 0 {
                 return Ok(false);
@@ -2557,7 +3677,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             task_context,
-            None,
+            PopulationTarget::default(),
         )
         .await
         .map(|fetch| fetch.batches)
@@ -2570,8 +3690,12 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
         task_context: Arc<TaskContext>,
-        memory_pool: Option<&Arc<dyn MemoryPool>>,
+        target: PopulationTarget<'_>,
     ) -> DataFusionResult<CacheFetch> {
+        let PopulationTarget {
+            memory_pool,
+            stores_paginated_responses,
+        } = target;
         tracing::debug!(
             "Fetching from source for dataset {dataset_name} with {} filters, limit={limit:?}",
             filters.len()
@@ -2614,9 +3738,17 @@ impl CacheRefreshHelper {
                     })
                     .ok()
             });
-        let complete = completion.as_ref().is_some_and(
-            data_components::http::provider::HttpFetchCompletion::is_complete_single_request,
-        ) && (memory_pool.is_none() || charge.is_some());
+        // A table that cannot group a response's pages (one created before
+        // `__spice_cache_request`) keeps caching what it always has: a response
+        // that read one page, stored under that page's path, query and body.
+        let complete = completion
+            .as_ref()
+            .and_then(|completion| {
+                completion
+                    .complete_request()
+                    .and_then(|pages| cache_write_pages(pages, stores_paginated_responses))
+            })
+            .filter(|_| memory_pool.is_none() || charge.is_some());
 
         tracing::debug!(
             "Federated source returned {} batches for dataset={}",
@@ -2629,6 +3761,57 @@ impl CacheRefreshHelper {
             complete,
             charge,
         })
+    }
+
+    /// Once `earlier`'s write has landed and released `key`, refreshes the
+    /// stored entry for `filters` from the origin as the key's new leader, in
+    /// the background. Used by a lookup that fetched for itself because it may
+    /// not replay `earlier`'s finished result: it cannot store that answer, and
+    /// without this the cache would keep `earlier`'s older one. If another
+    /// lookup leads the key by then, its fetch is at least as new, and it
+    /// stores that instead.
+    #[expect(clippy::too_many_arguments)]
+    fn refresh_after_release(
+        earlier: InFlightFetch,
+        in_flight_revalidations: &InFlightRevalidations,
+        key: String,
+        federated: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
+        dataset_name: &str,
+        filters: &[Expr],
+        namespace: CacheNamespace,
+        batch_write_tx: &CacheWriteSender,
+        io_runtime: &Handle,
+    ) {
+        let in_flight = Arc::clone(in_flight_revalidations);
+        let federated = Arc::clone(federated);
+        // Owned for the background task; taken only on this path.
+        let session_state = session_state.clone();
+        let dataset = dataset_name.to_string();
+        let filters = filters.to_vec();
+        let writer = batch_write_tx.clone();
+        let deadline = tokio::time::Instant::now() + FOLLOWER_WAIT_TIMEOUT;
+        if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
+            earlier.released(&in_flight, &key, deadline).await;
+            match CacheKeyClaim::acquire(&in_flight, key, None) {
+                ClaimOutcome::Leader(claim) => Self::refresh_entry(
+                    federated,
+                    &session_state,
+                    &dataset,
+                    &filters,
+                    namespace,
+                    writer,
+                    claim,
+                )
+                .await
+                .map(|_| ()),
+                ClaimOutcome::Follower(_) => Ok(()),
+            }
+        }) {
+            tracing::debug!(
+                "Declining to refresh the stored entry for dataset '{dataset_name}' after a zero-TTL lookup: {error}"
+            );
+        }
     }
 
     /// Handle a cache miss by fetching from source and returning a stream.
@@ -2651,6 +3834,9 @@ impl CacheRefreshHelper {
     ///   the write lands, so a reader whose observation of the cache is made
     ///   stale by a concurrent replacement cannot append beside it. See
     ///   [`CacheKeyClaim`].
+    /// * `lookup_started_at` - When the lookup this miss serves began. With
+    ///   `max_age`, it bounds which already-published fetch the miss may replay
+    ///   ([`InFlightFetch::replayable_for`]).
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -2669,6 +3855,8 @@ impl CacheRefreshHelper {
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
         in_flight_revalidations: InFlightRevalidations,
+        lookup_started_at: tokio::time::Instant,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
         // for why the window this covers has to include the fetch. A caller that
@@ -2677,13 +3865,40 @@ impl CacheRefreshHelper {
         // unless that fetch asked the origin for fewer rows than this caller
         // needs, in which case it fetches for itself and, holding no claim,
         // does not write.
-        let mut claim = match CacheKeyClaim::acquire(
-            &in_flight_revalidations,
-            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
-            limit,
-        ) {
+        let key = restriction.map_or_else(
+            || compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+            |restriction| restriction.claim_key(filters, namespace.storage_id()),
+        );
+        let mut claim = match CacheKeyClaim::acquire(&in_flight_revalidations, key.clone(), limit) {
             ClaimOutcome::Leader(claim) => claim,
             ClaimOutcome::Follower(in_flight) => {
+                let replayable = in_flight.replayable_for(lookup_started_at, max_age);
+                if !replayable {
+                    // An earlier lookup's fetch finished before this one began
+                    // and is older than the TTL; its write has not landed yet.
+                    // Replaying it would serve an answer older than this lookup
+                    // (#16148), so this lookup asks the origin itself, without
+                    // waiting for that write. Holding no claim, it cannot store
+                    // what it fetches, and once the earlier write lands the cache
+                    // would hold the older answer, which `caching_stale_if_error`
+                    // could serve later. So a background refresh stores a fresh
+                    // copy as soon as that write releases the key.
+                    tracing::debug!(
+                        "Cache miss for dataset {dataset_name} found a finished fetch for the same key older than its `caching_ttl` ({max_age:?}); fetching for itself and refreshing the stored entry once that fetch's write lands"
+                    );
+                    Self::refresh_after_release(
+                        in_flight.clone(),
+                        &in_flight_revalidations,
+                        key,
+                        &federated,
+                        session_state,
+                        dataset_name,
+                        filters,
+                        namespace,
+                        &batch_write_tx,
+                        io_runtime,
+                    );
+                }
                 let own_fetch = UncoalescedFetch {
                     federated,
                     session_state,
@@ -2696,13 +3911,15 @@ impl CacheRefreshHelper {
                     max_age,
                     expired_batches,
                 };
-                if in_flight.serves(limit) {
+                if replayable && in_flight.serves(limit) {
                     return Self::follow_cache_miss(in_flight.state, own_fetch).await;
                 }
-                tracing::debug!(
-                    "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
-                    fetched = in_flight.limit
-                );
+                if replayable {
+                    tracing::debug!(
+                        "Cache miss for dataset {dataset_name} found an in-flight fetch for the same key bounded at {fetched:?} rows, below this request's limit {limit:?}; fetching for itself",
+                        fetched = in_flight.limit
+                    );
+                }
                 drop(in_flight);
                 return own_fetch.run().await;
             }
@@ -2723,7 +3940,7 @@ impl CacheRefreshHelper {
             filters,
             limit,
             batch_write_tx.task_context(session_state),
-            batch_write_tx.memory_pool(),
+            PopulationTarget::of(&batch_write_tx),
         )
         .await
         {
@@ -2798,7 +4015,12 @@ impl CacheRefreshHelper {
                     }
 
                     let native = batch_write_tx.requires_complete_fetch();
-                    if (native && complete && (total_rows > 0 || !response_filtered))
+                    if native && complete.is_none() {
+                        tracing::debug!(
+                            "Not caching the response for dataset '{dataset_name}': the fetch is not proven to hold the whole response of one request (a row limit, several requests, a page cap, an uncharged response, or a paginated response the table cannot group)"
+                        );
+                    }
+                    if (native && complete.is_some() && (total_rows > 0 || !response_filtered))
                         || (!native && total_rows > 0)
                     {
                         let write_request = CacheWriteRequest {
@@ -2807,6 +4029,7 @@ impl CacheRefreshHelper {
                             cache_key: claim.key().to_string(),
                             namespace_id: namespace.storage_id().into(),
                             replaces_existing: is_expired,
+                            pages: complete.unwrap_or(RequestPages::Single),
                         };
                         if native {
                             if let Some(input_charge) = &charge {
@@ -3032,10 +4255,11 @@ impl CacheRefreshHelper {
         stale_while_revalidate: Option<Duration>,
         io_runtime: &Handle,
         schema: SchemaRef,
-        filters: &[Expr],
+        revalidation_filters: &[Vec<Expr>],
         in_flight_revalidations: &InFlightRevalidations,
         batch_write_tx: &CacheWriteSender,
-        namespace: CacheNamespace,
+        namespace: &CacheNamespace,
+        restriction: Option<&RequestEntryRestriction>,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -3064,36 +4288,44 @@ impl CacheRefreshHelper {
                     // whole refresh and released by the write that lands it. A
                     // follower here means another caller already owns the
                     // revalidation, so this path simply skips.
-                    match CacheKeyClaim::acquire(
-                        in_flight_revalidations,
-                        compute_cache_key_from_filters_and_namespace(
-                            filters,
-                            namespace.storage_id(),
-                        ),
-                        None,
-                    ) {
-                        ClaimOutcome::Leader(claim) => {
-                            tracing::debug!(
-                                "Data is stale for dataset={dataset_name}, triggering background refresh"
-                            );
-
-                            // Log current fetched_at for debugging
-                            if let Some(timestamp) =
-                                get_first_fetched_at_timestamp(&cached_batches[0])
-                            {
+                    for filters in revalidation_filters {
+                        match CacheKeyClaim::acquire(
+                            in_flight_revalidations,
+                            restriction.map_or_else(
+                                || {
+                                    compute_cache_key_from_filters_and_namespace(
+                                        filters,
+                                        namespace.storage_id(),
+                                    )
+                                },
+                                |restriction| {
+                                    restriction.claim_key(filters, namespace.storage_id())
+                                },
+                            ),
+                            None,
+                        ) {
+                            ClaimOutcome::Leader(claim) => {
                                 tracing::debug!(
-                                    "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                    "Data is stale for dataset={dataset_name}, triggering background refresh"
                                 );
-                            }
 
-                            let federated_clone = Arc::clone(federated);
-                            let session_state_clone = Arc::clone(session_state);
-                            let dataset_name_clone = dataset_name.to_string();
-                            let filters_for_refresh: Vec<Expr> = filters.to_vec();
-                            let batch_write_tx_clone = batch_write_tx.clone();
-                            let namespace_clone = namespace;
+                                // Log current fetched_at for debugging
+                                if let Some(timestamp) =
+                                    get_first_fetched_at_timestamp(&cached_batches[0])
+                                {
+                                    tracing::debug!(
+                                        "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                                    );
+                                }
 
-                            if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
+                                let federated_clone = Arc::clone(federated);
+                                let session_state_clone = Arc::clone(session_state);
+                                let dataset_name_clone = dataset_name.to_string();
+                                let filters_for_refresh: Vec<Expr> = filters.clone();
+                                let batch_write_tx_clone = batch_write_tx.clone();
+                                let namespace_clone = namespace.clone();
+
+                                if let Err(error) = batch_write_tx.spawn_owned(io_runtime, async move {
                             tracing::debug!(
                                 "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
@@ -3136,11 +4368,12 @@ impl CacheRefreshHelper {
                         }) {
                                 tracing::debug!("Declining cache revalidation for dataset '{dataset_name}': {error}");
                             }
-                        }
-                        ClaimOutcome::Follower(_) => {
-                            tracing::debug!(
-                                "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
-                            );
+                            }
+                            ClaimOutcome::Follower(_) => {
+                                tracing::debug!(
+                                    "Skipping background refresh for dataset={dataset_name} because should_revalidate=false (revalidation already in progress for this cache key)"
+                                );
+                            }
                         }
                     }
                 }
@@ -3181,6 +4414,23 @@ pub(crate) static SHARED_SESSION_STATE: LazyLock<Arc<SessionState>> = LazyLock::
 });
 
 /// Whether a filtered cache read must ask the origin before it may serve stored rows.
+/// Whether a caching scan with these settings can never serve a stored entry: a
+/// zero TTL, no stale-while-revalidate window and no stale-if-error fallback.
+/// Such a lookup answers from the origin and stores nothing; storing would only
+/// queue writes nothing reads, and a stored answer could be replayed in place of
+/// the origin's current one (#16148).
+pub(super) fn passes_through(
+    filters: &[Expr],
+    max_age: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    stale_if_error: StaleIfError,
+) -> bool {
+    !filters.is_empty()
+        && effective_max_age(max_age).is_zero()
+        && stale_while_revalidate.unwrap_or_default().is_zero()
+        && !stale_if_error.serves_stale_on_error()
+}
+
 pub(super) fn uses_source_first(
     filters: &[Expr],
     max_age: Option<Duration>,
@@ -3266,6 +4516,7 @@ pub struct CachingAccelerationScanExec {
     dataset_name: String,
     io_runtime: Handle,
     filters: Vec<Expr>,
+    restriction: Arc<RequestEntryRestriction>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
@@ -3291,6 +4542,7 @@ impl CachingAccelerationScanExec {
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
         io_runtime: Handle,
+        restriction: Arc<RequestEntryRestriction>,
         filters: Vec<Expr>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -3340,6 +4592,7 @@ impl CachingAccelerationScanExec {
             dataset_name,
             io_runtime,
             filters,
+            restriction,
             projection,
             limit,
             accelerator_write_mutex,
@@ -3426,6 +4679,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&self.accelerator),
             self.dataset_name.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&self.restriction),
             self.filters.clone(),
             self.projection.clone(),
             self.limit,
@@ -3441,6 +4695,9 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        // The lookup begins here, before any read: a fetch that published its
+        // result after this point answered this lookup at any TTL.
+        let lookup_started_at = tokio::time::Instant::now();
         tracing::debug!(
             "CachingAccelerationScanExec::execute called for dataset={} partition={partition}",
             self.dataset_name
@@ -3468,14 +4725,55 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         // A native read that also filters response columns fetches, claims and
         // stores the whole response of its request. The filter above this scan
         // applies the response predicates to the result.
-        let response_filtered = batch_write_tx
-            .requires_complete_fetch()
-            .then(|| writer::response_filtered_request(&self.filters))
-            .flatten();
+        let response_filtered = (batch_write_tx.requires_complete_fetch()
+            && self
+                .filters
+                .iter()
+                .flat_map(Expr::column_refs)
+                .any(|column| {
+                    !REQUEST_KEY_COLUMNS.contains(&column.name.as_str())
+                        && column.name != "request_headers"
+                }))
+        .then(|| writer::response_filtered_request(&self.filters))
+        .flatten();
         let (fill_filters, response_filtered) = match response_filtered {
             Some(request) => (request, true),
             None => (self.filters.clone(), false),
         };
+
+        // Nothing stored could ever be served: ask the origin, store nothing.
+        if passes_through(
+            &self.filters,
+            self.max_age,
+            self.stale_while_revalidate,
+            self.stale_if_error,
+        ) {
+            let schema = self.input.schema();
+            let federated = Arc::clone(&self.federated);
+            let session_state = Arc::clone(&self.session_state);
+            let dataset_name = self.dataset_name.clone();
+            let limit = self.limit;
+            let task_context = Arc::clone(&context);
+            let fetch_schema = Arc::clone(&schema);
+            let stream = futures::stream::once(async move {
+                UncoalescedFetch {
+                    federated,
+                    session_state: &session_state,
+                    dataset_name: &dataset_name,
+                    filters: &fill_filters,
+                    limit,
+                    task_context,
+                    schema: fetch_schema,
+                    stale_if_error: StaleIfError::Disabled,
+                    max_age: Duration::ZERO,
+                    expired_batches: None,
+                }
+                .run()
+                .await
+            })
+            .flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
+        }
 
         // With neither a fresh nor an SWR window, a stale-if-error entry can
         // only be served after a failing fetch. Do not execute its scan until
@@ -3489,6 +4787,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let schema = self.input.schema();
             let stream_schema = Arc::clone(&schema);
             let input = self.input.clone();
+            let restriction = Arc::clone(&self.restriction);
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
@@ -3515,6 +4814,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Duration::ZERO,
                     Some(CacheFallback::Deferred {
                         input,
+                        restriction: Arc::clone(&restriction),
                         partition,
                         context,
                     }),
@@ -3523,6 +4823,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     batch_write_tx,
                     namespace,
                     in_flight_revalidations,
+                    lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             })
@@ -3535,7 +4837,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 "A cache-first read requires a planned accelerator input".to_string(),
             ));
         };
-        let accelerator_stream = input.execute(partition, Arc::clone(&context))?;
+        // Restrict each batch before collection, cache decisions, or a direct
+        // streamed hit can observe rows belonging to another entry.
+        let accelerator_stream = self
+            .restriction
+            .restrict_stream(input.execute(partition, Arc::clone(&context))?);
 
         // When no filters are provided (e.g., SELECT *), return cached data directly
         // without triggering HTTP requests to the federated source or staleness checks.
@@ -3569,6 +4875,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         );
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
+        let restriction = Arc::clone(&self.restriction);
         let cache_miss_or_stale_stream = futures::stream::once(async move {
             // Capture the originating request's cache namespace once. Every
             // subsequent cache lookup, write, and SWR refresh inherits this
@@ -3649,12 +4956,109 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             batch_write_tx.clone(),
                             namespace,
                             Arc::clone(&in_flight_revalidations),
+                            lookup_started_at,
+                            Some(&restriction),
                         )
                         .await;
                     }
                 }
 
-                // Data is fresh or stale - serve from cache (stale triggers background refresh)
+                // A connector request limit (the HTTP connector's
+                // `max_request_partitions`) covers every request key the query
+                // names. A miss plans the full filter set and is refused over
+                // the limit, but the fetch below splits the missing keys into
+                // scans that each pass it on their own. Plan the full set first,
+                // before the keys are expanded, so a partial hit is refused
+                // where a miss is. Planning sends no request.
+                if !restriction.single_tagged_entry(&cached_batches)
+                    && names_uncached_request_key(&fill_filters, &cached_batches, &restriction)
+                    && let Err(e) = federated
+                        .scan(session_state.as_ref(), None, &fill_filters, limit)
+                        .await
+                {
+                    let error_stream = RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema_clone),
+                        futures::stream::once(async move { Err(e) }),
+                    );
+                    return Box::pin(error_stream) as SendableRecordBatchStream;
+                }
+
+                // Data is fresh or stale. A hit that returned some rows is not
+                // enough when the query named several request keys: missing
+                // keys must still be fetched from the origin.
+                let missing_groups = if restriction.single_tagged_entry(&cached_batches) {
+                    None
+                } else {
+                    missing_request_key_filter_groups(
+                        &fill_filters,
+                        &cached_batches,
+                        batch_write_tx.requires_complete_fetch(),
+                        &restriction,
+                    )
+                };
+                if let Some(missing_groups) = missing_groups {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        "Partial cache hit: fetching request keys absent from the accelerator"
+                    );
+                    // Revalidate only the keys the hit served: the miss
+                    // scans below fetch (and store) the absent ones.
+                    let present_groups = present_request_key_filter_groups(
+                        &fill_filters,
+                        &cached_batches,
+                        batch_write_tx.requires_complete_fetch(),
+                        &restriction,
+                    );
+                    let hit_stream = CacheRefreshHelper::handle_cache_hit(
+                        cached_batches,
+                        &federated,
+                        &session_state,
+                        &dataset_name,
+                        max_age,
+                        stale_while_revalidate,
+                        &io_runtime,
+                        Arc::clone(&schema_clone),
+                        &present_groups,
+                        &in_flight_revalidations,
+                        &batch_write_tx,
+                        &namespace,
+                        Some(&restriction),
+                    );
+                    let mut combined: SendableRecordBatchStream =
+                        Box::pin(RecordBatchStreamAdapter::new(
+                            Arc::clone(&schema_clone),
+                            hit_stream,
+                        ));
+                    for missing_filters in &missing_groups {
+                        let miss_stream = CacheRefreshHelper::handle_cache_miss(
+                            Arc::clone(&federated),
+                            &session_state,
+                            &dataset_name,
+                            missing_filters,
+                            limit,
+                            Arc::clone(&schema_clone),
+                            false,
+                            response_filtered,
+                            StaleIfError::Disabled,
+                            max_age.unwrap_or_default(),
+                            None,
+                            &io_runtime,
+                            Arc::clone(&synchronized_children),
+                            batch_write_tx.clone(),
+                            namespace.clone(),
+                            Arc::clone(&in_flight_revalidations),
+                            lookup_started_at,
+                            Some(&restriction),
+                        )
+                        .await;
+                        combined = Box::pin(RecordBatchStreamAdapter::new(
+                            Arc::clone(&schema_clone),
+                            combined.chain(miss_stream),
+                        ));
+                    }
+                    return combined;
+                }
+
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
@@ -3664,10 +5068,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
-                    &fill_filters,
+                    std::slice::from_ref(&fill_filters),
                     &in_flight_revalidations,
                     &batch_write_tx,
-                    namespace,
+                    &namespace,
+                    Some(&restriction),
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
@@ -3685,6 +5090,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         &fill_filters,
                         namespace.storage_id(),
                         context,
+                        &restriction,
                     )
                     .await
                     {
@@ -3710,13 +5116,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     false,                  // is_expired = false, will insert (append)
                     response_filtered,
                     StaleIfError::Disabled, // no cached entry to fall back to
-                    max_age.unwrap_or_default(), // unused: no expired batches
+                    // No expired batches to measure; bounds which in-flight
+                    // fetch this miss may replay.
+                    effective_max_age(max_age),
                     None,                   // no expired batches
                     &io_runtime,
                     synchronized_children,
                     batch_write_tx,
                     namespace,
                     Arc::clone(&in_flight_revalidations),
+                    lookup_started_at,
+                    Some(&restriction),
                 )
                 .await
             }
@@ -3732,6 +5142,165 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 mod cache_namespace_column_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn caching_entry_keys_round_trip_and_preserve_omitted_dimensions() {
+        for filters in [
+            vec![col("request_path").eq(lit("/items"))],
+            vec![col("request_query").eq(lit("x=1"))],
+            vec![col("request_path").is_null(), col("request_body").is_null()],
+            vec![
+                col("request_path").eq(lit("/雪")),
+                col("request_body").eq(lit("a\0b")),
+            ],
+        ] {
+            let key = request_entry_key(&filters).expect("entry key");
+            let decoded = decode_request_key(&key).expect("decode");
+            assert_eq!(request_entry_key(&decoded), Some(key.clone()));
+            assert_eq!(
+                compute_cache_key_from_filters_and_namespace(&filters, "public"),
+                compute_cache_key_from_filters_and_namespace(&decoded, "public"),
+            );
+        }
+        let broad = vec![col("request_path").eq(lit("/items"))];
+        assert_eq!(
+            request_entry_key(&broad).as_deref(),
+            Some(r#"{"request_body":"","request_path":"/items"}"#)
+        );
+        assert_ne!(
+            request_entry_key(&broad),
+            request_entry_key(&[broad[0].clone(), col("request_query").eq(lit(""))])
+        );
+        assert_eq!(
+            lookup_entry_keys(&[
+                col("request_path").is_null(),
+                col("request_query").in_list(vec![lit("x"), lit("y")], false)
+            ]),
+            Some(vec![
+                r#"{"request_body":"","request_path":null,"request_query":"x"}"#.into(),
+                r#"{"request_body":"","request_path":null,"request_query":"y"}"#.into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn caching_entry_lookup_selects_only_its_tagged_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let broad = vec![col("request_path").eq(lit("/pages"))];
+        let narrow = vec![broad[0].clone(), col("request_query").eq(lit("cursor=2"))];
+        let broad_key = request_entry_key(&broad).expect("broad key");
+        let narrow_key = request_entry_key(&narrow).expect("narrow key");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("content", DataType::Utf8, false),
+            Field::new(CACHE_REQUEST_COLUMN, DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["A", "B", "C", "B", "untagged"])),
+                Arc::new(StringArray::from(vec![
+                    Some(broad_key.as_str()),
+                    Some(broad_key.as_str()),
+                    Some(broad_key.as_str()),
+                    Some(narrow_key.as_str()),
+                    None,
+                ])),
+            ],
+        )
+        .expect("stored entries");
+        for (filters, expected) in [(&broad, vec!["A", "B", "C"]), (&narrow, vec!["B"])] {
+            let batches = [RequestEntryRestriction::new(filters)
+                .apply(batch.clone())
+                .expect("restricted rows")];
+            let actual: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("content")
+                        .iter()
+                        .map(|value| value.expect("content value").to_string())
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        let filters = vec![
+            broad[0].clone(),
+            col("request_query").in_list(vec![lit("cursor=2"), lit("cursor=3")], false),
+        ];
+        assert_eq!(
+            missing_requested_cache_keys(
+                &filters,
+                std::slice::from_ref(&batch),
+                &RequestEntryRestriction::new(&filters),
+            ),
+            Some(vec![RequestedCacheKey {
+                path: Some("/pages".into()),
+                query: Some("cursor=3".into()),
+                body: None,
+            }])
+        );
+        let legacy = batch.project(&[0]).expect("legacy projection");
+        assert_eq!(
+            RequestEntryRestriction::new(&broad)
+                .apply(legacy.clone())
+                .expect("legacy rows"),
+            legacy,
+        );
+        assert_eq!(
+            RequestEntryRestriction::new(&[])
+                .apply(batch.clone())
+                .expect("all rows"),
+            batch,
+        );
+    }
+
+    #[test]
+    fn entry_restriction_bounds_combinations_before_encoding() {
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/a"), lit("/b")], false),
+            col("request_query").in_list(vec![lit("p"), lit("q")], false),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            CACHE_REQUEST_COLUMN,
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some(r#"{"request_body":"","request_path":"/a","request_query":"p"}"#),
+                Some(r#"{"request_body":"","request_path":"/b","request_query":"q"}"#),
+                None,
+            ]))],
+        )
+        .expect("tagged cache rows");
+        let at_bound = RequestEntryRestriction::with_bound(&filters, 4);
+        assert_eq!(
+            at_bound.apply(batch.clone()).expect("at bound").num_rows(),
+            2
+        );
+        let over_bound = RequestEntryRestriction::with_bound(&filters, 3);
+        assert_eq!(
+            over_bound
+                .apply(batch.clone())
+                .expect("over bound")
+                .num_rows(),
+            0
+        );
+        let mut with_headers = filters;
+        with_headers
+            .push(col("request_headers").in_list(vec![lit("{}"), lit(r#"{"x":"1"}"#)], false));
+        assert_eq!(
+            RequestEntryRestriction::with_bound(&with_headers, 7)
+                .apply(batch)
+                .expect("header combinations exceed bound")
+                .num_rows(),
+            0
+        );
+    }
 
     #[test]
     fn reserved_column_name_is_case_insensitive() {
@@ -4015,6 +5584,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    pages: RequestPages::Single,
                 },
                 claim,
                 Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -4176,100 +5746,140 @@ mod pool_tests {
         assert_eq!(leader_pool.reserved(), 0);
     }
 
-    #[tokio::test]
-    async fn refused_follower_releases_shared_buffers_before_real_http_fallback() {
+    /// The body the origin answers a follower's own fetch with.
+    const FALLBACK_PAYLOAD: &str = "fresh雪\0";
+
+    /// What the follower's own fetch holds in its pool at most: the HTTP response body,
+    /// charged as it is read, and its decoded text, charged before it is made while the
+    /// body is still held. `FALLBACK_PAYLOAD` is valid UTF-8, so the text is as long as
+    /// the body.
+    const FALLBACK_PEAK_BYTES: usize = 2 * FALLBACK_PAYLOAD.len();
+
+    /// A follower whose pool cannot hold its share of the leader's response, falling
+    /// back to its own fetch from a real HTTP origin. The origin answers only once the
+    /// follower has released the leader's shared batches and their charge.
+    struct RefusedFollower {
+        result: datafusion::error::Result<Vec<RecordBatch>>,
+        request: String,
+        response_written: std::io::Result<()>,
+        origin: String,
+        caller_pool: Arc<dyn MemoryPool>,
+        leader_pool: Arc<dyn MemoryPool>,
+    }
+
+    async fn refused_follower(body: Option<&str>, caller_limit: usize) -> RefusedFollower {
         use data_components::http::provider::HttpTableProvider;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for body in [None, Some("")] {
-            let batch = row("leader");
-            let leader_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
-            let caller_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(0));
-            let charge =
-                RetainedBufferCharge::for_batches(&leader_pool, std::slice::from_ref(&batch))
-                    .expect("leader charge");
-            let weak = Arc::downgrade(&charge);
-            let (sender, receiver) =
-                watch::channel(FetchState::Ready(Arc::new(vec![batch]), Some(charge)));
-            drop(sender);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("listener");
-            let url = format!("http://{}/", listener.local_addr().expect("address"));
-            let pool = Arc::clone(&leader_pool);
-            let server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.expect("HTTP request");
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0; 1024];
-                    let size = socket.read(&mut buffer).await.expect("read request");
-                    assert!(size > 0);
-                    request.extend_from_slice(&buffer[..size]);
-                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                        break;
-                    }
-                    assert!(request.len() < 8192);
-                }
-                assert!(
-                    weak.upgrade().is_none(),
-                    "fallback must release shared watch and charge"
-                );
-                assert_eq!(pool.reserved(), 0);
-                let payload = "fresh雪\0";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                    payload.len()
-                );
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("response");
-                String::from_utf8(request).expect("request headers")
-            });
-            #[expect(
-                clippy::default_trait_access,
-                reason = "this crate has no direct reqwest dependency"
-            )]
-            let source: Arc<dyn TableProvider> = Arc::new(
-                HttpTableProvider::new(
-                    url.parse().expect("URL"),
-                    Default::default(),
-                    "text".into(),
-                    true,
-                )
-                .with_allowed_paths(["/items"])
-                .expect("allow test endpoint")
-                .enable_body_filters(1024),
-            );
-            let mut filters = vec![col("request_path").eq(lit("/items"))];
-            if let Some(body) = body {
-                filters.push(col("request_body").eq(lit(body)));
-            }
-            let state = context(&caller_pool).state();
-            let batches: Vec<RecordBatch> = tokio::time::timeout(Duration::from_secs(10), async {
-                CacheRefreshHelper::follow_cache_miss(
-                    receiver,
-                    UncoalescedFetch {
-                        federated: Arc::clone(&source),
-                        session_state: &state,
-                        task_context: state.task_ctx(),
-                        dataset_name: "pool_test",
-                        filters: &filters,
-                        limit: None,
-                        schema: source.schema(),
-                        stale_if_error: StaleIfError::Disabled,
-                        max_age: Duration::ZERO,
-                        expired_batches: None,
-                    },
-                )
-                .await
-                .try_collect()
-                .await
-            })
+        let batch = row("leader");
+        let shared = batch.get_array_memory_size();
+        assert!(
+            shared > caller_limit,
+            "the follower's share of the leader's response ({shared} bytes) must not fit its \
+             {caller_limit}-byte pool, or it would be served the shared batches"
+        );
+        let leader_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let caller_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(caller_limit));
+        let charge = RetainedBufferCharge::for_batches(&leader_pool, std::slice::from_ref(&batch))
+            .expect("leader charge");
+        let weak = Arc::downgrade(&charge);
+        let (sender, receiver) =
+            watch::channel(FetchState::Ready(Arc::new(vec![batch]), Some(charge)));
+        drop(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bounded HTTP fetch")
-            .expect("fallback response");
-            let wire = server.await.expect("HTTP server");
-            assert!(wire.starts_with(if body.is_some() {
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let url = format!("http://{address}/");
+        let pool = Arc::clone(&leader_pool);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("HTTP request");
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let size = socket.read(&mut buffer).await.expect("read request");
+                assert!(size > 0);
+                request.extend_from_slice(&buffer[..size]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(request.len() < 8192);
+            }
+            assert!(
+                weak.upgrade().is_none(),
+                "fallback must release shared watch and charge"
+            );
+            assert_eq!(pool.reserved(), 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FALLBACK_PAYLOAD}",
+                FALLBACK_PAYLOAD.len()
+            );
+            // A refused fetch may close the connection before the body is written.
+            let written = socket.write_all(response.as_bytes()).await;
+            (
+                String::from_utf8(request).expect("request headers"),
+                written,
+            )
+        });
+        #[expect(
+            clippy::default_trait_access,
+            reason = "this crate has no direct reqwest dependency"
+        )]
+        let source: Arc<dyn TableProvider> = Arc::new(
+            HttpTableProvider::new(
+                url.parse().expect("URL"),
+                Default::default(),
+                "text".into(),
+                true,
+            )
+            .with_allowed_paths(["/items"])
+            .expect("allow test endpoint")
+            .enable_body_filters(1024),
+        );
+        let mut filters = vec![col("request_path").eq(lit("/items"))];
+        if let Some(body) = body {
+            filters.push(col("request_body").eq(lit(body)));
+        }
+        let state = context(&caller_pool).state();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            CacheRefreshHelper::follow_cache_miss(
+                receiver,
+                UncoalescedFetch {
+                    federated: Arc::clone(&source),
+                    session_state: &state,
+                    task_context: state.task_ctx(),
+                    dataset_name: "pool_test",
+                    filters: &filters,
+                    limit: None,
+                    schema: source.schema(),
+                    stale_if_error: StaleIfError::Disabled,
+                    max_age: Duration::ZERO,
+                    expired_batches: None,
+                },
+            )
+            .await
+            .try_collect()
+            .await
+        })
+        .await
+        .expect("bounded HTTP fetch");
+        let (request, response_written) = server.await.expect("HTTP server");
+        RefusedFollower {
+            result,
+            request,
+            response_written,
+            origin: format!("http://{address}"),
+            caller_pool,
+            leader_pool,
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_follower_releases_shared_buffers_before_real_http_fallback() {
+        for body in [None, Some("")] {
+            let fallback = refused_follower(body, FALLBACK_PEAK_BYTES).await;
+            fallback.response_written.expect("response");
+            let batches = fallback.result.expect("fallback response");
+            assert!(fallback.request.starts_with(if body.is_some() {
                 "POST /items "
             } else {
                 "GET /items "
@@ -4291,10 +5901,49 @@ mod pool_tests {
                 strings("request_body").iter().collect::<Vec<_>>(),
                 vec![Some(body.unwrap_or(""))]
             );
-            assert_eq!(strings("content").value(0), "fresh雪\0");
-            assert_eq!(caller_pool.reserved(), 0);
-            assert_eq!(leader_pool.reserved(), 0);
+            assert_eq!(strings("content").value(0), FALLBACK_PAYLOAD);
+            assert_eq!(fallback.caller_pool.reserved(), 0);
+            assert_eq!(fallback.leader_pool.reserved(), 0);
         }
+    }
+
+    /// The follower's own fetch is held to its pool like any other read: a pool that
+    /// cannot hold the response refuses it, after the shared batches were released.
+    #[tokio::test]
+    async fn refused_follower_s_own_fetch_is_held_to_its_pool() {
+        let fallback = refused_follower(None, 0).await;
+        let Err(DataFusionError::ResourcesExhausted(message)) = fallback.result else {
+            panic!(
+                "a zero pool must refuse the fallback response: {:?}",
+                fallback.result
+            );
+        };
+        assert_eq!(
+            message,
+            format!(
+                "Failed to read the response from {} for this dataset: holding the decoded data \
+                 would pass the query memory limit: Failed to allocate additional {}.0 B for HTTP \
+                 response for this dataset with 0.0 B already allocated for this reservation - \
+                 0.0 B remain available for the total memory pool: greedy(used: 0.0 B, \
+                 pool_size: 0.0 B). Raise `runtime.query.memory_limit`, or request less data per \
+                 call with filters or pagination. See: https://spiceai.org/docs/reference/memory",
+                fallback.origin,
+                FALLBACK_PAYLOAD.len()
+            )
+        );
+        assert!(fallback.request.starts_with("GET /items "));
+        assert_eq!(fallback.caller_pool.reserved(), 0);
+        assert_eq!(fallback.leader_pool.reserved(), 0);
+
+        // One byte short of the body and its text together is refused too, so the
+        // fallback needs exactly that room.
+        let fallback = refused_follower(None, FALLBACK_PEAK_BYTES - 1).await;
+        assert!(
+            matches!(fallback.result, Err(DataFusionError::ResourcesExhausted(_))),
+            "{:?}",
+            fallback.result
+        );
+        assert_eq!(fallback.caller_pool.reserved(), 0);
     }
 
     #[tokio::test]
@@ -4383,11 +6032,14 @@ mod pool_tests {
                 &filters,
                 None,
                 state.task_ctx(),
-                Some(&pool),
+                PopulationTarget {
+                    memory_pool: Some(&pool),
+                    stores_paginated_responses: true,
+                },
             )
             .await
             .expect("initial HTTP fetch");
-            assert!(initial.complete);
+            assert_eq!(initial.complete, Some(RequestPages::Single));
             let expected_scope =
                 CacheRefreshHelper::extract_filters_from_row(&initial.batches[0], 0)
                     .expect("initial stored scope");
@@ -4481,6 +6133,66 @@ mod pool_tests {
     }
 
     #[tokio::test]
+    async fn caching_legacy_sink_admits_only_single_page_responses() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let (child, sink, _) = target(&pool, vec![row("old")]);
+        let filters = vec![col("request_path").eq(lit("/items"))];
+        for wait in [false, true] {
+            for followed_pages in [true, false] {
+                let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+                let ClaimOutcome::Leader(claim) =
+                    CacheKeyClaim::acquire(&child.in_flight, key.clone(), None)
+                else {
+                    panic!("exclusive claim");
+                };
+                let request = CacheWriteRequest {
+                    batches: vec![row(if followed_pages {
+                        "declined"
+                    } else if wait {
+                        "newer"
+                    } else {
+                        "new"
+                    })],
+                    filters: filters.clone(),
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                    pages: RequestPages::Paginated { followed_pages },
+                };
+                if wait {
+                    child
+                        .writer
+                        .send_claimed_and_wait(request, claim)
+                        .await
+                        .expect("declined publication");
+                } else {
+                    child
+                        .writer
+                        .send_claimed(request, claim)
+                        .await
+                        .expect("declined admission");
+                }
+                sink.flush().await.expect("flush");
+                assert_eq!(
+                    contents(&child.accelerator).await,
+                    vec![if followed_pages && !wait {
+                        "old"
+                    } else if wait && !followed_pages {
+                        "newer"
+                    } else {
+                        "new"
+                    }]
+                );
+                assert!(child.in_flight.lock().is_empty());
+                assert_eq!(pool.reserved(), 0);
+            }
+        }
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close sink");
+    }
+
+    #[tokio::test]
     async fn child_admission_and_pending_publication_retain_both_pools() {
         let parent_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
         let child_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
@@ -4497,7 +6209,7 @@ mod pool_tests {
             "pool_test",
             &[col("request_path").eq(lit("/items"))],
             &[batch],
-            true,
+            Some(RequestPages::Single),
             Some(charge),
             "public",
         )
@@ -4569,6 +6281,7 @@ mod pool_tests {
                 cache_key: key,
                 namespace_id: "public".into(),
                 replaces_existing: true,
+                pages: RequestPages::Single,
             },
             claim,
             Arc::new(tokio::sync::RwLock::new(vec![child.clone()])),
@@ -4593,6 +6306,66 @@ mod pool_tests {
             .close(Duration::from_secs(5))
             .await
             .expect("close child");
+    }
+
+    /// Regression test for #15356: an empty response replaces the entry of the
+    /// request it answers. A GET lookup names no body, and the HTTP connector
+    /// stores its rows with `request_body = ''`, so the replacement keeps the
+    /// POST cached for the same path and query, and the other query's GET.
+    #[tokio::test]
+    async fn an_empty_response_replaces_only_the_entry_of_its_request() {
+        let entry = |query: &str, body: &str, content: &str| {
+            RecordBatch::try_new(
+                row("").schema(),
+                vec![
+                    Arc::new(StringArray::from(vec!["/items"])),
+                    Arc::new(StringArray::from(vec![query])),
+                    Arc::new(StringArray::from(vec![body])),
+                    Arc::new(StringArray::from(vec![content])),
+                ],
+            )
+            .expect("stored entry")
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let (target, sink, _) = target(
+            &pool,
+            vec![
+                entry("a", "", "get a"),
+                entry("a", r#"{"b":1}"#, "post a"),
+                entry("b", "", "get b"),
+            ],
+        );
+        let filters = vec![
+            col("request_path").eq(lit("/items")),
+            col("request_query").eq(lit("a")),
+        ];
+        let key = compute_cache_key_from_filters_and_namespace(&filters, "public");
+        let ClaimOutcome::Leader(claim) =
+            CacheKeyClaim::acquire(&target.in_flight, key.clone(), None)
+        else {
+            panic!("exclusive claim");
+        };
+        target
+            .writer
+            .send_claimed_and_wait(
+                CacheWriteRequest {
+                    batches: vec![RecordBatch::new_empty(row("").schema())],
+                    filters,
+                    cache_key: key,
+                    namespace_id: "public".into(),
+                    replaces_existing: true,
+                    pages: RequestPages::Single,
+                },
+                claim,
+            )
+            .await
+            .expect("the empty response replaces the entry");
+        let mut stored = contents(&target.accelerator).await;
+        stored.sort_unstable();
+        assert_eq!(stored, vec!["get b", "post a"]);
+        sink.close(Duration::from_secs(5))
+            .await
+            .expect("close storage");
     }
 }
 
@@ -4740,6 +6513,375 @@ mod tests {
         );
     }
 
+    #[test]
+    fn requested_cache_keys_expand_in_list_and_same_column_or() {
+        let path = col("request_path").eq(lit("/v1/items"));
+        let in_list = col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false);
+        let keys = requested_cache_keys(&[path.clone(), in_list]).expect("enumerable");
+        assert_eq!(
+            keys,
+            vec![
+                RequestedCacheKey {
+                    path: Some("/v1/items".into()),
+                    query: Some("cat=p".into()),
+                    body: None,
+                },
+                RequestedCacheKey {
+                    path: Some("/v1/items".into()),
+                    query: Some("cat=q".into()),
+                    body: None,
+                },
+            ]
+        );
+
+        let or_query = col("request_query")
+            .eq(lit("cat=p"))
+            .or(col("request_query").eq(lit("cat=r")));
+        let keys = requested_cache_keys(&[path, or_query]).expect("enumerable");
+        assert_eq!(
+            keys.iter().map(|k| k.query.clone()).collect::<Vec<_>>(),
+            vec![Some("cat=p".into()), Some("cat=r".into())]
+        );
+    }
+
+    #[test]
+    fn requested_cache_keys_none_without_request_predicates() {
+        assert!(requested_cache_keys(&[col("content").eq(lit("x"))]).is_none());
+        assert!(requested_cache_keys(&[]).is_none());
+    }
+
+    #[test]
+    fn requested_cache_keys_skip_paired_cross_column_or() {
+        // (path = '/a' AND query = 'p') OR (path = '/b' AND query = 'q')
+        // names the same two columns on both sides, so a left-vs-right set
+        // comparison would allow a cartesian expansion that invents
+        // ('/a','q') and ('/b','p'). The HTTP connector rejects this OR.
+        let paired = col("request_path")
+            .eq(lit("/a"))
+            .and(col("request_query").eq(lit("p")))
+            .or(col("request_path")
+                .eq(lit("/b"))
+                .and(col("request_query").eq(lit("q"))));
+        assert!(
+            requested_cache_keys(&[paired]).is_none(),
+            "paired cross-column OR must not be expanded into a cartesian product"
+        );
+    }
+
+    fn missing_filters_are_connector_safe(groups: &[Vec<Expr>]) {
+        for group in groups {
+            for expr in group {
+                assert!(
+                    !rejects_http_cross_column_or(expr),
+                    "generated filter would be rejected by the HTTP connector: {expr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_request_key_filters_only_names_absent_keys() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
+        missing_filters_are_connector_safe(&groups);
+        assert_eq!(
+            groups.len(),
+            1,
+            "one missing key should be one scan: {groups:?}"
+        );
+        let rendered: Vec<String> = groups[0].iter().map(ToString::to_string).collect();
+        assert!(
+            rendered.iter().any(|expr| expr.contains("cat=q")),
+            "missing filters should name cat=q: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "missing filters should not re-fetch cat=p: {rendered:?}"
+        );
+
+        let both = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, true),
+                Field::new("request_query", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items", "/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p", "cat=q"])),
+            ],
+        )
+        .expect("both keys");
+        assert!(
+            missing_request_key_filter_groups(
+                &filters,
+                &[both],
+                false,
+                &RequestEntryRestriction::new(&filters),
+            )
+            .is_none(),
+            "complete hit should not produce a fetch"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_factor_two_missing_queries_into_in_list() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
+        ];
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
+        missing_filters_are_connector_safe(&groups);
+        assert_eq!(
+            groups.len(),
+            1,
+            "shared path should stay one connector-safe scan: {groups:?}"
+        );
+        let rendered: Vec<String> = groups[0].iter().map(ToString::to_string).collect();
+        let joined = rendered.join(" AND ");
+        assert!(joined.contains("cat=q"), "{rendered:?}");
+        assert!(joined.contains("cat=r"), "{rendered:?}");
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "should not re-fetch cat=p: {rendered:?}"
+        );
+        assert!(
+            joined.contains("IN") || joined.contains("in"),
+            "two missing queries on one path should be an IN list: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_split_keys_that_cannot_factor() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("three combinations are absent");
+        missing_filters_are_connector_safe(&groups);
+        assert!(
+            groups.len() >= 2,
+            "unfactorable combinations should split into connector-safe scans: {groups:?}"
+        );
+        let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
+        assert!(
+            rendered.iter().any(|expr| expr.contains("/v1/other")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|expr| expr.contains("cat=q")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_preserve_header_conjunct() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let header = r#"{"x-sandbox-id":"sandbox-1"}"#;
+        let filters = vec![
+            col("request_query")
+                .in_list(vec![lit("cat=p"), lit("cat=q")], false)
+                .and(col("request_headers").eq(lit(header))),
+        ];
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            false,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
+        missing_filters_are_connector_safe(&groups);
+        let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
+        assert!(
+            rendered.iter().any(|expr| expr.contains("cat=q")),
+            "missing filters should name cat=q: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "missing filters should not re-fetch cat=p: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|expr| expr.contains("x-sandbox-id")),
+            "header conjunct must be preserved on the missing-key fetch: {rendered:?}"
+        );
+    }
+
+    /// A generated missing-key scan carries its key predicate as top-level
+    /// conjuncts, so it computes the claim key a point lookup for the same key
+    /// computes, and the two coalesce instead of fetching twice.
+    #[test]
+    fn missing_key_scan_shares_a_point_lookups_claim_key() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let point_lookup = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").eq(lit("cat=q")),
+        ];
+        let missing = missing_request_key_filter_groups(
+            &filters,
+            std::slice::from_ref(&cached),
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q is absent");
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(
+            compute_cache_key_from_filters_and_namespace(&missing[0], "ns"),
+            compute_cache_key_from_filters_and_namespace(&point_lookup, "ns"),
+            "{missing:?}"
+        );
+
+        let present = present_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        );
+        let point_lookup_p = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").eq(lit("cat=p")),
+        ];
+        assert_eq!(present.len(), 1, "{present:?}");
+        assert_eq!(
+            compute_cache_key_from_filters_and_namespace(&present[0], "ns"),
+            compute_cache_key_from_filters_and_namespace(&point_lookup_p, "ns"),
+            "{present:?}"
+        );
+    }
+
+    #[test]
+    fn missing_request_key_filters_split_equality_scans_for_complete_fetch() {
+        let schema = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+        ]);
+        let cached = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/v1/items"])),
+                Arc::new(StringArray::from(vec!["cat=p"])),
+            ],
+        )
+        .expect("cached row");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
+        ];
+        let groups = missing_request_key_filter_groups(
+            &filters,
+            &[cached],
+            true,
+            &RequestEntryRestriction::new(&filters),
+        )
+        .expect("q and r are absent");
+        missing_filters_are_connector_safe(&groups);
+        assert_eq!(
+            groups.len(),
+            2,
+            "complete fetch needs one equality scan per missing key: {groups:?}"
+        );
+        let rendered: Vec<String> = groups.iter().flatten().map(ToString::to_string).collect();
+        let joined = rendered.join(" | ");
+        assert!(joined.contains("cat=q"), "{rendered:?}");
+        assert!(joined.contains("cat=r"), "{rendered:?}");
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("cat=p")),
+            "should not re-fetch cat=p: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|expr| !expr.contains(" IN ") && !expr.contains(" in ")),
+            "complete-fetch scans must be equalities, not an IN list: {rendered:?}"
+        );
+        for group in &groups {
+            assert!(
+                writer::canonical_request_filters(group).is_some(),
+                "each complete-fetch group must be a canonical single request: {group:?}"
+            );
+        }
+    }
+
     /// Test-only stand-in for the shared `Arc<SessionState>`.
     fn test_session_state() -> Arc<SessionState> {
         Arc::new(SessionStateBuilder::new().with_default_features().build())
@@ -4753,6 +6895,9 @@ mod tests {
         data: Vec<RecordBatch>,
         /// Record of all filter sets passed to `scan()` calls
         recorded_filters: Arc<RwLock<Vec<Vec<String>>>>,
+        /// Answer only the rows whose request key the scan's filters name, as
+        /// an HTTP origin does.
+        honor_request_keys: bool,
     }
 
     impl FilterTrackingTableProvider {
@@ -4761,6 +6906,14 @@ mod tests {
                 schema,
                 data,
                 recorded_filters: Arc::new(RwLock::new(Vec::new())),
+                honor_request_keys: false,
+            }
+        }
+
+        fn honoring_request_keys(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                honor_request_keys: true,
+                ..Self::new(schema, data)
             }
         }
 
@@ -4786,21 +6939,46 @@ mod tests {
             filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            // Record the filters for later verification
+            if filters.iter().any(rejects_http_cross_column_or) {
+                return Err(DataFusionError::Execution(
+                    "OR across different HTTP filter columns is not supported".to_string(),
+                ));
+            }
+
+            // Record the filters when the scan executes, as an origin would
+            // see the request.
             let filter_strings: Vec<String> = filters
                 .iter()
                 .map(|f| f.human_display().to_string())
                 .collect();
-            self.recorded_filters.write().push(filter_strings);
+            let recorded_filters = Arc::clone(&self.recorded_filters);
+
+            let data = match (self.honor_request_keys, requested_cache_keys(filters)) {
+                (true, Some(requested)) => self
+                    .data
+                    .iter()
+                    .map(|batch| {
+                        let keep: arrow::array::BooleanArray = (0..batch.num_rows())
+                            .map(|row| {
+                                let key = cached_request_key(batch, row);
+                                Some(requested.iter().any(|wanted| wanted.matches(&key)))
+                            })
+                            .collect();
+                        arrow::compute::filter_record_batch(batch, &keep)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => self.data.clone(),
+            };
 
             // Return the configured data
-            Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(
-                    std::slice::from_ref(&self.data),
+            Ok(RecordOnExecute::wrap(
+                Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                    &[data],
                     Arc::clone(&self.schema),
                     None,
-                )?,
-            ))))
+                )?))),
+                move || recorded_filters.write().push(filter_strings.clone()),
+            ))
         }
     }
 
@@ -4982,6 +7160,358 @@ mod tests {
             current.as_ref().and_then(ComponentStatus::error_message),
             Some("refresh failed"),
             "cache writes succeeding again says nothing about a refresh that is still failing"
+        );
+    }
+
+    // Partial hits against the HTTP connector's `max_request_partitions`.
+
+    /// Local HTTP origin that answers every request with a one-line text body
+    /// and records each request line, so a test can count origin requests.
+    async fn request_limit_counting_origin() -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_by_server = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&seen_by_server);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0; 4096];
+                        let Ok(size) = socket.read(&mut buffer).await else {
+                            return;
+                        };
+                        if size == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..size]);
+                        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request);
+                    seen.lock()
+                        .push(text.lines().next().unwrap_or_default().to_string());
+                    let payload = "ok";
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn request_limit_http_source(
+        url: &str,
+        paths: &[String],
+        cap: usize,
+    ) -> Arc<dyn TableProvider> {
+        use data_components::http::provider::HttpTableProvider;
+        #[expect(
+            clippy::default_trait_access,
+            reason = "this crate has no direct reqwest dependency"
+        )]
+        let provider = HttpTableProvider::new(
+            url.parse().expect("URL"),
+            Default::default(),
+            "text".into(),
+            true,
+        )
+        .with_allowed_paths(paths.iter().map(String::as_str))
+        .expect("allow probe paths")
+        .enable_query_filters(1024)
+        .enable_body_filters(1024)
+        .with_max_request_partitions(cap)
+        .with_max_retries(0);
+        Arc::new(provider)
+    }
+
+    /// Runs a caching-mode scan whose accelerator holds `cached`.
+    async fn request_limit_run_caching_scan(
+        source: &Arc<dyn TableProvider>,
+        cached: Vec<RecordBatch>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Vec<RecordBatch>> {
+        let schema = source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            cached.clone(),
+        ));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[cached], Arc::clone(&schema), None).expect("cache input"),
+        )));
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let exec = CachingAccelerationScanExec::new(
+            input,
+            Some(Duration::from_mins(10)),
+            None,
+            StaleIfError::Disabled,
+            Arc::clone(source),
+            accelerator,
+            "items".to_string(),
+            Handle::current(),
+            Arc::new(RequestEntryRestriction::for_lookup(
+                &filters,
+                source.as_ref(),
+            )),
+            filters,
+            None,
+            None,
+            Arc::new(Mutex::new(())),
+            in_flight,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx,
+        );
+        exec.execute(0, Arc::new(TaskContext::default()))?
+            .try_collect()
+            .await
+    }
+
+    /// Fetches one key straight from the origin, to seed the cache.
+    async fn request_limit_warm(
+        source: &Arc<dyn TableProvider>,
+        filters: &[Expr],
+    ) -> Vec<RecordBatch> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = source
+            .scan(&state, None, filters, None)
+            .await
+            .expect("warm scan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("warm collect")
+    }
+
+    fn request_limit_lits(values: &[String]) -> Vec<Expr> {
+        values.iter().map(|value| lit(value.as_str())).collect()
+    }
+
+    fn request_limit_strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn request_limit_summary(result: &datafusion::error::Result<Vec<RecordBatch>>) -> String {
+        match result {
+            Ok(batches) => format!(
+                "Ok(rows={})",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            ),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    const REQUEST_LIMIT_OVER_3: &str = "Failed to plan the query on this dataset (https): its request filters combine into 6 requests, more than the 3 allowed. Use fewer request_path, request_query, request_body or request_headers values, or set `max_request_partitions: 6` on the dataset. See: https://spiceai.org/docs/components/data-connectors/https";
+
+    /// A partial hit is refused where a miss is: the query names 6 request
+    /// keys with `max_request_partitions = 3`, so it must not reach the origin
+    /// even though one key is cached. Regression test for the partial-hit fetch
+    /// (#16153), which split the missing keys into scans of 1, 2 and 2 that each
+    /// passed the limit.
+    #[tokio::test]
+    async fn partial_hit_over_request_limit_is_refused_like_a_miss() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let queries = request_limit_strings(&["x=1", "y=1"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, 3);
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+        ];
+
+        let cold = request_limit_run_caching_scan(&source, Vec::new(), filters.clone()).await;
+        assert_eq!(
+            seen.lock().drain(..).count(),
+            0,
+            "a refused miss sends nothing"
+        );
+        let cold_error = cold.expect_err("a miss over the limit is refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&cold_error),
+            "the refusal keeps its type: {cold_error:?}"
+        );
+        let cold_error = cold_error.to_string();
+        assert!(cold_error.contains(REQUEST_LIMIT_OVER_3), "{cold_error}");
+
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/a")),
+                col("request_query").eq(lit("x=1")),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen.lock().drain(..).collect::<Vec<_>>(),
+            vec!["GET /a?x=1 HTTP/1.1"]
+        );
+
+        let partial = request_limit_run_caching_scan(&source, warm, filters).await;
+        let summary = request_limit_summary(&partial);
+        let requests = seen.lock().drain(..).collect::<Vec<_>>();
+        eprintln!("partial hit over the limit: {summary} origin_requests={requests:?}");
+        assert_eq!(
+            requests,
+            Vec::<String>::new(),
+            "no origin request: {summary}"
+        );
+        let partial_error = partial.expect_err("a partial hit over the limit is refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&partial_error),
+            "the refusal keeps its type: {partial_error:?}"
+        );
+        let partial_error = partial_error.to_string();
+        assert_eq!(
+            partial_error, cold_error,
+            "the partial hit fails as the miss does"
+        );
+    }
+
+    /// Within the limit, a partial hit still fetches exactly the missing keys
+    /// and returns every named key (#16153).
+    #[tokio::test]
+    async fn partial_hit_within_request_limit_fetches_missing_keys() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, 3);
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").eq(lit("x=1")),
+        ];
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/a")),
+                col("request_query").eq(lit("x=1")),
+            ],
+        )
+        .await;
+        seen.lock().clear();
+
+        let batches = request_limit_run_caching_scan(&source, warm, filters)
+            .await
+            .expect("a partial hit within the limit succeeds");
+        let mut requests = seen.lock().drain(..).collect::<Vec<_>>();
+        requests.sort();
+        assert_eq!(
+            requests,
+            vec!["GET /b?x=1 HTTP/1.1", "GET /c?x=1 HTTP/1.1"],
+            "only the missing keys are fetched"
+        );
+        let mut paths_returned: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("request_path")
+                    .expect("request_path")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 request_path");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths_returned.sort();
+        assert_eq!(paths_returned, vec!["/a", "/b", "/c"]);
+    }
+
+    /// A full hit sends no request, so the limit does not apply: six cached
+    /// keys are served with `max_request_partitions = 3`.
+    #[tokio::test]
+    async fn full_hit_over_request_limit_is_served_from_cache() {
+        let paths = request_limit_strings(&["/a", "/b", "/c"]);
+        let queries = request_limit_strings(&["x=1", "y=1"]);
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, 3);
+        let mut cached = Vec::new();
+        for path in &paths {
+            for query in &queries {
+                cached.extend(
+                    request_limit_warm(
+                        &source,
+                        &[
+                            col("request_path").eq(lit(path.as_str())),
+                            col("request_query").eq(lit(query.as_str())),
+                        ],
+                    )
+                    .await,
+                );
+            }
+        }
+        seen.lock().clear();
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+        ];
+
+        let batches = request_limit_run_caching_scan(&source, cached, filters)
+            .await
+            .expect("a full hit is served");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 6);
+        assert_eq!(seen.lock().drain(..).count(), 0, "a full hit sends nothing");
+    }
+
+    /// A partial hit over the limit is refused before its request keys are
+    /// expanded: the error counts the query's 1,000,000 keys, not the
+    /// keys of one split scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_hit_over_request_limit_is_refused_before_expansion() {
+        let paths: Vec<String> = (0..50).map(|i| format!("/p{i}")).collect();
+        let queries: Vec<String> = (0..200).map(|i| format!("q={i}")).collect();
+        let bodies: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
+        let (url, seen) = request_limit_counting_origin().await;
+        let source = request_limit_http_source(&url, &paths, 3);
+        let filters = vec![
+            col("request_path").in_list(request_limit_lits(&paths), false),
+            col("request_query").in_list(request_limit_lits(&queries), false),
+            col("request_body").in_list(request_limit_lits(&bodies), false),
+        ];
+        let warm = request_limit_warm(
+            &source,
+            &[
+                col("request_path").eq(lit("/p0")),
+                col("request_query").eq(lit("q=0")),
+                col("request_body").eq(lit("b0")),
+            ],
+        )
+        .await;
+        seen.lock().clear();
+
+        let started = std::time::Instant::now();
+        let partial = request_limit_run_caching_scan(&source, warm, filters).await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "partial hit, 1000000 keys: {elapsed:?} {}",
+            request_limit_summary(&partial)
+        );
+        assert_eq!(seen.lock().drain(..).count(), 0);
+        let error = partial.expect_err("refused");
+        assert!(
+            data_components::refusal::is_request_bound_refusal(&error),
+            "the refusal keeps its type: {error:?}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains(
+                "its request filters combine into 1,000,000 requests, more than the 3 allowed"
+            ),
+            "{error}"
         );
     }
 
@@ -5340,6 +7870,7 @@ mod tests {
         let fetch = |limit| InFlightFetch {
             limit,
             state: watch::channel(FetchState::Pending).1,
+            published_at: Arc::new(OnceLock::new()),
         };
 
         assert!(fetch(None).serves(None));
@@ -6140,10 +8671,11 @@ mod tests {
             stale_while_revalidate,
             &io_runtime,
             Arc::clone(&schema),
-            &access_filters,
+            std::slice::from_ref(&access_filters),
             &in_flight_revalidations,
             &batch_write_tx,
-            CacheNamespace::Public,
+            &CacheNamespace::Public,
+            None,
         );
         // `handle_cache_hit` clones the sender it is lent, so dropping this one
         // leaves the background refresh holding the only sender: once it has queued
@@ -6263,6 +8795,7 @@ mod tests {
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("to send write request");
@@ -6340,6 +8873,8 @@ mod tests {
             batch_write_tx.clone(),
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6382,6 +8917,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6476,6 +9013,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6525,6 +9064,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6629,6 +9170,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -6638,6 +9180,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6800,6 +9344,7 @@ mod tests {
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
+                restriction: Arc::new(RequestEntryRestriction::new(&[])),
                 input,
                 partition: 0,
                 context: Arc::new(TaskContext::default()),
@@ -6809,6 +9354,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -6983,7 +9530,8 @@ mod tests {
 
     /// A reader that coalesces onto a fetch already in flight (a follower)
     /// replays the leader's published batches and never writes — so a key can
-    /// never hold two copies of the same response.
+    /// never hold two copies of the same response. The result is published, so
+    /// it is replayed only within the dataset's `caching_ttl` (here an hour).
     #[tokio::test]
     async fn a_follower_replays_the_leaders_batches_and_does_not_write() {
         use futures::StreamExt;
@@ -7030,13 +9578,15 @@ mod tests {
             false,
             false,
             StaleIfError::Disabled,
-            Duration::ZERO,
+            Duration::from_secs(3600),
             None,
             &tokio::runtime::Handle::current(),
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -7066,6 +9616,235 @@ mod tests {
         assert!(
             accelerator.get_data().is_empty(),
             "the follower must not write a second copy of the response"
+        );
+    }
+
+    /// Under `caching_ttl: 0s` a miss that finds a fetch whose result was
+    /// published before the lookup began (its write not yet landed) does not
+    /// replay it, which would serve an answer older than the lookup (#16148).
+    /// It answers from the origin at once, without waiting for that write, and
+    /// once the write releases the key a background refresh stores the origin's
+    /// answer, so the cache does not end up holding the older one.
+    #[tokio::test]
+    async fn a_zero_ttl_miss_does_not_replay_a_published_fetch() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // Stand in for the leader: it holds the claim for this key and has
+        // already published its fetched batches, exactly as the miss path does
+        // before it enqueues the write.
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let mut leader = leader_claim(&in_flight, &key);
+        let published = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/leader"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["leader-body"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("leader batch");
+        leader.publish_ready(Arc::new(vec![published]));
+        let session_state = test_session_state();
+        let io = tokio::runtime::Handle::current();
+
+        // Answered while the leader's write is still pending: no waiting on it.
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            CacheRefreshHelper::handle_cache_miss(
+                Arc::clone(&http_source) as Arc<dyn TableProvider>,
+                &session_state,
+                "test_dataset",
+                &filters,
+                None,
+                Arc::clone(&schema),
+                false,
+                false,
+                StaleIfError::Disabled,
+                Duration::ZERO,
+                None,
+                &io,
+                Arc::new(vec![].into()),
+                batch_write_tx,
+                CacheNamespace::Public,
+                Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
+            ),
+        )
+        .await
+        .expect("the miss answers without waiting for the earlier write");
+
+        // The miss is served the origin's row, not the leader's published one.
+        let mut served = Vec::new();
+        while let Some(batch) = stream.next().await {
+            served.push(batch.expect("stream"));
+        }
+        let rows: usize = served.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the miss serves the origin's one row");
+        let content = served[0]
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("content column");
+        assert_eq!(
+            content.value(0),
+            "body",
+            "a zero-TTL miss must ask the origin, not replay a finished fetch"
+        );
+
+        drop(stream);
+        // The earlier write lands, releasing the key to the background refresh;
+        // the writer exits once that refresh, the last sender, has stored.
+        drop(leader);
+        await_writer_exit(handle).await;
+
+        let stored: Vec<String> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column")
+                    .iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            ["body"],
+            "the miss stores the origin's answer as the leader, not the earlier one"
+        );
+    }
+
+    /// Like [`a_zero_ttl_miss_does_not_replay_a_published_fetch`], but the
+    /// leader's write is queued on the batched writer rather than dropped. A
+    /// queued write gives up the claim's sender when it is enqueued and removes
+    /// the key only after the next flush lands, so the background refresh must
+    /// wait for that removal: one that resumes when the sender goes finds the
+    /// key still held, skips the refresh, and leaves the cache holding the
+    /// leader's older answer.
+    #[tokio::test]
+    async fn a_zero_ttl_miss_refreshes_after_a_queued_leader_write_lands() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        let mut leader = leader_claim(&in_flight, &key);
+        // The leader's row matches the key's filter, so a later replace of the
+        // key removes it.
+        let published = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/leader"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["test"])) as ArrayRef,
+                Arc::new(UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("leader batch");
+        leader.publish_ready(Arc::new(vec![published.clone()]));
+        // The leader queues its write, as the miss path does after publishing;
+        // the batched writer holds the key until its next flush lands.
+        batch_write_tx
+            .send_claimed(
+                CacheWriteRequest {
+                    batches: vec![published],
+                    filters: filters.clone(),
+                    cache_key: key.clone(),
+                    namespace_id: CacheNamespace::Public.storage_id().into(),
+                    replaces_existing: false,
+                    pages: RequestPages::Single,
+                },
+                leader,
+            )
+            .await
+            .expect("queue the leader's write");
+        assert!(
+            in_flight.lock().contains_key(&key),
+            "the queued write holds the key until it lands"
+        );
+
+        let session_state = test_session_state();
+        let io = tokio::runtime::Handle::current();
+        let stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            &session_state,
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            StaleIfError::Disabled,
+            Duration::ZERO,
+            None,
+            &io,
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
+        )
+        .await;
+        let served: Vec<RecordBatch> = stream.map(|batch| batch.expect("stream")).collect().await;
+        assert_eq!(
+            served.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "the miss serves the origin's one row"
+        );
+
+        // The writer exits once the background refresh, its last sender, is done.
+        await_writer_exit(handle).await;
+
+        let stored: Vec<String> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column")
+                    .iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            ["body"],
+            "once the leader's queued write lands, the refresh replaces its older answer"
         );
     }
 
@@ -7116,6 +9895,8 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -7201,6 +9982,8 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -7275,6 +10058,8 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
             )
         };
 
@@ -7375,6 +10160,8 @@ mod tests {
                 batch_write_tx.clone(),
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -7498,6 +10285,8 @@ mod tests {
                 batch_write_tx,
                 CacheNamespace::Public,
                 Arc::clone(&in_flight),
+                tokio::time::Instant::now(),
+                None,
             )
             .await,
         )
@@ -7738,6 +10527,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -7875,6 +10666,8 @@ mod tests {
             batch_write_tx,
             CacheNamespace::Public,
             Arc::clone(&in_flight),
+            tokio::time::Instant::now(),
+            None,
         )
         .await;
 
@@ -7972,16 +10765,16 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.session_ids
-                .write()
-                .push(state.session_id().to_string());
-            Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(
+            let session_ids = Arc::clone(&self.session_ids);
+            let session_id = state.session_id().to_string();
+            Ok(RecordOnExecute::wrap(
+                Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
                     std::slice::from_ref(&self.data),
                     Arc::clone(&self.schema),
                     None,
-                )?,
-            ))))
+                )?))),
+                move || session_ids.write().push(session_id.clone()),
+            ))
         }
     }
 
@@ -8015,9 +10808,349 @@ mod tests {
         .expect("http response row")
     }
 
+    fn http_row_with_key(
+        schema: &SchemaRef,
+        path: &str,
+        query: &str,
+        content: &str,
+        refreshed_at: i64,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec![path])),
+                Arc::new(StringArray::from(vec![query])),
+                Arc::new(StringArray::from(vec![content])),
+                Arc::new(UInt16Array::from(vec![200_u16])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(refreshed_at)])),
+            ],
+        )
+        .expect("http response row")
+    }
+
+    async fn execute_partial_hit(
+        filters: Vec<Expr>,
+        cached: RecordBatch,
+        origin: RecordBatch,
+    ) -> (Vec<RecordBatch>, Vec<Vec<String>>) {
+        let (batches, recorded) = execute_partial_hit_with_swr(filters, cached, origin, None).await;
+        let recorded = recorded.read().clone();
+        (batches, recorded)
+    }
+
+    /// Like [`execute_partial_hit`] with a stale-while-revalidate window, and
+    /// hands back the live record of origin scans so a test can wait for the
+    /// background revalidation.
+    async fn execute_partial_hit_with_swr(
+        filters: Vec<Expr>,
+        cached: RecordBatch,
+        origin: RecordBatch,
+        stale_while_revalidate: Option<Duration>,
+    ) -> (Vec<RecordBatch>, Arc<RwLock<Vec<Vec<String>>>>) {
+        let schema = cached.schema();
+        let federated = Arc::new(FilterTrackingTableProvider::honoring_request_keys(
+            Arc::clone(&schema),
+            vec![origin],
+        ));
+        let recorded = Arc::clone(&federated.recorded_filters);
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![cached.clone()],
+        ));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&[vec![cached]], Arc::clone(&schema), None)
+                .expect("cache input"),
+        )));
+        let in_flight: InFlightRevalidations = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (tx, _consumer) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let exec = CachingAccelerationScanExec::new(
+            input,
+            Some(Duration::from_mins(10)),
+            stale_while_revalidate,
+            StaleIfError::Disabled,
+            federated,
+            accelerator,
+            "items".to_string(),
+            Handle::current(),
+            Arc::new(RequestEntryRestriction::new(&filters)),
+            filters,
+            None,
+            None,
+            Arc::new(Mutex::new(())),
+            in_flight,
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            tx,
+        );
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .try_collect()
+            .await
+            .expect("collect");
+        (batches, recorded)
+    }
+
+    fn contents_of(batches: &[RecordBatch]) -> Vec<String> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let content = batch
+                .column_by_name("content")
+                .expect("content")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("string content");
+            for i in 0..content.len() {
+                if !content.is_null(i) {
+                    values.push(content.value(i).to_string());
+                }
+            }
+        }
+        values.sort();
+        values
+    }
+
+    #[tokio::test]
+    async fn partial_hit_in_list_fetches_the_uncached_query_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-q".to_string()]
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "origin should be asked once for the missing key: {recorded:?}"
+        );
+        let joined = recorded[0].join(" AND ");
+        assert!(
+            joined.contains("cat=q"),
+            "origin filters should name cat=q: {recorded:?}"
+        );
+        assert!(
+            !joined.contains("cat=p"),
+            "origin should not be re-asked for cached cat=p: {recorded:?}"
+        );
+    }
+
+    /// A stale hit on `cat=p` with `cat=q` missing revalidates `cat=p` alone:
+    /// the miss path fetches `cat=q`, so a revalidation of the whole filter set
+    /// would ask the origin for `cat=q` twice, under claim keys that never
+    /// coalesce.
+    #[tokio::test]
+    async fn stale_partial_hit_revalidates_only_the_cached_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let stale_at = nanos_ago(now, Duration::from_mins(15));
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", stale_at);
+        let origin_p = http_row_with_key(&schema, "/v1/items", "cat=p", "origin-p", now);
+        let origin_q = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let origin = arrow::compute::concat_batches(&schema, &[origin_p, origin_q])
+            .expect("concat origin rows");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q")], false),
+        ];
+        let (batches, recorded) =
+            execute_partial_hit_with_swr(filters, cached, origin, Some(Duration::from_hours(1)))
+                .await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-q".to_string()],
+            "the stale cat=p entry is served and only cat=q is fetched"
+        );
+
+        // The miss scan ran inline; the revalidation runs in the background.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while recorded.read().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let recorded = recorded.read().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "one miss scan for cat=q and one revalidation of cat=p: {recorded:?}"
+        );
+        let naming_q = recorded
+            .iter()
+            .filter(|scan| scan.join(" AND ").contains("cat=q"))
+            .count();
+        let naming_p = recorded
+            .iter()
+            .filter(|scan| scan.join(" AND ").contains("cat=p"))
+            .count();
+        assert_eq!(naming_q, 1, "cat=q is fetched once: {recorded:?}");
+        assert_eq!(naming_p, 1, "cat=p is revalidated once: {recorded:?}");
+        assert!(
+            recorded.iter().all(|scan| {
+                let joined = scan.join(" AND ");
+                !(joined.contains("cat=p") && joined.contains("cat=q"))
+            }),
+            "no scan names both keys: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_hit_or_fetches_the_uncached_query_key() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin = http_row_with_key(&schema, "/v1/items", "cat=r", "origin-r", now);
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query")
+                .eq(lit("cat=p"))
+                .or(col("request_query").eq(lit("cat=r"))),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-p".to_string(), "origin-r".to_string()]
+        );
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("cat=r"), "{recorded:?}");
+        assert!(!joined.contains("cat=p"), "{recorded:?}");
+    }
+
+    #[tokio::test]
+    async fn partial_hit_path_in_list_fetches_the_uncached_path() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-items", now);
+        let origin = http_row_with_key(&schema, "/v1/other", "cat=p", "origin-other", now);
+        let filters = vec![
+            col("request_path").in_list(vec![lit("/v1/items"), lit("/v1/other")], false),
+            col("request_query").eq(lit("cat=p")),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec!["cached-items".to_string(), "origin-other".to_string()]
+        );
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("/v1/other"), "{recorded:?}");
+        assert!(!joined.contains("/v1/items"), "{recorded:?}");
+    }
+
     /// Unix nanoseconds for `ago` before `now_nanos`.
     fn nanos_ago(now_nanos: i64, ago: Duration) -> i64 {
         now_nanos - i64::try_from(ago.as_nanos()).expect("duration fits in i64 nanoseconds")
+    }
+
+    /// Runs `record` each time the plan executes. A mock origin records here,
+    /// not in `scan()`: an HTTP origin is contacted when a plan runs, while
+    /// planning alone (the request-limit check on a partial hit) sends nothing.
+    struct RecordOnExecute {
+        inner: Arc<dyn ExecutionPlan>,
+        record: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl RecordOnExecute {
+        fn wrap(
+            inner: Arc<dyn ExecutionPlan>,
+            record: impl Fn() + Send + Sync + 'static,
+        ) -> Arc<dyn ExecutionPlan> {
+            Arc::new(Self {
+                inner,
+                record: Arc::new(record),
+            })
+        }
+    }
+
+    impl fmt::Debug for RecordOnExecute {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("RecordOnExecute")
+                .field("inner", &self.inner)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DisplayAs for RecordOnExecute {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for RecordOnExecute {
+        fn name(&self) -> &'static str {
+            "RecordOnExecute"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: Arc::clone(&children[0]),
+                record: Arc::clone(&self.record),
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            (self.record)();
+            self.inner.execute(partition, context)
+        }
     }
 
     #[derive(Debug)]
@@ -8082,8 +11215,51 @@ mod tests {
 
     /// Counts accelerator executions through the actual caching scan plan.
     /// A backend-first success must not execute its child, whereas an origin
-    /// failure reads it once, and the disabled and nonzero-TTL paths retain
-    /// their normal cache-first scan.
+    /// failure reads it once; a zero TTL with no fallback never reads it, and
+    /// the nonzero-TTL and SWR paths retain their normal cache-first scan.
+    #[tokio::test]
+    async fn partial_hit_in_list_fetches_two_uncached_query_keys() {
+        let schema = http_cache_schema();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos(),
+        )
+        .expect("now fits in i64 nanoseconds");
+        let cached = http_row_with_key(&schema, "/v1/items", "cat=p", "cached-p", now);
+        let origin_q = http_row_with_key(&schema, "/v1/items", "cat=q", "origin-q", now);
+        let origin_r = http_row_with_key(&schema, "/v1/items", "cat=r", "origin-r", now);
+        let origin = arrow::compute::concat_batches(&schema, &[origin_q, origin_r])
+            .expect("concat origin rows");
+        let filters = vec![
+            col("request_path").eq(lit("/v1/items")),
+            col("request_query").in_list(vec![lit("cat=p"), lit("cat=q"), lit("cat=r")], false),
+        ];
+        let (batches, recorded) = execute_partial_hit(filters, cached, origin).await;
+        assert_eq!(
+            contents_of(&batches),
+            vec![
+                "cached-p".to_string(),
+                "origin-q".to_string(),
+                "origin-r".to_string()
+            ]
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "shared path should be one origin scan: {recorded:?}"
+        );
+        let joined = recorded[0].join(" AND ");
+        assert!(joined.contains("cat=q"), "{recorded:?}");
+        assert!(joined.contains("cat=r"), "{recorded:?}");
+        assert!(!joined.contains("cat=p"), "{recorded:?}");
+        assert!(
+            joined.contains("IN") || joined.contains("in") || joined.contains("In"),
+            "two missing keys should be fetched as an IN list: {recorded:?}"
+        );
+    }
+
     #[tokio::test]
     async fn zero_ttl_backend_first_only_scans_on_failure() {
         let schema = http_cache_schema();
@@ -8119,7 +11295,7 @@ mod tests {
                 None,
                 StaleIfError::Disabled,
                 503,
-                1,
+                0,
                 "error",
             ),
             (
@@ -8168,6 +11344,7 @@ mod tests {
                 accelerator,
                 "http_data".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters.clone(),
                 None,
                 None,
@@ -8238,6 +11415,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -8300,6 +11478,7 @@ mod tests {
                 stale_if_error: StaleIfError::Enabled,
                 max_age: Duration::ZERO,
                 expired_batches: Some(CacheFallback::Deferred {
+                    restriction: Arc::new(RequestEntryRestriction::new(&filters)),
                     input: input.into(),
                     partition: 0,
                     context: Arc::new(TaskContext::default()),
@@ -8372,6 +11551,7 @@ mod tests {
                 Arc::clone(&accelerator) as Arc<dyn TableProvider>,
                 "test_dataset".to_string(),
                 Handle::current(),
+                Arc::new(RequestEntryRestriction::new(&filters)),
                 filters,
                 None,
                 None,
@@ -8902,6 +12082,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: false,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");
@@ -8935,6 +12116,7 @@ mod write_path_tests {
                 cache_key: "same-key".to_string(),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                pages: RequestPages::Single,
             })
             .await
             .expect("send");
@@ -8961,6 +12143,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: true,
+            pages: RequestPages::Single,
         })
         .await
         .expect("send");

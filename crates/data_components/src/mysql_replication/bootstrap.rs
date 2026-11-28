@@ -38,6 +38,21 @@ use super::setup::TableLayout;
 use super::{Error, err_to_stream};
 use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter};
 
+/// Floor, in seconds, for how long the source will hold snapshot rows we have
+/// not read before aborting the snapshot connection. Applied to the snapshot
+/// session because the server default is 60s.
+///
+/// The reader hands rows to the apply loop through a two-batch channel, so the
+/// socket stops draining whenever the accelerator stops accepting this table's
+/// writes. A Cayenne table excludes writers for the whole of a move of its
+/// warm-tier data to the datalake, which takes minutes on a table of hundreds of
+/// millions of rows; past the timeout the source aborts the snapshot and the
+/// dataset fails with `bytes remaining on stream`. The binlog dump survives the
+/// same abort by resuming from its acked position; a snapshot has no position to
+/// resume from, so its floor is well above the longest such exclusion rather
+/// than sharing the dump's.
+const SNAPSHOT_NET_WRITE_TIMEOUT_SECS: u32 = 1200;
+
 pub(super) struct SnapshotInput {
     pub params: ReplicationParams,
     pub layout: TableLayout,
@@ -95,9 +110,11 @@ pub(super) fn snapshot_stream(input: SnapshotInput) -> ChangesStream {
             tokio::sync::mpsc::channel::<Result<Vec<Row>, mysql_async::Error>>(2);
         let batch_size = params.bootstrap_batch_size;
         let reader_params = params.clone();
+        let reader_dataset = dataset_name.clone();
         let reader: tokio::task::JoinHandle<Result<(), mysql_async::Error>> =
             tokio::spawn(async move {
                 let mut conn = mysql_async::Conn::new(reader_params.opts.clone()).await?;
+                raise_snapshot_net_write_timeout(&mut conn, &reader_dataset).await;
                 // Pin the session to UTC so TIMESTAMP columns render in the
                 // same zone the binlog stores them in (binlog TIMESTAMP
                 // values are UTC unix seconds) — snapshot and live batches
@@ -187,6 +204,31 @@ pub(super) fn snapshot_stream(input: SnapshotInput) -> ChangesStream {
             "mysql replication: initial snapshot complete"
         );
     })
+}
+
+/// Raise the snapshot session's `net_write_timeout` to
+/// [`SNAPSHOT_NET_WRITE_TIMEOUT_SECS`].
+///
+/// Best effort: a session whose value cannot be read, or that refuses the
+/// assignment, keeps what the source set, and the snapshot runs as it would
+/// have without the floor.
+async fn raise_snapshot_net_write_timeout(conn: &mut mysql_async::Conn, dataset_name: &str) {
+    let inherited = match super::binlog::inherited_net_write_timeout(conn).await {
+        Ok(inherited) => inherited,
+        Err(e) => {
+            tracing::debug!(dataset = %dataset_name, error = %e, "failed to read the snapshot session's net_write_timeout; leaving it as the source set it");
+            return;
+        }
+    };
+    let Some(sql) = super::binlog::net_write_timeout_floor_statement(
+        inherited,
+        SNAPSHOT_NET_WRITE_TIMEOUT_SECS,
+    ) else {
+        return;
+    };
+    if let Err(e) = conn.query_drop(sql.as_str()).await {
+        tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to raise the snapshot session's net_write_timeout");
+    }
 }
 
 fn snapshot_error(context: &str, e: &mysql_async::Error) -> crate::cdc::StreamError {

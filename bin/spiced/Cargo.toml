@@ -44,10 +44,8 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
-accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
-accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
-accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
-accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
+llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -60,8 +58,10 @@ crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
 podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+spiced-args = { path = "../../crates/spiced-args" }
 runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
@@ -73,6 +73,7 @@ opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
+redact = { path = "../../crates/redact" }
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
@@ -85,9 +86,12 @@ runtime-secrets = { path = "../../crates/runtime-secrets", default-features = fa
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true
+# Not used directly; sets the version floors declared in the workspace `Cargo.toml`.
+rustls-webpki.workspace = true
+webpki-root-certs.workspace = true
+webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
-zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
@@ -102,14 +106,11 @@ tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
-
-# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
-# Cayenne), so the startup parallelism declaration is gated the same way.
-[target.'cfg(not(windows))'.dependencies]
-# The Cayenne engine is not built on Windows, so it is a target dependency rather
-# than an optional one behind a feature.
-accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
+
+# Raising the soft open file limit at startup (`open_file_limit.rs`).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource"] }
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
@@ -136,9 +137,12 @@ tokio-stream.workspace = true
 tonic.workspace = true
 # Issues the cluster nodes' mTLS certificates for the executor export test.
 test-framework = { path = "../../crates/test-framework" }
+# `spice run` reads these arguments to find the Spicepod they load; its
+# reading is tested against this parser.
+spice = { path = "../spice" }
 
 [features]
-adbc = ["dep:connector-adbc", "runtime/adbc"]
+adbc = ["dep:connector-adbc", "dep:connector-duckdb", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 # Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
 # is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
@@ -152,14 +156,14 @@ azure-keyvault = ["runtime/azure-keyvault"]
 hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse"]
 cosmosdb = ["connector-cosmosdb", "runtime/cosmosdb"]
-cuda = ["runtime/cuda"]
+cuda = ["runtime/cuda", "llms-llamacpp?/cuda"]
+# Serves single-node GGUF models with llama.cpp; ring models and safetensors stay on mistral.rs.
+llamacpp = ["dep:llms-llamacpp"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "adbc",
-    "duckdb",
     "postgres",
-    "sqlite",
     "mysql",
     "flightsql",
     "delta_lake",
@@ -183,7 +187,6 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
     "models",
     "aws-secrets-manager",
@@ -194,22 +197,20 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]
 wasm-functions = ["runtime/wasm-functions"]
-wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
 kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
-metal = ["runtime/metal"]
+metal = ["runtime/metal", "llms-llamacpp?/metal"]
 distributed = ["runtime/distributed"]
-models = ["runtime/models"]
+models = ["runtime/models", "llamacpp"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 # Opt-in Kerberos integrated auth (GSSAPI) for MSSQL on Unix; not in `default`.
@@ -221,7 +222,6 @@ odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
-postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
 # Opt-in ScyllaDB connector; not in `default`.
@@ -234,9 +234,7 @@ client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
-sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]

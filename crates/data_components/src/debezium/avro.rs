@@ -30,7 +30,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apache_avro::{Schema as AvroSchema, from_avro_datum, types::Value as AvroValue};
+use apache_avro::error::Details;
+use apache_avro::util::{DEFAULT_MAX_ALLOCATION_BYTES, max_allocation_bytes};
+use apache_avro::{
+    Schema as AvroSchema, decode_with_max_allocation, schema::Name, types::Value as AvroValue,
+};
 use arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 use snafu::prelude::*;
@@ -54,8 +58,18 @@ pub enum Error {
     #[snafu(display("Invalid Avro schema JSON: {source}"))]
     InvalidSchema { source: Box<apache_avro::Error> },
 
+    #[snafu(display(
+        "Invalid Avro schema: record '{name}' contains itself, directly or through other types. CDC ingest does not accept recursive Avro schemas; send a schema without self-referencing records"
+    ))]
+    RecursiveSchema { name: String },
+
     #[snafu(display("Failed to decode Avro datum: {source}"))]
     DecodeDatum { source: Box<apache_avro::Error> },
+
+    #[snafu(display(
+        "Failed to decode Avro datum: a {datum_bytes}-byte datum can decode to at most {limit} bytes, and this one declares more. Check that its array, map, bytes, string and fixed lengths match the data it carries. For details, visit: https://spiceai.org/docs/features/cdc"
+    ))]
+    DecodeLimit { datum_bytes: usize, limit: usize },
 
     #[snafu(display("Failed to fetch schema id {schema_id} from registry {url}: {message}"))]
     RegistryFetch {
@@ -97,7 +111,9 @@ const EXPLICIT_SCHEMA_CACHE_MAX: usize = 32;
 /// registry that hangs mid-connect or mid-body-read cannot stall ingest even if
 /// the builder fell back to a client without configured timeouts.
 static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
+    // Schemas are read through `http_body_limit`, which decodes them while refusing
+    // decompression amplification.
+    http_body_limit::decode_manually(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
@@ -107,6 +123,21 @@ static REGISTRY_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLo
 /// Hard wall-clock bound on a full Schema Registry fetch (connect + body read),
 /// enforced independently of the HTTP client's own timeouts.
 const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bytes of decoded values a CDC Avro body may build per byte of the body, once past
+/// [`http_body_limit::RATIO_CHECK_FLOOR_BYTES`]. A one-byte nullable field decodes to
+/// under 150 bytes plus its name; items such as `null` decode from no input at all.
+const MAX_DECODED_BYTES_PER_BODY_BYTE: usize = 256;
+
+/// The decode budget for an Avro datum of `encoded_len` bytes:
+/// [`MAX_DECODED_BYTES_PER_BODY_BYTE`] times its length, at least
+/// [`http_body_limit::RATIO_CHECK_FLOOR_BYTES`] and at most apache-avro's per-datum limit.
+fn decode_budget(encoded_len: usize) -> usize {
+    encoded_len
+        .saturating_mul(MAX_DECODED_BYTES_PER_BODY_BYTE)
+        .max(http_body_limit::RATIO_CHECK_FLOOR_BYTES)
+        .min(max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES))
+}
 
 /// Options for decoding an Avro CDC body.
 #[derive(Debug, Clone, Default)]
@@ -144,12 +175,18 @@ pub async fn parse_avro_change_events(
         return MissingSchemaSnafu.fail();
     };
 
+    let limit = decode_budget(datum.len());
     let value =
-        from_avro_datum(schema.as_ref(), &mut std::io::Cursor::new(datum), None).map_err(|e| {
-            Error::DecodeDatum {
-                source: Box::new(e),
-            }
-        })?;
+        decode_with_max_allocation(schema.as_ref(), &mut std::io::Cursor::new(datum), limit)
+            .map_err(|e| match e.details() {
+                Details::MemoryAllocation { .. } => Error::DecodeLimit {
+                    datum_bytes: datum.len(),
+                    limit,
+                },
+                _ => Error::DecodeDatum {
+                    source: Box::new(e),
+                },
+            })?;
     let event = avro_value_to_change_event(&value)?;
     Ok(vec![event])
 }
@@ -175,18 +212,58 @@ fn parse_explicit_schema(schema_json: &str) -> Result<Arc<AvroSchema>> {
     if let Some(schema) = EXPLICIT_SCHEMA_CACHE.lock().get(schema_json).cloned() {
         return Ok(schema);
     }
-    let schema =
-        Arc::new(
-            AvroSchema::parse_str(schema_json).map_err(|e| Error::InvalidSchema {
-                source: Box::new(e),
-            })?,
-        );
+    let schema = Arc::new(parse_schema(schema_json)?);
     let mut cache = EXPLICIT_SCHEMA_CACHE.lock();
     if cache.len() >= EXPLICIT_SCHEMA_CACHE_MAX {
         cache.clear();
     }
     cache.insert(schema_json.to_string(), Arc::clone(&schema));
     Ok(schema)
+}
+
+/// Parse an Avro schema for CDC ingest, rejecting recursive schemas. The Avro
+/// decoder recurses once per nested record with no depth limit, so with a
+/// recursive schema the request body would set the recursion depth.
+fn parse_schema(schema_json: &str) -> Result<AvroSchema> {
+    let schema = AvroSchema::parse_str(schema_json).map_err(|e| Error::InvalidSchema {
+        source: Box::new(e),
+    })?;
+    if let Some(name) = recursive_record_name(&schema) {
+        return RecursiveSchemaSnafu {
+            name: name.fullname(None),
+        }
+        .fail();
+    }
+    Ok(schema)
+}
+
+/// Returns the name of a record that refers to itself, directly or through
+/// other types. The parser resolves a reference to a record still being
+/// defined, by name or alias, to a `Schema::Ref` with that record's full name,
+/// so every cycle closes at a `Ref` that names an enclosing record.
+fn recursive_record_name(schema: &AvroSchema) -> Option<&Name> {
+    fn visit<'a>(schema: &'a AvroSchema, enclosing: &mut Vec<&'a Name>) -> Option<&'a Name> {
+        match schema {
+            AvroSchema::Ref { name } => enclosing.contains(&name).then_some(name),
+            AvroSchema::Record(record) => {
+                enclosing.push(&record.name);
+                let found = record
+                    .fields
+                    .iter()
+                    .find_map(|field| visit(&field.schema, enclosing));
+                enclosing.pop();
+                found
+            }
+            AvroSchema::Array(array) => visit(&array.items, enclosing),
+            AvroSchema::Map(map) => visit(&map.types, enclosing),
+            AvroSchema::Union(union) => union
+                .variants()
+                .iter()
+                .find_map(|variant| visit(variant, enclosing)),
+            _ => None,
+        }
+    }
+    visit(schema, &mut Vec::new())
 }
 
 fn is_confluent_wire_format(body: &[u8]) -> bool {
@@ -223,6 +300,12 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
         if !status.is_success() {
             return Ok(Err(format!("HTTP {status}")));
         }
+        let response =
+            match http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await {
+                Ok(response) => response,
+                Err(http_body_limit::Error::Read { source }) => return Err(source),
+                Err(refused) => return Ok(Err(refused.to_string())),
+            };
         Ok::<_, reqwest::Error>(Ok(response.json::<serde_json::Value>().await?))
     };
 
@@ -262,17 +345,20 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
             message: "response missing 'schema' field".to_string(),
         })?;
 
-    let schema = Arc::new(
-        AvroSchema::parse_str(schema_str).map_err(|e| Error::InvalidSchema {
-            source: Box::new(e),
-        })?,
-    );
+    let schema = Arc::new(parse_schema(schema_str)?);
     let mut cache = SCHEMA_CACHE.lock();
     if cache.len() >= SCHEMA_CACHE_MAX {
         cache.clear();
     }
     cache.insert(key, Arc::clone(&schema));
     Ok(schema)
+}
+
+/// The schema kind of an Avro value, for errors. A value's `Debug` output
+/// would include the row data (a record prints every field), which can hold
+/// credentials, so errors name only the kind.
+fn avro_kind(value: &AvroValue) -> apache_avro::schema::SchemaKind {
+    apache_avro::schema::SchemaKind::from(value)
 }
 
 fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
@@ -283,7 +369,7 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
         }
         other => {
             return MapPayloadSnafu {
-                message: format!("expected Avro record at root, got {other:?}"),
+                message: format!("expected Avro record at root, got {:?}", avro_kind(other)),
             }
             .fail();
         }
@@ -308,14 +394,14 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
             AvroValue::String(s) => parse_op(s)?,
             other => {
                 return MapPayloadSnafu {
-                    message: format!("op must be a string, got {other:?}"),
+                    message: format!("op must be a string, got {:?}", avro_kind(other)),
                 }
                 .fail();
             }
         },
         other => {
             return MapPayloadSnafu {
-                message: format!("missing or invalid op field: {other:?}"),
+                message: format!("missing or invalid op field: {:?}", other.map(avro_kind)),
             }
             .fail();
         }
@@ -379,7 +465,7 @@ fn avro_to_i64(value: &AvroValue) -> Result<i64> {
         AvroValue::Int(v) => Ok(i64::from(*v)),
         AvroValue::Union(_, inner) => avro_to_i64(inner),
         other => MapPayloadSnafu {
-            message: format!("expected int/long, got {other:?}"),
+            message: format!("expected int/long, got {:?}", avro_kind(other)),
         }
         .fail(),
     }
@@ -435,7 +521,10 @@ fn avro_to_json(value: &AvroValue) -> Result<serde_json::Value> {
         AvroValue::Duration(d) => serde_json::Value::String(format!("{d:?}")),
         other => {
             return MapPayloadSnafu {
-                message: format!("unsupported Avro value type for JSON conversion: {other:?}"),
+                message: format!(
+                    "unsupported Avro value type for JSON conversion: {:?}",
+                    avro_kind(other)
+                ),
             }
             .fail();
         }
@@ -444,6 +533,39 @@ fn avro_to_json(value: &AvroValue) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Avro mapping errors name the value's kind, never its contents: a
+    /// record's `Debug` output prints every field of the row.
+    #[test]
+    fn mapping_errors_never_show_row_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let not_a_record = AvroValue::Array(vec![AvroValue::Record(vec![(
+            "api_key".to_string(),
+            AvroValue::String(FAKE_SECRET.to_string()),
+        )])]);
+        let bad_op = AvroValue::Record(vec![(
+            "op".to_string(),
+            AvroValue::Union(
+                0,
+                Box::new(AvroValue::Record(vec![(
+                    "api_key".to_string(),
+                    AvroValue::String(FAKE_SECRET.to_string()),
+                )])),
+            ),
+        )]);
+        for value in [not_a_record, bad_op] {
+            let Err(err) = super::avro_value_to_change_event(&value) else {
+                panic!("must not map");
+            };
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                assert!(
+                    !rendered.contains(FAKE_SECRET),
+                    "row value leaked: {rendered}"
+                );
+                assert!(!rendered.contains("api_key"), "row leaked: {rendered}");
+            }
+        }
+    }
     use super::*;
     use apache_avro::{to_avro_datum, types::Record};
 
@@ -495,5 +617,280 @@ mod tests {
         assert!(matches!(events[0].payload.op, Op::Create));
         assert_eq!(events[0].payload.after["id"], 7);
         assert_eq!(events[0].payload.ts_ms, 42);
+    }
+
+    #[test]
+    fn decode_budget_scales_with_the_body_between_the_floor_and_the_datum_limit() {
+        let floor = http_body_limit::RATIO_CHECK_FLOOR_BYTES;
+        let ceiling = max_allocation_bytes(DEFAULT_MAX_ALLOCATION_BYTES);
+        let ratio = MAX_DECODED_BYTES_PER_BODY_BYTE;
+        assert_eq!(decode_budget(1), floor);
+        assert_eq!(decode_budget(floor / ratio), floor);
+        assert_eq!(decode_budget(floor / ratio + 1), floor + ratio);
+        assert_eq!(decode_budget(ceiling / ratio - 1), ceiling - ratio);
+        assert_eq!(decode_budget(ceiling / ratio), ceiling);
+        assert_eq!(decode_budget(usize::MAX), ceiling);
+    }
+
+    #[test]
+    fn a_datum_decodes_within_the_budget_it_is_given() {
+        let limit = 1000 * size_of::<AvroValue>();
+        let nulls = AvroSchema::parse_str(r#"{"type": "array", "items": "null"}"#).expect("schema");
+        let block = |count: i64| {
+            let mut body = to_avro_datum(&AvroSchema::Long, AvroValue::Long(count)).expect("datum");
+            body.push(0);
+            body
+        };
+        let decoded = decode_with_max_allocation(&nulls, &mut &block(1000)[..], limit)
+            .expect("1000 null items fit");
+        assert_eq!(decoded, AvroValue::Array(vec![AvroValue::Null; 1000]));
+        let refused = decode_with_max_allocation(&nulls, &mut &block(1001)[..], limit)
+            .expect_err("1001 null items do not fit");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Unable to allocate {} bytes (maximum allowed: {limit})",
+                1001 * size_of::<AvroValue>()
+            )
+        );
+
+        let string = |len: usize| {
+            to_avro_datum(&AvroSchema::String, AvroValue::String("x".repeat(len))).expect("datum")
+        };
+        let decoded =
+            decode_with_max_allocation(&AvroSchema::String, &mut &string(limit)[..], limit)
+                .expect("a string as long as the limit fits");
+        assert_eq!(decoded, AvroValue::String("x".repeat(limit)));
+        let refused =
+            decode_with_max_allocation(&AvroSchema::String, &mut &string(limit + 1)[..], limit)
+                .expect_err("a string longer than the limit does not fit");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Unable to allocate {} bytes (maximum allowed: {limit})",
+                limit + 1
+            )
+        );
+    }
+
+    /// A body large enough to raise its budget past the floor decodes values
+    /// past the floor.
+    #[tokio::test]
+    async fn decodes_an_event_past_the_floor_when_its_body_is_large_enough() {
+        let schema = r#"{
+            "type": "record",
+            "name": "Envelope",
+            "fields": [
+                {"name": "after", "type": ["null", {
+                    "type": "record", "name": "Value",
+                    "fields": [{"name": "readings", "type": {"type": "array", "items": "long"}}]
+                }], "default": null},
+                {"name": "op", "type": "string"}
+            ]
+        }"#;
+        let readings = http_body_limit::RATIO_CHECK_FLOOR_BYTES / size_of::<AvroValue>() + 1;
+        let avro_schema = AvroSchema::parse_str(schema).expect("schema");
+        let mut record = Record::new(&avro_schema).expect("record");
+        record.put(
+            "after",
+            AvroValue::Union(
+                1,
+                Box::new(AvroValue::Record(vec![(
+                    "readings".to_string(),
+                    AvroValue::Array(vec![AvroValue::Long(1); readings]),
+                )])),
+            ),
+        );
+        record.put("op", AvroValue::String("c".into()));
+        let datum = to_avro_datum(&avro_schema, record).expect("datum");
+
+        let events = parse_avro_change_events(
+            &datum,
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("parse");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload.after["readings"].as_array().map(Vec::len),
+            Some(readings)
+        );
+    }
+
+    /// Arrays and maps longer than the decoder reserves up front still decode
+    /// whole, item for item.
+    #[tokio::test]
+    async fn decodes_arrays_and_maps_longer_than_the_up_front_reservation() {
+        let schema = r#"{
+            "type": "record",
+            "name": "Envelope",
+            "fields": [
+                {"name": "after", "type": ["null", {
+                    "type": "record", "name": "Value",
+                    "fields": [
+                        {"name": "id", "type": "long"},
+                        {"name": "tags", "type": {"type": "array", "items": "string"}},
+                        {"name": "attrs", "type": {"type": "map", "values": "long"}}
+                    ]
+                }], "default": null},
+                {"name": "op", "type": "string"}
+            ]
+        }"#;
+        let items = 3_000_i64;
+        let tags: Vec<String> = (0..items).map(|i| format!("t{i}")).collect();
+        let attrs: HashMap<String, i64> = (0..items).map(|i| (format!("k{i}"), i * 7)).collect();
+
+        let avro_schema = AvroSchema::parse_str(schema).expect("schema");
+        let mut record = Record::new(&avro_schema).expect("record");
+        record.put(
+            "after",
+            AvroValue::Union(
+                1,
+                Box::new(AvroValue::Record(vec![
+                    ("id".to_string(), AvroValue::Long(1)),
+                    (
+                        "tags".to_string(),
+                        AvroValue::Array(tags.iter().cloned().map(AvroValue::String).collect()),
+                    ),
+                    (
+                        "attrs".to_string(),
+                        AvroValue::Map(
+                            attrs
+                                .iter()
+                                .map(|(k, v)| (k.clone(), AvroValue::Long(*v)))
+                                .collect(),
+                        ),
+                    ),
+                ])),
+            ),
+        );
+        record.put("op", AvroValue::String("c".into()));
+        let datum = to_avro_datum(&avro_schema, record).expect("datum");
+
+        let events = parse_avro_change_events(
+            &datum,
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("parse");
+        assert_eq!(events.len(), 1);
+        let after = &events[0].payload.after;
+        assert_eq!(after["id"], 1);
+        assert_eq!(after["tags"], serde_json::json!(tags));
+        assert_eq!(after["attrs"], serde_json::json!(attrs));
+    }
+
+    fn recursive_schema_name(schema_json: &str) -> String {
+        match parse_schema(schema_json) {
+            Err(Error::RecursiveSchema { name }) => name,
+            Err(other) => panic!("expected a recursive schema error, got: {other}"),
+            Ok(_) => panic!("recursive schema was accepted: {schema_json}"),
+        }
+    }
+
+    #[test]
+    fn rejects_self_reference_through_union() {
+        let schema = r#"{"type": "record", "name": "Node", "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "next", "type": ["null", "Node"]}
+        ]}"#;
+        assert_eq!(recursive_schema_name(schema), "Node");
+    }
+
+    #[test]
+    fn rejects_self_reference_through_array_and_map() {
+        let array = r#"{"type": "record", "name": "Tree", "fields": [
+            {"name": "children", "type": {"type": "array", "items": "Tree"}}
+        ]}"#;
+        assert_eq!(recursive_schema_name(array), "Tree");
+
+        let map = r#"{"type": "record", "name": "Tree", "fields": [
+            {"name": "children", "type": {"type": "map", "values": "Tree"}}
+        ]}"#;
+        assert_eq!(recursive_schema_name(map), "Tree");
+    }
+
+    #[test]
+    fn rejects_mutual_recursion() {
+        let schema = r#"{"type": "record", "name": "A", "fields": [
+            {"name": "b", "type": ["null", {"type": "record", "name": "B", "fields": [
+                {"name": "a", "type": ["null", "A"]}
+            ]}]}
+        ]}"#;
+        assert_eq!(recursive_schema_name(schema), "A");
+    }
+
+    #[test]
+    fn rejects_self_reference_through_alias_in_namespace() {
+        let schema = r#"{"type": "record", "name": "Node", "namespace": "cdc",
+            "aliases": ["Link"], "fields": [
+                {"name": "next", "type": ["null", "Link"]}
+            ]}"#;
+        assert_eq!(recursive_schema_name(schema), "cdc.Node");
+    }
+
+    #[tokio::test]
+    async fn recursive_explicit_schema_is_rejected_before_decode() {
+        let schema = r#"{"type": "record", "name": "Node", "fields": [
+            {"name": "next", "type": ["null", "Node"]}
+        ]}"#;
+        let Err(err) = parse_avro_change_events(
+            &[0],
+            &AvroDecodeOptions {
+                avro_schema_json: Some(schema.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        else {
+            panic!("recursive schema was accepted");
+        };
+        assert!(
+            matches!(&err, Error::RecursiveSchema { name } if name == "Node"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_flat_envelope_and_non_recursive_reuse() {
+        let envelope = r#"{"type": "record", "name": "Envelope", "namespace": "pg.public.orders",
+            "fields": [
+                {"name": "before", "type": ["null", {"type": "record", "name": "Value", "fields": [
+                    {"name": "id", "type": "long"},
+                    {"name": "amount", "type": ["null", "double"], "default": null}
+                ]}], "default": null},
+                {"name": "after", "type": ["null", "Value"], "default": null},
+                {"name": "source", "type": {"type": "record", "name": "Source",
+                    "namespace": "io.debezium.connector.postgresql", "fields": [
+                        {"name": "db", "type": "string"},
+                        {"name": "table", "type": "string"},
+                        {"name": "lsn", "type": ["null", "long"], "default": null}
+                    ]}},
+                {"name": "op", "type": "string"},
+                {"name": "ts_ms", "type": ["null", "long"], "default": null}
+            ]}"#;
+        let reuse = r#"{"type": "record", "name": "Outer", "fields": [
+            {"name": "first", "type": {"type": "record", "name": "Point", "fields": [
+                {"name": "x", "type": "long"}
+            ]}},
+            {"name": "second", "type": "Point"},
+            {"name": "inner", "type": {"type": "record", "name": "Inner", "fields": [
+                {"name": "points", "type": {"type": "array", "items": "Point"}},
+                {"name": "by_key", "type": {"type": "map", "values": ["null", "Point"]}}
+            ]}}
+        ]}"#;
+        for (schema, root) in [(envelope, "pg.public.orders.Envelope"), (reuse, "Outer")] {
+            let parsed = parse_schema(schema).expect("non-recursive schema is accepted");
+            assert_eq!(
+                parsed.name().map(|name| name.fullname(None)).as_deref(),
+                Some(root)
+            );
+        }
     }
 }

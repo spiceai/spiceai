@@ -387,6 +387,35 @@ struct ReclaimPace {
     busy: Duration,
 }
 
+/// The pace of a table's whole-table reclaims when it is not `auto`: they take at
+/// most one [`RECLAIM_SHARE_DENOMINATOR`]th of the time, as an `auto` table's do
+/// (see [`AutoDeletionMode::reclaim_due`]).
+#[derive(Debug, Default)]
+pub(crate) struct WholeTableReclaimPace(Mutex<ReclaimPace>);
+
+impl WholeTableReclaimPace {
+    /// Whether a whole-table reclaim may start at `now`.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        let pace = self.0.lock();
+        pace.last_end.is_none_or(|last_end| {
+            now.saturating_duration_since(last_end)
+                >= pace.busy.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1)
+        })
+    }
+
+    /// Record a whole-table reclaim that took `busy` and ended at `ended`.
+    pub(crate) fn record(&self, busy: Duration, ended: Instant) {
+        let mut pace = self.0.lock();
+        pace.busy = busy;
+        pace.last_end = Some(ended);
+    }
+
+    /// Forget the pace, so the next reclaim is due at once.
+    pub(crate) fn forget(&self) {
+        *self.0.lock() = ReclaimPace::default();
+    }
+}
+
 /// The largest bound `auto` keeps position deletes within, whatever the target file
 /// size: the size up to which they were measured to read faster (see
 /// [`AutoDeletionMode::max_position_bytes_for`]).

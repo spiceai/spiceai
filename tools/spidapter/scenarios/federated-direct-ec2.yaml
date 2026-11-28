@@ -1,0 +1,16 @@
+# Temporary EC2 cluster for the Ballista distributed-query bench: one scheduler
+# instance and SPIDAPTER_EC2_EXECUTOR_COUNT executor instances, launched at setup
+# and terminated at teardown. Same spicepod handling as `federated-direct`.
+compute:
+  ec2:
+    region: ${SPIDAPTER_EC2_REGION:-us-west-2}
+    subnet_id: ${SPIDAPTER_EC2_SUBNET_ID}
+    ami_id: ${SPIDAPTER_EC2_AMI_ID}
+    image: ${SPIDAPTER_EC2_IMAGE}
+    scheduler_instance_type: ${SPIDAPTER_EC2_SCHEDULER_INSTANCE_TYPE:-m7i.2xlarge}
+    executor_instance_type: ${SPIDAPTER_EC2_EXECUTOR_INSTANCE_TYPE:-i3.4xlarge}
+    executor_count: ${SPIDAPTER_EC2_EXECUTOR_COUNT:-3}
+    disk_size_gb: ${SPIDAPTER_EC2_DISK_SIZE_GB:-100}
+    max_lifetime_minutes: ${SPIDAPTER_EC2_MAX_LIFETIME_MINUTES:-360}
+source:
+  direct: {}

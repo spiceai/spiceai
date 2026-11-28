@@ -1,0 +1,57 @@
+# A sidecar dataset reads an upstream dataset with a primary key over its
+# append stream (`DoExchange`) into Cayenne. The stream's snapshot opens with a
+# truncate row whose data is null, and the primary key makes its column
+# non-nullable. The change sink groups that truncate without reading its data
+# as a batch, which it cannot be (`group_into_sub_batches` in
+# crates/runtime-acceleration/src/change_sink/cdc.rs). Reading it as a batch
+# panicked the refresh worker, and the dataset stayed in error.
+name: sidecar-append-stream-keyed
+duration: 6s
+description: >
+  A sidecar dataset that reads an upstream dataset with a primary key over its
+  append stream loads the upstream's rows.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-append-stream-keyed-upstream
+  datasets:
+    - from: 'postgres:public.orders'
+      name: orders
+      params: '${sources.src.params}'
+      acceleration: { enabled: true }
+
+# The sidecar reads the upstream with no key, as the upstream requires none.
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-append-stream-keyed-app
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+        acceleration: { enabled: true, refresh_mode: append }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - generate:
+      src:
+        table: orders
+        rows: 2000
+        seed: 16433
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+  - start: {}
+  # The sidecar loads the upstream's snapshot, keyed column included.
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids, count(customer_id) AS customers, sum(amount) AS total FROM orders
+    eventually: 60s
+  - query: SELECT id, customer_id, amount FROM orders WHERE id IN (1, 1000, 2000) ORDER BY id

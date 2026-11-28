@@ -42,6 +42,7 @@ permissions: {}
 
 jobs:
   test-reclaim-runner-disk:
+    environment: secret-free
     name: Unit tests for the runner disk sweep (${{ matrix.os }})
     # GitHub-hosted on purpose: a sub-second check must not queue behind the
     # self-hosted pool whose full disks it exists to keep from recurring.

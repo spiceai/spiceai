@@ -69,7 +69,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
@@ -83,7 +83,7 @@ use super::table::{
 };
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
-use crate::metadata::{DeleteFile, InlinedData};
+use crate::metadata::{DeleteFile, InlinedData, SnapshotFile};
 use crate::metastore::MetastoreTransaction;
 
 /// A prepared overwrite: data has been written to a new snapshot directory
@@ -117,6 +117,9 @@ pub struct PreparedOverwrite {
     delete_files: Vec<DeleteFile>,
     /// The file-local positions `delete_files` hide, per data file.
     position_deletions: HashMap<String, Vec<u32>>,
+    /// The new snapshot's manifest, for the commit to record; `None` when it is
+    /// recorded already, or there is none.
+    manifest: Option<Vec<SnapshotFile>>,
 }
 
 impl std::fmt::Debug for PreparedOverwrite {
@@ -187,6 +190,16 @@ impl PreparedOverwrite {
         catalog: &CayenneCatalog,
         txn: &mut dyn MetastoreTransaction,
     ) -> CatalogResult<()> {
+        if let Some(manifest) = &self.manifest {
+            catalog
+                .replace_snapshot_files_in_txn(
+                    txn,
+                    self.table_id(),
+                    &self.new_snapshot_id,
+                    manifest,
+                )
+                .await?;
+        }
         catalog
             .commit_overwrite_in_txn(
                 txn,
@@ -212,15 +225,26 @@ impl PreparedOverwrite {
     ///
     /// Returns any error surfaced by the catalog's `commit_overwrite`.
     pub async fn apply_owned_txn(&self) -> CatalogResult<()> {
-        self.table
+        let committed = self
+            .table
             .catalog()
             .commit_overwrite(
                 self.table_id(),
                 &self.new_snapshot_id,
                 self.inlined.as_ref(),
                 &self.delete_files,
+                self.manifest.as_deref(),
             )
-            .await
+            .await;
+        if self.manifest.is_some() {
+            // Once the commit returns, the files are no longer a write in flight
+            // on either outcome: the orphan sweep reclaims them only if no commit
+            // names them, so a commit accepted despite an error keeps them. A
+            // failed commit is never retried with this snapshot, and deleting its
+            // files here could remove the files of a commit that was accepted.
+            self.table.uncommitted_files().forget(&self.new_snapshot_id);
+        }
+        committed
     }
 
     /// Publish the new snapshot in memory after the caller's transaction has
@@ -339,7 +363,9 @@ impl PreparedOverwrite {
                 false,
                 true,
                 0,
-                self.table.reserve_live_rows_delta().published(),
+                self.table
+                    .reserve_live_rows_delta()
+                    .published(self.table.statistics_epoch()),
             );
         }
 
@@ -383,12 +409,9 @@ impl PreparedOverwrite {
 
         self.table.schedule_old_snapshot_cleanup();
 
-        // Invalidate the in-memory optimizer cache so a zero-row overwrite
-        // leaves the cache empty rather than stale; `persist_table_stats`
-        // repopulates it when the accumulator has rows. The catalog row was
-        // already cleared atomically with the snapshot pointer flip.
-        // The accumulator counts every written row, including those the position
-        // deletes hide.
+        // Record the overwrite's statistics; the flip has already cleared the
+        // cached ones. The accumulator counts every written row, including
+        // those the position deletes hide.
         let hidden: u64 = self
             .position_deletions
             .values()
@@ -428,17 +451,18 @@ impl PreparedOverwrite {
         let _write_guard = self.write_guard;
         let _checkpoint_guard = self.checkpoint_guard;
 
-        // Best-effort cleanup of the new snapshot directory. Object stores
-        // (S3) don't have a single "remove dir" call; we leave object-store
-        // cleanup to `trigger_old_snapshot_cleanup` on a subsequent
-        // successful overwrite, which prunes any snapshot dir not referenced
-        // by the catalog.
+        // Best-effort cleanup of the new snapshot's files and the deletion
+        // vectors written for it, on a local directory as in an object store:
+        // nothing committed names them, and nothing else would ever remove the
+        // deletion vectors.
         self.table
             .remove_unpublished_snapshot_dir(&self.new_snapshot_id)
             .await;
-        if !self.table.table_path().starts_with("s3://") {
-            remove_deletion_vectors(&self.delete_files).await;
-        }
+        remove_deletion_vectors(
+            &self.delete_files,
+            self.table.dataset_storage().map(AsRef::as_ref),
+        )
+        .await;
         Ok(())
     }
 }
@@ -596,12 +620,18 @@ impl CayenneTableProvider {
     ///
     /// Acquires the per-table write lock for the duration of the prepared
     /// state, so concurrent writes (inserts, overwrites, sort rewrites) block
-    /// until this handle is finished or rolled back.
+    /// until this handle is finished or rolled back. The lock is taken once
+    /// every append staged before this call has published or been abandoned:
+    /// a keyed change-stream append publishes without the write lock, so one
+    /// published after the overwrite would land on the replacement with
+    /// deletes resolved against the replaced snapshot, and an unkeyed one
+    /// would find its target snapshot gone.
     ///
     /// # Errors
     ///
-    /// Returns an error if the snapshot directory cannot be created, the
-    /// stream write fails, or directory sync fails.
+    /// Returns an error if the appends staged before this call have not
+    /// published within the drain timeout, the snapshot directory cannot be
+    /// created, the stream write fails, or directory sync fails.
     pub async fn begin_overwrite(
         &self,
         data: SendableRecordBatchStream,
@@ -612,7 +642,9 @@ impl CayenneTableProvider {
         // in the inline tier below ignores the plan.
         let routing = self.overwrite_range_plan(target_partitions).await;
 
-        let write_guard = self.write_lock_arc().lock_owned().await;
+        let write_guard = self
+            .lock_write_after_staged_appends("the full refresh or INSERT OVERWRITE")
+            .await?;
         // Also hold `mem_checkpoint_lock` until the overwrite is published or
         // rolled back. A checkpoint or seal of the in-memory CDC tier takes only
         // this lock at one shard, and the rows it would make durable are rows this
@@ -624,7 +656,7 @@ impl CayenneTableProvider {
         let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_path().starts_with("s3://");
+        let is_s3 = self.data_in_store();
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -656,6 +688,7 @@ impl CayenneTableProvider {
                     _inline_admission: Some(inlined.admission),
                     delete_files: Vec::new(),
                     position_deletions: HashMap::new(),
+                    manifest: None,
                 });
             }
             OverwriteAdmission::Fallback(stream) => stream,
@@ -842,16 +875,34 @@ impl CayenneTableProvider {
         // with a bogus `[0, 0]` range would make seq-based decisions (the
         // seq-prefix bake) treat this snapshot as "very old" and risk an unsafe
         // prune. Skip authoring entirely and leave the scan on directory listing.
+        //
+        // A table in the object-native location scans only its manifest, so an
+        // overwrite does not commit a snapshot the manifest lacks, and records
+        // the manifest in the commit that makes the snapshot current.
+        let in_location = self.data_in_object_native_location();
+        let mut manifest = None;
         match self.reserve_sequences_local(1).await {
             Ok(overwrite_sequence) => {
-                if let Err(error) = self
-                    .author_uniform_snapshot_manifest(
+                let recorded = match self
+                    .uniform_snapshot_manifest_rows(
                         &new_snapshot_id,
                         overwrite_sequence,
                         overwrite_sequence,
                     )
                     .await
                 {
+                    Ok(rows) if in_location => {
+                        manifest = Some(rows);
+                        Ok(())
+                    }
+                    Ok(rows) => self.record_snapshot_manifest(&new_snapshot_id, &rows).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
+                    if in_location {
+                        self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                        return Err(super::Error::Catalog { source: error });
+                    }
                     tracing::warn!(
                         table = self.table_name(),
                         %error,
@@ -860,6 +911,10 @@ impl CayenneTableProvider {
                          scan falls back to directory listing"
                     );
                 }
+            }
+            Err(error) if in_location => {
+                self.abandon_overwrite_snapshot(&new_snapshot_id).await;
+                return Err(super::Error::Catalog { source: error });
             }
             Err(error) => {
                 tracing::warn!(
@@ -900,6 +955,7 @@ impl CayenneTableProvider {
             _inline_admission: None,
             delete_files,
             position_deletions,
+            manifest,
         })
     }
 
@@ -925,19 +981,27 @@ impl CayenneTableProvider {
                 )
             })
             .collect();
-        Ok(super::delete::DeletionVectorWriter::new(&metadata)
-            .write(specs)
-            .await?
-            .into_iter()
-            .map(|written| written.delete_file)
-            .collect())
+        Ok(
+            super::delete::DeletionVectorWriter::new(&metadata, self.dataset_storage())
+                .write(specs)
+                .await?
+                .into_iter()
+                .map(|written| written.delete_file)
+                .collect(),
+        )
     }
 
-    /// Remove an unpublished snapshot's local directory, best-effort: a
-    /// directory left behind is pruned by the next snapshot cleanup, and object
-    /// stores are left to it entirely.
+    /// Remove an unpublished snapshot's files, best-effort: a file left behind
+    /// is an object no commit names. In an object store, the snapshot's own
+    /// prefix is listed and deleted in batched requests, and the manifest rows
+    /// recorded for it before the commit are dropped; the caller guarantees
+    /// that no commit made the snapshot live.
     async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
-        if self.table_path().starts_with("s3://") {
+        if self.data_in_store() {
+            self.remove_unpublished_snapshot_objects(snapshot_id).await;
+            // Discarded: what its writer recorded is no longer a write in flight,
+            // and anything left under it is the orphan sweep's.
+            self.uncommitted_files().forget(snapshot_id);
             return;
         }
         let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
@@ -951,6 +1015,59 @@ impl CayenneTableProvider {
                     self.table_name()
                 );
             }
+        }
+    }
+
+    /// The object-store half of [`Self::remove_unpublished_snapshot_dir`].
+    async fn remove_unpublished_snapshot_objects(&self, snapshot_id: &str) {
+        let table_name = self.table_name().to_string();
+        let removed: Result<()> = async {
+            // A table in the object-native location deletes by name the files
+            // its writer recorded, never the snapshot's prefix: anything else is
+            // the orphan sweep's.
+            if self.data_in_object_native_location() {
+                self.clear_snapshot_dir(snapshot_id).await?;
+                return self
+                    .catalog()
+                    .clear_snapshot_cached_metadata(self.table_id(), snapshot_id)
+                    .await
+                    .map_err(|source| super::Error::Catalog { source });
+            }
+            let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
+                return Ok(());
+            };
+            let store = Arc::clone(&self.require_object_store()?.store);
+            let listed: Vec<object_store::ObjectMeta> = store
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(|source| super::Error::ObjectStore {
+                    operation: "list an unpublished snapshot's files",
+                    table: table_name.clone(),
+                    source,
+                })?;
+            let outcome = crate::dataset_storage::delete_in_batches(
+                &store,
+                listed.into_iter().map(|meta| meta.location).collect(),
+            )
+            .await;
+            if let Some(source) = outcome.first_error {
+                return Err(super::Error::ObjectStore {
+                    operation: "delete an unpublished snapshot's files",
+                    table: table_name.clone(),
+                    source,
+                });
+            }
+            self.catalog()
+                .clear_snapshot_cached_metadata(self.table_id(), snapshot_id)
+                .await
+                .map_err(|source| super::Error::Catalog { source })
+        }
+        .await;
+        if let Err(error) = removed {
+            tracing::warn!(
+                "Failed to delete the files of a write to table '{table_name}' that was not committed, so they keep using storage; no data is lost. Cause: {error}"
+            );
         }
     }
 
@@ -1003,6 +1120,7 @@ impl CayenneTableProvider {
             fan_out: EncodeFanOut::PerCaller,
             encode_budget: write.write_policy.encode_budget,
             routing: ShardRouting::Key,
+            max_shards: write.write_policy.max_shards,
         };
         let in_flight = if self.context().is_coupled_writer() {
             1
@@ -1154,6 +1272,8 @@ impl FileStatsObserver {
 }
 
 impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
+    fn file_written(&self, _file_path: &object_store::path::Path, _size: u64) {}
+
     fn batch_written(
         &self,
         file_path: &object_store::path::Path,
@@ -1185,12 +1305,13 @@ impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
 /// file left behind is swept as an orphan.
 async fn remove_deletion_vectors<'a>(
     files: impl IntoIterator<Item = &'a crate::metadata::DeleteFile>,
+    storage: Option<&crate::dataset_storage::DatasetStorage>,
 ) {
     let paths: Vec<std::path::PathBuf> = files
         .into_iter()
         .map(|file| std::path::PathBuf::from(&file.path))
         .collect();
-    super::delete::cleanup_uncommitted_delete_paths(&paths).await;
+    super::delete::cleanup_uncommitted_delete_paths(&paths, storage).await;
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
@@ -79,8 +79,8 @@ impl StreamingDataset for LineitemDataset {
             .context("Failed to generate TPCH data")?;
 
         // Query the lineitem table and collect into vectors
-        let mut stmt = conn
-            .prepare(
+        let batches = conn
+            .query(
                 "SELECT
                     l_orderkey, l_partkey, l_suppkey, l_linenumber,
                     CAST(l_quantity AS DOUBLE) as l_quantity,
@@ -93,74 +93,13 @@ impl StreamingDataset for LineitemDataset {
                 FROM lineitem
                 ORDER BY l_orderkey, l_linenumber",
             )
-            .context("Failed to prepare lineitem query")?;
+            .context("Failed to query lineitem query")?;
 
         // Collect all rows into vectors
-        let mut l_orderkey = Vec::new();
-        let mut l_partkey = Vec::new();
-        let mut l_suppkey = Vec::new();
-        let mut l_linenumber = Vec::new();
-        let mut l_quantity = Vec::new();
-        let mut l_extendedprice = Vec::new();
-        let mut l_discount = Vec::new();
-        let mut l_tax = Vec::new();
-        let mut l_returnflag = Vec::new();
-        let mut l_linestatus = Vec::new();
-        let mut l_shipdate = Vec::new();
-        let mut l_commitdate = Vec::new();
-        let mut l_receiptdate = Vec::new();
-        let mut l_shipinstruct = Vec::new();
-        let mut l_shipmode = Vec::new();
-        let mut l_comment = Vec::new();
-
-        let mut rows = stmt.query([]).context("Failed to query lineitem data")?;
-        while let Some(row) = rows.next().context("Failed to read row")? {
-            l_orderkey.push(row.get::<_, i64>(0)?);
-            l_partkey.push(row.get::<_, i64>(1)?);
-            l_suppkey.push(row.get::<_, i64>(2)?);
-            l_linenumber.push(row.get::<_, i64>(3)?);
-            l_quantity.push(row.get::<_, f64>(4)?);
-            l_extendedprice.push(row.get::<_, f64>(5)?);
-            l_discount.push(row.get::<_, f64>(6)?);
-            l_tax.push(row.get::<_, f64>(7)?);
-            l_returnflag.push(row.get::<_, String>(8)?);
-            l_linestatus.push(row.get::<_, String>(9)?);
-            l_shipdate.push(row.get::<_, String>(10)?);
-            l_commitdate.push(row.get::<_, String>(11)?);
-            l_receiptdate.push(row.get::<_, String>(12)?);
-            l_shipinstruct.push(row.get::<_, String>(13)?);
-            l_shipmode.push(row.get::<_, String>(14)?);
-            l_comment.push(row.get::<_, String>(15)?);
-        }
-
-        let record_count = l_orderkey.len();
-        println!("Generated {record_count} lineitem records");
-
-        // Build Arrow arrays
-        let batch = RecordBatch::try_new(
-            Arc::new(Self::schema()),
-            vec![
-                Arc::new(Int64Array::from(l_orderkey)),
-                Arc::new(Int64Array::from(l_partkey)),
-                Arc::new(Int64Array::from(l_suppkey)),
-                Arc::new(Int64Array::from(l_linenumber)),
-                Arc::new(Float64Array::from(l_quantity)),
-                Arc::new(Float64Array::from(l_extendedprice)),
-                Arc::new(Float64Array::from(l_discount)),
-                Arc::new(Float64Array::from(l_tax)),
-                Arc::new(StringArray::from(l_returnflag)),
-                Arc::new(StringArray::from(l_linestatus)),
-                Arc::new(StringArray::from(l_shipdate)),
-                Arc::new(StringArray::from(l_commitdate)),
-                Arc::new(StringArray::from(l_receiptdate)),
-                Arc::new(StringArray::from(l_shipinstruct)),
-                Arc::new(StringArray::from(l_shipmode)),
-                Arc::new(StringArray::from(l_comment)),
-            ],
-        )
-        .context("Failed to create Arrow RecordBatch")?;
-
-        Ok(vec![batch])
+        let batches = super::with_dataset_schema(batches, Self::schema())?;
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("Generated {record_count} records");
+        Ok(batches)
     }
 
     fn marker_count(&self) -> usize {

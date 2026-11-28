@@ -142,6 +142,31 @@ impl RouterModel {
 
 #[async_trait::async_trait]
 impl Chat for RouterModel {
+    /// The smallest of each limit among the models it routes between, since a request may
+    /// reach any of them; a limit is unknown when one of them does not report it.
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        let routed: Option<Vec<Arc<dyn Chat>>> = {
+            let models = self.models.read().await;
+            self.models_cfg
+                .iter()
+                .map(|config| models.get(&config.from()).map(Arc::clone))
+                .collect()
+        };
+        let Some(routed) = routed.filter(|routed| !routed.is_empty()) else {
+            return llms::chat::TokenLimits::default();
+        };
+        let limits =
+            futures::future::join_all(routed.iter().map(|model| model.token_limits())).await;
+        llms::chat::TokenLimits {
+            context_window: limits.iter().try_fold(u64::MAX, |least, limits| {
+                Some(least.min(limits.context_window?))
+            }),
+            max_output_tokens: limits.iter().try_fold(u64::MAX, |least, limits| {
+                Some(least.min(limits.max_output_tokens?))
+            }),
+        }
+    }
+
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,

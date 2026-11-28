@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    BinlogPosition, CursorType, NoopPositionStore, PersistedPosition, PositionStore,
-    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    StoreError, derive_server_id, process_nonce, start_replication_stream,
+    BinlogPosition, ColumnTypeChanges, CursorType, NoopPositionStore, PersistedPosition,
+    PositionStore, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
@@ -97,6 +97,16 @@ pub fn build_changes_stream(
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
+    // Under `block` the acceleration never evolves, so the stream keeps the
+    // registered types and its batches keep one schema; every other policy
+    // receives a widened column type as a schema change to act on.
+    let column_type_changes = match dataset.on_schema_change {
+        runtime_component::dataset::OnSchemaChange::Block => ColumnTypeChanges::Keep,
+        runtime_component::dataset::OnSchemaChange::Fail
+        | runtime_component::dataset::OnSchemaChange::AppendNewColumns
+        | runtime_component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime_component::dataset::OnSchemaChange::DropAndRecreate => ColumnTypeChanges::Widen,
+    };
 
     let (database, table) = match split_database_table(&dataset.from, params) {
         Ok(parts) => parts,
@@ -269,6 +279,7 @@ pub fn build_changes_stream(
             position_store,
             schema_json,
             metrics,
+            column_type_changes,
         };
 
         let mut inner = start_replication_stream(input);

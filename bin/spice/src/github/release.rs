@@ -16,6 +16,7 @@ limitations under the License.
 
 //! GitHub release types and operations.
 
+use super::verify::{VerifyOptions, verify_release_asset};
 use super::{GitHubClient, GitHubError};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
@@ -61,6 +62,10 @@ pub struct ReleaseAsset {
     pub size: u64,
     pub download_count: u64,
     pub browser_download_url: String,
+    /// `sha256:<hex>` of the asset, which GitHub records at upload. Releases published before
+    /// GitHub recorded digests have none.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Get the latest release from GitHub.
@@ -70,19 +75,21 @@ pub async fn get_latest_release(client: &GitHubClient) -> Result<RepoRelease, Gi
 }
 
 /// Get a specific release by version tag.
+///
+/// The release is fetched by its tag rather than searched for in the release list, which
+/// GitHub pages 30 at a time: a search of the first page cannot find any older release.
 pub async fn get_release(client: &GitHubClient, version: &str) -> Result<RepoRelease, GitHubError> {
-    let url = client.releases_url();
-    let releases: Vec<RepoRelease> = client.get(&url).await?;
-
-    releases
-        .into_iter()
-        .find(|r| r.tag_name == version)
-        .ok_or(GitHubError::ReleaseNotFound {
+    let url = client.release_by_tag_url(version);
+    match client.get(&url).await {
+        Err(GitHubError::Api { status: 404, .. }) => Err(GitHubError::ReleaseNotFound {
             version: version.to_string(),
-        })
+        }),
+        result => result,
+    }
 }
 
-/// Download a release asset and extract it to a directory.
+/// Download a release asset, check it against the sha256 its release records, and extract it
+/// to a directory.
 pub async fn download_release_asset(
     client: &GitHubClient,
     release: &RepoRelease,
@@ -102,6 +109,8 @@ pub async fn download_release_asset(
     );
 
     let data = download_reporting_progress(client, asset, "Downloading").await?;
+    let data =
+        verify_release_asset(client, release, asset, data, &VerifyOptions::from_env()).await?;
 
     // Extract tar.gz
     extract_tar_gz(&data, download_dir)?;
@@ -169,13 +178,15 @@ pub async fn download_release_asset_with_fallback(
 /// Upgrade the CLI binary in-place by downloading and replacing the current executable.
 ///
 /// This function:
-/// 1. Downloads the CLI asset from the release
+/// 1. Downloads the CLI asset from the release and checks it against the sha256 the release
+///    records for it
 /// 2. Extracts the binary to a temporary file
 /// 3. Atomically replaces the current executable with the new one
 ///
 /// # Errors
 ///
-/// Returns an error if the download fails, extraction fails, or the file replacement fails.
+/// Returns an error if the download fails or does not verify, extraction fails, or the file
+/// replacement fails.
 pub async fn upgrade_cli_in_place(
     client: &GitHubClient,
     release: &RepoRelease,
@@ -194,6 +205,8 @@ pub async fn upgrade_cli_in_place(
     );
 
     let data = download_reporting_progress(client, asset, "Downloading CLI").await?;
+    let data =
+        verify_release_asset(client, release, asset, data, &VerifyOptions::from_env()).await?;
 
     // Get the current executable path
     let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
@@ -225,6 +238,50 @@ pub async fn upgrade_cli_in_place(
         });
     }
 
+    swap_into_current_exe(&extracted_binary, &current_exe)
+}
+
+/// Replace the running CLI with `binary`, returning the path it now has.
+///
+/// # Errors
+///
+/// Returns an error if the executable's path cannot be read or the file cannot be written or
+/// moved into place.
+pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf, GitHubError> {
+    let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
+        message: format!("Failed to get current executable path: {e}"),
+    })?;
+    let exe_dir = current_exe.parent().ok_or_else(|| GitHubError::Io {
+        message: "Failed to get executable parent directory".to_string(),
+    })?;
+    // Next to the executable, so the rename stays on one filesystem.
+    let temp_dir = tempfile::tempdir_in(exe_dir).map_err(|e| GitHubError::Io {
+        message: format!("Failed to create temporary directory: {e}"),
+    })?;
+    let new_binary = temp_dir
+        .path()
+        .join(if cfg!(windows) { "spice.exe" } else { "spice" });
+    std::fs::write(&new_binary, binary).map_err(|e| GitHubError::Io {
+        message: format!("Failed to write {}: {e}", new_binary.display()),
+    })?;
+    swap_into_current_exe(&new_binary, &current_exe)?;
+    Ok(current_exe)
+}
+
+/// Make `new_binary`, a file in `current_exe`'s directory, executable, then move it to
+/// `current_exe`.
+fn swap_into_current_exe(new_binary: &Path, current_exe: &Path) -> Result<(), GitHubError> {
+    // Executable before it takes the path, so that a `spice` started right after the rename
+    // can run it, and an interrupted upgrade cannot leave the CLI without its execute bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(new_binary, permissions).map_err(|e| GitHubError::Io {
+            message: format!("Failed to set executable permissions: {e}"),
+        })?;
+    }
+
     // We cannot overwrite a running executable directly — Linux returns ETXTBSY and
     // Windows locks the file. Use rename to atomically swap the directory entry: the
     // old inode stays alive (referenced by the running process) while the new binary
@@ -236,25 +293,15 @@ pub async fn upgrade_cli_in_place(
         // Try to remove old backup if it exists
         let _ = std::fs::remove_file(&backup_path);
         // Rename current executable to backup
-        std::fs::rename(&current_exe, &backup_path).map_err(|e| GitHubError::Io {
+        std::fs::rename(current_exe, &backup_path).map_err(|e| GitHubError::Io {
             message: format!("Failed to backup current executable: {e}"),
         })?;
     }
 
     // Atomically move the new binary into place.
-    std::fs::rename(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
+    std::fs::rename(new_binary, current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
-
-    // Make the binary executable on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&current_exe, permissions).map_err(|e| GitHubError::Io {
-            message: format!("Failed to set executable permissions: {e}"),
-        })?;
-    }
 
     Ok(())
 }
@@ -288,6 +335,9 @@ fn format_size(bytes: u64) -> String {
 }
 
 pub struct Arch(pub String);
+
+/// The runtime asset prefix. There is no Windows runtime asset.
+const RUNTIME_ASSET_PREFIX: &str = "spiced";
 
 pub enum SystemType {
     Linux(Arch),
@@ -335,14 +385,6 @@ impl SystemType {
         }
     }
 
-    /// Get the runtime asset prefix for the current platform.
-    fn runtime_asset_prefix(&self) -> &str {
-        match self {
-            SystemType::Windows(_) => "spiced.exe",
-            _ => "spiced",
-        }
-    }
-
     /// Get the runtime asset names for the current platform.
     ///
     /// Returns a list of possible asset names to try, in order of preference.
@@ -354,8 +396,14 @@ impl SystemType {
     /// # Arguments
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
     /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
+    ///
+    /// Empty on Windows: no release publishes a native Windows runtime, which runs
+    /// under WSL or in Docker instead.
     pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
         let mut names = Vec::new();
+        if matches!(self, SystemType::Windows(_)) {
+            return names;
+        }
 
         // Determine the accelerator based on flavor
         let accelerator = match flavor {
@@ -381,7 +429,7 @@ impl SystemType {
             // New naming (v1.11+/trunk): accelerator without "models_" prefix
             names.push(format!(
                 "{prefix}_{accel}_{os}_{arch}.tar.gz",
-                prefix = self.runtime_asset_prefix(),
+                prefix = RUNTIME_ASSET_PREFIX,
                 os = self.os_type_name(),
                 arch = self.arch()
             ));
@@ -391,7 +439,7 @@ impl SystemType {
             if !is_v2_or_later(target_version) {
                 names.push(format!(
                     "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
-                    prefix = self.runtime_asset_prefix(),
+                    prefix = RUNTIME_ASSET_PREFIX,
                     os = self.os_type_name(),
                     arch = self.arch()
                 ));
@@ -401,7 +449,7 @@ impl SystemType {
         // Fallback: base runtime without accelerator
         names.push(format!(
             "{prefix}_{os}_{arch}.tar.gz",
-            prefix = self.runtime_asset_prefix(),
+            prefix = RUNTIME_ASSET_PREFIX,
             os = self.os_type_name(),
             arch = self.arch()
         ));
@@ -538,8 +586,9 @@ mod tests {
             .expect("gzip stream is finished")
     }
 
-    /// A release advertising one asset of `size` bytes, served by `server_uri`.
-    fn release_advertising(server_uri: &str, size: u64) -> RepoRelease {
+    /// A release advertising one asset of `size` bytes with GitHub digest `digest`, served by
+    /// `server_uri`.
+    fn release_advertising(server_uri: &str, size: u64, digest: Option<String>) -> RepoRelease {
         RepoRelease {
             url: String::new(),
             html_url: String::new(),
@@ -558,14 +607,27 @@ mod tests {
                 size,
                 download_count: 0,
                 browser_download_url: format!("{server_uri}/{ASSET_NAME}"),
+                digest,
             }],
         }
     }
 
-    /// Serve `body` for the asset, and download it into a fresh directory.
+    /// Serve `body` for the asset, and download it into a fresh directory. The release records
+    /// the sha256 of `body`, so only the size check and the archive decide.
     async fn download_body(
         body: Vec<u8>,
         advertised_size: u64,
+    ) -> (Result<(), GitHubError>, tempfile::TempDir) {
+        let digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&body));
+        download_body_recorded_as(body, advertised_size, Some(digest)).await
+    }
+
+    /// Serve `body` for the asset, recorded with GitHub digest `digest`, and download it into a
+    /// fresh directory.
+    async fn download_body_recorded_as(
+        body: Vec<u8>,
+        advertised_size: u64,
+        digest: Option<String>,
     ) -> (Result<(), GitHubError>, tempfile::TempDir) {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -574,7 +636,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let release = release_advertising(&server.uri(), advertised_size);
+        let release = release_advertising(&server.uri(), advertised_size, digest);
         let dest = tempfile::tempdir().expect("temp dir is created");
         let client = GitHubClient::new("spiceai", "spiceai");
 
@@ -660,6 +722,30 @@ mod tests {
         assert_eq!(extracted, b"runtime binary");
     }
 
+    /// A complete archive whose sha256 is not the one its release records is refused before
+    /// anything is extracted from it.
+    #[tokio::test]
+    async fn an_archive_not_matching_its_recorded_sha256_is_not_extracted() {
+        let archive = tar_gz_containing("spiced", b"altered runtime binary");
+        let advertised_size = archive.len() as u64;
+        let recorded = format!("sha256:{}", "ab".repeat(32));
+
+        let (result, dest) =
+            download_body_recorded_as(archive, advertised_size, Some(recorded)).await;
+
+        assert!(
+            matches!(&result, Err(GitHubError::ChecksumMismatch { asset, .. }) if asset == ASSET_NAME),
+            "expected a checksum mismatch, got: {result:?}"
+        );
+        assert!(
+            std::fs::read_dir(dest.path())
+                .expect("destination is readable")
+                .next()
+                .is_none(),
+            "a refused download must not leave anything extracted"
+        );
+    }
+
     /// The length check is not a stand-in for decoding: a body of the right length that is
     /// still not an archive keeps reporting the extraction failure, so a genuinely corrupt
     /// asset is not relabelled as a network problem.
@@ -730,27 +816,12 @@ mod tests {
     // default flavor on x86 - auto-detects accelerator, but in tests no accelerator is present
     #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "default",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     // default flavor on arm
     #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
     #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
-    #[case(
-        SystemType::windows_arm(),
-        "default",
-        "spiced.exe_windows_aarch64.tar.gz"
-    )]
     // unknown flavor falls back to default behavior
     #[case(SystemType::linux_x86(), "unknown", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "unknown", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "unknown",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     fn test_runtime_asset_names(
         #[case] os_type: SystemType,
         #[case] flavor: &str,
@@ -760,6 +831,17 @@ mod tests {
         let names = os_type.runtime_asset_names(flavor, "v1.0.0");
         // The last entry should always be the fallback base name
         assert!(names.last().is_some_and(|n| n == expected));
+    }
+
+    #[rstest]
+    #[case(SystemType::windows_x86(), "default")]
+    #[case(SystemType::windows_arm(), "default")]
+    #[case(SystemType::windows_x86(), "cuda")]
+    fn windows_has_no_runtime_asset(#[case] os_type: SystemType, #[case] flavor: &str) {
+        assert_eq!(
+            os_type.runtime_asset_names(flavor, "v2.0.0"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -772,5 +854,98 @@ mod tests {
         assert!(is_v2_or_later("v2.1.0"));
         assert!(is_v2_or_later("v10.0.0"));
         assert!(!is_v2_or_later("invalid"));
+    }
+
+    /// A release tagged `tag`, in the shape the releases API serves.
+    fn release_json(tag: &str) -> serde_json::Value {
+        serde_json::json!({
+            "url": "",
+            "html_url": "",
+            "assets_url": "",
+            "tag_name": tag,
+            "name": tag,
+            "draft": false,
+            "prerelease": false,
+            "created_at": "",
+            "published_at": null,
+            "assets": [],
+        })
+    }
+
+    /// A mock API serving `GET /repos/spiceai/spiceai/releases` as GitHub does without
+    /// `per_page`: only the 30 newest releases, none of them `v1.11.4`.
+    async fn api_listing_only_the_newest_releases() -> MockServer {
+        let server = MockServer::start().await;
+        let newest: Vec<_> = (0..30)
+            .map(|patch| release_json(&format!("v2.0.{patch}")))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(newest))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `spice install v1.11.4` failed with `Release not found: v1.11.4` once 30 newer releases
+    /// were published, because the lookup searched only the first page of the release list.
+    #[tokio::test]
+    async fn a_release_older_than_the_first_page_of_the_list_is_found_by_its_tag() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_json("v1.11.4")))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let release = match get_release(&client, "v1.11.4").await {
+            Ok(release) => release,
+            Err(error) => panic!("v1.11.4 is published, so it must be found: {error}"),
+        };
+
+        assert_eq!(release.tag_name, "v1.11.4");
+    }
+
+    #[tokio::test]
+    async fn a_tag_with_no_release_is_reported_as_release_not_found() {
+        let server = api_listing_only_the_newest_releases().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v9.9.9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"message":"Not Found"}"#))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v9.9.9").await else {
+            panic!("an unpublished tag must not resolve to a release");
+        };
+
+        assert!(
+            matches!(&error, GitHubError::ReleaseNotFound { version } if version == "v9.9.9"),
+            "expected ReleaseNotFound for v9.9.9, got: {error}"
+        );
+    }
+
+    /// Only a 404 means the release does not exist. A server error must still read as one,
+    /// rather than telling the user that a published release is missing.
+    #[tokio::test]
+    async fn a_server_error_is_not_reported_as_a_missing_release() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/repos/spiceai/spiceai/releases/tags/v1.11.4"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+            .mount(&server)
+            .await;
+        let client = GitHubClient::new("spiceai", "spiceai").with_api_base(&server.uri());
+
+        let Err(error) = get_release(&client, "v1.11.4").await else {
+            panic!("a 502 must not resolve to a release");
+        };
+
+        assert!(
+            matches!(error, GitHubError::Api { status: 502, .. }),
+            "expected the 502 to surface as an API error, got: {error}"
+        );
     }
 }

@@ -525,7 +525,7 @@ mod tests {
     fn top_columns_empty_without_observations() {
         let observations = FilterColumnObservations::new();
         let schema = test_schema();
-        assert!(observations.top_columns(2, &schema).is_empty());
+        assert_eq!(observations.top_columns(2, &schema), [] as [String; 0]);
     }
 
     #[test]

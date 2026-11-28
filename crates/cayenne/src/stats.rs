@@ -35,6 +35,7 @@ use vortex::error::VortexResult;
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
 use vortex::file::FileStatistics;
 use vortex::flatbuffers::WriteFlatBufferExt;
+use vortex::layout::layouts::file_stats::{AggregateStat, AggregateStats};
 use vortex::scalar::{DecimalValue, Scalar};
 
 /// Convert a `DataFusion` [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
@@ -390,7 +391,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.min_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.min_value.is_exact().is_some() {
+        let precision = if cs.min_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -401,7 +402,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.max_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.max_value.is_exact().is_some() {
+        let precision = if cs.max_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -419,7 +420,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     if let Some(sv) = cs.sum_value.get_value()
         && let Some(vortex_sv) = df_scalar_to_vortex(sv)
     {
-        let precision = if cs.sum_value.is_exact().is_some() {
+        let precision = if cs.sum_value.is_exact() == Some(true) {
             VortexPrecision::Exact(vortex_sv)
         } else {
             VortexPrecision::Inexact(vortex_sv)
@@ -438,7 +439,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         match u64::try_from(*size) {
             Ok(size_u64) => {
                 let vortex_sv = vortex::scalar::ScalarValue::from(size_u64);
-                if cs.byte_size.is_exact().is_some() {
+                if cs.byte_size.is_exact() == Some(true) {
                     stats.set(
                         Stat::UncompressedSizeInBytes,
                         VortexPrecision::Exact(vortex_sv),
@@ -490,7 +491,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
             return stats;
         };
         let vortex_sv = vortex::scalar::ScalarValue::from(count_u64);
-        if cs.null_count.is_exact().is_some() {
+        if cs.null_count.is_exact() == Some(true) {
             stats.set(Stat::NullCount, VortexPrecision::Exact(vortex_sv));
         } else {
             stats.set(Stat::NullCount, VortexPrecision::Inexact(vortex_sv));
@@ -550,12 +551,15 @@ pub(crate) fn stats_set_to_column_stats(
             .and_then(|size| usize::try_from(size).ok()),
     );
 
+    let distinct_count =
+        vortex_datafusion::singleton_distinct_count(&min_value, &max_value, &null_count)
+            .unwrap_or(Precision::Absent);
     ColumnStatistics {
         null_count,
         max_value,
         min_value,
         sum_value,
-        distinct_count: Precision::Absent,
+        distinct_count,
         byte_size,
     }
 }
@@ -578,12 +582,20 @@ pub fn file_statistics_to_df(
     schema: &Schema,
     num_rows: i64,
 ) -> Statistics {
-    let column_statistics: Vec<ColumnStatistics> = file_stats
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (stats, dtype))| {
-            let arrow_type = schema.fields().get(idx).map(|field| field.data_type());
-            stats_set_to_column_stats(stats, dtype, arrow_type)
+    column_stats_sets_to_df(&column_stats_sets(file_stats, schema), schema, num_rows)
+}
+
+/// [`file_statistics_to_df`] over columns already looked up with [`column_stats_sets`].
+fn column_stats_sets_to_df(
+    columns: &[(StatsSet, DType)],
+    schema: &Schema,
+    num_rows: i64,
+) -> Statistics {
+    let column_statistics: Vec<ColumnStatistics> = columns
+        .iter()
+        .zip(schema.fields())
+        .map(|((stats, dtype), field)| {
+            stats_set_to_column_stats(stats, dtype, Some(field.data_type()))
         })
         .collect();
 
@@ -632,7 +644,7 @@ pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Opti
             column_stats_to_stats_set(&align_column_stats_to_schema(cs, field.data_type()))
         })
         .collect();
-    let file_stats = build_file_statistics(column_stats, schema).ok()?;
+    let file_stats = build_file_statistics(&column_stats, schema).ok()?;
     serialize_file_statistics(&file_stats).ok()
 }
 
@@ -651,7 +663,7 @@ fn align_column_stats_to_schema(cs: &ColumnStatistics, column_type: &DataType) -
             return bound.clone();
         };
         match retag_bound_to_column(value.clone(), column_type) {
-            Some(aligned) if bound.is_exact().is_some() => Precision::Exact(aligned),
+            Some(aligned) if bound.is_exact() == Some(true) => Precision::Exact(aligned),
             Some(aligned) => Precision::Inexact(aligned),
             None => Precision::Absent,
         }
@@ -709,14 +721,15 @@ pub(crate) fn restore_persisted_statistics(
     num_rows: i64,
 ) -> Option<RestoredStatistics> {
     let file_stats = deserialize_file_statistics(blob, schema).ok()?;
-    let accounts_for_nan = file_stats.into_iter().all(|(stats, dtype)| {
+    let columns = column_stats_sets(&file_stats, schema);
+    let accounts_for_nan = columns.iter().all(|(stats, dtype)| {
         let bounded = stats
             .iter()
             .any(|(stat, _)| matches!(stat, Stat::Min | Stat::Max | Stat::Sum));
         !bounded || vortex_datafusion::bounds_account_for_nan(stats, dtype)
     });
     Some(RestoredStatistics {
-        statistics: Arc::new(file_statistics_to_df(&file_stats, schema, num_rows)),
+        statistics: Arc::new(column_stats_sets_to_df(&columns, schema, num_rows)),
         accounts_for_nan,
     })
 }
@@ -742,7 +755,11 @@ pub(crate) fn blob_carries_per_column_byte_sizes(statistics: &Statistics) -> boo
 }
 
 /// Serialize a Vortex [`FileStatistics`] to bytes.
-pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
+///
+/// # Errors
+///
+/// Returns an error when a statistic cannot be encoded as a flatbuffer.
+pub fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
     let fb = stats.write_flatbuffer_bytes()?;
     Ok(fb.as_slice().to_vec())
 }
@@ -757,13 +774,16 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 /// expected schema.
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
-    let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
-    FileStatistics::from_flatbuffer(
-        &fb_stats,
-        &struct_dtype,
-        &vortex_session::VortexSession::default(),
-    )
+    let fb_stats = flatbuffers::root::<vortex::file::flatbuffers::footer::FileStatistics>(bytes)?;
+    FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype, &STATISTICS_SESSION)
 }
+
+/// The session statistics blobs decode with, built once rather than per decode
+/// (building a default session registers every encoding). Decoding only reads
+/// it (scalar values look their types up), so one shared session serves every
+/// caller.
+static STATISTICS_SESSION: LazyLock<vortex_session::VortexSession> =
+    LazyLock::new(vortex_session::VortexSession::default);
 
 /// The Arrow/Vortex type conversions statistics use: the same default session
 /// the Vortex writer converts a table's schema with, so a statistics blob is typed
@@ -784,24 +804,86 @@ pub(crate) fn vortex_struct_dtype_from_schema(schema: &Schema) -> VortexResult<D
 /// # Errors
 ///
 /// Returns an error for an Arrow type Vortex cannot represent.
-pub(crate) fn build_file_statistics(
-    column_stats: Vec<StatsSet>,
+pub fn build_file_statistics(
+    column_stats: &[StatsSet],
     schema: &Schema,
 ) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
-    Ok(FileStatistics::new_with_dtype(
-        Arc::from(column_stats.into_boxed_slice()),
-        &struct_dtype,
-    ))
+    let Some(fields) = struct_dtype.as_struct_fields_opt() else {
+        vortex::error::vortex_bail!("a table schema converts to a struct dtype");
+    };
+    vortex::error::vortex_ensure!(
+        column_stats.len() == fields.nfields(),
+        "{} column statistics for {} columns",
+        column_stats.len(),
+        fields.nfields()
+    );
+    let aggregates: Arc<[AggregateStats]> = column_stats
+        .iter()
+        .zip(fields.fields())
+        .map(|(stats, dtype)| aggregate_stats_from_stats_set(stats, &dtype))
+        .collect();
+    // Only the top-level layout the footer has always carried, so a build that predates
+    // nested file statistics reads a blob this one writes.
+    Ok(FileStatistics::new_legacy_only(aggregates, &struct_dtype))
+}
+
+/// Each column's statistics as a [`StatsSet`], with its Vortex type, in `schema`'s order.
+///
+/// Columns are looked up by name: a blob or footer that carries nested statistics stores
+/// them in post-order over every field, so a position is not a top-level column. A column
+/// with no entry gets no statistics.
+#[must_use]
+pub fn column_stats_sets(file_stats: &FileStatistics, schema: &Schema) -> Vec<(StatsSet, DType)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            vortex_datafusion::column_stats(file_stats, field.name()).unwrap_or_else(|| {
+                (
+                    StatsSet::default(),
+                    ARROW_SESSION.from_arrow_field(field).unwrap_or(DType::Null),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The aggregates a [`StatsSet`] over a column of `dtype` records, for statistics the
+/// footer stores as aggregates. A statistic with no aggregate function, or whose value
+/// is not a valid scalar of its type, is left out.
+fn aggregate_stats_from_stats_set(stats: &StatsSet, dtype: &DType) -> AggregateStats {
+    AggregateStats::new(
+        stats
+            .iter()
+            .filter_map(|(stat, value)| {
+                let aggregate_fn = stat.aggregate_fn()?;
+                let stat_dtype = stat.dtype(dtype)?;
+                let value = value
+                    .clone()
+                    .map(|value| Scalar::try_new(stat_dtype.clone(), Some(value)).ok());
+                let value = match value {
+                    VortexPrecision::Exact(Some(value)) => VortexPrecision::Exact(value),
+                    VortexPrecision::Inexact(Some(value)) => VortexPrecision::Inexact(value),
+                    VortexPrecision::Exact(None)
+                    | VortexPrecision::Inexact(None)
+                    | VortexPrecision::Absent => return None,
+                };
+                Some(AggregateStat::from_value(aggregate_fn, value))
+            })
+            .collect(),
+    )
 }
 
 /// Merge an existing serialized [`FileStatistics`] blob with new per-column
 /// [`StatsSet`]s and return the merged, serialized blob.
 ///
 /// Uses Vortex's commutative `merge_unordered` per column so the caller does
-/// not need to worry about ordering. If the existing blob cannot be
-/// deserialized, or if the column counts do not match, `None` is returned so
-/// callers can fall back to writing the new stats alone.
+/// not need to worry about ordering. `None` is returned, so callers can fall
+/// back to writing the new stats alone, when the existing blob cannot be read
+/// against `schema` (a blob written for a different set of columns, such as one
+/// from before a column was added, does not deserialize against it), or when
+/// `new_column_stats` does not hold one entry per `schema` column.
 ///
 /// This preserves data correctness across multi-write sequences: once a row's
 /// min/max/null-count has been incorporated it stays incorporated, and the
@@ -832,14 +914,16 @@ pub(crate) fn merge_serialized_stats(
         }
     };
 
-    let existing_sets: Vec<StatsSet> = existing.into_iter().map(|(set, _)| set.clone()).collect();
+    let existing_sets: Vec<StatsSet> = column_stats_sets(&existing, schema)
+        .into_iter()
+        .map(|(set, _)| set)
+        .collect();
 
-    if existing_sets.len() != new_column_stats.len() {
+    if new_column_stats.len() != schema.fields().len() {
         tracing::warn!(
-            "merge_serialized_stats: existing column count {} != new count {}; \
-             skipping merge (schema may have changed)",
-            existing_sets.len(),
+            "merge_serialized_stats: new stats cover {} columns, the schema {}; skipping merge",
             new_column_stats.len(),
+            schema.fields().len(),
         );
         return None;
     }
@@ -851,7 +935,7 @@ pub(crate) fn merge_serialized_stats(
         .map(|((existing, new), dtype)| existing.merge_unordered(new, dtype))
         .collect();
 
-    match build_file_statistics(merged, schema)
+    match build_file_statistics(&merged, schema)
         .and_then(|file_stats| serialize_file_statistics(&file_stats))
     {
         Ok(bytes) => Some(bytes),
@@ -870,6 +954,325 @@ mod tests {
         ColumnStatistics, ScalarValue, Statistics, stats::Precision as DfPrecision,
     };
     use std::sync::Arc;
+
+    /// Statistics are found by column name when nested fields come first. The footer stores
+    /// them in post-order over every field, so `n` and `t` are not its second and third
+    /// entries. Each scalar column keeps its min, max, sum and null count, read from a real
+    /// file's footer and again from the blob Cayenne persists and restores, and a column the
+    /// file lacks gets no statistics.
+    #[tokio::test]
+    async fn nested_fields_before_scalar_columns_keep_each_columns_statistics() {
+        use arrow::array::{
+            ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+        };
+        use vortex::array::stream::ArrayStreamAdapter;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::buffer::ByteBufferMut;
+        use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+
+        let x = Arc::new(Field::new("x", DataType::Int32, false));
+        let y = Arc::new(Field::new("y", DataType::Utf8, false));
+        let nested = StructArray::from(vec![
+            (
+                Arc::clone(&x),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                Arc::clone(&y),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Struct(vec![x, y].into()), false),
+            Field::new("n", DataType::Int64, true),
+            Field::new("t", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(nested),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])),
+                Arc::new(StringArray::from(vec![Some("p"), Some("q"), None])),
+            ],
+        )
+        .expect("batch");
+
+        // Written as Cayenne writes a file: its session, with the column sums it asks for.
+        let session = crate::provider::delta_encoding::write_session();
+        let arrow = session.arrow();
+        let dtype = arrow.from_arrow_schema(&schema).expect("dtype");
+        let chunk = arrow.from_arrow_record_batch(batch, &schema);
+        drop(arrow);
+        let mut file = ByteBufferMut::empty();
+        session
+            .write_options()
+            .with_additional_file_statistics(Stat::Sum.aggregate_fn().into_iter().collect())
+            .write(
+                &mut file,
+                ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk])),
+            )
+            .await
+            .expect("write");
+        let file = session
+            .open_options()
+            .open_buffer(file.freeze())
+            .expect("open");
+        let footer = file
+            .footer()
+            .statistics()
+            .expect("the file records statistics")
+            .clone();
+
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("missing", DataType::Int64, true)));
+        let read_schema = Schema::new(fields);
+
+        let check = |file_stats: &FileStatistics, stage: &str| {
+            let stats = column_stats_sets_to_df(
+                &column_stats_sets(file_stats, &read_schema),
+                &read_schema,
+                3,
+            );
+            let [_, n, t, missing] = stats.column_statistics.as_slice() else {
+                panic!(
+                    "{stage}: one entry per column, got {}",
+                    stats.column_statistics.len()
+                );
+            };
+            assert_eq!(
+                n.min_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(10))),
+                "{stage}: n min"
+            );
+            assert_eq!(
+                n.max_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(30))),
+                "{stage}: n max"
+            );
+            assert_eq!(
+                n.sum_value,
+                DfPrecision::Exact(ScalarValue::Int64(Some(40))),
+                "{stage}: n sum"
+            );
+            assert_eq!(n.null_count, DfPrecision::Exact(1), "{stage}: n nulls");
+            assert_eq!(
+                t.min_value.get_value(),
+                Some(&ScalarValue::Utf8(Some("p".to_string()))),
+                "{stage}: t min"
+            );
+            assert_eq!(
+                t.max_value.get_value(),
+                Some(&ScalarValue::Utf8(Some("q".to_string()))),
+                "{stage}: t max"
+            );
+            assert_eq!(t.null_count, DfPrecision::Exact(1), "{stage}: t nulls");
+            assert_eq!(
+                missing.min_value,
+                DfPrecision::Absent,
+                "{stage}: missing min"
+            );
+            assert_eq!(
+                missing.max_value,
+                DfPrecision::Absent,
+                "{stage}: missing max"
+            );
+            assert_eq!(
+                missing.sum_value,
+                DfPrecision::Absent,
+                "{stage}: missing sum"
+            );
+        };
+        check(&footer, "footer");
+
+        let sets: Vec<StatsSet> = column_stats_sets(&footer, &schema)
+            .into_iter()
+            .map(|(set, _)| set)
+            .collect();
+        let blob =
+            serialize_file_statistics(&build_file_statistics(&sets, &schema).expect("build"))
+                .expect("serialize");
+        let restored = deserialize_file_statistics(&blob, &schema).expect("deserialize");
+        check(&restored, "restored");
+    }
+
+    /// A stored blob merges with a write's statistics when both describe the table's columns,
+    /// and is not merged when it was written for other columns, here before one was added:
+    /// it does not deserialize against the current schema, so the caller falls back.
+    #[test]
+    fn a_stored_blob_merges_only_against_the_columns_it_was_written_for() {
+        let column = |min: i64, max: i64, nulls: usize| ColumnStatistics {
+            null_count: DfPrecision::Exact(nulls),
+            min_value: DfPrecision::Exact(ScalarValue::Int64(Some(min))),
+            max_value: DfPrecision::Exact(ScalarValue::Int64(Some(max))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let stored_for = |schema: &Schema, columns: Vec<ColumnStatistics>| {
+            statistics_to_persisted_blob(
+                &Statistics {
+                    num_rows: DfPrecision::Exact(2),
+                    total_byte_size: DfPrecision::Absent,
+                    column_statistics: columns,
+                },
+                schema,
+            )
+            .expect("stored blob")
+        };
+        let dtypes = |schema: &Schema| -> Vec<DType> {
+            schema
+                .fields()
+                .iter()
+                .map(|field| ARROW_SESSION.from_arrow_field(field).expect("dtype"))
+                .collect()
+        };
+        let before = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let after = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let new_sets: Vec<StatsSet> = [column(3, 9, 1), column(10, 20, 0)]
+            .iter()
+            .map(column_stats_to_stats_set)
+            .collect();
+
+        let same = stored_for(&after, vec![column(1, 5, 0), column(12, 30, 2)]);
+        let merged = merge_serialized_stats(&same, &new_sets, &dtypes(&after), &after)
+            .expect("a blob for the same columns merges");
+        let merged = restore_persisted_statistics(&merged, &after, 4)
+            .expect("restore")
+            .statistics;
+        let [a, b] = merged.column_statistics.as_slice() else {
+            panic!("two columns");
+        };
+        assert_eq!(a.min_value, DfPrecision::Exact(ScalarValue::Int64(Some(1))));
+        assert_eq!(a.max_value, DfPrecision::Exact(ScalarValue::Int64(Some(9))));
+        assert_eq!(a.null_count, DfPrecision::Exact(1));
+        assert_eq!(
+            b.min_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(10)))
+        );
+        assert_eq!(
+            b.max_value,
+            DfPrecision::Exact(ScalarValue::Int64(Some(30)))
+        );
+        assert_eq!(b.null_count, DfPrecision::Exact(2));
+
+        let narrower = stored_for(&before, vec![column(1, 5, 0)]);
+        assert!(
+            merge_serialized_stats(&narrower, &new_sets, &dtypes(&after), &after).is_none(),
+            "a blob written before b was added is not merged"
+        );
+        assert!(
+            merge_serialized_stats(&same, &new_sets[..1], &dtypes(&after)[..1], &after).is_none(),
+            "statistics for only some of the columns are not merged"
+        );
+    }
+
+    /// An inexact statistic stays inexact through the per-file blob a scan persists from a
+    /// footer, and an exact one stays exact. `Precision::is_exact` is `Some(false)` for an
+    /// inexact value, so testing it with `is_some()` persisted every inexact bound, null
+    /// count, sum and size as exact: after a restart a string column's 64-byte footer bound
+    /// answered `MIN`/`MAX` as if it were the value.
+    #[test]
+    fn inexact_column_statistics_stay_inexact_through_the_persisted_blob() {
+        let schema = Schema::new(vec![
+            Field::new("t", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let bound = |c: char| ScalarValue::Utf8(Some(c.to_string().repeat(64)));
+        for (label, wrap) in [
+            (
+                "inexact",
+                DfPrecision::Inexact as fn(ScalarValue) -> DfPrecision<ScalarValue>,
+            ),
+            (
+                "exact",
+                DfPrecision::Exact as fn(ScalarValue) -> DfPrecision<ScalarValue>,
+            ),
+        ] {
+            let count = |n: usize| {
+                if label == "exact" {
+                    DfPrecision::Exact(n)
+                } else {
+                    DfPrecision::Inexact(n)
+                }
+            };
+            let stats = Statistics {
+                num_rows: DfPrecision::Exact(3),
+                total_byte_size: DfPrecision::Exact(30),
+                column_statistics: vec![
+                    ColumnStatistics {
+                        null_count: count(1),
+                        min_value: wrap(bound('a')),
+                        max_value: wrap(bound('z')),
+                        sum_value: DfPrecision::Absent,
+                        distinct_count: DfPrecision::Absent,
+                        byte_size: count(20),
+                    },
+                    ColumnStatistics {
+                        null_count: count(0),
+                        min_value: wrap(ScalarValue::Int64(Some(1))),
+                        max_value: wrap(ScalarValue::Int64(Some(3))),
+                        sum_value: wrap(ScalarValue::Int64(Some(6))),
+                        distinct_count: DfPrecision::Absent,
+                        byte_size: count(10),
+                    },
+                ],
+            };
+            let blob = statistics_to_persisted_blob(&stats, &schema).expect("blob");
+            let restored = restore_persisted_statistics(&blob, &Arc::new(schema.clone()), 3)
+                .expect("restore")
+                .statistics;
+            let [t, n] = restored.column_statistics.as_slice() else {
+                panic!("{label}: two columns");
+            };
+            assert_eq!(t.min_value, wrap(bound('a')), "{label}: t min");
+            assert_eq!(t.max_value, wrap(bound('z')), "{label}: t max");
+            // A count Vortex keeps only when exact comes back absent rather than inexact,
+            // which is as safe: it is never served as exact.
+            let counted = |restored: &DfPrecision<usize>, expected: usize| {
+                if label == "exact" {
+                    *restored == DfPrecision::Exact(expected)
+                } else {
+                    !matches!(restored, DfPrecision::Exact(_))
+                }
+            };
+            assert!(
+                counted(&t.null_count, 1),
+                "{label}: t nulls {:?}",
+                t.null_count
+            );
+            assert!(
+                counted(&t.byte_size, 20),
+                "{label}: t size {:?}",
+                t.byte_size
+            );
+            assert_eq!(
+                n.min_value,
+                wrap(ScalarValue::Int64(Some(1))),
+                "{label}: n min"
+            );
+            assert_eq!(
+                n.max_value,
+                wrap(ScalarValue::Int64(Some(3))),
+                "{label}: n max"
+            );
+            if label == "exact" {
+                assert_eq!(
+                    n.sum_value,
+                    wrap(ScalarValue::Int64(Some(6))),
+                    "exact: n sum"
+                );
+            } else {
+                assert!(
+                    !matches!(n.sum_value, DfPrecision::Exact(_)),
+                    "inexact: n sum {:?}",
+                    n.sum_value
+                );
+            }
+        }
+    }
 
     fn restored_column(
         data_type: DataType,
@@ -1084,8 +1487,7 @@ mod tests {
             "max present in StatsSet"
         );
 
-        let file_stats =
-            build_file_statistics(vec![set], &schema).expect("statistics types convert");
+        let file_stats = build_file_statistics(&[set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -1128,11 +1530,9 @@ mod tests {
             byte_size: DfPrecision::Absent,
         };
         let blob = |float_set: StatsSet| {
-            let file_stats = build_file_statistics(
-                vec![float_set, column_stats_to_stats_set(&int_stats)],
-                &schema,
-            )
-            .expect("statistics types convert");
+            let file_stats =
+                build_file_statistics(&[float_set, column_stats_to_stats_set(&int_stats)], &schema)
+                    .expect("statistics types convert");
             serialize_file_statistics(&file_stats).expect("serialize ok")
         };
 
@@ -1191,7 +1591,7 @@ mod tests {
         let first_set = column_stats_to_stats_set(&first_stats);
         let second_set = column_stats_to_stats_set(&second_stats);
         let first_file_stats =
-            build_file_statistics(vec![first_set], &schema).expect("statistics types convert");
+            build_file_statistics(&[first_set], &schema).expect("statistics types convert");
         let first_blob = serialize_file_statistics(&first_file_stats).expect("serialize ok");
         let dtypes = vec![
             ARROW_SESSION
@@ -1537,8 +1937,7 @@ mod tests {
             "sum present in StatsSet"
         );
 
-        let file_stats =
-            build_file_statistics(vec![set], &schema).expect("statistics types convert");
+        let file_stats = build_file_statistics(&[set], &schema).expect("statistics types convert");
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
         let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
 
@@ -1564,7 +1963,7 @@ mod tests {
         let first_set = column_stats_to_stats_set(&mk_sum(60));
         let second_set = column_stats_to_stats_set(&mk_sum(30));
         let first_blob = serialize_file_statistics(
-            &build_file_statistics(vec![first_set], &schema).expect("statistics types convert"),
+            &build_file_statistics(&[first_set], &schema).expect("statistics types convert"),
         )
         .expect("serialize ok");
         let dtypes = vec![

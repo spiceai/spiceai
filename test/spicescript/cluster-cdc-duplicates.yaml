@@ -1,0 +1,47 @@
+name: cluster-cdc-duplicates
+duration: 26s
+description: >
+  On a cluster of two executors, a CDC (`refresh_mode: changes`) Cayenne
+  dataset answers each row once, as the source does, before and after
+  updates and inserts: each executor keeps to its own partitions rather
+  than building and applying the whole table.
+sources:
+  src: { kind: postgres }
+
+# The spicepod as written, and the same with the prototype object-native
+# Cayenne metastore (`runtime.params.cayenne_vnext`) enabled. A cluster keeps
+# the SQLite metastore under the flag, since its executors share one state
+# location and the object-native metastore has one writer per dataset log; the
+# variant checks that the cluster still serves every row once (#16205). The
+# other cluster scripts run without it.
+variants:
+  as-written: federated
+  object-native: object-native
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-cdc-duplicates
+  datasets:
+    - from: postgres:public.acct
+      name: acct
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  cluster: { executors: 2 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE acct (id int PRIMARY KEY, bal int NOT NULL); INSERT INTO acct SELECT i, 1000 FROM generate_series(1, 100) i" }
+  - start: { ready: false }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM acct
+    expect: { rows: [['100', '100']] }
+    eventually: 90s
+  - query: SELECT id, bal FROM acct
+  - source-exec: { src: "UPDATE acct SET bal = 0 WHERE id <= 10; INSERT INTO acct VALUES (1000, 5)" }
+  - query: SELECT id, bal FROM acct
+    eventually: 30s
+  - assert-log: { contains: 'uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support cluster mode yet' }
+    only: object-native

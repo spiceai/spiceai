@@ -38,10 +38,7 @@ use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    metadata::CreateTableOptions,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 
 use common::TestFixture;
 
@@ -95,7 +92,7 @@ async fn setup_int64_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -104,7 +101,10 @@ async fn setup_int64_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -122,7 +122,7 @@ async fn setup_string_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["code".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -131,7 +131,10 @@ async fn setup_string_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -149,7 +152,7 @@ async fn setup_composite_pk_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
         on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -158,7 +161,10 @@ async fn setup_composite_pk_table(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -510,8 +516,9 @@ async fn test_acid_durability_reopen_impl(fixture: TestFixture) -> TestResult<()
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
         let ctx2 = SessionContext::new();
         let reopened_table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog, ctx2.runtime_env())
-                .open(table_name)
+            fixture
+                .data_store
+                .open(catalog, ctx2.runtime_env(), table_name)
                 .await?,
         );
 
@@ -554,7 +561,7 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: fixture.data_path.to_string_lossy().to_string(),
+            base_path: fixture.data_store.base_path(table_name),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
         };
@@ -563,7 +570,10 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
         let ctx = SessionContext::new();
         let table = Arc::new(
-            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+            fixture
+                .data_store
+                .create(catalog, ctx.runtime_env(), table_options)
+                .await?,
         );
 
         let batch1 = RecordBatch::try_new(
@@ -594,8 +604,9 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
         let ctx2 = SessionContext::new();
         let reopened_table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog, ctx2.runtime_env())
-                .open(table_name)
+            fixture
+                .data_store
+                .open(catalog, ctx2.runtime_env(), table_name)
                 .await?,
         );
 
@@ -1295,7 +1306,7 @@ async fn test_multifile_position_based_delete_reinsert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         on_conflict: None, // No PK = position-based deletion
-        base_path: fixture.data_path.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path("mf_position_delete_insert"),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
@@ -1304,7 +1315,10 @@ async fn test_multifile_position_based_delete_reinsert_impl(
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        fixture
+            .data_store
+            .create(catalog, ctx.runtime_env(), table_options)
+            .await?,
     );
     ctx.register_table(
         "mf_position_delete_insert",
@@ -1434,46 +1448,23 @@ async fn test_multifile_bulk_delete_bulk_reinsert_impl(fixture: TestFixture) -> 
 // Test Registration Macros
 // =============================================================================
 
-macro_rules! test_with_backends {
-    ($test_fn:ident) => {
-        paste::paste! {
-            #[tokio::test]
-            async fn [<$test_fn _sqlite>]() {
-                let fixture = TestFixture::new(common::BackendType::Sqlite)
-                    .await
-                    .expect("Failed to create test fixture");
-                $test_fn(fixture).await.expect("Test failed");
-            }
-
-            #[cfg(feature = "turso")]
-            #[tokio::test]
-            async fn [<$test_fn _turso>]() {
-                let fixture = TestFixture::new(common::BackendType::Turso)
-                    .await
-                    .expect("Failed to create test fixture");
-                $test_fn(fixture).await.expect("Test failed");
-            }
-        }
-    };
-}
-
-test_with_backends!(test_acid_upsert_int64_pk_impl);
-test_with_backends!(test_acid_upsert_string_pk_impl);
-test_with_backends!(test_acid_upsert_composite_pk_impl);
-test_with_backends!(test_acid_multiple_upserts_impl);
-test_with_backends!(test_acid_durability_reopen_impl);
-test_with_backends!(test_acid_durability_deletions_persist_impl);
-test_with_backends!(test_acid_batch_upsert_impl);
-test_with_backends!(test_acid_delete_all_then_insert_impl);
-test_with_backends!(test_acid_interleaved_ops_impl);
+test_on_data_store!(test_acid_upsert_int64_pk_impl);
+test_on_data_store!(test_acid_upsert_string_pk_impl);
+test_on_data_store!(test_acid_upsert_composite_pk_impl);
+test_on_data_store!(test_acid_multiple_upserts_impl);
+test_on_data_store!(test_acid_durability_reopen_impl);
+test_on_data_store!(test_acid_durability_deletions_persist_impl);
+test_on_data_store!(test_acid_batch_upsert_impl);
+test_on_data_store!(test_acid_delete_all_then_insert_impl);
+test_on_data_store!(test_acid_interleaved_ops_impl);
 
 // Multi-file upsert tests
-test_with_backends!(test_multifile_delete_file1_insert_file2_int64_impl);
-test_with_backends!(test_multifile_delete_file1_insert_file2_string_impl);
-test_with_backends!(test_multifile_multiple_upserts_int64_impl);
-test_with_backends!(test_multifile_upsert_composite_pk_impl);
-test_with_backends!(test_multifile_delete_all_readd_all_impl);
-test_with_backends!(test_multifile_interleaved_many_files_impl);
-test_with_backends!(test_multifile_duplicate_pk_in_batch_impl);
-test_with_backends!(test_multifile_position_based_delete_reinsert_impl);
-test_with_backends!(test_multifile_bulk_delete_bulk_reinsert_impl);
+test_on_data_store!(test_multifile_delete_file1_insert_file2_int64_impl);
+test_on_data_store!(test_multifile_delete_file1_insert_file2_string_impl);
+test_on_data_store!(test_multifile_multiple_upserts_int64_impl);
+test_on_data_store!(test_multifile_upsert_composite_pk_impl);
+test_on_data_store!(test_multifile_delete_all_readd_all_impl);
+test_on_data_store!(test_multifile_interleaved_many_files_impl);
+test_on_data_store!(test_multifile_duplicate_pk_in_batch_impl);
+test_on_data_store!(test_multifile_position_based_delete_reinsert_impl);
+test_on_data_store!(test_multifile_bulk_delete_bulk_reinsert_impl);

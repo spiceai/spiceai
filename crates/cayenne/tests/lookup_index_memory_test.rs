@@ -17,8 +17,6 @@ limitations under the License.
 //! Measures Rust allocator live bytes while Cayenne reopens persisted indexes.
 //! Native allocations and memory-mapped pages are outside this measurement.
 
-#![expect(clippy::expect_used, reason = "test setup and assertions")]
-
 use crate::common;
 
 use crate::live_bytes;
@@ -33,7 +31,6 @@ use common::lookup_index::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use cayenne::MetadataCatalog;
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };

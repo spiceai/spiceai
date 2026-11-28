@@ -98,7 +98,6 @@ const CATEGORIES_CSV: &str = r"id,category,rating
 /// in-process executors for this test, using an isolated temporary directory
 /// per test run to avoid interference with other tests.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -190,9 +189,9 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 /// federation wrapper must not hide the inner `AcceleratedTable` from `should_partition`;
 /// the query must still distribute (`FlightSqlExec`).
 #[tokio::test(flavor = "multi_thread")]
-// Builds a DuckDB file to federate over, so it needs the optional `duckdb`
-// dependency this crate only carries under its own feature.
-#[cfg(all(not(target_os = "windows"), feature = "duckdb"))]
+// Reads the source through the installed DuckDB library, which the `duckdb:`
+// connector loads over ADBC.
+#[cfg(feature = "adbc")]
 async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -204,7 +203,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
     let duck_tempdir = tempfile::tempdir().expect("duckdb tempdir");
     let db_path = duck_tempdir.path().join("source.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        let conn = duckdb_oracle::Connection::open(&db_path).expect("open duckdb");
         conn.execute_batch(
             "CREATE TABLE test_data (id BIGINT, name VARCHAR, age BIGINT, city VARCHAR, score BIGINT);
              INSERT INTO test_data VALUES
@@ -300,7 +299,6 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
 /// the source instead of distributing. This is identical to `bucket_partitioning_plan` EXCEPT
 /// the dataset has a column description.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=info,warn"))
@@ -388,7 +386,6 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
 /// A query on the table must fail: the scheduler holds none of the data, and an answer from
 /// the assigned partition alone would be wrong.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=info,warn"))
@@ -396,6 +393,7 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
         .try_init();
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -407,11 +405,12 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
             configure_test_datafusion();
 
             let app = AppBuilder::new("partition_without_executor")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(SchedulerConfig {
@@ -476,7 +475,6 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
 /// - Full SELECT returns all 10 rows without duplicates
 /// - COUNT/AVG aggregations produce correct results
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -598,7 +596,6 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 /// - `WHERE score > 85` appears in the `FlightSqlExec` sql string in the EXPLAIN plan
 /// - Only rows matching the predicate are returned (5 rows: ids 2,4,6,8,10)
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -612,6 +609,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -621,11 +619,12 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
         .scope(async {
             configure_test_datafusion();
             let app = AppBuilder::new("test_predicate_pushdown_accel")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(make_named_scheduler_config(
@@ -668,7 +667,6 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 /// Test that `ORDER BY col LIMIT N` is pushed down into each executor's `FlightSqlExec`
 /// so each partition returns at most N rows (`TopK`)
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -769,7 +767,6 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
 ///    executor[1]
 /// 5. Verify queries still return all 10 rows
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -863,7 +860,6 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 /// - JOIN returns the expected 10 rows with correct column values from both tables
 /// - EXPLAIN plan reflects the distributed scatter-gather for both tables
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -987,7 +983,6 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 /// - Executors receive the `RefreshDataset` command and trigger a local refresh
 /// - Data remains correct after the distributed refresh
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -1001,6 +996,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -1010,11 +1006,12 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
         .scope(async {
             configure_test_datafusion();
             let app = AppBuilder::new("test_refresh_forwarding")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(make_named_scheduler_config(
@@ -1076,7 +1073,6 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
 /// 2. After refresh: partition store has 11 partition values (new city discovered + assigned)
 /// 3. All 11 rows are queryable
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -1090,6 +1086,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -1105,6 +1102,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                     format!("file:{}", csv_path.display()),
                     "test_data",
                     "city",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(
@@ -1274,6 +1272,26 @@ fn make_accelerated_dataset(
     partition_column: &str,
     base_dir: &std::path::Path,
 ) -> Dataset {
+    make_cayenne_partitioned_dataset(
+        source_path,
+        name,
+        PartitionedBy {
+            name: "expr0".to_string(),
+            expression: format!("bucket({num_buckets}, {partition_column})"),
+        },
+        base_dir,
+    )
+}
+
+/// A Cayenne file-mode acceleration under `base_dir`, partitioned by `partition_by`.
+/// Cayenne refuses `partition_by` in memory mode, so every partitioned Cayenne test
+/// here uses file mode.
+fn make_cayenne_partitioned_dataset(
+    source_path: impl Into<String>,
+    name: &str,
+    partition_by: PartitionedBy,
+    base_dir: &std::path::Path,
+) -> Dataset {
     let mut dataset = Dataset::new(source_path, name);
 
     dataset.acceleration = Some(Acceleration {
@@ -1281,10 +1299,7 @@ fn make_accelerated_dataset(
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
-        partition_by: vec![PartitionedBy {
-            name: "expr0".to_string(),
-            expression: format!("bucket({num_buckets}, {partition_column})"),
-        }],
+        partition_by: vec![partition_by],
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 (
@@ -1308,6 +1323,10 @@ fn make_accelerated_dataset(
 /// Unlike [`make_accelerated_dataset`], this uses `Mode::Memory` so no shared file path
 /// is required between executors — each executor materialises its assigned partitions
 /// independently in process memory.
+///
+/// The tests with two executors use this rather than Cayenne: two Cayenne executors in
+/// one process serve rows from each other's partitions, which separate `spiced`
+/// processes do not (see `test/spicescript/cluster-checked-sum.yaml`).
 fn make_memory_accelerated_dataset(
     source_path: impl Into<String>,
     name: &str,
@@ -1331,29 +1350,24 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
-/// Create a dataset with in-memory Arrow acceleration, partitioned by a raw column value (not
-/// `bucket()`).
-/// Each unique value of `partition_column` becomes its own partition.
+/// Create a dataset with Cayenne file-mode acceleration, partitioned by a raw column value
+/// (not `bucket()`): each unique value of `partition_column` becomes its own partition.
+/// `base_dir` is used as in [`make_accelerated_dataset`].
 fn make_column_partitioned_dataset(
     source_path: impl Into<String>,
     name: &str,
     partition_column: &str,
+    base_dir: &std::path::Path,
 ) -> Dataset {
-    let mut dataset = Dataset::new(source_path, name);
-
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("arrow".to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        partition_by: vec![PartitionedBy {
+    make_cayenne_partitioned_dataset(
+        source_path,
+        name,
+        PartitionedBy {
             name: partition_column.to_string(),
             expression: partition_column.to_string(),
-        }],
-        ..Acceleration::default()
-    });
-
-    dataset
+        },
+        base_dir,
+    )
 }
 
 /// Return a `SchedulerConfig` pointing at an S3 path scoped to `test_name`.
@@ -1373,24 +1387,27 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
     max_partitions_per_executor: usize,
 ) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
+    let mut params = std::collections::HashMap::from([
+        ("s3_region".to_string(), "us-east-1".to_string()),
+        (
+            "s3_key".to_string(),
+            "${env:AWS_S3_VECTORS_KEY}".to_string(),
+        ),
+        (
+            "s3_secret".to_string(),
+            "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+        ),
+        ("s3_auth".to_string(), "key".to_string()),
+    ]);
+    params.extend(crate::utils::aws_session_token_param(
+        "s3_session_token",
+        "AWS_S3_VECTORS_SESSION_TOKEN",
+    ));
     SchedulerConfig {
         state_location: Some(format!(
-            "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
+            "s3://spiceai-ci-integration-tests/cluster-state/{test_name}/{run_id}/"
         )),
-        params: Some(spicepod::param::Params::from_string_map(
-            std::collections::HashMap::from([
-                ("s3_region".to_string(), "us-east-1".to_string()),
-                (
-                    "s3_key".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
-                (
-                    "s3_secret".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
-                ("s3_auth".to_string(), "key".to_string()),
-            ]),
-        )),
+        params: Some(spicepod::param::Params::from_string_map(params)),
         partition_assignment_interval: "1s".to_string(),
         max_partition_assignments_per_interval:
             spicepod::component::runtime::default_max_partition_assignments_per_interval(),

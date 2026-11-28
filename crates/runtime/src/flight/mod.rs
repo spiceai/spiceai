@@ -39,6 +39,7 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
+use arrow_tools::ipc::{FLIGHT_TARGET_MESSAGE_BYTES, split_batch_for_flight};
 use bytes::Bytes;
 use cache::result::{
     CacheStatus,
@@ -76,8 +77,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument, Span};
 
 mod actions;
+pub(crate) mod append_stream;
 mod async_actions;
-mod do_exchange;
+pub(crate) mod do_exchange;
 mod do_get;
 mod do_put;
 mod flightsql;
@@ -629,11 +631,10 @@ impl Stream for InlineFlightStream {
                         &args.options,
                         &mut args.compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                this.queue_encoded(dict);
+                        Ok(messages) => {
+                            for message in messages {
+                                this.queue_encoded(message);
                             }
-                            this.queue_encoded(batch_data);
                         }
                         Err(status) => {
                             // Drop the source so a later poll cannot encode the
@@ -723,16 +724,12 @@ fn spawn_flight_encode_stream(
                         &options,
                         &mut compression_context,
                     ) {
-                        Ok((dicts, batch_data)) => {
-                            for dict in dicts {
-                                account.reserve(flight_data_size(&dict)).await;
-                                if tx.send(Ok(dict)).await.is_err() {
+                        Ok(messages) => {
+                            for message in messages {
+                                account.reserve(flight_data_size(&message)).await;
+                                if tx.send(Ok(message)).await.is_err() {
                                     return;
                                 }
-                            }
-                            account.reserve(flight_data_size(&batch_data)).await;
-                            if tx.send(Ok(batch_data)).await.is_err() {
-                                return;
                             }
                         }
                         Err(status) => {
@@ -760,8 +757,14 @@ fn spawn_flight_encode_stream(
 }
 
 /// Encode one served batch into its Flight dictionary + record-batch
-/// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
-/// advertised schema was expanded.
+/// messages, in send order, applying the `Utf8View`/`BinaryView` → `Large*`
+/// cast when the advertised schema was expanded.
+///
+/// A batch over [`FLIGHT_TARGET_MESSAGE_BYTES`] is split into zero-copy row
+/// slices first, each its own record-batch message, so one large batch (an
+/// accelerator scan, a coalesced sort, an engine that returns its whole
+/// result at once) never becomes a message over a client's gRPC receive
+/// limit — 4 MiB by default in tonic, grpc-go and grpc-java.
 ///
 /// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
 /// query does not pay `RecordBatch::clone` before `cast_view_columns`.
@@ -774,7 +777,7 @@ fn encode_flight_batch(
     dict_tracker: &mut DictionaryTracker,
     options: &IpcWriteOptions,
     compression_context: &mut IpcWriteContext,
-) -> Result<(Vec<FlightData>, FlightData), Status> {
+) -> Result<Vec<FlightData>, Status> {
     let cast;
     let batch = if needs_view_cast {
         let owned = match batch {
@@ -788,14 +791,18 @@ fn encode_flight_batch(
         batch.as_record_batch()
     };
 
-    let (dicts, batch_data) = encoder
-        .encode(batch, dict_tracker, options, compression_context)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok((
-        dicts.into_iter().map(Into::into).collect(),
-        batch_data.into(),
-    ))
+    // `RecordBatch::clone` is a handful of `Arc` bumps; the slices share the
+    // batch's buffers.
+    let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+    let mut messages = Vec::with_capacity(slices.len());
+    for slice in &slices {
+        let (dicts, batch_data) = encoder
+            .encode(slice, dict_tracker, options, compression_context)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        messages.extend(dicts.into_iter().map(Into::into));
+        messages.push(batch_data.into());
+    }
+    Ok(messages)
 }
 
 /// Heap/wire bytes a single [`FlightData`] message occupies while buffered for
@@ -890,17 +897,36 @@ pub(crate) fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
+/// Streams a committed transaction's final result, holding its memory
+/// reservation until the stream is dropped.
+pub(crate) fn transaction_outcome_to_flight_stream(
+    outcome: query::TransactionOutcome,
+) -> impl Stream<Item = Result<FlightData, Status>> {
+    let query::TransactionOutcome {
+        result,
+        reservation,
+    } = outcome;
+    let batches = result.map(|(batches, _)| batches).unwrap_or_default();
+    record_batches_to_flight_stream(batches).map(move |item| {
+        let _held = &reservation;
+        item
+    })
+}
+
 /// Returns `true` when the request has an authenticated principal that
-/// lacks write permission (`"write"` or `"read_write"` group).
-/// Returns `false` when there is no principal (auth not configured)
+/// lacks write permission (`"write"` or `"read_write"` group), or no principal
+/// and comes to an executor from a cluster node other than the scheduler, which
+/// only reads there.
+/// Returns `false` when there is no principal otherwise (auth not configured)
 /// or the principal has write access.
 pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
-    context.auth_principal().is_some_and(|principal| {
-        !principal
+    match context.auth_principal() {
+        Some(principal) => !principal
             .groups()
             .iter()
-            .any(|g| *g == "write" || *g == "read_write")
-    })
+            .any(|g| *g == "write" || *g == "read_write"),
+        None => crate::cluster::peer::is_from_peer_executor(context),
+    }
 }
 
 /// If the current principal is read-only, validates that `sql` does not contain
@@ -969,6 +995,7 @@ fn handle_query_error(e: query::Error) -> Status {
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(&source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
+        query::Error::NotCached => Status::failed_precondition(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
@@ -1014,6 +1041,14 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
         },
         DataFusionError::SchemaError(schema_err, _) => {
             Status::invalid_argument(format!("{schema_err}"))
+        }
+        // Data a connector refused as a compression bomb: the query is the client's to
+        // change, so a client error, as `/v1/sql` answers it.
+        DataFusionError::External(e)
+            if data_components::refusal::is_compression_refusal(e.as_ref())
+                || data_components::refusal::is_request_bound_refusal(e.as_ref()) =>
+        {
+            Status::invalid_argument(e.to_string())
         }
         DataFusionError::External(e) => {
             if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
@@ -1395,7 +1430,7 @@ impl Default for RateLimits {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
+        Array, ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
     };
     use arrow::datatypes::{Field, Fields, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
@@ -1404,6 +1439,62 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
     use runtime_request_context::Protocol;
+
+    /// Data refused as a compression bomb is a client error with the refusal's own
+    /// message, however it was wrapped; text alone does not make an error one.
+    #[test]
+    fn a_compression_refusal_is_a_client_error_by_its_type() {
+        let refusal = http_body_limit::Error::CompressionRatio {
+            codec: http_body_limit::Codec::Gzip,
+            input: http_body_limit::Input::File,
+            decoded: 67_200_000,
+            received: 33_600,
+        };
+        let typed =
+            http_body_limit::CompressionRefusal::new("a reworded refusal".to_string(), &refusal)
+                .expect("a compression refusal");
+        let error = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(typed))),
+        );
+        let status = handle_datafusion_error(&error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "a reworded refusal");
+
+        let text_only = DataFusionError::External(Box::new(std::io::Error::other(
+            "the response was refused as a compression bomb",
+        )));
+        assert_eq!(
+            handle_datafusion_error(&text_only).code(),
+            tonic::Code::Internal
+        );
+    }
+
+    /// A query over an HTTP dataset's request bound is a client error with the
+    /// refusal's own message, however it was wrapped; text alone does not make an
+    /// error one.
+    #[test]
+    fn a_request_bound_refusal_is_a_client_error_by_its_type() {
+        let error = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(
+                data_components::http::provider::Error::TooManyRequests {
+                    message: "a reworded request-bound refusal".to_string(),
+                },
+            ))),
+        );
+        let status = handle_datafusion_error(&error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "a reworded request-bound refusal");
+
+        let text_only = DataFusionError::External(Box::new(std::io::Error::other(
+            "set `max_request_partitions` on the dataset",
+        )));
+        assert_eq!(
+            handle_datafusion_error(&text_only).code(),
+            tonic::Code::Internal
+        );
+    }
 
     /// The messages a Flight response sent, and the failure that ended it, if any.
     type Sent = (Vec<FlightData>, Option<(tonic::Code, String)>);
@@ -1478,6 +1569,80 @@ mod tests {
 
     fn batch(schema: &SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), columns).expect("record batch")
+    }
+
+    /// One batch whose single message would be over a gRPC client's default 4 MiB
+    /// receive limit — the ~7.6 MB message an accelerated `SELECT *` sent — must go
+    /// out as several messages under it, on the inline, encode-task and cached-raw
+    /// paths alike, with every row arriving in order.
+    #[tokio::test]
+    async fn a_large_batch_is_sent_as_messages_under_the_client_receive_limit() {
+        const CLIENT_DEFAULT_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("js", DataType::Utf8View, false),
+        ]));
+        let rows = 32_768_i64;
+        let pad = "x".repeat(231);
+        let ids: Vec<i64> = (0..rows).collect();
+        let large = batch(
+            &schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+                Arc::new(StringViewArray::from_iter_values(
+                    ids.iter().map(|i| format!("{i:09}{pad}")),
+                )) as ArrayRef,
+            ],
+        );
+        assert!(large.get_array_memory_size() > CLIENT_DEFAULT_DECODE_LIMIT);
+
+        for (path, response) in [
+            ("inline", respond(&schema, vec![Ok(large.clone())], true)),
+            (
+                "encode task",
+                respond(&schema, vec![Ok(large.clone())], false),
+            ),
+            (
+                "cached raw",
+                respond_cached_raw(&schema, vec![large.clone()]),
+            ),
+        ] {
+            let (messages, failure) = sent(response).await;
+            assert_eq!(failure, None, "{path}");
+            for message in &messages {
+                let bytes = message.data_header.len() + message.data_body.len();
+                assert!(
+                    bytes <= CLIENT_DEFAULT_DECODE_LIMIT,
+                    "{path}: a {bytes}-byte message exceeds the client limit"
+                );
+            }
+            let decoded =
+                arrow_flight::utils::flight_data_to_batches(&messages).expect("decode messages");
+            assert!(decoded.len() > 1, "{path}: the batch was not split");
+            let decoded_ids: Vec<i64> = decoded
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column")
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(decoded_ids, ids, "{path}");
+            let last = decoded.last().expect("a batch");
+            let js = arrow::compute::cast(last.column(1), &DataType::Utf8).expect("cast js");
+            let js = js
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("js column");
+            assert_eq!(
+                js.value(js.len() - 1),
+                format!("{:09}{pad}", rows - 1),
+                "{path}"
+            );
+        }
     }
 
     /// A result encoded on the request's task must send exactly the messages the
@@ -1973,7 +2138,7 @@ mod tests {
         );
         let (messages, error) = sent(response).await;
         assert!(error.is_none(), "{error:?}");
-        assert!(!messages.is_empty());
+        assert_ne!(messages, [] as [FlightData; 0]);
         assert_eq!(pool.reserved(), 0);
     }
 
@@ -2171,5 +2336,34 @@ mod tests {
                 "Arrow error: Memory error: buffer too small"
             )
         );
+    }
+
+    /// A transaction result's reservation is held until its Flight stream is
+    /// dropped, not released when the stream is built.
+    #[tokio::test]
+    async fn transaction_stream_holds_its_reservation() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("transaction_result").register(&pool);
+        reservation.grow(1024);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("record batch");
+        let outcome = query::TransactionOutcome {
+            result: Some((vec![batch], cache::result::CacheStatus::CacheMiss)),
+            reservation,
+        };
+
+        let mut stream = Box::pin(transaction_outcome_to_flight_stream(outcome));
+        assert_eq!(pool.reserved(), 1024);
+        while let Some(item) = stream.next().await {
+            item.expect("flight data");
+            assert_eq!(pool.reserved(), 1024);
+        }
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
     }
 }

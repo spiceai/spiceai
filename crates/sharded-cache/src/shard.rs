@@ -1176,7 +1176,7 @@ mod tests {
             100,
             "a refill after churn + clear must not append new slots"
         );
-        assert!(shard.free.is_empty());
+        assert_eq!(shard.free, [] as [u32; 0]);
         assert_eq!(shard.len(), 100);
     }
 
@@ -1354,10 +1354,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one operation per match arm keeps the history readable"
-    )]
     fn run_expiry_history(seed: u64, policy: EvictionPolicy) {
         use std::collections::BTreeMap;
 

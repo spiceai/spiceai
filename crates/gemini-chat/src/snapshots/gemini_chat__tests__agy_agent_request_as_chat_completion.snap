@@ -1,0 +1,22 @@
+---
+source: crates/gemini-chat/src/tests.rs
+expression: pretty(&wire(&chat))
+---
+{
+  "max_completion_tokens": 16384,
+  "messages": [
+    {
+      "content": "<identity>\nYou are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nYou are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, ",
+      "role": "system"
+    },
+    {
+      "content": "<USER_REQUEST>\nReply with exactly the word: pong\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-26T17:11:21-07:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to qwen. No need to comment on this change if the user doesn",
+      "role": "user"
+    }
+  ],
+  "model": "qwen",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

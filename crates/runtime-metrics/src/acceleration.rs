@@ -15,10 +15,13 @@ limitations under the License.
 */
 
 use opentelemetry::{
-    global,
+    KeyValue, global,
     metrics::{Counter, Gauge, Histogram, Meter},
 };
-use std::sync::LazyLock;
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicU64, Ordering},
+};
 use telemetry::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
@@ -34,9 +37,16 @@ pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_wor
 /// Always emit this label. A listed object replaced mid-scan is
 /// `object_generation_changed` so it can be filtered without hiding genuine
 /// Parquet corruption (`parquet_decode`) or other refresh failures (`other`).
+/// A snapshot reader (`refresh_mode: snapshot`) reports why it could not advance:
+/// `snapshot_not_found` when none is published, `snapshot_older_than_loaded` when
+/// loading the published one would regress the dataset, and `snapshot_download_failed`
+/// when a newer one could not be loaded.
 pub const REFRESH_ERROR_REASON: &str = "reason";
 pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generation_changed";
 pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED: &str = "snapshot_older_than_loaded";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_DOWNLOAD_FAILED: &str = "snapshot_download_failed";
 pub const REFRESH_ERROR_REASON_OTHER: &str = "other";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
@@ -532,3 +542,40 @@ pub static CDC_APPLY_CYCLE_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
+
+/// CDC change events that could not be decoded and were skipped so the rest of
+/// the poll chunk could still apply. Labeled by `dataset`. Counted and logged:
+/// the log names the topic, partition, offset and error kind; this series is
+/// the rate. Sticky dataset `Error` is the companion health signal.
+pub static CDC_DECODE_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_cdc_decode_errors")
+        .with_description(
+            "Number of CDC change events that failed to decode and were skipped so later events in the same poll could still apply.",
+        )
+        .build()
+});
+
+static CDC_DECODE_ERRORS_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+fn cdc_decode_error_labels(dataset: &str) -> [KeyValue; 1] {
+    [KeyValue::new("dataset", dataset.to_string())]
+}
+
+/// Record one skipped CDC change event for `dataset`.
+pub fn record_cdc_decode_error(dataset: &str) {
+    CDC_DECODE_ERRORS.add(1, &cdc_decode_error_labels(dataset));
+    CDC_DECODE_ERRORS_RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish the series at zero so a dashboard is not empty until the first skip.
+pub fn seed_cdc_decode_errors(dataset: &str) {
+    CDC_DECODE_ERRORS.add(0, &cdc_decode_error_labels(dataset));
+}
+
+/// Process-wide count of [`record_cdc_decode_error`] calls. Tests use this
+/// because the OpenTelemetry counter is not scrapeable from a library test.
+#[must_use]
+pub fn cdc_decode_errors_recorded() -> u64 {
+    CDC_DECODE_ERRORS_RECORDED.load(Ordering::Relaxed)
+}

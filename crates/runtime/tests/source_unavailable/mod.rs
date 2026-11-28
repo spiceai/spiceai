@@ -55,9 +55,9 @@ use crate::{
 /// and `read_provider` fails instead.
 ///
 /// It can also be slow (building its connector waits `build_delay_ms` first, and every
-/// `read_provider` waits `read_delay_ms`), counts every build and read it is asked
-/// for, and can report a primary key on `id`, the way `DynamoDB` reports its key
-/// schema.
+/// `read_provider` waits `read_delay_ms`; with [`Self::read_lazily`], every scan waits
+/// `scan_delay_ms`), counts every build, read and lazy scan it is asked for, and can
+/// report a primary key on `id`, the way `DynamoDB` reports its key schema.
 pub(crate) struct UnreachableSource {
     pub(crate) prefix: &'static str,
     up: AtomicBool,
@@ -75,6 +75,8 @@ pub(crate) struct UnreachableSource {
     dynamic_reads: AtomicBool,
     fail_scans: AtomicBool,
     failed_scans: AtomicUsize,
+    scan_delay_ms: AtomicU64,
+    scans: AtomicUsize,
 }
 
 impl UnreachableSource {
@@ -96,6 +98,8 @@ impl UnreachableSource {
             dynamic_reads: AtomicBool::new(false),
             fail_scans: AtomicBool::new(false),
             failed_scans: AtomicUsize::new(0),
+            scan_delay_ms: AtomicU64::new(0),
+            scans: AtomicUsize::new(0),
         })
     }
 
@@ -150,6 +154,18 @@ impl UnreachableSource {
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::SeqCst,
         );
+    }
+
+    fn set_scan_delay(&self, delay: Duration) {
+        self.scan_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// How many times a lazily read provider was scanned (counted as each scan starts).
+    fn scans(&self) -> usize {
+        self.scans.load(Ordering::SeqCst)
     }
 
     /// How many times a connector was built (counted as each build starts).
@@ -269,6 +285,11 @@ impl TableProvider for DynamicSourceTable {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.source.scans.fetch_add(1, Ordering::SeqCst);
+        let delay = self.source.scan_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self.source.fail_scans.load(Ordering::SeqCst) {
             self.source.failed_scans.fetch_add(1, Ordering::SeqCst);
             return Err(datafusion::error::DataFusionError::Execution(
@@ -601,9 +622,135 @@ async fn a_dataset_whose_source_refuses_reads_at_startup_loads_once_the_source_i
     .await
 }
 
+/// A Spicepod change to an accelerated dataset whose source is down cannot load the
+/// new configuration. The dataset loads it once the source is reachable again.
+#[tokio::test]
+async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_reachable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("changed-while-down", 7);
+    source.refuse_reads_instead_of_connecting();
+    source.register().await;
+    source.bring_up();
+
+    let app = |refresh_check_interval: &str| {
+        let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
+            refresh_check_interval: Some(refresh_check_interval.to_string()),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build()
+    };
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app("30s")).build().await);
+    let loader = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_components().await }
+    });
+    let ready = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(ready, "the dataset must load while its source is up");
+
+    source.take_down();
+    assert!(Arc::clone(&rt).apply_app(Arc::new(app("60s"))).await);
+    assert!(
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_err(),
+        "the new configuration cannot load while the source is down"
+    );
+
+    source.bring_up();
+    let queryable = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(
+        queryable,
+        "the dataset must load once its source is reachable; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+
+    loader.abort();
+    rt.shutdown().await;
+    Ok(())
+}
+
+/// A `refresh_cron` removed while the dataset's initial load runs stays removed: the load
+/// that the reload replaced must not create a schedule from the earlier definition.
+#[tokio::test]
+async fn a_refresh_cron_removed_during_the_initial_load_stays_removed() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("cron-removed-during-load", 3);
+    source.read_lazily();
+    source.set_scan_delay(Duration::from_secs(2));
+    source.register().await;
+    source.bring_up();
+
+    let app = |refresh_cron: Option<&str>| {
+        let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
+            refresh_cron: refresh_cron.map(str::to_string),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build()
+    };
+    configure_test_datafusion();
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app(Some("* * * * * *")))
+            .build()
+            .await,
+    );
+    let loader = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_components().await }
+    });
+    let loading = wait_until_true(Duration::from_secs(10), || async { source.scans() > 0 }).await;
+    assert!(loading, "the initial load must start");
+
+    // The replaced load ends while the reload's own load still runs, so only the removal
+    // at the start of the reload can stop the replaced load from creating its schedule.
+    source.set_scan_delay(Duration::from_secs(4));
+    assert!(Arc::clone(&rt).apply_app(Arc::new(app(None))).await);
+    let reloaded = wait_until_true(Duration::from_secs(30), || async {
+        source.scans() >= 2 && matches!(dataset_status(&rt, "orders"), Some(ComponentStatus::Ready))
+    })
+    .await;
+    assert!(
+        reloaded,
+        "the reloaded dataset must load; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+    let scans_after_reload = source.scans();
+    // Longer than a scan plus a cron tick: a schedule of the replaced definition would
+    // start another refresh in this time.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        source.scans(),
+        scans_after_reload,
+        "no scheduled refresh may run after `refresh_cron` is removed; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+
+    loader.abort();
+    rt.shutdown().await;
+    Ok(())
+}
+
 /// Accelerated datasets whose acceleration is already on disk when the runtime
 /// starts with the source down or slow (#14610).
-#[cfg(feature = "duckdb")]
 mod served_from_acceleration {
     use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
@@ -620,6 +767,7 @@ mod served_from_acceleration {
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
         component::dataset::{Dataset as SpicepodDataset, ReadyState},
+        component::view::View,
         param::Params,
         semantic::Column,
     };
@@ -631,21 +779,39 @@ mod served_from_acceleration {
         utils::{run_query, wait_until_true},
     };
 
-    /// A `DuckDB` file acceleration that refreshes every second, so a refresh is due
+    /// Cayenne file-mode params keeping the data under `data_dir` and the metastore
+    /// beside it. A process keeps one Cayenne metastore, so every acceleration in a
+    /// test shares the one in its fixture directory; leaving it at the default would
+    /// share one metastore between tests that run at the same time.
+    fn cayenne_params(data_dir: &Path) -> Params {
+        let metadata_dir = data_dir
+            .parent()
+            .expect("an acceleration directory sits inside the fixture directory")
+            .join("cayenne_metadata");
+        Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.to_string_lossy().to_string(),
+            ),
+        ]))
+    }
+
+    /// A `Cayenne` file acceleration that refreshes every second, so a refresh is due
     /// as soon as the runtime restarts.
-    fn dataset(prefix: &str, duckdb_file: &Path, ready_state: ReadyState) -> SpicepodDataset {
+    fn dataset(prefix: &str, data_dir: &Path, ready_state: ReadyState) -> SpicepodDataset {
         let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
         dataset.ready_state = ready_state;
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("duckdb".to_string()),
+            engine: Some("cayenne".to_string()),
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
             refresh_check_interval: Some("1s".to_string()),
-            params: Some(Params::from_string_map(HashMap::from([(
-                "duckdb_file".to_string(),
-                duckdb_file.to_string_lossy().to_string(),
-            )]))),
+            params: Some(cayenne_params(data_dir)),
             ..Default::default()
         });
         dataset
@@ -730,16 +896,22 @@ mod served_from_acceleration {
         fn dataset(&self, ready_state: ReadyState) -> SpicepodDataset {
             dataset(
                 self.source.prefix,
-                &self.dir.path().join("orders.duckdb"),
+                &self.dir.path().join("orders"),
                 ready_state,
             )
         }
     }
 
     async fn start(dataset: SpicepodDataset) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
-        let app = AppBuilder::new("source_unavailable")
-            .with_dataset(dataset)
-            .build();
+        start_app(
+            AppBuilder::new("source_unavailable")
+                .with_dataset(dataset)
+                .build(),
+        )
+        .await
+    }
+
+    async fn start_app(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         let loader = tokio::spawn({
@@ -828,7 +1000,15 @@ mod served_from_acceleration {
         rt: &Arc<Runtime>,
         table: &str,
     ) -> Result<(i64, i64), String> {
-        let sql = format!("SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM {table}");
+        query_column_sum_and_count(rt, table, "v").await
+    }
+
+    async fn query_column_sum_and_count(
+        rt: &Arc<Runtime>,
+        table: &str,
+        column: &str,
+    ) -> Result<(i64, i64), String> {
+        let sql = format!("SELECT CAST(SUM({column}) AS BIGINT) AS s, COUNT(*) AS n FROM {table}");
         let batches = run_query(rt, &sql).await.map_err(|err| err.to_string())?;
         let batch = batches.first().ok_or("no batches")?;
         let sum = batch
@@ -948,6 +1128,252 @@ mod served_from_acceleration {
             ),
             "the Error clears once the source is reached ({:?})",
             dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// `orders_view` reading `orders` with `sql`, accelerated in `Cayenne` under
+    /// `data_dir` and refreshed every second.
+    fn accelerated_orders_view(data_dir: &Path, sql: &str) -> View {
+        let mut view = View::new("orders_view".to_string());
+        view.sql = Some(sql.to_string());
+        view.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_check_interval: Some("1s".to_string()),
+            params: Some(cayenne_params(data_dir)),
+            ..Default::default()
+        });
+        view
+    }
+
+    /// `orders` federated from `prefix`, and [`accelerated_orders_view`].
+    fn federated_orders_and_accelerated_view(prefix: &str, data_dir: &Path, sql: &str) -> app::App {
+        AppBuilder::new("source_unavailable")
+            .with_dataset(SpicepodDataset::new(format!("{prefix}://orders"), "orders"))
+            .with_view(accelerated_orders_view(data_dir, sql))
+            .build()
+    }
+
+    /// Builds `orders_view`'s acceleration from the source (three rows, `v = 1`) with
+    /// `app`, and stops the runtime once the view answers from it.
+    async fn seed_view(
+        source: &Arc<UnreachableSource>,
+        app: app::App,
+    ) -> Result<(), anyhow::Error> {
+        source.bring_up();
+        let (rt, loader) = start_app(app).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        let observed = query_table_sum_and_count(&rt, "orders_view").await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+        Ok(())
+    }
+
+    fn view_status(rt: &Runtime) -> Option<ComponentStatus> {
+        rt.status().get_component_status("view:orders_view")
+    }
+
+    /// An accelerated view whose source is down at startup is served from its
+    /// existing acceleration, as an accelerated dataset is, instead of staying
+    /// unregistered until the dataset it reads loads; once the source is back the
+    /// refresh brings the view up to date.
+    #[tokio::test]
+    async fn an_accelerated_view_is_served_while_the_dataset_it_reads_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-served-while-down").await?;
+        let source = &fixture.source;
+        let app = || {
+            federated_orders_and_accelerated_view(
+                source.prefix,
+                &fixture.dir.path().join("orders_view"),
+                "SELECT id, v FROM orders",
+            )
+        };
+        let view_sum_and_count =
+            |rt: Arc<Runtime>| async move { query_table_sum_and_count(&rt, "orders_view").await };
+
+        source.bring_up();
+        let (rt, loader) = start_app(app()).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+                && view_status(&rt) == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = view_sum_and_count(Arc::clone(&rt)).await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) = start_app(app()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        assert_eq!(
+            view_status(&rt),
+            Some(ComponentStatus::Ready),
+            "a view served from its acceleration is ready"
+        );
+
+        source.bring_up();
+        let refreshed = wait_until_true(Duration::from_secs(60), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((6, 3))
+        })
+        .await;
+        assert!(
+            refreshed,
+            "the refresh must bring the view up to date once its source is back, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        // Refreshed every second, the view is `Refreshing` part of the time.
+        let ready = wait_until_true(Duration::from_secs(10), || async {
+            view_status(&rt) == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(ready, "the view reports Ready ({:?})", view_status(&rt));
+        assert_eq!(
+            dataset_status(&rt, "orders_view"),
+            None,
+            "the view's refreshes report its status as a view's, not a dataset's"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    // A view whose SQL changes between restarts, and the views reading it, should answer
+    // from the new definition. A Cayenne file acceleration keeps the schema it was built
+    // with instead (#16111);
+    // `test/spicescript/known-failing/schema-evolution/view-redefined-after-restart.yaml`
+    // guards that until it is fixed.
+
+    /// A view removed by a Spicepod change while it was served, redefined, from its
+    /// acceleration stays removed once the source returns.
+    #[tokio::test]
+    async fn a_view_removed_while_served_redefined_stays_removed() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-redefined-removed").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view");
+        seed_view(
+            source,
+            federated_orders_and_accelerated_view(source.prefix, &file, "SELECT id, v FROM orders"),
+        )
+        .await?;
+
+        source.take_down();
+        let (rt, loader) = start_app(federated_orders_and_accelerated_view(
+            source.prefix,
+            &file,
+            "SELECT id, v, v * 10 AS w FROM orders",
+        ))
+        .await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?}",
+            query_table_sum_and_count(&rt, "orders_view").await
+        );
+
+        let without_view = AppBuilder::new("source_unavailable")
+            .with_dataset(SpicepodDataset::new(
+                format!("{}://orders", source.prefix),
+                "orders",
+            ))
+            .build();
+        assert!(Arc::clone(&rt).apply_app(Arc::new(without_view)).await);
+        assert!(
+            query_table_sum_and_count(&rt, "orders_view").await.is_err(),
+            "the removed view must not answer"
+        );
+
+        source.bring_up();
+        let source_back = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders").await == Ok((3, 3))
+        })
+        .await;
+        assert!(source_back, "the source must answer again");
+        let resurrected = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await.is_ok()
+        })
+        .await;
+        assert!(
+            !resurrected,
+            "the removed view must stay removed once its source is back"
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// With one load at a time, an accelerated view served from its acceleration does
+    /// not take the load slot while it waits for the dataset it reads, whose own load
+    /// needs that slot.
+    #[tokio::test]
+    async fn a_served_view_waiting_for_what_it_reads_leaves_it_a_load_slot()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-load-slot").await?;
+        let source = &fixture.source;
+        let file = fixture.dir.path().join("orders_view");
+        let app = || {
+            let mut orders = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+            orders.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::Memory,
+                ..Default::default()
+            });
+            AppBuilder::new("source_unavailable")
+                .with_dataset(orders)
+                .with_view(accelerated_orders_view(&file, "SELECT id, v FROM orders"))
+                .with_runtime(SpicepodRuntime {
+                    dataset_load_parallelism: Some(1),
+                    ..Default::default()
+                })
+                .build()
+        };
+        seed_view(source, app()).await?;
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) = start_app(app()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?}",
+            query_table_sum_and_count(&rt, "orders_view").await
+        );
+
+        source.bring_up();
+        let refreshed = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "orders_view").await == Ok((6, 3))
+        })
+        .await;
+        assert!(
+            refreshed,
+            "the dataset must load and the view refresh from it, got {:?} (orders: {:?})",
+            query_table_sum_and_count(&rt, "orders_view").await,
+            query_sum_and_count(&rt).await
         );
         stop(rt, loader).await;
         Ok(())
@@ -1361,7 +1787,8 @@ mod served_from_acceleration {
         Ok(())
     }
 
-    /// Missed cron occurrences are skipped unless a refresh has already been triggered.
+    /// Missed cron occurrences are skipped unless a refresh has already been triggered,
+    /// and a triggered refresh due after the next cron time shows the cron time.
     #[tokio::test]
     async fn cron_freshness_skips_missed_occurrences_and_retains_pending_refresh()
     -> Result<(), anyhow::Error> {
@@ -1398,6 +1825,10 @@ mod served_from_acceleration {
         };
         let pending: chrono::DateTime<chrono::Utc> = pending.into();
         assert_eq!(next_refresh.timestamp(), pending.timestamp());
+        // A refresh waiting out a long jitter; the next cron tick starts it first.
+        rt.status()
+            .record_dataset_next_refresh(&name, now + Duration::from_hours(2 * 8760));
+        assert_eq!(freshness(&rt).await.1, Some(expected));
         rt.status().clear_dataset_next_refresh(&name);
         assert_eq!(freshness(&rt).await.1, Some(expected));
         stop(rt, loader).await;
@@ -1543,6 +1974,48 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A cron-scheduled dataset whose first load fails is still refreshed on its schedule,
+    /// so it loads once the source answers again.
+    #[tokio::test]
+    async fn a_cron_scheduled_dataset_whose_first_load_failed_loads_on_schedule()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("cron-after-failed-load").await?;
+        let source = &fixture.source;
+        source.bring_up();
+        source.read_lazily();
+        source.set_scans_failing(true);
+        let mut dataset = with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "*/2 * * * * *");
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_jitter_enabled = false;
+            acceleration.refresh_retry_enabled = false;
+        }
+        let (rt, loader) = start(dataset).await;
+        let failed = wait_until_true(Duration::from_secs(15), || async {
+            source.failed_scans() > 0
+                && matches!(
+                    dataset_status(&rt, "orders"),
+                    Some(ComponentStatus::Error(_))
+                )
+        })
+        .await;
+
+        source.set_scans_failing(false);
+        let recovered = wait_until_true(Duration::from_secs(15), || async {
+            sum_and_count(&rt).await == Some((3, 3))
+                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = (sum_and_count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        assert!(failed, "the first load fails while scans fail");
+        assert!(
+            recovered,
+            "a scheduled refresh loads the dataset once scans succeed, got {observed:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn synchronized_child_uses_parent_refresh_deadline() -> Result<(), anyhow::Error> {
         assert_synchronized_deadline("sync-child-deadline", false, Some("10m")).await
@@ -1581,7 +2054,8 @@ mod served_from_acceleration {
         let mut child = SpicepodDataset::new("localpod:orders", "child");
         child.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::Memory,
             refresh_mode: Some(RefreshMode::Full),
             refresh_check_interval: child_interval.map(str::to_string),
             refresh_jitter_enabled: false,
@@ -1712,7 +2186,8 @@ mod served_from_acceleration {
                 );
                 dataset.acceleration = Some(Acceleration {
                     enabled: true,
-                    engine: Some("arrow".to_string()),
+                    engine: Some("cayenne".to_string()),
+                    mode: spicepod::acceleration::Mode::Memory,
                     refresh_check_interval: Some("1h".to_string()),
                     ..Acceleration::default()
                 });
@@ -2331,5 +2806,206 @@ mod served_from_acceleration {
         );
         stop(rt, loader).await;
         Ok(())
+    }
+}
+
+/// `append` datasets with a `time_column` and acceleration snapshots enabled.
+#[cfg(feature = "snapshots")]
+mod served_with_snapshots_enabled {
+    use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
+    use app::AppBuilder;
+    use arrow::array::Int64Array;
+    use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::{
+        acceleration::{Acceleration, Mode, RefreshMode, SnapshotBehavior},
+        component::{
+            dataset::{Dataset as SpicepodDataset, TimeFormat},
+            snapshot::{BootstrapOnFailureBehavior, Snapshots},
+        },
+        param::Params,
+    };
+    use tempfile::TempDir;
+
+    use super::{UnreachableSource, dataset_status};
+    use crate::{
+        configure_test_datafusion, init_tracing,
+        utils::{run_query, wait_until_true},
+    };
+
+    fn app(prefix: &str, dir: &Path) -> app::App {
+        let mut dataset = SpicepodDataset::new(format!("{prefix}://orders"), "orders");
+        dataset.time_column = Some("id".to_string());
+        dataset.time_format = Some(TimeFormat::UnixSeconds);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            primary_key: Some("id".to_string()),
+            refresh_mode: Some(RefreshMode::Append),
+            refresh_check_interval: Some("1s".to_string()),
+            snapshots: SnapshotBehavior::Enabled,
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join("data").display().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    dir.join("metadata").display().to_string(),
+                ),
+            ]))),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .with_snapshots(Snapshots {
+                enabled: true,
+                location: Some(format!("file://{}/", dir.join("snapshots").display())),
+                bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Fallback,
+                params: None,
+            })
+            .build()
+    }
+
+    async fn start(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    }
+
+    async fn stop(rt: Arc<Runtime>, loader: tokio::task::JoinHandle<()>) {
+        rt.shutdown().await;
+        loader.abort();
+    }
+
+    /// `COUNT(*)` of `orders`, or why the query failed.
+    async fn count(rt: &Arc<Runtime>) -> Result<i64, String> {
+        let batches = run_query(rt, "SELECT COUNT(*) AS n FROM orders")
+            .await
+            .map_err(|err| err.to_string())?;
+        batches
+            .first()
+            .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|counts| counts.value(0))
+            .ok_or_else(|| "COUNT(*) is not Int64".to_string())
+    }
+
+    /// Whether a Cayenne snapshot archive was published under `dir`.
+    fn has_snapshot(dir: &Path) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    has_snapshot(&path)
+                } else {
+                    path.extension().is_some_and(|ext| ext == "cayenne")
+                }
+            })
+        })
+    }
+
+    /// Loads the three source rows and stops once a snapshot of them is published, which
+    /// also checkpoints the acceleration.
+    async fn seed(source: &Arc<UnreachableSource>, dir: &Path) -> Result<(), anyhow::Error> {
+        source.bring_up();
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let seeded = wait_until_true(Duration::from_secs(60), || async {
+            count(&rt).await == Ok(3) && has_snapshot(&dir.join("snapshots"))
+        })
+        .await;
+        let observed = (count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        anyhow::ensure!(
+            seeded,
+            "seeding the acceleration and its snapshot, got {observed:?}"
+        );
+        Ok(())
+    }
+
+    /// Restarts with the source down, asserts the acceleration is served and the runtime
+    /// is ready, then that the dataset reports `Error` until the source is back.
+    async fn assert_served_while_source_is_down(
+        source: &Arc<UnreachableSource>,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        source.take_down();
+        let (rt, loader) = start(app(source.prefix, dir)).await;
+        let served = wait_until_true(Duration::from_secs(30), || async {
+            count(&rt).await == Ok(3) && rt.status().is_ready()
+        })
+        .await;
+        assert!(
+            served,
+            "queries must be answered from the acceleration and the runtime must be ready, got {:?}, ready={} ({:?})",
+            count(&rt).await,
+            rt.status().is_ready(),
+            dataset_status(&rt, "orders")
+        );
+
+        let reports_error = wait_until_true(Duration::from_secs(30), || async {
+            matches!(
+                dataset_status(&rt, "orders"),
+                Some(ComponentStatus::Error(message))
+                    if message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("Serving data from the existing acceleration"))
+            )
+        })
+        .await;
+        assert!(
+            reports_error,
+            "a source that cannot be reached sets Error, saying the dataset is still served ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert!(
+            rt.status().is_ready(),
+            "a served dataset in Error stays ready"
+        );
+
+        source.bring_up();
+        let reached = wait_until_true(Duration::from_secs(30), || async {
+            dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        assert!(
+            reached,
+            "the dataset must report Ready once its source is reached ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        assert_eq!(count(&rt).await, Ok(3));
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// An acceleration reopened from disk is served while its source is down.
+    #[tokio::test]
+    async fn a_reopened_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-reopened", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        assert_served_while_source_is_down(&source, dir.path()).await
+    }
+
+    /// An acceleration restored from a snapshot is served while its source is down: with
+    /// nothing on disk and the source down, the rows can only come from the snapshot.
+    #[tokio::test]
+    async fn a_restored_append_acceleration_is_served_while_its_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let source = UnreachableSource::new("append-snapshots-restored", 1);
+        source.register().await;
+        let dir = TempDir::new()?;
+        seed(&source, dir.path()).await?;
+        std::fs::remove_dir_all(dir.path().join("data"))?;
+        std::fs::remove_dir_all(dir.path().join("metadata"))?;
+        assert_served_while_source_is_down(&source, dir.path()).await
     }
 }

@@ -434,7 +434,7 @@ pub(crate) async fn load_app(args: &CommonArgs) -> anyhow::Result<App> {
     let mut dependencies = Vec::new();
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
-            dependencies.push(Spicepod::load(&dependencies_root.join(dependency)).await?);
+            dependencies.push(Spicepod::load(&dependencies_root.join(dependency.from())).await?);
         }
     }
     spicepod.dependencies = vec![];
@@ -453,7 +453,7 @@ pub(crate) async fn get_app_and_start_request(
     // remains unset and all metric operations are no-ops.
 
     let app = load_app(args).await?;
-    let start_request = start_request_from_app(args, app.clone())?;
+    let start_request = start_request_from_app(args, app.clone()).await?;
 
     Ok((app, start_request))
 }
@@ -462,7 +462,7 @@ pub(crate) async fn get_dataset_app_and_start_request(
     args: &DatasetTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
     let app = prepare_dataset_app(args).await?;
-    let start_request = start_request_from_app(&args.common, app.clone())?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
 
     Ok((app, start_request))
 }
@@ -476,7 +476,7 @@ pub(crate) async fn get_htap_app_and_start_request(
     ensure_layout_applies(args)?;
     let mut app = load_app(&args.common).await?;
     apply_layout_option(args, &mut app)?;
-    let start_request = start_request_from_app(&args.common, app.clone())?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
     Ok((app, start_request))
 }
 
@@ -517,8 +517,14 @@ fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<
     Ok(())
 }
 
-fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app))?;
+async fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
+    let mut spicepod = from_app(app);
+    // `from_app` writes the newest spicepod version, which releases before 2.0
+    // reject; `spiced` gets the version the spicepod file declares.
+    spicepod.version = Spicepod::load_exact(args.spicepod_path.clone())
+        .await?
+        .version;
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), spicepod)?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());
@@ -1022,8 +1028,12 @@ mod tests {
     /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
+    /// - The TPC-H sources that hold `DuckDB` 1.x data — Glue, Spice Cloud,
+    ///   Snowflake and `BigQuery`: `DuckDB` 1.x writes
+    ///   different free-text columns than `dbgen`, so Q2, Q10, Q13 and Q20 cannot
+    ///   match the answer files.
     ///
-    /// - The five `ClickBench` arms whose acceleration holds only part of the
+    /// - The two `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -1032,16 +1042,19 @@ mod tests {
     /// Every other scale factor 1 TPC-H, TPC-DS and `ClickBench` dispatch must
     /// validate against an oracle.
     const BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION: &[&str] = &[
-        "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-cayenne[file]-partitioned.yaml",
+        "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
+        "tpch/sf1/federated/adbc[bigquery].yaml",
+        "tpch/sf1/federated/glue[catalog].yaml",
         "tpch/sf1/federated/glue[csv].yaml",
+        "tpch/sf1/federated/glue[parquet].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",
         "tpch/sf1/federated/mssql[catalog].yaml",
         "tpch/sf1/federated/odbc[athena].yaml",
+        "tpch/sf1/federated/snowflake[catalog].yaml",
+        "tpch/sf1/federated/spicecloud.yaml",
+        "tpch/sf1/federated/spicecloud[catalog].yaml",
     ];
 
     /// rustc `--test` names this module's tests `commands::tests::<fn>`.
@@ -1095,9 +1108,8 @@ mod tests {
         query_set == "chbench"
             || (spicepod.contains("postgres")
                 && !spicepod.contains("ducklake")
-                && (((query_set.starts_with("tpch") || query_set == "tpcds")
-                    && (scale_factor == "1" || scale_factor == "10"))
-                    || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres"))))
+                && (query_set.starts_with("tpch") || query_set == "tpcds")
+                && (scale_factor == "1" || scale_factor == "10"))
     }
 
     /// Every CH-benCH HTAP dispatch config names source versions its source
@@ -1166,7 +1178,7 @@ mod tests {
                         assert_eq!(
                             bench.validate_results,
                             Some(false),
-                            "{dispatch_name} is opted out of result validation because TPC-H Q6 is known-wrong; keep `validate_results: false`"
+                            "{dispatch_name} is opted out of result validation for the reason in its dispatch file; keep `validate_results: false`"
                         );
                         checked += 1;
                     }
@@ -1223,7 +1235,7 @@ mod tests {
                                 scale_factor,
                                 &bench.spicepod_path.to_string_lossy()
                             ),
-                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
+                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, so the version would not apply"
                         );
                     }
                     // testoperator_run_bench.yml's path: CH-benCH spicepods carry no

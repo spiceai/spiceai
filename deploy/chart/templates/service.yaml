@@ -28,6 +28,10 @@ spec:
       name: metrics
     - port: 50051
       name: flight
+    {{- if include "spiceai.clusterNode" . }}
+    - port: {{ .Values.cluster.port }}
+      name: cluster
+    {{- end }}
     {{- end }}
   selector:
     {{- if .Values.service.selector }}
@@ -35,4 +39,32 @@ spec:
     {{- else }}
     {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
-    {{- end }}
+    {{- end }}{{- if include "spiceai.clusterNode" . }}
+---
+# Headless Service: gives each scheduler or executor pod a stable DNS name
+# `<pod>.<this-service>.<namespace>.svc.cluster.local`, which its certificate
+# covers with one wildcard SAN, so other cluster nodes reach each pod at a name
+# its certificate names (https://spiceai.org/docs/features/distributed-query).
+# Clients keep using the Service above.
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}
+  name: {{ template "spiceai.headlessServiceName" . }}
+  namespace: {{ template "spiceai.namespace" . }}
+spec:
+  clusterIP: None
+  # Give each pod its DNS record as soon as it exists, before it is ready, so
+  # other cluster nodes can reach a pod while it joins.
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.cluster.port }}
+      name: cluster
+    - port: 50051
+      name: flight
+  selector:
+    {{- include "spiceai.selectorLabels" . | indent 4 }}
+    app: {{ .Release.Name }}
+{{- end }}

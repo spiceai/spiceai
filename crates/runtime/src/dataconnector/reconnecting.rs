@@ -253,6 +253,11 @@ impl DataConnector for ReconnectingConnector {
             .is_some_and(|inner| inner.supports_changes_stream())
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        self.built()
+            .is_some_and(|inner| inner.supports_partitioned_changes())
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,
@@ -381,6 +386,10 @@ impl DataConnector for ReconnectingConnector {
             .map_or_else(ComponentInitialization::default, |inner| {
                 inner.initialization_for_dataset(dataset)
             })
+    }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.built().and_then(|inner| inner.user_token_client_id())
     }
 }
 

@@ -40,14 +40,14 @@ pub mod write_back;
 pub use connector::{
     DATA_CONNECTOR_REGISTRATIONS, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorFactory, DataConnectorRegistration, MetricsProviderComponent,
-    NewDataConnectorResult, default_spice_client,
+    NewDataConnectorResult, RedirectScope, default_spice_client_builder,
 };
 /// Re-exported so a crate invoking [`register_data_connector!`] can bring
 /// `linkme` into scope with `use data_connector_api::linkme;` instead of taking
 /// its own dependency. `$crate` does not resolve inside an attribute-macro path,
 /// so the expansion has to name `linkme` unqualified.
 pub use linkme;
-pub use write_back::{DeliveryError, DeliveryResult, WriteBackDeliverer};
+pub use write_back::{DeliveryError, DeliveryResult, ReadFence, WriteBackDeliverer};
 // Glob rather than a named list: SNAFU generates ~25 context selectors
 // (`InvalidConfigurationSnafu`, …) alongside `DataConnectorError`, and every
 // connector builds its errors through them.

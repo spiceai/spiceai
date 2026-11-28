@@ -34,7 +34,9 @@ use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol};
+use crate::flight::{
+    Service, flightsql::bounded_list, metrics, to_tonic_err, util::set_flightsql_protocol,
+};
 use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.
@@ -46,7 +48,9 @@ pub(crate) async fn get_flight_info(
     set_flightsql_protocol().await;
 
     tracing::trace!("get_flight_info_get_sql_info: query={query:?}");
-    let builder = query.clone().into_builder(get_sql_info_data());
+    let mut bounded = query.clone();
+    bounded.info = bounded_list("GetSqlInfo info", bounded.info)?;
+    let builder = bounded.into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
     let fd = request.into_inner();
@@ -68,12 +72,13 @@ pub(crate) async fn get_flight_info(
 
 /// Get a `FlightDataStream` containing the list of `SqlInfo` results.
 pub(crate) async fn do_get(
-    query: sql::CommandGetSqlInfo,
+    mut query: sql::CommandGetSqlInfo,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get_sql_info: {query:?}");
     let start = metrics::track_flight_request("do_get", Some("get_sql_info")).await;
     set_flightsql_protocol().await;
 
+    query.info = bounded_list("GetSqlInfo info", query.info)?;
     let builder = query.into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
@@ -493,6 +498,12 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     // don't yet support `CancelQuery` action
     builder.append(SqlInfoFlightSqlServerCancel, false);
     builder.append(SqlInfoFlightSqlServerStatementTimeout, 0i32);
+    // A sidecar sends its plans as parameterized Substrait tickets only to an
+    // upstream that reports this; one that does not is sent plain plans.
+    builder.append(
+        flight_client::parameterized_ticket::SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        flight_client::parameterized_ticket::PARAMETERIZED_SUBSTRAIT_VERSION,
+    );
     builder.append(SqlInfoFlightSqlServerTransactionTimeout, 0i32);
     // SQL syntax information
     builder.append(SqlInfo::SqlDdlCatalog, false);
@@ -609,4 +620,76 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
 /// Return a [`SqlInfoData`] that describes Spice's capablities
 pub(crate) fn get_sql_info_data() -> &'static SqlInfoData {
     &INSTANCE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_normal_request_returns_the_requested_infos() {
+        let server_name = SqlInfo::FlightSqlServerName as u32;
+        let read_only = SqlInfo::FlightSqlServerReadOnly as u32;
+        let info = bounded_list("GetSqlInfo info", vec![read_only, server_name, read_only])
+            .expect("a normal request was rejected");
+        let batch = sql::CommandGetSqlInfo { info }
+            .into_builder(get_sql_info_data())
+            .build()
+            .expect("sql info batch");
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt32Array>()
+            .expect("info_name column");
+        assert_eq!(names.values(), &[server_name, read_only]);
+
+        let all = sql::CommandGetSqlInfo { info: vec![] }
+            .into_builder(get_sql_info_data())
+            .build()
+            .expect("sql info batch");
+        assert!(all.num_rows() > 2);
+    }
+
+    /// A sidecar trusts the parameterized Substrait version only beside Spice's
+    /// server name, so the answer must carry both, at the types it reads them
+    /// as: a string name and an int32 version.
+    #[test]
+    fn reports_the_parameterized_substrait_version_beside_the_server_name() {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::{Int32Type, UInt32Type};
+        use flight_client::parameterized_ticket::{
+            PARAMETERIZED_SUBSTRAIT_VERSION, SPICE_SERVER_NAME, SQL_INFO_PARAMETERIZED_SUBSTRAIT,
+        };
+
+        let server_name = SqlInfo::FlightSqlServerName as u32;
+        let batch = sql::CommandGetSqlInfo {
+            info: vec![server_name, SQL_INFO_PARAMETERIZED_SUBSTRAIT],
+        }
+        .into_builder(get_sql_info_data())
+        .build()
+        .expect("sql info batch");
+        let names = batch.column(0).as_primitive::<UInt32Type>();
+        let values = batch.column(1).as_union();
+        let mut found = (None, None);
+        for row in 0..batch.num_rows() {
+            let value = values.value(row);
+            match names.value(row) {
+                name if name == server_name => {
+                    found.0 = Some(value.as_string::<i32>().value(0).to_string());
+                }
+                SQL_INFO_PARAMETERIZED_SUBSTRAIT => {
+                    assert!(!value.is_null(0));
+                    found.1 = Some(value.as_primitive::<Int32Type>().value(0));
+                }
+                other => panic!("unrequested code {other}"),
+            }
+        }
+        assert_eq!(
+            found,
+            (
+                Some(SPICE_SERVER_NAME.to_string()),
+                Some(PARAMETERIZED_SUBSTRAIT_VERSION)
+            )
+        );
+    }
 }

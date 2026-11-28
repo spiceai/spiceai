@@ -1,0 +1,67 @@
+name: postgres-cdc-limit-after-delete
+duration: 10s
+description: >
+  A LIMIT on a CDC-accelerated Cayenne table returns LIMIT rows while the CDC
+  deletes that hide most of its rows are still held in the in-memory tier
+  (`cdc_durability: memory`, the default, before the checkpoint that makes them
+  durable). The initial load writes the rows to data files; the deletes hide
+  the first rows of every file, so a row limit applied inside the file scan,
+  below the filter that removes deleted keys, would return fewer rows than
+  exist. Checkpoints are held off for the whole scenario so every query runs
+  while the deletes are only in memory.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-limit-after-delete
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+        params:
+          cayenne_cdc_mem_tier_checkpoint_interval_ms: '600000'
+          cayenne_cdc_mem_tier_max_age_ms: '600000'
+          cayenne_cdc_mem_tier_seal_age_ms: '600000'
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text NOT NULL);
+        INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 1000) AS g;
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['1000']] }
+    eventually: 60s
+
+  # The source deletes 990 of the 1,000 rows. Spice holds the deletes in the
+  # in-memory tier: the apply-path counter shows they took that path.
+  - source-exec: { src: DELETE FROM t WHERE id <= 990 }
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['10']] }
+    eventually: 60s
+  - wait-metric:
+      name: dataset_acceleration_cdc_apply_path_total
+      labels: { dataset: t, path: inmem_delete }
+      above: 0
+      timeout: 30s
+
+  # LIMIT without ORDER BY may return any rows, so compare how many it returns.
+  - query: SELECT count(*) AS n FROM (SELECT id FROM t LIMIT 1) q
+  - query: SELECT count(*) AS n FROM (SELECT id FROM t LIMIT 5) q
+  - query: SELECT count(*) AS n FROM (SELECT id FROM t LIMIT 10) q
+  - query: SELECT count(*) AS n FROM (SELECT * FROM t LIMIT 20) q
+  - query: SELECT count(*) AS n FROM (SELECT id FROM t WHERE id > 0 LIMIT 5) q
+  - query: SELECT * FROM t ORDER BY id LIMIT 5
+  - query: SELECT * FROM t ORDER BY id

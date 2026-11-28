@@ -30,13 +30,13 @@ mod q8;
 
 fn get_hits_small_accelerated_dataset() -> Dataset {
     let mut dataset = Dataset::new(
-        "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/clickbench/hits_small.parquet"
+        "https://spice-datasets-gjezag77s0hu.s3.us-east-1.amazonaws.com/clickbench/hits_small.parquet"
             .to_string(),
         "hits",
     );
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         ..Acceleration::default()
     });
     dataset

@@ -60,6 +60,7 @@ use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::on_conflict::{PostValidationState, PreparedOnConflictDeletionPublish};
 use super::table::{CayenneTableProvider, PreparedAppendSnapshotPublish};
+use super::uncommitted_files::DiscardedFinalKeyWrite;
 use crate::metadata::SnapshotFile;
 use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
@@ -163,7 +164,11 @@ impl CayenneStagedAppend {
         staging_snapshot_id: String,
         row_count: u64,
     ) -> Self {
-        let target_snapshot_id = table.get_current_snapshot_id();
+        // An append at its final keys commits to the snapshot it wrote into.
+        let target_snapshot_id = table
+            .uncommitted_files()
+            .final_key_directory(&staging_snapshot_id)
+            .unwrap_or_else(|| table.get_current_snapshot_id());
         Self {
             table,
             write_guard,
@@ -377,11 +382,11 @@ impl CayenneStagedAppend {
             // publish), which finalizes via `apply_under_held_barrier` and holds
             // the lock across the coordinated commit. A single-table
             // current-snapshot append finalizes via `finish` → `apply_under_barrier`,
-            // which RE-ACQUIRES `write_lock` in `lock_current_snapshot_for_apply`:
-            // keeping the guard here would self-deadlock that re-acquire and block
-            // any concurrent staged append. Dropping it (it stays held through this
-            // method's WAL write, then releases when `self` is consumed) mirrors the
-            // pre-refactor behavior and the `write_cdc_pipelined` guard handling.
+            // which takes `write_lock` in `lock_current_snapshot_for_apply` via
+            // `acquire_or_share` (an outer UPDATE hold is reused; a local hold
+            // that is not in `write_lock_held` would still self-deadlock). Drop
+            // the local guard here so the non-UPDATE path can re-acquire, then
+            // release when `self` is consumed.
             write_guard: if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
                 None
             } else {
@@ -489,6 +494,21 @@ impl Drop for PreparedStagedAppend {
     fn drop(&mut self) {
         self.table
             .unregister_inflight_staging_append(&self.staging_snapshot_id);
+        // An append at its final keys that ends here without being discarded
+        // keeps its files: committed, they are the table's; otherwise they are
+        // orphans for the orphan sweep.
+        let ended = self
+            .table
+            .uncommitted_files()
+            .discard_final_key_write(&self.staging_snapshot_id);
+        // A keyed write into a new protected snapshot recorded its keys in the
+        // primary-key cache when it prepared, so that the next write validates
+        // against them. Ending uncommitted, those keys are not the table's.
+        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot
+            && matches!(ended, DiscardedFinalKeyWrite::Uncommitted { .. })
+        {
+            self.table.clear_cached_pk_keyset();
+        }
     }
 }
 
@@ -497,6 +517,36 @@ impl PreparedStagedAppend {
     #[must_use]
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Whether this is a keyed write into a new protected snapshot that wrote
+    /// its files at their final keys: it commits once, in one record that names
+    /// the files and makes the snapshot live
+    /// ([`super::table::CayenneCdcWrite::finish`]).
+    pub(crate) fn writes_new_protected_snapshot_at_final_keys(&self) -> bool {
+        self.target_kind == StagingWalTargetKind::ProtectedSnapshot
+            && self.table.is_final_key_write(&self.staging_snapshot_id)
+    }
+
+    /// The files this write put at their final keys, with their sizes.
+    pub(crate) fn final_key_files(&self) -> Vec<(String, u64)> {
+        self.table
+            .uncommitted_files()
+            .files(&self.staging_snapshot_id)
+    }
+
+    /// Record that the commit naming this write's final-key files was accepted.
+    pub(crate) fn mark_final_key_files_committed(&self) {
+        self.table
+            .uncommitted_files()
+            .mark_final_key_write_committed(&self.staging_snapshot_id);
+    }
+
+    /// Feed the maintained-aggregate registry from this write, under the
+    /// listing fence the caller holds (see [`Self::apply_under_held_barrier`]).
+    pub(crate) fn feed_ivm_under_held_fence(&self) {
+        self.table
+            .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
     }
 
     /// Attach the IVM insert batches captured at Stage A (write path → receipt),
@@ -760,7 +810,9 @@ impl PreparedStagedAppend {
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
         if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
-            Some(self.table.write_lock_arc().lock_owned().await)
+            // Autocommit UPDATE already holds `write_lock`. A second acquire
+            // deadlocks after Stage A. `acquire_or_share` reuses that hold.
+            Some(super::write_lock_held::acquire_or_share(&self.table.write_lock_arc()).await)
         } else {
             None
         }
@@ -769,6 +821,9 @@ impl PreparedStagedAppend {
     fn try_lock_current_snapshot_for_held_barrier(&self) -> Result<Option<OwnedMutexGuard<()>>> {
         if self.target_kind != StagingWalTargetKind::CurrentSnapshot || self.write_guard.is_some() {
             return Ok(None);
+        }
+        if super::write_lock_held::is_held() {
+            return Ok(Some(super::write_lock_held::dummy_owned_guard()));
         }
 
         self.table.write_lock_arc().try_lock_owned().map(Some).map_err(|_| Error::Internal {
@@ -798,6 +853,13 @@ impl PreparedStagedAppend {
         let current_snapshot_id = self.table.get_current_snapshot_id();
         if current_snapshot_id == self.target_snapshot_id {
             return Ok(());
+        }
+        // An append at its final keys has no staging WAL to resolve: it is not
+        // committed, its files are orphans, and it can be retried.
+        if self.table.is_final_key_write(&self.staging_snapshot_id) {
+            return Err(Error::WriteConflict {
+                table: self.table.table_name().to_string(),
+            });
         }
 
         Err(Error::IncompleteWrite {
@@ -829,10 +891,12 @@ impl PreparedStagedAppend {
     /// 6) uses [`Self::apply_under_held_barrier`] instead so it can hold the
     /// fences on every participating partition for one shared barrier window.
     ///
+    /// Returns the statistics epoch the files were published under.
+    ///
     /// # Errors
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
-    pub async fn apply_under_barrier(&self) -> Result<()> {
+    pub async fn apply_under_barrier(&self) -> Result<u64> {
         let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         // Hold the listing fence for the entire move + WAL removal + listing
@@ -857,7 +921,7 @@ impl PreparedStagedAppend {
         // (non-IVM table, or a non-incremental write) marks stale instead.
         self.table
             .feed_staged_ivm_under_fence(self.ivm_feed_batches.as_ref());
-        Ok(())
+        Ok(self.table.statistics_epoch())
     }
 
     /// Apply the staged write ASSUMING the caller already holds this
@@ -988,8 +1052,12 @@ impl PreparedStagedAppend {
         if !self.overlay
             && let Some(source_snapshot_id) = &self.source_snapshot_id
         {
-            self.table
-                .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
+            if self.table.reclaims_retired_files() {
+                self.table.schedule_retired_file_sweep();
+            } else {
+                self.table
+                    .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
+            }
         }
     }
 
@@ -1093,10 +1161,13 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
+        // A write at its final keys deletes exactly the files it wrote when it
+        // is discarded; its target directory holds nothing else to clear.
+        let final_keys = self.table.is_final_key_write(&self.staging_snapshot_id);
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
-        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot {
+        if self.target_kind == StagingWalTargetKind::ProtectedSnapshot && !final_keys {
             self.table
                 .clear_snapshot_dir(&self.target_snapshot_id)
                 .await?;
@@ -1166,10 +1237,16 @@ impl CayenneTableProvider {
     /// Returns an error if object-store configuration or the canonical table
     /// prefix cannot be resolved.
     pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
-        if !self.table_path().starts_with("s3://") {
+        if !self.data_in_store() {
             return Ok(None);
         }
         let config = self.require_object_store()?;
+        // Partitions are compared by the storage service their data lives in, not by
+        // their own store's URL, which is per table.
+        let backend = self.dataset_storage().map_or_else(
+            || config.url.to_string(),
+            |storage| storage.recorded_authority().to_string(),
+        );
         let snapshot_id = self.get_current_snapshot_id();
         let partition_prefix = self
             .snapshot_object_store_prefix(&snapshot_id)?
@@ -1190,7 +1267,7 @@ impl CayenneTableProvider {
         Ok(Some((
             Arc::clone(&config.store),
             ObjectStorePath::from(prefix),
-            config.url.to_string(),
+            backend,
         )))
     }
 
@@ -1243,10 +1320,11 @@ impl CayenneTableProvider {
         }
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
-        self.clear_staging_snapshot_dir(&staging_snapshot_id)
-            .await?;
-
-        self.staging_may_have_files().store(true, Ordering::Release);
+        if !self.begin_final_key_write(&staging_snapshot_id, &self.get_current_snapshot_id()) {
+            self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
+                .await?;
+            self.mark_staging_may_have_files(&staging_snapshot_id);
+        }
 
         let (row_count, _writer_ops, _stats_acc) = match self
             .write_to_snapshot(
@@ -1366,7 +1444,7 @@ impl CayenneTableProvider {
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
-        self.clear_staging_snapshot_dir(&staging_snapshot_id)
+        self.clear_new_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
         // A partition's append is one statement over its whole input: the keys
         // it repeats are resolved after it is staged. Its staged files move into
@@ -1522,7 +1600,12 @@ impl CayenneTableProvider {
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
     ) -> Result<()> {
-        if self.table_path().starts_with("s3://") {
+        // An append at its final keys commits by naming its files in one
+        // record, so there is no move for a staging WAL to make recoverable.
+        if self.is_final_key_write(staging_snapshot_id) {
+            return Ok(());
+        }
+        if self.data_in_store() {
             self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         } else {
@@ -1650,33 +1733,39 @@ impl CayenneTableProvider {
             return Ok(());
         };
 
-        // List staged data files (exclude WAL bookkeeping objects).
-        let objects: Vec<_> = config
-            .store
-            .list(Some(&staging_prefix))
-            .try_collect()
-            .await
-            .map_err(|e| Error::ObjectStore {
-                operation: "list staging objects for WAL",
-                table: self.table_name().to_string(),
-                source: e,
-            })?;
-
-        let staged_files: Vec<String> = objects
-            .iter()
-            .filter_map(|meta| {
-                let name = meta
-                    .location
-                    .as_ref()
-                    .strip_prefix(staging_prefix.as_ref())
-                    .unwrap_or(meta.location.as_ref());
-                if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
-                    None
-                } else {
-                    Some(name.to_string())
-                }
-            })
-            .collect();
+        // The staged data files: the ones this write put there, for a table in
+        // the object-native location, or a listing of the write's own staging
+        // prefix (excluding WAL bookkeeping objects).
+        let staged_files: Vec<String> = if self.data_in_object_native_location() {
+            self.uncommitted_files()
+                .files(staging_snapshot_id)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        } else {
+            let objects: Vec<_> = config
+                .store
+                .list(Some(&staging_prefix))
+                .try_collect()
+                .await
+                .map_err(|e| Error::ObjectStore {
+                    operation: "list staging objects for WAL",
+                    table: self.table_name().to_string(),
+                    source: e,
+                })?;
+            objects
+                .iter()
+                .filter_map(|meta| {
+                    let name = crate::object_relative(&staging_prefix, &meta.location)
+                        .unwrap_or(meta.location.as_ref());
+                    if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
+                        None
+                    } else {
+                        Some(name.to_string())
+                    }
+                })
+                .collect()
+        };
 
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
@@ -1701,8 +1790,7 @@ impl CayenneTableProvider {
             content.into_bytes()
         };
 
-        let wal_key =
-            ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
+        let wal_key = crate::object_child(&staging_prefix, STAGING_WAL_FILENAME);
         config
             .store
             .put(&wal_key, record_bytes.into())
@@ -1728,13 +1816,41 @@ impl CayenneTableProvider {
     /// removal fails, the commit is not reported as complete: callers must retain
     /// the recovery intent and surface the failure.
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
-        if self.table_path().starts_with("s3://") {
+        // An append at its final keys wrote no staging WAL; this is where its
+        // write ends.
+        if self.is_final_key_write(staging_snapshot_id) {
+            self.uncommitted_files()
+                .end_final_key_write(staging_snapshot_id);
+            return Ok(());
+        }
+        // Inside a same-record scope the write's changes are only buffered, so
+        // the WAL that lets recovery finish it stays until they commit.
+        if crate::catalog::deletes_wait_for_commit() {
+            let table = self.clone_for_write();
+            let id = staging_snapshot_id.to_string();
+            let delete = Box::pin(async move {
+                table
+                    .remove_staging_wal_now(&id)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            if let Some(delete) = self.delete_staging_after_commit(staging_snapshot_id, delete) {
+                delete.await.map_err(|message| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message,
+                })?;
+            }
+            return Ok(());
+        }
+        self.remove_staging_wal_now(staging_snapshot_id).await
+    }
+
+    /// [`Self::remove_staging_wal_for`], sent now.
+    async fn remove_staging_wal_now(&self, staging_snapshot_id: &str) -> Result<()> {
+        if self.data_in_store() {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
-                let wal_key = ObjectStorePath::from(format!(
-                    "{}{STAGING_WAL_FILENAME}",
-                    staging_prefix.as_ref()
-                ));
+                let wal_key = crate::object_child(&staging_prefix, STAGING_WAL_FILENAME);
                 match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         if !self.has_inflight_staging_appends() {
@@ -1827,14 +1943,18 @@ impl CayenneTableProvider {
     ///    finalize's move**, so even at the instant of hand-off there is no torn
     ///    concurrent directory mutation (see the lock note below).
     /// 3. **Roll-forward vs roll-back is decided by the DURABLE snapshot sequence,
-    ///    not the provider pointer.** A single-table CDC upsert commits its
-    ///    `snapshot_sequence` synchronously in Stage A
+    ///    not the provider pointer.** A single-table CDC upsert that stages
+    ///    commits its `snapshot_sequence` in Stage A
     ///    (`commit_on_conflict_deletions_with_tombstone`), which runs *before*
-    ///    `finish()`. Since `not-in-flight ⟹ finish() ran (or the receipt was
-    ///    dropped)`, a *committed* upsert always has a durable sequence when
-    ///    recovery sees its WAL ⟹ it is always rolled FORWARD, never back. An
-    ///    append abandoned *before* its sequence commit has no durable sequence
-    ///    and is correctly rolled back (it published no rows).
+    ///    `finish()`; inside a same-record scope that commit is buffered, and the
+    ///    WAL and staged files stay until the scope's record commits. Since
+    ///    `not-in-flight ⟹ finish() ran (or the receipt was dropped)`, a
+    ///    *committed* upsert always has a durable sequence when recovery sees its
+    ///    WAL ⟹ it is always rolled FORWARD, never back. An append abandoned
+    ///    *before* its sequence commit has no durable sequence and is correctly
+    ///    rolled back (it published no rows). A table that writes at final keys
+    ///    stages no upsert: it commits each in one record, and recovery has
+    ///    nothing to finish.
     /// 4. **The roll-forward move is idempotent.**
     ///    `move_staged_files_to_snapshot` renames whatever is in the (uuid-named)
     ///    `_staging/<id>/` dir into the target; once finalize has moved the files
@@ -1852,7 +1972,7 @@ impl CayenneTableProvider {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {
-            if self.table_path().starts_with("s3://") {
+            if self.data_in_store() {
                 return Ok(());
             }
 
@@ -1963,9 +2083,43 @@ impl CayenneTableProvider {
                 }
             }
 
+            // A table in the object-native location commits an append when its
+            // moved files are recorded in the target's manifest, so recovery never
+            // moves anything: a committed append only leaves its staging behind,
+            // and one whose files are not all recorded never committed and was
+            // never acknowledged, so recovery discards it rather than adopt it; this is
+            // also what keeps a write fenced by another instance's takeover out
+            // of the dataset. Copies it left in the target are orphans, which the
+            // orphan sweep reclaims. A table that writes at final keys stages no
+            // write at all, so a staging WAL it finds, whatever its target, was
+            // left by an earlier build and is cleared the same way.
+            if self.data_in_object_native_location()
+                && (wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                    || self.writes_at_final_keys())
+            {
+                let named: std::collections::HashSet<String> = self
+                    .metadata_catalog()
+                    .get_snapshot_files(self.table_id(), &wal.target_snapshot)
+                    .await?
+                    .into_iter()
+                    .map(|file| file.file_path)
+                    .collect();
+                let committed = wal.staged_files.iter().all(|file| named.contains(file));
+                tracing::debug!(
+                    table = table_name.as_str(),
+                    target_snapshot = wal.target_snapshot.as_str(),
+                    staged_files = wal.staged_files.len(),
+                    committed,
+                    "Clearing a staged append: committed ones are already named, the others never committed"
+                );
+                self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .await?;
+                continue;
+            }
+
             // The provider-local pointer can be stale if cancellation happens
-            // while the metastore COMMIT is in flight: both SQLite and Turso
-            // may complete that COMMIT after the coordinator future is dropped,
+            // while the metastore COMMIT is in flight: SQLite may complete that
+            // COMMIT after the coordinator future is dropped,
             // before its synchronous publication block runs. Classify protected
             // targets from the durable catalog pointer so recovery never deletes
             // a snapshot that the catalog has committed.
@@ -2070,7 +2224,7 @@ impl CayenneTableProvider {
             // empty, recovery is just a WAL unlink) from "filesystem-level
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
-            if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+            if !self.data_in_store() && !wal.staged_files.is_empty() {
                 let staging_dir = Self::snapshot_dir_path(
                     self.table_path(),
                     self.table_id(),
@@ -2116,7 +2270,7 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-            } else if self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+            } else if self.data_in_store() && !wal.staged_files.is_empty() {
                 // Pre-recovery audit (S3): symmetric to the local-FS audit.
                 // List the staging prefix and the target snapshot prefix. Every
                 // WAL-listed file must appear in at least one of those prefixes.
@@ -2141,7 +2295,7 @@ impl CayenneTableProvider {
                 };
 
                 let Some(target_prefix) = self
-                    .snapshot_object_store_prefix(&wal.target_snapshot)
+                    .data_files_prefix(&wal.target_snapshot)
                     .map_err(|error| Error::IncompleteWrite {
                         table: table_name.clone(),
                         message: format!(
@@ -2166,7 +2320,7 @@ impl CayenneTableProvider {
                 let expected = wal
                     .staged_files
                     .iter()
-                    .map(String::as_str)
+                    .map(|f| f.trim_start_matches('/'))
                     .collect::<std::collections::HashSet<_>>();
 
                 let mut staging_objects = config.store.list(Some(&staging_prefix));
@@ -2179,7 +2333,7 @@ impl CayenneTableProvider {
                             wal.target_snapshot
                         ),
                     })?;
-                    if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                    if let Some(rel) = crate::object_relative(&staging_prefix, &meta.location)
                         && expected.contains(rel)
                     {
                         reachable.insert(rel.to_string());
@@ -2189,7 +2343,48 @@ impl CayenneTableProvider {
                     }
                 }
 
-                if reachable.len() != expected.len() {
+                // A table in the object-native location never lists where its
+                // files live: each file still missing is looked up by name.
+                if reachable.len() != expected.len() && self.data_in_object_native_location() {
+                    let missing: Vec<String> = expected
+                        .iter()
+                        .filter(|name| !reachable.contains(**name))
+                        .map(|name| (*name).to_string())
+                        .collect();
+                    let mut heads = futures::stream::iter(missing)
+                        .map(|name| {
+                            let target_prefix = &target_prefix;
+                            async move {
+                                let result = config
+                                    .store
+                                    .head(&crate::object_child(target_prefix, &name))
+                                    .await;
+                                (name, result)
+                            }
+                        })
+                        .buffer_unordered(super::table::OBJECT_STORE_MOVE_CONCURRENCY);
+                    while let Some((name, result)) = heads.next().await {
+                        match result {
+                            Ok(_) => {
+                                reachable.insert(name);
+                            }
+                            Err(object_store::Error::NotFound { .. }) => {}
+                            Err(error) => {
+                                return Err(Error::IncompleteWrite {
+                                    table: table_name.clone(),
+                                    message: format!(
+                                        "A previous write was interrupted while moving {} file(s) to '{}'. Failed to look up a moved file during the pre-recovery audit ({error}); refusing automated recovery because file reachability is unknown. Manual resolution is required. The WAL file is located at '{wal_location}'.{extra}",
+                                        wal.staged_files.len(),
+                                        wal.target_snapshot
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                // The lookups by name above answer for every file of such a
+                // table, whose target is its whole flat directory.
+                if reachable.len() != expected.len() && !self.data_in_object_native_location() {
                     let mut target_objects = config.store.list(Some(&target_prefix));
                     while let Some(meta) = target_objects.next().await {
                         let meta = meta.map_err(|error| Error::IncompleteWrite {
@@ -2200,8 +2395,7 @@ impl CayenneTableProvider {
                                 wal.target_snapshot
                             ),
                         })?;
-                        if let Some(rel) =
-                            meta.location.as_ref().strip_prefix(target_prefix.as_ref())
+                        if let Some(rel) = crate::object_relative(&target_prefix, &meta.location)
                             && expected.contains(rel)
                         {
                             reachable.insert(rel.to_string());
@@ -2214,7 +2408,7 @@ impl CayenneTableProvider {
 
                 let mut missing_files: Vec<String> = Vec::new();
                 for staged_file in &wal.staged_files {
-                    if !reachable.contains(staged_file) {
+                    if !reachable.contains(staged_file.trim_start_matches('/')) {
                         missing_files.push(staged_file.clone());
                     }
                 }
@@ -2357,7 +2551,7 @@ impl CayenneTableProvider {
     }
 
     async fn read_staging_wals(&self) -> Result<Vec<LocatedStagingWal>> {
-        if self.table_path().starts_with("s3://") {
+        if self.data_in_store() {
             self.read_staging_wals_s3().await
         } else {
             self.read_staging_wals_local().await
@@ -2465,8 +2659,7 @@ impl CayenneTableProvider {
 
         let mut wals = Vec::new();
         for meta in objects {
-            let Some(relative) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
-            else {
+            let Some(relative) = crate::object_relative(&staging_prefix, &meta.location) else {
                 continue;
             };
             let staging_snapshot_id = if relative == STAGING_WAL_FILENAME {

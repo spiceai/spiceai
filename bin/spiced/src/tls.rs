@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use app::spicepod::component::runtime::TlsConfig as SpicepodTlsConfig;
 use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
-use runtime_tls::{TlsConfig, TlsControl};
+use runtime_tls::{ClientTrustPaths, ClientTrustPem, TlsConfig, TlsControl};
 use tokio::sync::RwLock;
 
 use crate::{Args, ClientAuthMode};
@@ -195,7 +195,7 @@ pub(crate) async fn load_tls_config(
             TlsConfig::try_new_from_paths_with_client_auth_mode(
                 cert_path,
                 key_path,
-                client_ca_path,
+                client_ca_path.map(ClientTrustPaths::ca_only),
                 client_auth_enforcement(client_auth.mode),
                 control,
             )?
@@ -213,7 +213,7 @@ pub(crate) async fn load_tls_config(
             TlsConfig::try_new_with_client_auth_mode(
                 &cert_bytes,
                 &key_bytes,
-                ca_bytes.as_deref(),
+                ca_bytes.as_deref().map(ClientTrustPem::ca_only),
                 client_auth_enforcement(client_auth.mode),
             )?
         }

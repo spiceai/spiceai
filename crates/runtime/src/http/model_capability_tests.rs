@@ -32,7 +32,7 @@ use axum::{
 };
 use datafusion::datasource::MemTable;
 use http_body_util::BodyExt;
-use model_capabilities::{Capability, DecisionsBackend, ModelCapabilities};
+use model_capabilities::{Capability, DecisionsBackend, MessagesBackend, ModelCapabilities};
 use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
@@ -256,7 +256,9 @@ async fn runtime_with(models: Vec<Model>) -> (Arc<Runtime>, Router) {
 
     let search = Arc::new(SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        parse_explicit_primary_keys(Arc::clone(&rt.app))
+            .await
+            .into(),
         crate::search::util::RuntimeTableProviderExplorer,
     ));
     let routes = super::routes::routes(
@@ -357,18 +359,20 @@ enum Path {
     Ai,
     Worker,
     Responses,
+    Messages,
     Decisions,
     AiIf,
     Rerank,
 }
 
 impl Path {
-    const ALL: [Path; 8] = [
+    const ALL: [Path; 9] = [
         Path::ChatCompletions,
         Path::Nsql,
         Path::Ai,
         Path::Worker,
         Path::Responses,
+        Path::Messages,
         Path::Decisions,
         Path::AiIf,
         Path::Rerank,
@@ -409,6 +413,14 @@ impl Path {
                 )
                 .await
             }
+            Path::Messages => {
+                post_json(
+                    routes,
+                    "/v1/messages",
+                    &json!({"model": name, "max_tokens": 16, "messages": [{"role": "user", "content": "ping"}]}),
+                )
+                .await
+            }
             Path::Decisions => {
                 post_json(
                     routes,
@@ -443,7 +455,9 @@ impl Path {
     /// Text that the answer of a call that succeeded contains.
     fn answer(self) -> &'static str {
         match self {
-            Path::ChatCompletions | Path::Worker | Path::Ai | Path::Responses => "pong",
+            Path::ChatCompletions | Path::Worker | Path::Ai | Path::Responses | Path::Messages => {
+                "pong"
+            }
             Path::Nsql => "42",
             Path::Decisions => r#""probability":0.9"#,
             Path::AiIf => "true",
@@ -471,19 +485,25 @@ impl Path {
             Path::Responses => {
                 if capabilities.has(Capability::Responses) {
                     vec!["/v1/responses"]
+                } else if capabilities.has(Capability::Chat) {
+                    // A provider without a Responses API is answered through its chat.
+                    vec![chat]
                 } else {
                     vec![]
                 }
             }
+            Path::Messages => match capabilities.messages() {
+                Some(MessagesBackend::Native) => vec!["/v1/messages"],
+                Some(MessagesBackend::ViaChat) => vec![chat],
+                None => vec![],
+            },
             Path::Decisions | Path::AiIf => decisions,
-            // A model with chat reranks through it, even one with native decisions.
-            Path::Rerank => {
-                if capabilities.has(Capability::Chat) {
-                    vec![chat]
-                } else {
-                    decisions
-                }
-            }
+            // A model with native decisions reranks through them, even one with chat.
+            Path::Rerank => match capabilities.decisions() {
+                Some(DecisionsBackend::Native) => decisions,
+                _ if capabilities.has(Capability::Chat) => vec![chat],
+                _ => decisions,
+            },
         }
     }
 }

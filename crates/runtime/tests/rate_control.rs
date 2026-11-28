@@ -26,6 +26,11 @@ limitations under the License.
 //! run it without loading the `integration` binary, whose debug build on macOS
 //! is too large for dyld to map the shared cache beside it.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use app::{App, AppBuilder};

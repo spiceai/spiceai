@@ -39,6 +39,10 @@ use serde::Serialize;
     path = "/v1/namespaces/{namespace}/tables/{table}",
     operation_id = "head_table",
     tag = "Iceberg",
+    params(
+        ("namespace" = String, Path, description = "The namespace of the table."),
+        ("table" = String, Path, description = "The name of the table.")
+    ),
     responses(
         (status = 200, description = "Table exists"),
         (status = 404, description = "Table does not exist")

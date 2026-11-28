@@ -43,7 +43,7 @@ impl FromStr for S3DistanceMetric {
         match s.trim().to_ascii_lowercase().as_str() {
             "euclidean" => Ok(S3DistanceMetric::Euclidean),
             "cosine" => Ok(S3DistanceMetric::Cosine),
-            other => Err(format!("must be one of: euclidean, cosine. Found {other}")),
+            _ => Err("must be one of: euclidean, cosine".to_string()),
         }
     }
 }
@@ -64,9 +64,7 @@ impl FromStr for AwsIamRoleSource {
             "auto" => Ok(AwsIamRoleSource::Auto),
             "metadata" => Ok(AwsIamRoleSource::Metadata),
             "env" => Ok(AwsIamRoleSource::Env),
-            other => Err(format!(
-                "must be one of: auto, metadata, env. Found {other}"
-            )),
+            _ => Err("must be one of: auto, metadata, env".to_string()),
         }
     }
 }

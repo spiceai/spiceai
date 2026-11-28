@@ -74,7 +74,13 @@ impl std::fmt::Display for ConnectorComponent {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
+    /// The connector's error can quote the URL it failed to reach, an object store's
+    /// `Error performing GET http://user:password@host/...` among them, so URL credentials
+    /// are removed from it: the message is logged and kept as the component's status.
+    #[snafu(display(
+        "Cannot connect to the {connector_component} ({dataconnector}). {}",
+        redact::redact_message_credentials(&source.to_string())
+    ))]
     UnableToConnectInternal {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -151,8 +157,11 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The `InvalidConfiguration*` messages often quote the source URL (`... is not a valid
+    /// URL`), which can hold credentials, so they are redacted like `UnableToConnectInternal`.
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {}",
+        redact::redact_message_credentials(message)
     ))]
     InvalidConfiguration {
         dataconnector: String,
@@ -162,7 +171,8 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {source}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {}",
+        redact::redact_message_credentials(&source.to_string())
     ))]
     InvalidConfigurationSourceOnly {
         dataconnector: String,
@@ -171,7 +181,8 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {}",
+        redact::redact_message_credentials(message)
     ))]
     InvalidConfigurationNoSource {
         dataconnector: String,
@@ -346,3 +357,46 @@ impl DataConnectorError {
 pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_configuration_messages_hide_url_credentials() {
+        let component = ConnectorComponent::from(&DatasetSpec::new(
+            "https://example.com/data.csv",
+            "d".into(),
+        ));
+        let message =
+            "https://alice:FAKEPASSWORD@example.com:bad/data.csv is not a valid URL.".to_string();
+        let errors = [
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                connector_component: component.clone(),
+                message: message.clone(),
+                source: message.clone().into(),
+            },
+            DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "https".to_string(),
+                connector_component: component.clone(),
+                source: message.clone().into(),
+            },
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: component,
+                message,
+            },
+        ];
+        for error in errors {
+            let shown = error.to_string();
+            assert!(!shown.contains("FAKEPASSWORD"), "{shown}");
+            assert!(
+                shown.ends_with(
+                    "with an invalid configuration. https://example.com:bad/data.csv is not a valid URL."
+                ),
+                "{shown}"
+            );
+        }
+    }
+}

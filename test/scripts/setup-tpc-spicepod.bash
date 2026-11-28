@@ -4,24 +4,12 @@ set -e
 set -o pipefail
 
 # Initialize variables
-pg_host=localhost
-pg_port=5432
-pg_user=postgres
-pg_pass=postgres
-pg_sslmode=disable
-pg_db=postgres
-engine=arrow
+engine=cayenne
 
 # Function to display flag usage
 usage() {
-    echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor> [-engine acceleration_engine] [-pg_host pg_host] [-pg_port pg_port] [-pg_user pg_user] [-pg_pass pg_pass] [-pg_sslmode pg_sslmode]"
-    echo "  --engine Acceleration Engine (default: arrow)"
-    echo "  --pg_host Acceleration parameter: pg_host (default: localhost)"
-    echo "  --pg_port Acceleration parameter: pg_port (default: 5432)"
-    echo "  --pg_user Acceleration parameter: pg_user (default: postgres)"
-    echo "  --pg_pass Acceleration parameter: pg_pass (default: postgres)"
-    echo "  --pg_sslmode Acceleration parameter: pg_sslmode (default: disabled)"
-    echo "  --pg_db Acceleration parameter: pg_db (default: postgres)"
+    echo "Usage: ./setup-tpc-spicepod.bash <tpch or tpcds> <scale factor> [-engine acceleration_engine]"
+    echo "  --engine Acceleration Engine: cayenne (default: cayenne)"
 }
 
 # two arguments, one is tpch or tpcds, the other one is the scale factor
@@ -58,30 +46,6 @@ while [[ "$#" -gt 0 ]]; do
             engine="$2"
             shift 2
             ;;
-        pg_port )
-            pg_port="$2"
-            shift 2
-            ;;
-        pg_host )
-            pg_host="$2"
-            shift 2
-            ;;
-        pg_user )
-            pg_user="$2"
-            shift 2
-            ;;
-        pg_pass )
-            pg_pass="$2"
-            shift 2
-            ;;
-        pg_sslmode )
-            pg_sslmode="$2"
-            shift 2
-            ;;
-        pg_db )
-            pg_db="$2"
-            shift 2
-            ;;
         * )
             echo "error: Invalid option: $1" 1>&2
             usage
@@ -90,13 +54,22 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+# Reject unsupported engines before creating benchmark data or the Spicepod.
+case "$engine" in
+    cayenne ) ;;
+    * )
+        echo "error: Unsupported engine: $engine (expected cayenne)" 1>&2
+        usage
+        exit 1
+        ;;
+esac
+
 # test if duckdb command exists
 if ! type "duckdb" 1> /dev/null 2>&1; then
   echo "'duckdb' is required"
 fi
 
 dbname="$bench-sf$sf.db"
-dbname_accelerated_prefix="$bench-sf$sf-accelerated-"
 generate_command() {
   if [ "$bench" = "tpch" ]; then
     echo "INSTALL tpch; LOAD tpch; CALL dbgen(sf = $sf)"
@@ -125,7 +98,7 @@ echo "name: $dbname" >> spicepod.yaml
 echo "datasets:" >> spicepod.yaml
 
 if [ "$bench" = "tpch" ]; then
-  if [ "$engine" = "arrow" ]; then
+  if [ "$engine" = "cayenne" ]; then
     for i in customer lineitem nation orders part partsupp region supplier; do
       echo "  - from: duckdb:$i" >> spicepod.yaml
       echo "    name: $i" >> spicepod.yaml
@@ -133,59 +106,14 @@ if [ "$bench" = "tpch" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: arrow" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "postgres" ]; then
-    for i in customer lineitem nation orders part partsupp region supplier; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: postgres" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        pg_host: $pg_host" >> spicepod.yaml
-      echo "        pg_port: $pg_port" >> spicepod.yaml
-      echo "        pg_user: $pg_user" >> spicepod.yaml
-      echo "        pg_pass: $pg_pass" >> spicepod.yaml
-      echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
-      echo "        pg_db: $pg_db" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "duckdb" ]; then
-    for i in customer lineitem nation orders part partsupp region supplier; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      engine: cayenne" >> spicepod.yaml
       echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "sqlite" ]; then
-    for i in customer lineitem nation orders part partsupp region supplier; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: sqlite" >> spicepod.yaml
-      echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        sqlite_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
     done
   fi
 fi
 
 if [ "$bench" = "tpcds" ]; then
-  if [ "$engine" = "arrow" ]; then
+  if [ "$engine" = "cayenne" ]; then
     for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
       echo "  - from: duckdb:$i" >> spicepod.yaml
       echo "    name: $i" >> spicepod.yaml
@@ -193,53 +121,8 @@ if [ "$bench" = "tpcds" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: arrow" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "postgres" ]; then
-    for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: postgres" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        pg_host: $pg_host" >> spicepod.yaml
-      echo "        pg_port: $pg_port" >> spicepod.yaml
-      echo "        pg_user: $pg_user" >> spicepod.yaml
-      echo "        pg_pass: $pg_pass" >> spicepod.yaml
-      echo "        pg_sslmode: $pg_sslmode" >> spicepod.yaml
-      echo "        pg_db: $pg_db" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "duckdb" ]; then
-    for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: duckdb" >> spicepod.yaml
+      echo "      engine: cayenne" >> spicepod.yaml
       echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        duckdb_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
-    done
-  fi
-  if [ "$engine" = "sqlite" ]; then
-    for i in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do
-      echo "  - from: duckdb:$i" >> spicepod.yaml
-      echo "    name: $i" >> spicepod.yaml
-      echo "    params:" >> spicepod.yaml
-      echo "      duckdb_open: $dbname" >> spicepod.yaml
-      echo "    acceleration:" >> spicepod.yaml
-      echo "      enabled: true" >> spicepod.yaml
-      echo "      engine: sqlite" >> spicepod.yaml
-      echo "      mode: file" >> spicepod.yaml
-      echo "      params:" >> spicepod.yaml
-      echo "        sqlite_file: $dbname_accelerated_prefix$i.db" >> spicepod.yaml
     done
   fi
 fi

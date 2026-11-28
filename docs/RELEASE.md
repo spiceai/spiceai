@@ -40,6 +40,8 @@ For version `vX.Y.Z`:
 2. Cherry-pick required fixes from `trunk`. No new features are allowed in patch releases, only bug/security fixes.
 3. Update patch version number.
 
+The open-source release supports only the latest release for security updates (see [`SECURITY.md`](../SECURITY.md)), so open-source security patches are cut only from the latest minor release branch.
+
 ## Endgame issue
 
 Create a [Milestone Endgame](https://github.com/spiceai/spiceai/issues/new?assignees=&labels=endgame&projects=&template=end_game.md&title=v0.x.x-alpha+Endgame) issue to track the checklist needed for a specific milestone release.
@@ -50,8 +52,17 @@ Create a [Milestone Endgame](https://github.com/spiceai/spiceai/issues/new?assig
 - Create a PR updating version.txt to the next planned version number.
   - i.e. `0.2.1-alpha` -> `0.3.0-alpha`
 - Ensure the release notes at `docs/release_notes/v{version}.md` exist
-- Create a new pre-release [GitHub release](https://github.com/spiceai/spiceai/releases/new) with placeholder information. Create a tag that matches the version to be released. The details of the release will be filled in by the automation.
-  - Alternatively push a new tag via the git command line to the GitHub repository, and the release automation will be triggered.
+- Check that the release branch head passed the full post-merge suite: its commit carries a green `trunk-tests` status. The scheduled `trunk_tests.yml` run tests each release branch head that changed; to test it now, run `gh workflow run trunk_tests.yml -f branch=release/{major.minor}` and wait for it.
+- Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. It builds the binaries without publishing them. Don't push the release tag. Its first job, `Release health`, refuses a commit without a green `trunk-tests` status (a commit that predates `trunk_tests.yml` is exempt, since its merge queue ran the full suite). For a known flake or infrastructure fault, set `unhealthy_reason`; the run summary records it.
+- Create a [draft GitHub release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch.
+- Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`. Someone other than the person who started it approves the `publish` job, which publishes the release and creates the tag, and then the two Docker image publish jobs.
+- When the release is the latest release, pin it on install.spiceai.org. The site serves the install scripts of one release, pinned in the install.spiceai.org Worker's repository, so it keeps serving the previous release until the pin moves. Follow "Updating the scripts" in the Worker's README, and merge the pull request once its checks pass. Merging starts the Worker's deploy, which waits for a second person to approve it ("Deploying" in the same README); the pin is live once that deploy finishes. Until then, the `Check install.spiceai.org` job of the publish_release run warns with the pin to make.
+- Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml) with no inputs. Its `install.spiceai.org serves the latest release` job fails unless, on every path the site serves:
+  - `X-Spice-Install-Release` names the latest release (`spiceai/spiceai@v{version}` once it is pinned) and `X-Spice-Install-Commit` is the commit its tag points at;
+  - `ETag`, `Content-Digest` and `Repr-Digest` are the sha256 of the script received;
+  - the script is byte-identical to `install/` at that commit and, from v2.5.0, is the release asset that the release's `SHA256SUMS` lists.
+
+  Each install job runs only the script it fetched and verified the same way. `.github/scripts/verify_install_site.py` runs these checks, and can be run by hand.
 
 ## Acknowledgements update
 

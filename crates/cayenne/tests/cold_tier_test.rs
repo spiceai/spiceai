@@ -30,8 +30,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{
-    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    ScanViewReuse, SlotAdvancer,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, ScanViewReuse, SlotAdvancer,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
@@ -236,10 +235,11 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
         "exactly one row removed across the cold tier"
     );
 
-    // Insert more warm rows, then promote AGAIN. The tombstone for id=42
-    // dirties the (single) prior cold file, so this promotion rewrites it
-    // together with the warm delta; the commit's replace-then-register must
-    // prevent gen-1 rows from being double-counted alongside gen-2.
+    // Insert more warm rows, then promote AGAIN. The promotion writes only the
+    // warm delta and carries the first generation forward untouched — id=42
+    // stays physically in it, hidden by the tombstone the promotion keeps — and
+    // the commit's replace-then-register must prevent gen-1 rows from being
+    // double-counted alongside gen-2.
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -271,10 +271,19 @@ async fn test_cold_tier_promotion_cross_tier_scan_and_delete_impl(
         .catalog
         .list_cold_tier_files(table.table_id())
         .await?;
+    let cold2_urls: Vec<&String> = cold2.iter().map(|f| &f.file_url).collect();
+    for f in &cold {
+        assert!(
+            cold2_urls.contains(&&f.file_url),
+            "the first generation is carried forward, not rewritten: {}",
+            f.file_url
+        );
+    }
     let regraduated_rows: i64 = cold2.iter().map(|f| f.row_count).sum();
     assert_eq!(
-        regraduated_rows, 202,
-        "cold manifest holds exactly the live row set after replace-all promotion"
+        regraduated_rows, 203,
+        "the manifest holds both generations once: 200 promoted rows (id=42 among them, \
+         hidden by its tombstone) plus the 3 new ones"
     );
 
     Ok(())
@@ -298,10 +307,10 @@ fn count_vortex_files(dir: &std::path::Path) -> usize {
 
 test_with_backends!(test_cold_tier_carry_forward_promotion_impl);
 
-/// Carry-forward (incremental) promotion: a promotion rewrites only the warm
-/// data plus the cold files a tombstone may touch; every other cold file is
-/// carried forward by manifest reference — same `file_url`, its object never
-/// re-read or re-written.
+/// Carry-forward (incremental) promotion: a promotion writes only the warm data;
+/// every existing cold file is carried forward by manifest reference — same
+/// `file_url`, its object never re-read or re-written — even one holding a row
+/// a later delete tombstoned.
 async fn test_cold_tier_carry_forward_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -390,10 +399,9 @@ async fn test_cold_tier_carry_forward_promotion_impl(
     assert_eq!(row_count(&ctx, "cf_t").await?, 200, "all rows visible");
 
     // Delete an id that lives in generation 1 (0..100), then promote again
-    // with fresh warm data. The tombstone dirties generation-1 files (their id
-    // rectangles contain 5); generation-2 files (100..200) are provably clean
-    // and must survive with their exact file_urls, while dirty files are
-    // rewritten (their old urls leave the manifest).
+    // with fresh warm data. Every generation-1 and generation-2 file must
+    // survive with its exact file_url: the tombstone for id=5 is kept and hides
+    // the row at read time instead of a rewrite removing it.
     let deleted = delete_id(&table, 5).await?;
     eprintln!("[carry_forward_test] DELETE id=5 rows-affected = {deleted}");
     common::insert_batch(table.as_ref(), insert_range(200..203)?).await?;
@@ -406,37 +414,20 @@ async fn test_cold_tier_carry_forward_promotion_impl(
         .list_cold_tier_files(table.table_id())
         .await?;
     let after3_urls: Vec<&String> = after3.iter().map(|f| &f.file_url).collect();
-    let gen2_only: Vec<&String> = after2
-        .iter()
-        .map(|f| &f.file_url)
-        .filter(|u| !gen1.contains(u))
-        .collect();
-    for url in &gen2_only {
+    for f in &after2 {
         assert!(
-            after3_urls.contains(url),
-            "clean generation-2 file carried through the dirty rewrite: {url}"
+            after3_urls.contains(&&f.file_url),
+            "every existing file is carried forward through promotion 3: {}",
+            f.file_url
         );
     }
-    // A promotion writes MULTIPLE partition files, so generation 1 is several
-    // files covering id sub-ranges. The id=5 tombstone dirties only the file
-    // whose rectangle contains 5 — that one must be rewritten (url dropped);
-    // its clean siblings must be carried. Both sides firing proves the
-    // classification is file-granular WITHIN a generation.
-    let gen1_dropped = gen1.iter().filter(|u| !after3_urls.contains(u)).count();
-    let gen1_carried = gen1.len() - gen1_dropped;
     assert!(
-        gen1_dropped >= 1,
-        "the generation-1 file containing the tombstoned id must be rewritten (none dropped of {})",
-        gen1.len()
-    );
-    assert!(
-        gen1.len() == 1 || gen1_carried >= 1,
-        "clean generation-1 sibling files must be carried, not rewritten (all {} dropped)",
-        gen1.len()
+        after3.len() > after2.len(),
+        "promotion 3 adds new files for the warm delta"
     );
 
-    // Correctness across the carry-forward rewrite: the tombstoned row is
-    // physically gone, everything else is intact, no double counting.
+    // Correctness across the carry-forward: the tombstoned row is hidden,
+    // everything else is intact, no double counting.
     assert_eq!(
         row_count(&ctx, "cf_t").await?,
         202,
@@ -446,7 +437,7 @@ async fn test_cold_tier_carry_forward_promotion_impl(
         collect_pairs(&ctx, "SELECT id, value FROM cf_t WHERE id = 5")
             .await?
             .is_empty(),
-        "tombstoned row physically dropped by the dirty rewrite"
+        "the kept tombstone hides the carried generation-1 row"
     );
     assert_eq!(
         collect_pairs(&ctx, "SELECT id, value FROM cf_t WHERE id = 150").await?,
@@ -455,8 +446,8 @@ async fn test_cold_tier_carry_forward_promotion_impl(
     );
     let manifest_rows: i64 = after3.iter().map(|f| f.row_count).sum();
     assert_eq!(
-        manifest_rows, 202,
-        "manifest row counts match the live row set"
+        manifest_rows, 203,
+        "the manifest holds every promoted row once: 200 (id=5 among them, hidden) + 3 new"
     );
 
     Ok(())
@@ -605,8 +596,8 @@ test_with_backends!(test_cold_tier_concurrent_scan_during_promotion_impl);
 /// they published at different times, so a scan racing the gap paired the OLD
 /// warm snapshot with the NEW cold manifest and counted the promoted rows
 /// TWICE. Hammer `COUNT(*)` from concurrent tasks across three promotions
-/// (fresh, dirty-rewrite, carry-forward); every observation must equal the
-/// live row count.
+/// (fresh, one that keeps a tombstone hiding a carried row, tombstone-free);
+/// every observation must equal the live row count.
 async fn test_cold_tier_concurrent_scan_during_promotion_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -634,15 +625,15 @@ async fn test_cold_tier_concurrent_scan_during_promotion_impl(
         .stop_and_assert_all(400, "promotion 1 (fresh)")
         .await?;
 
-    // Promotion 2: a tombstone dirties the prior cold generation, so this one
-    // rewrites cold files (replace-then-register) while scans run.
+    // Promotion 2: a tombstone hides a row of the prior cold generation, so this
+    // one keeps it while the commit re-registers the carried files under scans.
     delete_id(&table, 7).await?;
     insert_id_range(&table, &schema, 400..403).await?;
     flush_warm(&table).await;
     let hammer = spawn_scan_hammer(&ctx, "race_t", 4);
     assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
     hammer
-        .stop_and_assert_all(402, "promotion 2 (dirty rewrite)")
+        .stop_and_assert_all(402, "promotion 2 (tombstone kept)")
         .await?;
 
     // Promotion 3: tombstone-free carry-forward plus a warm delta.
@@ -759,7 +750,7 @@ async fn test_cold_tier_restart_reopen_impl(fixture: common::TestFixture) -> Tes
 
     // Session 2: a NEW catalog connection over the same metastore file — the
     // provider must rebuild everything from persisted state.
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(
@@ -806,9 +797,9 @@ async fn test_cold_tier_restart_reopen_impl(fixture: common::TestFixture) -> Tes
     );
     assert_eq!(row_count(&ctx2, "restart_t").await?, 198);
 
-    // A further promotion from the reopened provider: the id=7 tombstone
-    // dirties the prior generation, so this exercises classification against
-    // the reloaded manifest + blooms end-to-end.
+    // A further promotion from the reopened provider: the id=7 and id=42
+    // tombstones hide rows of the prior generation, so this exercises the
+    // retention decision against the reloaded manifest + blooms end-to-end.
     insert_id_range(&reopened, &schema, 300..303).await?;
     flush_warm(&reopened).await;
     assert!(
@@ -827,8 +818,9 @@ async fn test_cold_tier_restart_reopen_impl(fixture: common::TestFixture) -> Tes
         .map(|f| f.row_count)
         .sum();
     assert_eq!(
-        manifest_rows, 201,
-        "cold manifest matches the live row set after the post-restart promotion"
+        manifest_rows, 203,
+        "the manifest holds every promoted row once after the post-restart promotion: \
+         200 (ids 7 and 42 among them, hidden) + 3 new"
     );
 
     Ok(())
@@ -848,8 +840,8 @@ test_with_backends!(test_cold_tier_gc_end_to_end_impl);
 /// End-to-end mark-and-sweep over the physical cold store: an orphan `.vortex`
 /// object is deleted only after being observed orphaned for a full grace
 /// interval (mark on one tick, sweep on a later one); manifest-referenced
-/// files and non-`.vortex` objects are never touched; a superseded generation
-/// (dirty rewrite) is physically reclaimed the same way.
+/// files and non-`.vortex` objects are never touched, including a generation
+/// a later promotion carried forward with a tombstoned row in it.
 async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> TestResult<()> {
     // Short GC interval: it doubles as the orphan grace, which is exactly the
     // time-domain behavior under test.
@@ -928,8 +920,8 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
         );
     }
 
-    // Supersede generation 1: a tombstone dirties it, so promotion 2 rewrites
-    // the dirty file(s); their old objects become orphans for GC.
+    // Tombstone a generation-1 row, then promote: generation 1 is carried
+    // forward with that row still in it, so none of its objects is an orphan.
     delete_id(&table, 5).await?;
     insert_id_range(&table, &schema, 200..203).await?;
     flush_warm(&table).await;
@@ -942,27 +934,19 @@ async fn test_cold_tier_gc_end_to_end_impl(fixture: common::TestFixture) -> Test
         .iter()
         .map(|f| file_url_to_path(&f.file_url))
         .collect();
-    let superseded: Vec<&std::path::PathBuf> = gen1_paths
-        .iter()
-        .filter(|p| !live_paths.contains(p))
-        .collect();
-    assert!(
-        !superseded.is_empty(),
-        "the dirty rewrite must supersede at least one generation-1 file"
-    );
+    for path in &gen1_paths {
+        assert!(
+            live_paths.contains(path),
+            "generation 1 is carried forward, not superseded: {}",
+            path.display()
+        );
+    }
 
     // Mark, age past the grace, sweep.
     table.run_cold_tier_gc_tick().await;
     tokio::time::sleep(std::time::Duration::from_millis(GRACE_MS * 2)).await;
     table.run_cold_tier_gc_tick().await;
 
-    for path in &superseded {
-        assert!(
-            !path.exists(),
-            "superseded generation-1 file reclaimed by GC: {}",
-            path.display()
-        );
-    }
     for path in &live_paths {
         assert!(
             path.is_file(),
@@ -1050,8 +1034,8 @@ async fn test_cold_tier_upsert_after_promotion_impl(
         "non-upserted cold rows keep their original value"
     );
 
-    // The invariants must survive checkpointing and a second promotion (the
-    // dirty rewrite physically drops the superseded cold versions).
+    // The invariants must survive checkpointing and a second promotion, which
+    // carries the superseded cold versions forward behind their tombstones.
     flush_warm(&table).await;
     assert_eq!(
         row_count(&ctx, "upsert_t").await?,
@@ -1065,12 +1049,12 @@ async fn test_cold_tier_upsert_after_promotion_impl(
     assert_eq!(
         row_count(&ctx, "upsert_t").await?,
         1000,
-        "count stable after the dirty-rewrite promotion"
+        "count stable after the second promotion"
     );
     assert_eq!(
         collect_pairs(&ctx, "SELECT id, value FROM upsert_t WHERE id = 7").await?,
         vec![(7, 70)],
-        "upserted value survives the rewrite"
+        "upserted value survives the second promotion"
     );
     let manifest_rows: i64 = fixture
         .catalog
@@ -1080,10 +1064,131 @@ async fn test_cold_tier_upsert_after_promotion_impl(
         .map(|f| f.row_count)
         .sum();
     assert_eq!(
-        manifest_rows, 1000,
-        "cold manifest holds exactly the live set"
+        manifest_rows, 1500,
+        "the manifest holds the 1000 first-generation rows (500 of them superseded, \
+         hidden by their tombstones) plus the 500 upserted versions"
     );
 
+    Ok(())
+}
+
+test_with_backends!(test_cold_tier_upsert_range_precheck_impl);
+
+/// Total keys hidden by inline tombstones currently recorded for the table.
+async fn inline_tombstone_rows(fixture: &common::TestFixture, table: &CayenneTableProvider) -> i64 {
+    fixture
+        .catalog
+        .get_inlined_deletes(table.table_id())
+        .await
+        .expect("list inlined deletes")
+        .iter()
+        .map(|d| d.delete_count)
+        .sum()
+}
+
+/// Two cold files cover disjoint key ranges. Appending brand-new keys that lie
+/// outside every cold file's range (below, between and above them) must record
+/// no supersede tombstone, because no cold file can hold such a key even when a
+/// file's bloom would falsely report it. Upserting keys that do exist in the
+/// cold files, including each file's minimum and maximum, must leave exactly
+/// one live row per key carrying the latest value. The oracle is an in-memory
+/// map of the same operation history.
+async fn test_cold_tier_upsert_range_precheck_impl(fixture: common::TestFixture) -> TestResult<()> {
+    use std::collections::BTreeMap;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let options = cold_table_options_with_conflict(
+        &fixture,
+        "range_t",
+        &schema,
+        &cold_dir,
+        300_000,
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table("range_t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+
+    let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+    for range in [10_000..14_000_i64, 100_000..104_000_i64] {
+        insert_id_range(&table, &schema, range.clone()).await?;
+        for id in range {
+            oracle.insert(id, id * 2);
+        }
+        flush_warm(&table).await;
+        assert!(table.promote_warm_to_cold().await?, "promotion fires");
+    }
+    let cold_files = fixture
+        .catalog
+        .list_cold_tier_files(table.table_id())
+        .await?;
+    assert_eq!(
+        cold_files.len(),
+        2,
+        "two cold files with disjoint key ranges"
+    );
+
+    // (a) Brand-new keys outside both ranges: below, between and above.
+    let before = inline_tombstone_rows(&fixture, &table).await;
+    for range in [0..8_000_i64, 20_000..60_000_i64, 200_000..208_000_i64] {
+        insert_id_range(&table, &schema, range.clone()).await?;
+        for id in range {
+            oracle.insert(id, id * 2);
+        }
+    }
+    let after = inline_tombstone_rows(&fixture, &table).await;
+    assert_eq!(
+        after - before,
+        0,
+        "keys outside every cold file's range must not record tombstones"
+    );
+
+    // (b) Keys present in the cold files, including each file's min and max,
+    // plus keys just outside each range that no file holds.
+    let upserts: Vec<i64> = vec![
+        10_000, 10_001, 12_345, 13_998, 13_999, 100_000, 100_001, 101_234, 103_999, 9_999, 14_000,
+        99_999, 104_000,
+    ];
+    let values: Vec<i64> = upserts.iter().map(|i| i * 10 + 1).collect();
+    for (id, value) in upserts.iter().zip(&values) {
+        oracle.insert(*id, *value);
+    }
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(upserts)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?;
+    common::insert_batch(table.as_ref(), batch).await?;
+
+    let expected: Vec<(i64, i64)> = oracle.iter().map(|(k, v)| (*k, *v)).collect();
+    let actual = collect_pairs(&ctx, "SELECT id, value FROM range_t ORDER BY id").await?;
+    assert_eq!(actual.len(), expected.len(), "row count matches the oracle");
+    assert_eq!(actual, expected, "every key has exactly its latest version");
+
+    // The result must also hold after a second promotion carries the superseded
+    // cold copies forward behind their tombstones.
+    flush_warm(&table).await;
+    assert!(
+        table.promote_warm_to_cold().await?,
+        "second promotion fires"
+    );
+    let actual = collect_pairs(&ctx, "SELECT id, value FROM range_t ORDER BY id").await?;
+    assert_eq!(
+        actual, expected,
+        "latest versions survive the second promotion"
+    );
     Ok(())
 }
 
@@ -1194,7 +1299,7 @@ async fn test_cold_tier_cdc_memory_upsert_after_promotion_impl(
         "the CDC-updated value wins over the cold-resident version"
     );
 
-    // Stability across checkpoint + second promotion (dirty rewrite).
+    // Stability across checkpoint + second promotion.
     flush_warm(&table).await;
     assert_eq!(
         row_count(&ctx, "cdc_mem_t").await?,
@@ -1208,12 +1313,12 @@ async fn test_cold_tier_cdc_memory_upsert_after_promotion_impl(
     assert_eq!(
         row_count(&ctx, "cdc_mem_t").await?,
         1000,
-        "count stable after the dirty-rewrite promotion"
+        "count stable after the second promotion"
     );
     assert_eq!(
         collect_pairs(&ctx, "SELECT id, value FROM cdc_mem_t WHERE id = 7").await?,
         vec![(7, 70)],
-        "updated value survives the rewrite"
+        "updated value survives the second promotion"
     );
 
     Ok(())
@@ -1226,9 +1331,9 @@ test_with_backends!(test_cold_tier_bake_preserves_cold_masking_tombstones_impl);
 /// the deletion index — but it never rewrites COLD objects, so a pruned
 /// tombstone that was masking a superseded cold-resident key silently
 /// resurrects the stale cold row (observed as promoted tables over-counting
-/// by ≈ their update count). The prune cutoff must be capped at the cold
-/// manifest's max sequence so cold-masking tombstones survive until a
-/// promotion physically applies them.
+/// by ≈ their update count). The prune cutoff must be capped at the oldest
+/// cold file's sequence so cold-masking tombstones survive as long as the
+/// files they mask.
 async fn test_cold_tier_bake_preserves_cold_masking_tombstones_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -1316,8 +1421,8 @@ async fn test_cold_tier_bake_preserves_cold_masking_tombstones_impl(
         "an un-upserted cold row keeps its original value after the bake"
     );
 
-    // A subsequent promotion physically applies the retained tombstones and
-    // clears the index; the count must hold through it.
+    // A subsequent promotion carries the cold files forward and keeps the
+    // tombstones that mask them; the count must hold through it.
     flush_warm(&table).await;
     assert!(
         table.promote_warm_to_cold().await?,
@@ -1326,7 +1431,7 @@ async fn test_cold_tier_bake_preserves_cold_masking_tombstones_impl(
     assert_eq!(
         row_count(&ctx, "bake_t").await?,
         1000,
-        "count stable after the dirty-rewrite promotion applies the retained tombstones"
+        "count stable after a promotion that keeps the cold-masking tombstones"
     );
 
     Ok(())
@@ -1415,7 +1520,7 @@ async fn test_cold_tier_cdc_upserts_concurrent_with_promotion_impl(
     assert_eq!(
         row_count(&ctx, "cdc_race_t").await?,
         KEYS,
-        "count stable after the dirty-rewrite promotion"
+        "count stable after the second promotion"
     );
     assert_eq!(
         collect_pairs(&ctx, "SELECT id, value FROM cdc_race_t WHERE id = 7").await?,
@@ -1536,7 +1641,7 @@ async fn test_cold_tier_promotion_preserves_pending_stage_b_impl(
         "the staged batch is visible after its Stage-B publish"
     );
 
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(
@@ -1621,7 +1726,7 @@ async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
     }
 
     // The loss manifests at restart (the source slot was acked at Stage-A).
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(

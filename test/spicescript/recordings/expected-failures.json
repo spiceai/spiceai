@@ -1,0 +1,2485 @@
+{
+  "builtins": [
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(name) AS d FROM names ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(coalesce(name, '')) AS d FROM names WHERE id = 4",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, encode(sha256(name), 'hex') AS h FROM names ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, 'a++') AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: quantifier operand invalid\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, '[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a') AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_count(s, 'a', 4294967296) AS c FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function regexp_count(text, unknown, bigint) does not exist\\nHINT: No function matches the given name and argument types. You might need to add exp",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_like(s, '\\x{1C89}', 'i') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_replace(s, '\\x{1C89}', 'X', 'i') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: invalid escape \\\\ sequence\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, regexp_like(s, 'a++') AS v FROM rx ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: invalid regular expression: quantifier operand invalid\\nSQLSTATE: 2201B\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/do",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_distinct(customer) AS n FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_distinct(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type cas",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_distinct(1) AS a FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_distinct(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT approx_median(qty) AS m FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function approx_median(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ca",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, sha256(customer) AS d FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT id, encode(sha256(customer), 'hex') AS h FROM cust ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function sha256(text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nSQLS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT median(qty) AS m FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function median(integer) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\nS",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "federated",
+      "key": "query: SELECT count(region, customer) AS n FROM cust",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function count(text, text) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type casts.\\",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, 'a*') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"3\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, 'a|\\b') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_count(s, '\\d') AS c FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 18, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '\\d') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '\\ba') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_like(s, '(?i)k') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 19, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '\\d', 'X') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy\u0661\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '$2$1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ba\\\"\", actual: \"\\\"$2$1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, 'a*', 'X', 'g') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"XbX\\\"\", actual: \"\\\"XXbX\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id FROM rx WHERE regexp_like(s, '\\d') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\0-\\2\\1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ab-ba\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\0-ba\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\10') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a0\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\\\1') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"a\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\1\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1\u0661') AS v FROM rx ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a\u0661\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT nth_value(customer, 2 ORDER BY customer) AS n FROM cust WHERE region = 'eu'",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"\u00c5ngstr\u00f6m\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(customer, '-', region) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"bob-\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(customer, CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"carol\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "builtins",
+      "who": "variants",
+      "key": "query: SELECT id, concat('', region) AS c FROM cust ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "federated vs cayenne-memory: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "group": "federation-postgres"
+    }
+  ],
+  "clickhouse-literals": [
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 6 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '1900-01-01 00:00:00', TIMESTAMP '1970-01-01 00:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '1900-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '1970-01-01 00:00:00.000001', TIMESTAMP '2000-02-29 12:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '1970-01-01 00:00:00.000001' AND TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '2000-02-29 12:00:00.000001', TIMESTAMP '2038-01-19 03:14:08') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '2000-02-29 12:00:00.000001' AND TIMESTAMP '2038-01-19 03:14:08' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '2038-01-19 03:14:08', TIMESTAMP '2261-12-31 23:59:59.999999') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '1900-01-01' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt < DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 3 rows from Spice and 0 expected",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt >= DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 4 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '1969-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt < DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 3 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt >= DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 4 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '2299-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '2299-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '1900-01-01', DATE '1969-12-31') ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 3",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '1900-01-01' AND DATE '1969-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 3",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '1969-12-31', DATE '2000-02-29') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '1969-12-31' AND DATE '2000-02-29' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '2000-02-29', DATE '2299-12-31') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '2000-02-29' AND DATE '2299-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    }
+  ],
+  "debezium-offset-recovery": [
+    {
+      "run": "debezium-offset-recovery",
+      "who": "as-written",
+      "key": "query: SELECT * FROM acct #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "debezium",
+      "may-pass": true
+    }
+  ],
+  "ducklake-coverage": [
+    {
+      "run": "ducklake-coverage[source=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "ducklake-coverage[source=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "files-and-lakes"
+    }
+  ],
+  "edge-values": [
+    {
+      "run": "edge-values",
+      "who": "cayenne",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "datafusion"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "datafusion"
+    },
+    {
+      "run": "edge-values",
+      "who": "federated",
+      "key": "query: SELECT id, i4 + 1 AS next FROM e WHERE id = 1",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: integer out of range\\nSQLSTATE: 22003\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code: 'Client s",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "edge-values",
+      "who": "federated",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "edge-values",
+      "who": "federated",
+      "key": "query: SELECT max(ts) - min(ts) AS span FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Internal error', message: \"Unable to cast column 0 'span' from Interval(MonthDayNano) to Duration(ns): Compute error: Cannot convert interval containing non-zero months or days to duration\": code: 'Internal error', message: \"Unable to cast column 0 'span",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "edge-values",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    }
+  ],
+  "feed-chaos": [
+    {
+      "run": "feed-chaos[src=mongodb]",
+      "who": "mongodb",
+      "key": "query: SELECT _id, n, v, s FROM t #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 457, actual: 368 }",
+      "group": "streaming-sources",
+      "may-pass": true
+    },
+    {
+      "run": "feed-chaos[src=mongodb]",
+      "who": "mongodb-object-native",
+      "key": "query: SELECT _id, n, v, s FROM t #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 457, actual: 368 }",
+      "group": "streaming-sources",
+      "may-pass": true
+    }
+  ],
+  "http-caching-keys": [
+    {
+      "run": "http-caching-keys",
+      "who": "as-written",
+      "key": "source-query: {\"api\":\"count /v1/missing\"} #2",
+      "kind": "other",
+      "signature": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "pattern": "the source answered \\[\\[Some\\(\"(\\d+|<n>)\"\\)\\]\\], expected \\[\\[Some\\(\"(3|<n>)\"\\)\\]\\]",
+      "group": "caching-http",
+      "may-pass": true
+    }
+  ],
+  "mysql-cdc-parity": [
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM orders #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM orders #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM orders #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM customers #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found"
+      ],
+      "varies": true,
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found"
+      ],
+      "varies": true,
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for customers: Acceleration not ready; loading initial data for customers",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found"
+      ],
+      "varies": true,
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3",
+      "key": "start: {\"ready-timeout\":\"60s\"}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "start: {\"ready-timeout\":\"60s\"}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "sqlite-key",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "sqlite-position",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-key",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native-position",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    },
+    {
+      "run": "mysql-cdc-parity",
+      "who": "object-native",
+      "key": "restart: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"from\":\"mysql:orders\",\"name\":\"orders\",\"properties\":{\"search\":\"unsupported\",\"vector_search\":\"unsupported\"},\"replication_enabled\":false,\"status\":\"Ready\"},{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.co",
+      "group": "cdc-mysql"
+    }
+  ],
+  "mysql-cdc-shared-binlog": [
+    {
+      "run": "mysql-cdc-shared-binlog[engine=cayenne]",
+      "who": "restart",
+      "key": "query: SELECT * FROM a #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
+      "group": "cdc-mysql",
+      "may-pass": true
+    }
+  ],
+  "mysql-literals": [
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '1000-01-01 00:00:00', TIMESTAMP '1970-01-01 00:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '1000-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '2038-01-19 03:14:08', TIMESTAMP '9999-12-31 23:59:59.999999') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '1000-01-01 00:00:00' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm = TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm < TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm >= TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm <> TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '1000-01-01 00:00:00', TIMESTAMP '1970-01-01 00:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '1000-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 1000-01-01 00:00:00 to Nanosecond. The dates that can be represe",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm IN (TIMESTAMP '2038-01-19 03:14:08', TIMESTAMP '9999-12-31 23:59:59.999999') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    },
+    {
+      "run": "mysql-literals",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM m WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '9999-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that can be represented as nanoseconds have to be between <time> and <time>: Cast error: Overflow converting 9999-12-31 23:59:59.999999 to Nanosecond. The dates that ",
+      "group": "cayenne"
+    }
+  ],
+  "postgres-cdc-atomicity": [
+    {
+      "run": "postgres-cdc-atomicity",
+      "who": "as-written",
+      "key": "query: SELECT count(*) AS n FROM by_changes",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-atomicity",
+      "who": "as-written",
+      "key": "stop-background: read-changes",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "also": [
+        "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")"
+      ],
+      "varies": true,
+      "group": "cayenne",
+      "may-pass": true
+    }
+  ],
+  "postgres-cdc-edge-values": [
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=default]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-edge-values[identity=full]",
+      "who": "object-native",
+      "key": "query: SELECT id, octet_length(bin) AS n FROM e #2",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
+      "group": "cayenne"
+    }
+  ],
+  "postgres-cdc-parity": [
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM orders #9",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.orders' not found: table 'spice.public.orders' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM customers #7",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #7",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #7",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne"
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3-latency",
+      "key": "query: SELECT * FROM customers #8",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.customers' not found: table 'spice.public.customers' not found",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-parity",
+      "who": "object-native-s3",
+      "key": "sample-objects: {\"contains\":\"/data/\",\"every\":\"10s\",\"for\":\"180s\",\"max-objects\":600,\"prefix\":\"state/cayenne/v1/datasets/orders-\",\"source\":\"lake\"}",
+      "kind": "other",
+      "signature": "objects under 'state/cayenne/v1/datasets/orders-' in 'lake' trend upward: the last third peaks at <n>",
+      "pattern": "^objects under 'state/cayenne/v1/datasets/orders-' in 'lake' (trend upward|went over their bound)",
+      "group": "cayenne",
+      "may-pass": true
+    }
+  ],
+  "postgres-literals": [
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r = CAST('1e-45' AS REAL) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r <> CAST('1e-45' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r = CAST('0.1' AS REAL) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r <> CAST('0.1' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r = CAST('3.4e38' AS REAL) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r < CAST('3.4e38' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 8 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r >= CAST('3.4e38' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r <> CAST('3.4e38' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r IN (CAST('-0' AS REAL), CAST('1e-45' AS REAL)) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r BETWEEN CAST('-0' AS REAL) AND CAST('1e-45' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r IN (CAST('1e-45' AS REAL), CAST('0.1' AS REAL)) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r BETWEEN CAST('1e-45' AS REAL) AND CAST('0.1' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r IN (CAST('0.1' AS REAL), CAST('3.4e38' AS REAL)) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r IN (CAST('3.4e38' AS REAL), CAST('Infinity' AS REAL)) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE r BETWEEN CAST('3.4e38' AS REAL) AND CAST('Infinity' AS REAL) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz = CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz <> CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz = CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz < CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz >= CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 8 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz <> CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz = CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz < CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 6 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz >= CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz <> CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz = CAST('2024-11-03 01:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz <> CAST('2024-11-03 01:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 9, actual: 10 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz IN (CAST('1969-12-31 23:59:59.999999+00' AS TIMESTAMPTZ), CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ)) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz BETWEEN CAST('1969-12-31 23:59:59.999999+00' AS TIMESTAMPTZ) AND CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz IN (CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ), CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ)) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz BETWEEN CAST('2024-03-10 01:30:00-08' AS TIMESTAMPTZ) AND CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 3",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz IN (CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ), CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ)) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz BETWEEN CAST('2024-03-10 03:30:00-07' AS TIMESTAMPTZ) AND CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 4 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz IN (CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ), CAST('2024-11-03 01:30:00-07' AS TIMESTAMPTZ)) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "postgres-literals",
+      "who": "federated",
+      "key": "query: SELECT id FROM e WHERE tz BETWEEN CAST('2024-06-30 23:59:59+14' AS TIMESTAMPTZ) AND CAST('2024-11-03 01:30:00-07' AS TIMESTAMPTZ) ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "federation-postgres"
+    }
+  ],
+  "postgres-write-back-outage": [
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT * FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT * FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT count(*), sum(balance) FROM accounts #3",
+      "kind": "wrong-answer",
+      "signature": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "pattern": "(RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT * FROM accounts #4",
+      "kind": "wrong-answer",
+      "signature": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "pattern": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT * FROM accounts #4",
+      "kind": "wrong-answer",
+      "signature": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "pattern": "((RowCountMismatch \\{ expected: 101, actual: 100 \\}|DataMismatch \\{ column: \"count\\(\\*\\)\", row_number: 1, expected: .*101.*, actual: .*100)|DataMismatch \\{ column: \"owner\", row_number: 47, expected: .*through spice.*, actual: .*at the source)",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "as-written",
+      "key": "query: SELECT owner FROM accounts WHERE id = 5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 1, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "group": "write-back",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-write-back-outage",
+      "who": "object-native",
+      "key": "query: SELECT owner FROM accounts WHERE id = 5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"owner\", row_number: 1, expected: \"\\\"through spice\\\"\", actual: \"\\\"at the source\\\"\" }",
+      "group": "write-back",
+      "may-pass": true
+    }
+  ],
+  "query-coverage": [
+    {
+      "run": "query-coverage[backend=postgres]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "query-coverage[backend=postgres]",
+      "who": "federated",
+      "key": "query: SELECT id, concat(s, '-', id) AS c1, s || '!' AS c2 FROM t WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c1\", row_number: 2, expected: \"None\", actual: \"\\\"-10\\\"\" }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT b, count(*) FILTER (WHERE i > 0) AS pos, count(*) FILTER (WHERE i < 0) AS neg FROM t GROUP BY b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT b, i % 3 AS k, count(*), sum(d) FROM t GROUP BY GROUPING SETS ((b), (i % 3), ())",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 3889 (HY000): Secondary engine operation failed. Reason: \\\"You have not defined the secondary engine for at least one of the query ta",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, date_trunc('month', ts) AS month FROM t WHERE id < 40",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT date_trunc('week', ts) AS week, count(*) FROM t GROUP BY date_trunc('week', ts)",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, EXTRACT(DOW FROM dt) AS dow, EXTRACT(DOY FROM dt) AS doy, EXTRACT(QUARTER FROM dt) AS q FROM t WHERE id < 40",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_part does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, position('a' IN s) AS p, left(s, 2) AS l2, right(s, 2) AS r2 FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.strpos does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-er",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id FROM t WHERE s ILIKE 'apple'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id FROM t WHERE s NOT LIKE '%a%'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 244, actual: 172 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, starts_with(s, 'ap') AS sw FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.starts_with does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mys",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, greatest(i, 0) AS g, least(i, 0) AS l FROM t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"g\", row_number: 7, expected: \"\\\"0\\\"\", actual: \"None\" }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT bool_and(b), bool_or(b), bool_and(i > -100) FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Failed to coerce arguments to satisfy a call to 'bool_and' function: coercion from Int8 to the signature Exact(Boolean) failed. No function matches the given name and argument types 'bool_and(Int8)'. You might need to add explicit type casts.",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT b, min(s), max(s) FROM t WHERE s IN ('apple', 'banana') GROUP BY b",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"min(t.s)\", row_number: 1, expected: \"\\\"apple\\\"\", actual: \"\\\"Apple\\\"\" }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id FROM t WHERE i IN (SELECT i FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "federated",
+      "key": "query: SELECT id, d FROM t WHERE d > (SELECT avg(d) FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT bool_and(b), bool_or(b), bool_and(i > -100) FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Failed to coerce arguments to satisfy a call to 'bool_and' function: coercion from Int8 to the signature Exact(Boolean) failed. No function matches the given name and argument types 'bool_and(Int8)'. You might need to add explicit type casts.",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE i IN (SELECT i FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id, d FROM t WHERE d > (SELECT avg(d) FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT bool_and(b), bool_or(b), bool_and(i > -100) FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Failed to coerce arguments to satisfy a call to 'bool_and' function: coercion from Int8 to the signature Exact(Boolean) failed. No function matches the given name and argument types 'bool_and(Int8)'. You might need to add explicit type casts.",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM t WHERE i IN (SELECT i FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, d FROM t WHERE d > (SELECT avg(d) FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "cayenne"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT t.id, u.label FROM t JOIN u ON t.id = u.t_id AND u.label <> 'blue' WHERE t.b",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "datafusion"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT bool_and(b), bool_or(b), bool_and(i > -100) FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Failed to coerce arguments to satisfy a call to 'bool_and' function: coercion from Int8 to the signature Exact(Boolean) failed. No function matches the given name and argument types 'bool_and(Int8)'. You might need to add explicit type casts.",
+      "group": "datafusion"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id FROM t WHERE i IN (SELECT i FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "datafusion"
+    },
+    {
+      "run": "query-coverage[backend=mysql]",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, d FROM t WHERE d > (SELECT avg(d) FROM t WHERE b) AND id < 100",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
+      "group": "datafusion"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "federated",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "adbc",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "adbc",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    }
+  ],
+  "readiness": [
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "assert-status: {\"dataset\":\"slow\",\"ready\":false}",
+      "kind": "status",
+      "signature": "expected ready=false, saw status=Ready ready=true message=",
+      "group": "other",
+      "may-pass": true
+    },
+    {
+      "run": "readiness[engine=cayenne,ready_state=on_load]",
+      "who": "object-native",
+      "key": "query: SELECT count(*) FROM slow",
+      "kind": "error",
+      "signature": "the query succeeded, but the script expected an error:",
+      "group": "other",
+      "may-pass": true
+    }
+  ],
+  "schema-ddl": [
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false} #3",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #8",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false}",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #4",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "refresh: {\"dataset\":\"cham\",\"wait\":false} #2",
+      "kind": "other",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    },
+    {
+      "run": "schema-ddl[engine=duckdb]",
+      "who": "block",
+      "key": "query: SELECT * FROM cham #6",
+      "kind": "error",
+      "signature": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "pattern": "No table named 'cham'|table 'spice\\.public\\.cham' not found",
+      "group": "schema-evolution",
+      "may-pass": true
+    }
+  ],
+  "surface": [
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT id, tz FROM ev WHERE tz >= TIMESTAMPTZ '2024-03-10 01:30:00-08' AND tz < TIMESTAMPTZ '2024-03-10 05:00:00-07'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT j ->> 'k' AS k, count(*) FROM ev GROUP BY j ->> 'k'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column \"ev.j\" must appear in the GROUP BY clause or must be part of an aggregate function, currently only \"j ->> 'k', count(Int64(1))\" appears in the SELECT clau",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT dst FROM edges JOIN r ON edges.src = r.n) SELECT n FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: WITH RECURSIVE r(n, depth) AS (SELECT 4, 0 UNION ALL SELECT dst, depth + 1 FROM edges JOIN r ON edges.src = r.n WHERE depth < 5) SELECT n, depth FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT id, abs(n) AS a, sign(n) AS s FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid function 'sign'.",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, '\u00e9') AS ew FROM ev WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function ends_with(text, unknown) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT id FROM ev WHERE n BETWEEN SYMMETRIC 20 AND -20",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Expected: AND, found: 20 at Line: 1, Column: 45: Expected: AND, found: 20 at Line: 1, Column: 45",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT id FROM ev WHERE (n, grp) IN ((1, 'red'), (-3, 'blue'), (12, 'green'))",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Only identifiers and literals are supported in tuples: Unsupported Query. Only identifiers and literals are supported in tuples",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "federated",
+      "key": "query: SELECT ev.id, l.doubled FROM ev, LATERAL (SELECT ev.id * 2 AS doubled) l WHERE ev.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Subquery(<subquery>): Unsupported Query. Unsupported operator: Subquery(<subquery>)",
+      "group": "federation-postgres"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, CAST(tz AT TIME ZONE 'America/New_York' AS TIMESTAMP) AS ny FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"ny\", row_number: 1, expected: \"\\\"2024-03-09 08:37:00.000000000\\\"\", actual: \"\\\"2024-03-09 13:37:00.000000000\\\"\" }",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, ts - TIMESTAMP '2000-01-01 00:00:00' < INTERVAL '30 days' AS early FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"early\", row_number: 4, expected: \"\\\"false\\\"\", actual: \"\\\"true\\\"\" }",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, to_char(dt, 'YYYY-MM-DD') AS c FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2024-01-12\\\"\", actual: \"\\\"YYYY-MM-DD\\\"\" }",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT j ->> 'k' AS k, count(*) FROM ev GROUP BY j ->> 'k'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column \"ev.j\" must appear in the GROUP BY clause or must be part of an aggregate function, currently only \"j ->> 'k', count(Int64(1))\" appears in the SELECT clau",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT dst FROM edges JOIN r ON edges.src = r.n) SELECT n FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: WITH RECURSIVE r(n, depth) AS (SELECT 4, 0 UNION ALL SELECT dst, depth + 1 FROM edges JOIN r ON edges.src = r.n WHERE depth < 5) SELECT n, depth FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id, abs(n) AS a, sign(n) AS s FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid function 'sign'.",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id FROM ev WHERE n BETWEEN SYMMETRIC 20 AND -20",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Expected: AND, found: 20 at Line: 1, Column: 45: Expected: AND, found: 20 at Line: 1, Column: 45",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT id FROM ev WHERE (n, grp) IN ((1, 'red'), (-3, 'blue'), (12, 'green'))",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Only identifiers and literals are supported in tuples: Unsupported Query. Only identifiers and literals are supported in tuples",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-memory",
+      "key": "query: SELECT ev.id, l.doubled FROM ev, LATERAL (SELECT ev.id * 2 AS doubled) l WHERE ev.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Physical plan does not support logical expression OuterReferenceColumn(Field { name: \"id\", data_type: Int32, metadata: {\"source_type\":\"integer\"} }, Column { relation: Some(Bare { table: \"ev\" }), name: \"id\" }): Unsupported Query. Ph",
+      "group": "datafusion"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id, CAST(tz AT TIME ZONE 'America/New_York' AS TIMESTAMP) AS ny FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"ny\", row_number: 1, expected: \"\\\"2024-03-09 08:37:00.000000000\\\"\", actual: \"\\\"2024-03-09 13:37:00.000000000\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id, ts - TIMESTAMP '2000-01-01 00:00:00' < INTERVAL '30 days' AS early FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"early\", row_number: 4, expected: \"\\\"false\\\"\", actual: \"\\\"true\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id, to_char(dt, 'YYYY-MM-DD') AS c FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2024-01-12\\\"\", actual: \"\\\"YYYY-MM-DD\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT j ->> 'k' AS k, count(*) FROM ev GROUP BY j ->> 'k'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column \"ev.j\" must appear in the GROUP BY clause or must be part of an aggregate function, currently only \"j ->> 'k', count(Int64(1))\" appears in the SELECT clau",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT dst FROM edges JOIN r ON edges.src = r.n) SELECT n FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: WITH RECURSIVE r(n, depth) AS (SELECT 4, 0 UNION ALL SELECT dst, depth + 1 FROM edges JOIN r ON edges.src = r.n WHERE depth < 5) SELECT n, depth FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id, abs(n) AS a, sign(n) AS s FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid function 'sign'.",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM ev WHERE n BETWEEN SYMMETRIC 20 AND -20",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Expected: AND, found: 20 at Line: 1, Column: 45: Expected: AND, found: 20 at Line: 1, Column: 45",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM ev WHERE (n, grp) IN ((1, 'red'), (-3, 'blue'), (12, 'green'))",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Only identifiers and literals are supported in tuples: Unsupported Query. Only identifiers and literals are supported in tuples",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne",
+      "key": "query: SELECT ev.id, l.doubled FROM ev, LATERAL (SELECT ev.id * 2 AS doubled) l WHERE ev.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Physical plan does not support logical expression OuterReferenceColumn(Field { name: \"id\", data_type: Int32, metadata: {\"source_type\":\"integer\"} }, Column { relation: Some(Bare { table: \"ev\" }), name: \"id\" }): Unsupported Query. Ph",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, CAST(tz AT TIME ZONE 'America/New_York' AS TIMESTAMP) AS ny FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"ny\", row_number: 1, expected: \"\\\"2024-03-09 08:37:00.000000000\\\"\", actual: \"\\\"2024-03-09 13:37:00.000000000\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, ts - TIMESTAMP '2000-01-01 00:00:00' < INTERVAL '30 days' AS early FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"early\", row_number: 4, expected: \"\\\"false\\\"\", actual: \"\\\"true\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, to_char(dt, 'YYYY-MM-DD') AS c FROM ev WHERE id < 40",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2024-01-12\\\"\", actual: \"\\\"YYYY-MM-DD\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT j ->> 'k' AS k, count(*) FROM ev GROUP BY j ->> 'k'",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column \"ev.j\" must appear in the GROUP BY clause or must be part of an aggregate function, currently only \"j ->> 'k', count(Int64(1))\" appears in the SELECT clau",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT dst FROM edges JOIN r ON edges.src = r.n) SELECT n FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: WITH RECURSIVE r(n, depth) AS (SELECT 4, 0 UNION ALL SELECT dst, depth + 1 FROM edges JOIN r ON edges.src = r.n WHERE depth < 5) SELECT n, depth FROM r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot project plan to expected schema: schema metadata differ: Cannot project plan to expected schema: schema metadata differ",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id, abs(n) AS a, sign(n) AS s FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid function 'sign'.",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM ev WHERE n BETWEEN SYMMETRIC 20 AND -20",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Expected: AND, found: 20 at Line: 1, Column: 45: Expected: AND, found: 20 at Line: 1, Column: 45",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT id FROM ev WHERE (n, grp) IN ((1, 'red'), (-3, 'blue'), (12, 'green'))",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Only identifiers and literals are supported in tuples: Unsupported Query. Only identifiers and literals are supported in tuples",
+      "group": "cayenne"
+    },
+    {
+      "run": "surface",
+      "who": "cayenne-object-native",
+      "key": "query: SELECT ev.id, l.doubled FROM ev, LATERAL (SELECT ev.id * 2 AS doubled) l WHERE ev.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Physical plan does not support logical expression OuterReferenceColumn(Field { name: \"id\", data_type: Int32, metadata: {\"source_type\":\"integer\"} }, Column { relation: Some(Bare { table: \"ev\" }), name: \"id\" }): Unsupported Query. Ph",
+      "group": "cayenne"
+    }
+  ]
+}

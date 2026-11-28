@@ -34,7 +34,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, SnapshotFileStatistics, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_common::stats::Precision;
@@ -44,7 +44,8 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TABLE: &str = "file_stats_source";
 
-test_with_backends!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
+test_on_data_store!(file_scan_byte_size_statistics_do_not_depend_on_their_source);
+test_on_data_store!(compaction_persists_no_statistics_for_the_files_it_replaces);
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -171,23 +172,25 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -210,16 +213,18 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     // Session 2 — a fresh catalog connection and a fresh provider over the same
     // metastore and the same files: the restart case, where every file is served
     // from the persisted blob rather than its footer.
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                TABLE,
+            )
+            .await?,
     );
 
     let (blob_total, blob_columns) = scan_statistics(&reopened, &ctx).await?;
@@ -238,7 +243,7 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     Ok(())
 }
 
-test_with_backends!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
+test_on_data_store!(a_blob_without_byte_sizes_is_re_inferred_from_its_footer);
 
 /// Build a blob shaped like one written before per-column byte sizes were
 /// persisted: every column's `byte_size` absent, so the restored total is too.
@@ -275,23 +280,25 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -313,8 +320,12 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let table_id = table.table_id().to_string();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
+    let data_path = table.metadata().path.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        common::statistics_row_key(&fixture.data_path, &table_id, file)
+        fixture
+            .data_store
+            .statistics_row_key(&data_path, &table_id, file)
+            .expect("statistics row key")
     };
     for file in &files {
         fixture
@@ -349,16 +360,18 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     );
 
     // A fresh provider over that metastore must not serve the legacy row.
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                TABLE,
+            )
+            .await?,
     );
 
     let (migrated_total, _) = scan_statistics(&reopened, &ctx).await?;
@@ -397,7 +410,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     Ok(())
 }
 
-test_with_backends!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
+test_on_data_store!(a_widened_table_still_serves_its_files_from_the_persisted_blob);
 
 const EVOLVED_TABLE: &str = "file_stats_source_evolved";
 
@@ -427,23 +440,25 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            CreateTableOptions {
-                table_name: EVOLVED_TABLE.to_string(),
-                schema: schema(),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: fixture.data_path.to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    inline_max_rows: 0,
-                    ..VortexConfig::default()
+        fixture
+            .data_store
+            .create(
+                catalog,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: EVOLVED_TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(EVOLVED_TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        ..VortexConfig::default()
+                    },
                 },
-            },
-            ctx.runtime_env(),
-        )
-        .await?,
+            )
+            .await?,
     );
     insert_rows(&table, 0..512).await?;
     table.drain_in_flight_maintenance().await?;
@@ -477,8 +492,12 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let table_id = table.table_id().to_string();
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
+    let data_path = table.metadata().path.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        common::statistics_row_key(&fixture.data_path, &table_id, file)
+        fixture
+            .data_store
+            .statistics_row_key(&data_path, &table_id, file)
+            .expect("statistics row key")
     };
     let mut poisoned = 0;
     for file in &files {
@@ -515,16 +534,18 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
         "the footer scan must have persisted a row to poison, or this test proves nothing"
     );
 
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(
-        CayenneTableProviderBuilder::new(
-            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-            ctx.runtime_env(),
-        )
-        .open(EVOLVED_TABLE)
-        .await?,
+        fixture
+            .data_store
+            .open(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                EVOLVED_TABLE,
+            )
+            .await?,
     );
     let (_, blob_columns) = scan_statistics(&reopened, &ctx).await?;
 
@@ -552,6 +573,8 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
 // and the upserts through triggers on the metastore table, so neither depends on
 // the provider's own accounting.
 
+// These stay on SQLite: they count footer reads through the session's `file://`
+// store, which a table in the object-native location does not read through.
 test_with_backends!(concurrent_cold_scans_share_one_footer_read_and_upsert_per_file);
 test_with_backends!(scan_file_statistics_counters_match_the_store_and_the_metastore);
 
@@ -709,7 +732,7 @@ async fn open_cold(
     SessionContext,
     Arc<FooterReadCounter>,
 )> {
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_metadata_cache_limit(0)
@@ -989,5 +1012,173 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
         "no footer is read when every row is persisted: {:?}",
         store.reads()
     );
+    Ok(())
+}
+
+const REPLACED_TABLE: &str = "replaced_file_stats";
+const REPLACED_FILES: i64 = 4;
+/// Object-native commits of the last append and the pass it triggers: their own
+/// changes only. A statistics row persisted per input file would add one each.
+const PASS_COMMITS: u64 = 5;
+
+/// Statistics rows written to the `SQLite` metastore since its write log was
+/// installed; `None` on the object-native metastore, where each row is a commit
+/// of the dataset's log instead.
+async fn sqlite_statistics_writes(
+    write_log: Option<&StatisticsWriteLog>,
+) -> TestResult<Option<usize>> {
+    Ok(match write_log {
+        Some(log) => Some(log.writes().await?.values().sum()),
+        None => None,
+    })
+}
+
+/// A small-file compaction reads its input files' statistics but persists none
+/// of them: it replaces those files, and drops their statistics rows once it
+/// publishes, so each row would be a metastore commit that buys nothing while
+/// the table's writers wait behind it. A query's scan afterwards still persists
+/// a row for each file it reads.
+async fn compaction_persists_no_statistics_for_the_files_it_replaces(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        fixture
+            .data_store
+            .create(
+                Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+                CreateTableOptions {
+                    table_name: REPLACED_TABLE.to_string(),
+                    schema: schema(),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: fixture.data_store.base_path(REPLACED_TABLE),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        // One Vortex file per insert, and a pass once there are four.
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        target_vortex_file_size_mb: 1,
+                        compaction_trigger_files: usize::try_from(REPLACED_FILES)?,
+                        compaction_max_files_per_pick: usize::try_from(REPLACED_FILES)?,
+                        compaction_background_interval_ms: 0,
+                        ..VortexConfig::default()
+                    },
+                },
+            )
+            .await?,
+    );
+    let write_log = StatisticsWriteLog::install(&fixture).await?;
+
+    for file in 0..REPLACED_FILES - 1 {
+        insert_rows(&table, file * ROWS_PER_FILE..(file + 1) * ROWS_PER_FILE).await?;
+    }
+    table.drain_in_flight_maintenance().await?;
+    let before_pass = table.current_snapshot_id();
+    let commits_before_pass = fixture.object_native_head_commit(REPLACED_TABLE).await?;
+    assert_eq!(
+        table.scan_file_statistics_counters().persisted_upserts,
+        0,
+        "appends persist no file statistics"
+    );
+
+    // The last insert reaches the trigger; its post-write pass merges all four.
+    insert_rows(
+        &table,
+        (REPLACED_FILES - 1) * ROWS_PER_FILE..REPLACED_FILES * ROWS_PER_FILE,
+    )
+    .await?;
+    table.drain_in_flight_maintenance().await?;
+    if table.current_snapshot_id() == before_pass {
+        assert!(
+            table.compact_current_snapshot_small_files().await?,
+            "a small-file pass merges the {REPLACED_FILES} appended files"
+        );
+    }
+    assert_ne!(
+        table.current_snapshot_id(),
+        before_pass,
+        "the pass published"
+    );
+    table.wait_for_scan_file_statistics_persistence().await;
+    let after_pass = table.scan_file_statistics_counters();
+    let pass_writes = sqlite_statistics_writes(write_log.as_ref()).await?;
+    let commits_after_pass = fixture.object_native_head_commit(REPLACED_TABLE).await?;
+    let pass_commits = commits_after_pass
+        .zip(commits_before_pass)
+        .map(|(after, before)| after - before);
+    eprintln!(
+        "REPLACED_FILE_STATS backend={} after the last append and its pass: {after_pass:?}, \
+         SQLite statistics writes {pass_writes:?}, object-native commits {pass_commits:?}",
+        fixture.backend_type.name()
+    );
+    assert_eq!(
+        after_pass.footer_reads,
+        u64::try_from(REPLACED_FILES)?,
+        "the pass read each input file's statistics"
+    );
+    assert_eq!(
+        after_pass.persisted_upserts, 0,
+        "the pass persists no statistics for the files it replaces"
+    );
+    if let Some(writes) = pass_writes {
+        assert_eq!(writes, 0, "the metastore records no statistics for them");
+    }
+    if let Some(commits) = pass_commits {
+        assert_eq!(
+            commits, PASS_COMMITS,
+            "the append and its pass commit only their own changes, none per input file"
+        );
+    }
+
+    // A query's scan of the merged file still persists its statistics.
+    let query = SessionContext::new();
+    query.register_table(REPLACED_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let batches = query
+        .sql(&format!("SELECT COUNT(*), SUM(id) FROM {REPLACED_TABLE}"))
+        .await?
+        .collect()
+        .await?;
+    let rows = REPLACED_FILES * ROWS_PER_FILE;
+    let column = |index: usize| {
+        batches[0]
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT and SUM are Int64")
+            .value(0)
+    };
+    assert_eq!((column(0), column(1)), (rows, rows * (rows - 1) / 2));
+    table.wait_for_scan_file_statistics_persistence().await;
+    let after_query = table.scan_file_statistics_counters();
+    let query_writes = sqlite_statistics_writes(write_log.as_ref()).await?;
+    let query_commits = fixture
+        .object_native_head_commit(REPLACED_TABLE)
+        .await?
+        .zip(commits_after_pass)
+        .map(|(after, before)| after - before);
+    eprintln!(
+        "REPLACED_FILE_STATS backend={} after the query: {after_query:?}, \
+         SQLite statistics writes {query_writes:?}, object-native commits {query_commits:?}",
+        fixture.backend_type.name()
+    );
+    assert_eq!(
+        after_query.footer_reads - after_pass.footer_reads,
+        1,
+        "the query read the merged file's statistics"
+    );
+    assert_eq!(
+        after_query.persisted_upserts - after_pass.persisted_upserts,
+        1,
+        "the query persists the merged file's statistics"
+    );
+    if let Some(writes) = query_writes {
+        assert_eq!(writes, 1, "the metastore records them once");
+    }
+    if let Some(commits) = query_commits {
+        assert_eq!(commits, 1, "in one commit");
+    }
     Ok(())
 }

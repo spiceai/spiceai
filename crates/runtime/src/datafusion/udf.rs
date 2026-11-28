@@ -42,7 +42,6 @@ use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
 use runtime_search::rrf;
 use runtime_search::rrf::RRF_UDF_NAME;
-use runtime_search::search_engine::parse_explicit_primary_keys;
 use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
@@ -89,7 +88,8 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    let explicit_pks = runtime.search_primary_keys.clone();
+    explicit_pks.update(runtime.app()).await;
     ctx.register_udf(
         VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
     );
@@ -176,6 +176,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     )
     .register(ctx);
 
+    // Places the remaining async calls (`ai`, async user functions). Runs after the
+    // decision rule, which places decision calls itself.
+    ctx.add_optimizer_rule(Arc::new(
+        runtime_datafusion_udfs::async_placement::AsyncCallPlacement,
+    ));
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
@@ -211,7 +217,8 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 
     warn_beta_once();
 
-    let enabled_functions = enabled_function_declarations(&app.functions);
+    let enabled_functions =
+        refuse_sidecar_code_functions(runtime, enabled_function_declarations(&app.functions));
     if enabled_functions.is_empty() {
         return;
     }
@@ -244,7 +251,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 upsert_user_function_info(info_from_decl(&decl));
                 tracing::info!(
                     name = %decl.name,
-                    from = %decl.from,
+                    from = %user_function_display_from(&decl),
                     "Registered user function"
                 );
                 functions_to_expose_as_tools.push(decl);
@@ -266,7 +273,7 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
                 upsert_user_function_info(info_from_decl(&decl));
                 tracing::info!(
                     name = %decl.name,
-                    from = %decl.from,
+                    from = %user_function_display_from(&decl),
                     "Registered user table function"
                 );
                 if decl.as_tool {
@@ -360,13 +367,51 @@ pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<Str
         .cloned()
 }
 
-fn function_executes_code(decl: &Function) -> bool {
-    let scheme = decl
-        .from
+/// The `from` scheme of a function declaration, lowercased: `sql`, `http`, `wasm`, ...
+fn function_scheme(decl: &Function) -> String {
+    decl.from
         .split_once(':')
         .map_or(decl.from.as_str(), |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    matches!(scheme.as_str(), "http" | "https")
+        .to_ascii_lowercase()
+}
+
+fn function_executes_code(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https")
+}
+
+/// Whether a sidecar refuses this declaration. HTTP and WebAssembly functions
+/// run code or make requests from inside the sidecar, which guards its
+/// application's access to the cluster. SQL functions are queries over the
+/// sidecar's own catalog and are kept.
+fn sidecar_refuses_function(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https" | "wasm")
+}
+
+/// The error logged for each function a sidecar refuses to register.
+fn sidecar_refused_function_message(name: &str) -> String {
+    format!(
+        "Function '{name}' was not registered, so queries that call it fail: a sidecar does not run \
+         HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start Spice \
+         without `--role sidecar`."
+    )
+}
+
+/// On a sidecar, drops the declarations [`sidecar_refuses_function`] refuses,
+/// logging each; on any other role, returns `functions` unchanged.
+fn refuse_sidecar_code_functions(
+    runtime: &crate::Runtime,
+    mut functions: Vec<Function>,
+) -> Vec<Function> {
+    if runtime.role() == crate::config::Role::Sidecar {
+        functions.retain(|decl| {
+            let refused = sidecar_refuses_function(decl);
+            if refused {
+                tracing::error!("{}", sidecar_refused_function_message(&decl.name));
+            }
+            !refused
+        });
+    }
+    functions
 }
 
 fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
@@ -411,12 +456,27 @@ pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static st
     }
 }
 
+/// A function's `from` as the runtime reports it: in its registration log line,
+/// `list_udfs()`, `/v1/functions` and the schema context NSQL sends a model.
+///
+/// An HTTP function's endpoint URL can carry a credential — `user:password@` or a
+/// signed or keyed query parameter (`?token=`, `?sig=`) — and every one of those
+/// readers is wider than the operator who wrote the Spicepod: a read-only API key, a
+/// log pipeline, a model provider. So the URL is reported the way `/v1/datasets`
+/// reports a dataset's `from`, through
+/// [`redact_source_credentials`](crate::http::v1::redact_source_credentials): the
+/// userinfo removed and secret query values replaced, everything else as written. The
+/// request still goes to the URL as written.
+pub(crate) fn user_function_display_from(decl: &Function) -> String {
+    crate::http::v1::redact_source_credentials(&decl.from)
+}
+
 fn info_from_decl(decl: &Function) -> UserFunctionInfo {
     UserFunctionInfo {
         name: decl.name.clone(),
         kind: decl.kind.as_str().to_string(),
         volatility: effective_user_function_volatility(decl).to_string(),
-        from: decl.from.clone(),
+        from: user_function_display_from(decl),
         description: decl.description.clone(),
     }
 }
@@ -441,10 +501,7 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        runtime.df.clear_cached_plans().await;
-        if let Some(results) = runtime.df.results_cache_provider() {
-            results.invalidate_all().await;
-        }
+        runtime.df.clear_cached_plans_and_results().await;
     }
 }
 
@@ -528,6 +585,7 @@ async fn apply_function_diff_inner(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let functions_to_register = refuse_sidecar_code_functions(runtime, functions_to_register);
     let functions_to_register =
         resolve_function_params(runtime.secrets(), &functions_to_register).await;
     let (built, errors) =
@@ -556,7 +614,7 @@ async fn apply_function_diff_inner(
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
-                tracing::info!(name = %next.name, from = %next.from, "Registered user function");
+                tracing::info!(name = %next.name, from = %user_function_display_from(&next), "Registered user function");
                 functions_to_expose_as_tools.push(next);
             }
             runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
@@ -575,7 +633,7 @@ async fn apply_function_diff_inner(
                     add_code_executing_function(&next.name);
                 }
                 upsert_user_function_info(info_from_decl(&next));
-                tracing::info!(name = %next.name, from = %next.from, "Registered user table function");
+                tracing::info!(name = %next.name, from = %user_function_display_from(&next), "Registered user table function");
                 if next.as_tool {
                     tracing::warn!(name = %next.name, "User table functions cannot be exposed as tools; skipping tool exposure");
                 }
@@ -604,6 +662,7 @@ pub struct UserFunctionInfo {
     pub name: String,
     pub kind: String,
     pub volatility: String,
+    /// The declaration's `from` without credentials; see [`user_function_display_from`].
     pub from: String,
     pub description: Option<String>,
 }
@@ -753,6 +812,11 @@ mod deny_list_registration_tests {
             runtime_decide::AI_CLASSIFY_NAME,
             runtime_decide::AI_SCORE_NAME,
             runtime_decide::AI_DECIDE_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -877,7 +941,33 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
+    }
+
+    /// A sidecar refuses the function schemes that run code or make requests,
+    /// and keeps SQL functions. The message names the function and the fix.
+    #[test]
+    fn sidecar_refuses_http_and_wasm_functions() {
+        for (from, refused) in [
+            ("sql", false),
+            ("SQL", false),
+            ("http://functions.internal/score", true),
+            ("https://functions.internal/score", true),
+            ("HTTPS://functions.internal/score", true),
+            ("wasm", true),
+            ("wasm:module", true),
+        ] {
+            let mut decl = test_user_function("f", true);
+            decl.from = from.to_string();
+            assert_eq!(sidecar_refuses_function(&decl), refused, "{from}");
+        }
+        assert_eq!(
+            sidecar_refused_function_message("score"),
+            "Function 'score' was not registered, so queries that call it fail: a sidecar does not \
+             run HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start \
+             Spice without `--role sidecar`."
+        );
     }
 
     #[test]
@@ -1028,6 +1118,23 @@ mod tests {
     /// The no-arg probe, for a name answered by name alone.
     fn make_named_expr(name: &str) -> Expr {
         make_named_call(name, vec![])
+    }
+
+    #[test]
+    fn deny_list_blocks_checked_integer_helpers() {
+        let support = deny_spice_specific_functions();
+        for name in [
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_PLUS_COUNT_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUM_WIDEN_UDF_NAME,
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must stay local; remotes do not implement the checked kernels"
+            );
+        }
     }
 
     #[test]

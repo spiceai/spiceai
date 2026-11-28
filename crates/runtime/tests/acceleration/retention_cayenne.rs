@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `retention_sql` on a file-mode Cayenne acceleration under `refresh_mode: full`.
+//! `retention_sql` on a file-mode Cayenne acceleration under `refresh_mode: full`,
+//! and the memory-mode, partitioned and `retention_period` cases beside it.
 //!
 //! A full refresh reloads every source row, so the retention predicate has to run again
 //! over the new snapshot on every refresh — the way the `DuckDB` accelerator applies it
@@ -38,6 +39,7 @@ use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params,
+    partitioning::PartitionedBy,
 };
 
 use crate::acceleration::{row_count, trigger_refresh};
@@ -205,7 +207,6 @@ fn make_dataset(source: &std::path::Path, data_path: &std::path::Path) -> Datase
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result<(), anyhow::Error>
 {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -278,7 +279,6 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
 /// Its file-mode twin above is the control — it must keep passing unchanged, which
 /// is what says the shared durable path was not disturbed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -390,7 +390,6 @@ const NULL_ROWS: [(i64, Option<i64>); 6] = [
 /// definitively; it is also the direction that fails silently, since a retention pass
 /// that deleted the NULLs would still leave a table with no row below the floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_evaluate()
 -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -483,7 +482,6 @@ async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_eva
 /// took from. The bypass is only correct if the filtered arm empties the tier on its own,
 /// and that is a claim about `is_delete_all`-shaped input that no other test makes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
 -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
@@ -539,6 +537,252 @@ async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
                  still holds {} row(s)",
                 row_count(&rt, MEM_ALL_TABLE).await?
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// `retention_sql` applies to a partitioned file-mode acceleration, in every partition.
+///
+/// Cayenne refuses `partition_by` in memory mode, so partitioned retention is only
+/// reachable in file mode. Retention runs from post-write maintenance after each
+/// partition's write commits, so the poll is what waits for it. As in the file-mode
+/// test above, the refresh adds a surviving row the initial load cannot produce, so
+/// the assertions pass only once the refresh has reloaded every partition and
+/// retention has run over it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cayenne_partitioned_file_mode_applies_retention_sql_in_every_partition()
+-> Result<(), anyhow::Error> {
+    const PART_TABLE: &str = "cayenne_retention_sql_partitioned_it";
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            crate::configure_test_datafusion();
+
+            let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("scores.csv");
+            write_source(&source, INITIAL_ROWS.as_ref())?;
+
+            let mut dataset = Dataset::new(format!("file://{}", source.display()), PART_TABLE);
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                retention_sql: Some(format!(
+                    "DELETE FROM {PART_TABLE} WHERE score < {SCORE_FLOOR}"
+                )),
+                retention_check_enabled: false,
+                retention_check_interval: None,
+                partition_by: vec![PartitionedBy {
+                    name: "expr0".to_string(),
+                    expression: "bucket(3, id)".to_string(),
+                }],
+                params: Some(Params::from_string_map(
+                    [(
+                        "cayenne_file_path".to_string(),
+                        temp_dir.path().join("accelerator").display().to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("test_cayenne_retention_sql_partitioned")
+                .with_dataset(dataset)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // The scan must read the partitions, or this is the unpartitioned test again.
+            let plan = run_query(&rt, &format!("EXPLAIN SELECT id FROM {PART_TABLE}")).await?;
+            let plan = arrow::util::pretty::pretty_format_batches(&plan)?.to_string();
+            assert!(
+                plan.contains("PartitionedUnionExec"),
+                "{PART_TABLE} sets `partition_by` but its scan reads no partitions:\n{plan}"
+            );
+
+            let mut rows = INITIAL_ROWS.to_vec();
+            rows.push(ADDED_ROW);
+            write_source(&source, &rows)?;
+            trigger_refresh(&rt, PART_TABLE).await?;
+
+            let expected: Vec<(i64, i64)> = rows
+                .iter()
+                .copied()
+                .filter(|(_, score)| *score >= SCORE_FLOOR)
+                .collect();
+            let survivors = i64::try_from(expected.len())?;
+            let retention_applied = wait_until_true(std::time::Duration::from_mins(1), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    row_count(&rt, PART_TABLE)
+                        .await
+                        .is_ok_and(|n| n == survivors)
+                }
+            })
+            .await;
+            assert!(
+                retention_applied,
+                "retention_sql must remove every row below {SCORE_FLOOR} from a partitioned \
+                 acceleration; the table still holds {} row(s)",
+                row_count(&rt, PART_TABLE).await?
+            );
+
+            let served = run_query(
+                &rt,
+                &format!("SELECT id, score FROM {PART_TABLE} ORDER BY id"),
+            )
+            .await?;
+            let lines = expected_table(&expected);
+            let rendered: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert_batches_eq!(&rendered, &served);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Rows this many minutes old sit outside the one-hour `retention_period` below and
+/// inside its 24-hour `refresh_data_window`.
+const STALE_AGE_MINUTES: i64 = 180;
+/// The source's stale rows (ids `0..STALE_ROWS`) and fresh rows (the next
+/// `FRESH_ROWS` ids).
+const STALE_ROWS: i64 = 5;
+const FRESH_ROWS: i64 = 5;
+
+/// Write an `id,ts` source whose first [`STALE_ROWS`] rows are [`STALE_AGE_MINUTES`]
+/// old and whose last [`FRESH_ROWS`] rows are seconds old, against the process clock.
+fn write_straddling_source(path: &std::path::Path) -> Result<(), anyhow::Error> {
+    use std::fmt::Write as _;
+
+    let now = chrono::Utc::now();
+    let mut csv = String::from("id,ts\n");
+    for id in 0..STALE_ROWS + FRESH_ROWS {
+        let ts = if id < STALE_ROWS {
+            now - chrono::Duration::minutes(STALE_AGE_MINUTES + id)
+        } else {
+            now - chrono::Duration::seconds(id)
+        };
+        writeln!(csv, "{id},{}", ts.format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
+    }
+    std::fs::write(path, csv)?;
+    Ok(())
+}
+
+/// A memory acceleration of `source` with a `time_column` and a 24-hour
+/// `refresh_data_window`, so the stale rows load. `retention` is the
+/// `(retention_period, retention_check_interval)` to set, if any.
+fn make_time_dataset(
+    source: &std::path::Path,
+    name: &str,
+    retention: Option<(&str, Option<&str>)>,
+) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", source.display()), name);
+    dataset.time_column = Some("ts".to_string());
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        refresh_data_window: Some("24h".to_string()),
+        retention_period: retention.map(|(period, _)| period.to_string()),
+        retention_check_enabled: retention.is_some(),
+        retention_check_interval: retention
+            .and_then(|(_, interval)| interval.map(ToString::to_string)),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// `retention_period` hides expired rows from every read on Cayenne, whether or not
+/// `retention_check_interval` is set.
+///
+/// `retention_check_interval` has no default, so a policy without it schedules no
+/// retention pass (#13804); on Cayenne that leaves the storage unreclaimed, which the
+/// accelerator warns about at load, but never serves an expired row, because Cayenne
+/// applies `retention_period` as a filter on every scan. The third dataset is the same
+/// source and refresh window with no `retention_period`: it must serve every row,
+/// which is what shows the stale rows were loaded and the other two hide them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cayenne_time_retention_hides_expired_rows_with_or_without_a_check_interval()
+-> Result<(), anyhow::Error> {
+    const WITH_INTERVAL: &str = "cayenne_time_retention_with_interval";
+    const WITHOUT_INTERVAL: &str = "cayenne_time_retention_without_interval";
+    const NO_RETENTION: &str = "cayenne_time_retention_none";
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            crate::configure_test_datafusion();
+
+            let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("events.csv");
+            write_straddling_source(&source)?;
+
+            let app = AppBuilder::new("test_cayenne_time_retention")
+                .with_dataset(make_time_dataset(
+                    &source,
+                    WITH_INTERVAL,
+                    Some(("3600s", Some("1s"))),
+                ))
+                .with_dataset(make_time_dataset(
+                    &source,
+                    WITHOUT_INTERVAL,
+                    Some(("3600s", None)),
+                ))
+                .with_dataset(make_time_dataset(&source, NO_RETENTION, None))
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let all = STALE_ROWS + FRESH_ROWS;
+            let loaded = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move { row_count(&rt, NO_RETENTION).await.is_ok_and(|n| n == all) }
+            })
+            .await;
+            assert!(
+                loaded,
+                "with no retention_period the acceleration must serve all {all} rows, but it \
+                 holds {}: the refresh window did not admit the stale rows, so this test \
+                 cannot observe retention",
+                row_count(&rt, NO_RETENTION).await?
+            );
+
+            let fresh_ids = [
+                "+----+", "| id |", "+----+", "| 5  |", "| 6  |", "| 7  |", "| 8  |", "| 9  |",
+                "+----+",
+            ];
+            for table in [WITH_INTERVAL, WITHOUT_INTERVAL] {
+                let rows = run_query(&rt, &format!("SELECT id FROM {table} ORDER BY id")).await?;
+                assert_batches_eq!(&fresh_ids, &rows);
+            }
 
             Ok(())
         })

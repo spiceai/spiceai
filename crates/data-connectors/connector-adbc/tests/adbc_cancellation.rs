@@ -30,6 +30,11 @@ limitations under the License.
 //! blocks until `StatementCancel` releases it, the way a real driver blocks on a
 //! remote query. Nothing external is needed, so this runs everywhere.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr::{dangling_mut, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -291,9 +296,11 @@ async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
         "the driver never started executing, so nothing was cancelled"
     );
 
+    // Timed from before the drop: a cancel serialized behind the running
+    // `execute` blocks inside the drop itself, until the query ends on its own.
+    let waited = Instant::now();
     drop(stream);
 
-    let waited = Instant::now();
     let second = tokio::time::timeout(Duration::from_secs(30), pool.connect())
         .await
         .expect("the pool connection did not come back after the query was abandoned")

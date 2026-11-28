@@ -21,7 +21,9 @@ pub mod datasets;
 pub mod decisions;
 pub mod embeddings;
 pub mod functions;
+pub mod gemini;
 pub mod iceberg;
+pub mod messages;
 pub mod responses;
 pub mod snapshots;
 
@@ -38,7 +40,7 @@ pub mod status;
 pub mod tools;
 pub mod workers;
 
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
 use crate::{
     component::dataset::Dataset,
@@ -48,18 +50,27 @@ use crate::{
             Error as QueryError, QueryBuilder, TransactionError, error_code::ErrorCode,
             is_cancellation_error, is_timeout_error, json_array_writer, run_transaction,
             schema_has_union_columns, single_line, transaction_statements, write_to_json_string,
-            write_to_json_value,
         },
     },
-    egress::EgressAccount,
+    egress::{EgressAccount, collect_reserved},
     http::server_timing::ServerTiming,
     status::ComponentStatus,
 };
-use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
+use arrow::{
+    array::RecordBatch,
+    datatypes::SchemaRef,
+    error::ArrowError,
+    util::{
+        display::{ArrayFormatter, FormatOptions},
+        pretty::pretty_format_batches,
+    },
+};
+use arrow_json::writer::JsonArray;
 use async_stream::try_stream;
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
@@ -70,7 +81,11 @@ use cache::result::{
 };
 use csv::Writer;
 use datafusion::common::ParamValues;
-use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
+use datafusion::error::DataFusionError;
+use datafusion::execution::{
+    SendableRecordBatchStream,
+    memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+};
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -80,7 +95,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -115,24 +130,45 @@ pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
         .any(|group| *group == "write" || *group == "read_write")
 }
 
+/// Whether the current request may only read: its principal lacks write access,
+/// or it has none and comes to an executor from a cluster node other than the
+/// scheduler.
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
+    match runtime_auth::AuthRequestContext::auth_principal(context.as_ref()) {
+        Some(principal) => !principal_has_write_access(principal),
+        None => crate::cluster::peer::is_from_peer_executor(&context),
+    }
 }
 
-pub(crate) async fn require_write_access() -> Option<Response> {
+/// Denies an OTLP gRPC export from a read-only API key. The OTLP gRPC services run on the
+/// Flight server, outside the [`require_write_access`] route layer, so each export handler
+/// calls this before it reads the request. With authentication disabled there is no
+/// principal, and the export is allowed.
+pub(crate) async fn ensure_otlp_grpc_write_access() -> Result<(), tonic::Status> {
     if current_principal_requires_read_only().await {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({ "message": "API key does not allow write access" })),
-            )
-                .into_response(),
-        )
-    } else {
-        None
+        return Err(tonic::Status::permission_denied(
+            "API key does not allow write access",
+        ));
     }
+    Ok(())
+}
+
+/// Route layer for routes that need a principal with write access.
+///
+/// It must sit inside the authentication layer, which sets the principal, and run as a
+/// layer rather than inside the handler: a handler's body extractors reject a request
+/// (415, 422) before the handler body runs, which would tell a read-only caller the
+/// route's request schema instead of answering 403.
+pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Response {
+    if current_principal_requires_read_only().await {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "API key does not allow write access" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 fn status_for_sql_error(message: &str) -> StatusCode {
@@ -234,6 +270,8 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
+pub(crate) use redact::{redact_message_credentials, redact_source_credentials};
+
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     // First check the runtime status which tracks the actual component state
     // (Initializing, Refreshing, Ready, Error, etc.)
@@ -252,11 +290,10 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 
 // Runs a query and converts the results to an HTTP response.
 //
-// The default JSON format is streamed batch-by-batch via a chunked body, so the
-// full result set is never materialized in memory (previously it was buffered
-// twice — once as `Vec<RecordBatch>`, then again as the rendered `String`). The
-// other formats — csv, plain, the vnd.* envelopes, and JSON containing union
-// columns — still buffer via `to_http_response`.
+// JSON, CSV and the vnd.* JSON envelopes stream batch-by-batch via a chunked
+// body, so the full result set is never materialized in memory. `text/plain`
+// and results containing union columns buffer via `to_http_response`, reserving
+// the buffered bytes from the query memory pool.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
     sql: Arc<str>,
@@ -313,23 +350,18 @@ async fn query_result_to_http_response(
 
 /// Converts a query stream to the requested HTTP response format.
 ///
-/// Default JSON responses stream batch-by-batch. Formats that require complete
-/// result metadata, and JSON schemas containing union columns, use the buffered
-/// response path.
+/// JSON, CSV and vnd JSON responses stream batch-by-batch; see
+/// [`streamed_encoder`] for the responses that buffer.
 async fn query_stream_to_http_response(
     mut data_stream: SendableRecordBatchStream,
     cache_status: CacheStatus,
     format: ResponseMimeType,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> Response {
-    // Stream only the default JSON format with non-union columns; csv/plain/vnd
-    // buffer via `to_http_response`, and union columns (which the arrow-json array
-    // writer can't render) fall back to the buffered JSON path. Streamability is a
-    // schema property, so decide it before pulling any batch.
-    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&data_stream.schema())
-    {
-        return buffered_sql_response(data_stream, cache_status, format).await;
-    }
+    // Streamability is a schema property, so decide it before pulling any batch.
+    let Some(encoder) = streamed_encoder(format, &data_stream.schema()) else {
+        return buffered_sql_response(data_stream, cache_status, format, &memory_pool).await;
+    };
 
     // Pull the first batch eagerly so the common immediate-execution error still
     // yields a clean status code instead of a truncated 200 response.
@@ -343,7 +375,7 @@ async fn query_stream_to_http_response(
 
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
+    let body = Body::from_stream(sql_body_from_batches(first, data_stream, encoder, account));
     streamed_response(headers, body)
 }
 
@@ -356,14 +388,16 @@ async fn transaction_to_http_response(
     read_only: bool,
     format: ResponseMimeType,
 ) -> Response {
-    match run_transaction(&df, &statements, parameters, read_only).await {
+    match run_transaction(&df, &statements, parameters, read_only, |data| {
+        rendered_bytes(format, data)
+    })
+    .await
+    {
         Ok(outcome) => match outcome.result {
             // Return the final statement's result (for the canonical gate+write
             // shape, the write's row-count summary).
             Some((batches, cache_status)) => {
-                to_http_response(batches, cache_status, format, ResponseMetadata::empty())
-                    .await
-                    .into_response()
+                render_reserved(batches, outcome.reservation, cache_status, format).await
             }
             None => (StatusCode::OK, "COMMIT").into_response(),
         },
@@ -375,9 +409,10 @@ async fn transaction_to_http_response(
 fn transaction_error_to_response(error: TransactionError) -> Response {
     match error {
         TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
-        TransactionError::Plan(e) | TransactionError::Stream(e) => {
+        TransactionError::Plan(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
+        TransactionError::Stream(e) => buffered_error_response(&e),
         TransactionError::Query(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
         }
@@ -417,13 +452,31 @@ enum SqlErrorKind {
     /// A cluster scheduler cannot yet reach executors that hold the data the
     /// query reads; a retry can succeed.
     Unavailable,
+    /// The request set `Cache-Control: only-if-cached` and no cached result was
+    /// servable, so the query was not run.
+    NotCached,
+    /// A connector refused data the query read as a compression bomb
+    /// (`data_components::refusal`): the query is well formed, but the data it reads
+    /// is what the runtime will not process.
+    RefusedData,
+    /// An HTTP dataset refused a query whose request filters combine into more
+    /// requests than `max_request_partitions` allows: the query is the client's to
+    /// change.
+    RefusedRequests,
 }
 
 impl SqlErrorKind {
     fn of_query_error(e: &QueryError) -> Self {
+        if data_components::refusal::is_compression_refusal(e) {
+            return Self::RefusedData;
+        }
+        if data_components::refusal::is_request_bound_refusal(e) {
+            return Self::RefusedRequests;
+        }
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::NotCached => Self::NotCached,
             QueryError::UnableToExecuteQuery { source }
             | QueryError::UnableToCreateMemoryStream { source }
             | QueryError::UnableToCollectResults { source }
@@ -436,7 +489,11 @@ impl SqlErrorKind {
     }
 
     fn of_datafusion_error(e: &datafusion::error::DataFusionError) -> Self {
-        if is_cancellation_error(e) {
+        if data_components::refusal::is_compression_refusal(e) {
+            Self::RefusedData
+        } else if data_components::refusal::is_request_bound_refusal(e) {
+            Self::RefusedRequests
+        } else if is_cancellation_error(e) {
             Self::Cancellation
         } else if is_timeout_error(e) {
             Self::Timeout
@@ -464,7 +521,7 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
     tracing::debug!("Error executing query: {}", single_line(&message));
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-        SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        SqlErrorKind::Timeout | SqlErrorKind::NotCached => StatusCode::GATEWAY_TIMEOUT,
         // A refusal for want of memory is the runtime's own capacity condition,
         // not a malformed request: 4xx tells intermediaries the client is at
         // fault and the request should not be retried, so a load balancer keeps
@@ -475,24 +532,175 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         SqlErrorKind::ResourcesExhausted | SqlErrorKind::Unavailable => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        // Data the runtime will not process, answered as JSON a client reads to act on.
+        SqlErrorKind::RefusedData => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        // A request the runtime will not send, answered as JSON a client reads to act on.
+        SqlErrorKind::RefusedRequests => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
 }
 
 /// Buffered (non-streaming) response path for formats that cannot stream.
-async fn buffered_sql_response(
-    data_stream: SendableRecordBatchStream,
+///
+/// The collected batches, and for `text/plain` the rendered table, are reserved
+/// from the query memory pool until the body is built; a refused reservation
+/// fails the query with 503.
+async fn buffered_sql_response<S, B>(
+    data_stream: S,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: &Arc<dyn MemoryPool>,
+) -> Response
+where
+    S: Stream<Item = Result<B, DataFusionError>> + Send,
+    B: Borrow<RecordBatch> + Send,
+{
+    match collect_buffered(data_stream, format, memory_pool).await {
+        Ok((data, reservation)) => render_reserved(data, reservation, cache_status, format).await,
+        Err(e) => buffered_error_response(&e),
+    }
+}
+
+/// Collects a result that is sent only once complete. Its batches and, for
+/// `text/plain`, the rendered table are reserved from `memory_pool`; hold the
+/// returned reservation until the body is built. Fails with the pool's
+/// resources-exhausted error when the pool refuses.
+async fn collect_buffered<S, B>(
+    data_stream: S,
+    format: ResponseMimeType,
+    memory_pool: &Arc<dyn MemoryPool>,
+) -> Result<(Vec<RecordBatch>, MemoryReservation), DataFusionError>
+where
+    S: Stream<Item = Result<B, DataFusionError>>,
+    B: Borrow<RecordBatch>,
+{
+    let reservation = MemoryConsumer::new("http_buffered_response").register(memory_pool);
+    let data = collect_reserved(data_stream, &reservation).await?;
+    reservation.try_grow(rendered_bytes(format, &data))?;
+    Ok((data, reservation))
+}
+
+/// The bytes rendering `data` as `format` adds beyond its batches: the padded
+/// `text/plain` table. A table that cannot be measured reports 0, and rendering
+/// it fails with the same error.
+fn rendered_bytes(format: ResponseMimeType, data: &[RecordBatch]) -> usize {
+    match format {
+        ResponseMimeType::Plain => plain_text_size(data).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Renders a collected result while `reservation` holds its batches and
+/// [`rendered_bytes`].
+async fn render_reserved(
+    data: Vec<RecordBatch>,
+    reservation: MemoryReservation,
     cache_status: CacheStatus,
     format: ResponseMimeType,
 ) -> Response {
-    let data = match data_stream.try_collect::<Vec<RecordBatch>>().await {
-        Ok(data) => data,
-        Err(e) => return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e)),
-    };
-    to_http_response(data, cache_status, format, ResponseMetadata::empty())
+    let response = to_http_response(data, cache_status, format, ResponseMetadata::empty())
         .await
-        .into_response()
+        .into_response();
+    drop(reservation);
+    response
+}
+
+fn buffered_error_response(e: &DataFusionError) -> Response {
+    let kind = SqlErrorKind::of_datafusion_error(e);
+    let message = if matches!(kind, SqlErrorKind::ResourcesExhausted) {
+        too_large_to_buffer_message(e)
+    } else {
+        e.to_string()
+    };
+    sql_error_response(message, kind)
+}
+
+/// The message for a result the query memory pool refused to buffer.
+fn too_large_to_buffer_message(e: &DataFusionError) -> String {
+    format!("The query result is too large to buffer in memory for this response. {e}")
+}
+
+/// The approximate size of the table [`arrow_to_plain`] renders: every line is
+/// padded to the full table width, and a value with line breaks adds lines to
+/// its row.
+fn plain_text_size(data: &[RecordBatch]) -> Result<usize, ArrowError> {
+    use std::fmt::Write as _;
+
+    let Some(schema) = data.first().map(RecordBatch::schema) else {
+        return Ok(0);
+    };
+    let options = FormatOptions::default().with_display_error(true);
+    let mut widths: Vec<usize> = schema.fields().iter().map(|f| f.name().len()).collect();
+    // The top, header-separator and bottom borders, and the header row.
+    let mut lines: usize = 4;
+    for batch in data {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in 0..batch.num_rows() {
+            let mut row_lines = 1;
+            for (width, formatter) in widths.iter_mut().zip(&formatters) {
+                let mut cell = CellExtent::default();
+                write!(cell, "{}", formatter.value(row))
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                *width = (*width).max(cell.widest);
+                row_lines = row_lines.max(cell.lines);
+            }
+            lines = lines.saturating_add(row_lines);
+        }
+    }
+    // `| a | b |` plus the line break.
+    let line_len = widths.iter().fold(2_usize, |len, width| {
+        len.saturating_add(width.saturating_add(3))
+    });
+    Ok(lines.saturating_mul(line_len))
+}
+
+/// The line count and widest line of one formatted value, measured without
+/// storing it.
+struct CellExtent {
+    lines: usize,
+    line: usize,
+    widest: usize,
+}
+
+impl Default for CellExtent {
+    fn default() -> Self {
+        Self {
+            lines: 1,
+            line: 0,
+            widest: 0,
+        }
+    }
+}
+
+impl std::fmt::Write for CellExtent {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.lines += 1;
+                self.line = 0;
+            }
+            self.line += part.len();
+            self.widest = self.widest.max(self.line);
+        }
+        Ok(())
+    }
 }
 
 async fn query_raw_stream_to_http_response(
@@ -502,20 +710,9 @@ async fn query_raw_stream_to_http_response(
     format: ResponseMimeType,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> Response {
-    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&schema) {
-        let data = match data_stream.try_collect::<Vec<_>>().await {
-            Ok(batches) => batches
-                .iter()
-                .map(|batch| RecordBatch::clone(batch.as_ref()))
-                .collect(),
-            Err(e) => {
-                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
-            }
-        };
-        return to_http_response(data, cache_status, format, ResponseMetadata::empty())
-            .await
-            .into_response();
-    }
+    let Some(encoder) = streamed_encoder(format, &schema) else {
+        return buffered_sql_response(data_stream, cache_status, format, &memory_pool).await;
+    };
 
     let first = match data_stream.next().await {
         Some(Ok(batch)) => Some(batch),
@@ -527,7 +724,7 @@ async fn query_raw_stream_to_http_response(
 
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
+    let body = Body::from_stream(sql_body_from_batches(first, data_stream, encoder, account));
     streamed_response(headers, body)
 }
 
@@ -539,56 +736,145 @@ fn streamed_response(headers: HeaderMap, body: Body) -> Response {
     response
 }
 
-trait SqlJsonBatch: Send + 'static {
+trait SqlBodyBatch: Send + 'static {
     fn as_record_batch(&self) -> &RecordBatch;
 }
 
-impl SqlJsonBatch for RecordBatch {
+impl SqlBodyBatch for RecordBatch {
     fn as_record_batch(&self) -> &RecordBatch {
         self
     }
 }
 
-impl SqlJsonBatch for Arc<RecordBatch> {
+impl SqlBodyBatch for Arc<RecordBatch> {
     fn as_record_batch(&self) -> &RecordBatch {
         self.as_ref()
     }
 }
 
-/// Streams the query result as a single JSON array, one input batch at a time,
-/// charging each serialized chunk against the query memory pool via `account`.
-/// The bytes emitted are identical to the non-streamed `arrow_to_json` output.
-fn json_array_body_stream(
-    first: Option<RecordBatch>,
-    rest: SendableRecordBatchStream,
-    account: Arc<EgressAccount>,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    json_array_body_from_batches(first, rest, account)
+/// Encodes a `/v1/sql` body one record batch at a time. The concatenated
+/// chunks are identical to the buffered `to_http_response` body.
+enum BodyEncoder {
+    /// One JSON-array writer drives the whole response: it emits the opening
+    /// `[`, the inter-row/inter-batch commas, and the closing `]`.
+    Json(arrow_json::Writer<Vec<u8>, JsonArray>),
+    /// The `data` array of the vnd JSON envelope. The envelope head is written
+    /// with the first batch, because its schema is that batch's schema.
+    VndJson {
+        rows: arrow_json::Writer<Vec<u8>, JsonArray>,
+        row_count: usize,
+        started: bool,
+    },
+    /// The header row is written with the first batch only.
+    Csv { header: bool },
 }
 
-fn json_array_body_from_batches<S, B>(
+/// The encoder that streams `format` over `schema`, or `None` when the
+/// response buffers: `text/plain` sizes its columns from the whole result, the
+/// Arrow JSON and CSV writers cannot render union columns, and the CSV writer
+/// rejects nested columns, an error that must reach the client as a status.
+fn streamed_encoder(
+    format: ResponseMimeType,
+    schema: &arrow::datatypes::Schema,
+) -> Option<BodyEncoder> {
+    if schema_has_union_columns(schema) {
+        return None;
+    }
+    match format {
+        ResponseMimeType::Json => Some(BodyEncoder::Json(json_array_writer())),
+        ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
+            Some(BodyEncoder::VndJson {
+                rows: json_array_writer(),
+                row_count: 0,
+                started: false,
+            })
+        }
+        ResponseMimeType::Csv if schema.fields().iter().any(|f| f.data_type().is_nested()) => None,
+        ResponseMimeType::Csv => Some(BodyEncoder::Csv { header: true }),
+        ResponseMimeType::Plain => None,
+    }
+}
+
+impl BodyEncoder {
+    /// Encodes `batch`, returning the bytes it adds to the body.
+    fn write(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, BoxedError> {
+        match self {
+            Self::Json(writer) => {
+                writer.write(batch)?;
+                Ok(std::mem::take(writer.get_mut()))
+            }
+            Self::VndJson {
+                rows,
+                row_count,
+                started,
+            } => {
+                if !*started {
+                    write_vnd_json_head(rows.get_mut(), Some(&batch.schema()))?;
+                    *started = true;
+                }
+                *row_count += batch.num_rows();
+                rows.write(batch)?;
+                Ok(std::mem::take(rows.get_mut()))
+            }
+            Self::Csv { header } => {
+                let mut writer = arrow_csv::WriterBuilder::new()
+                    .with_header(*header)
+                    .build(Vec::new());
+                writer.write(batch)?;
+                *header = false;
+                Ok(writer.into_inner())
+            }
+        }
+    }
+
+    /// Returns the bytes that end the body.
+    fn finish(self) -> Result<Vec<u8>, BoxedError> {
+        match self {
+            Self::Json(mut writer) => {
+                // Closes the array (`]`), or emits `[]` for an empty result.
+                writer.finish()?;
+                Ok(writer.into_inner())
+            }
+            Self::VndJson {
+                mut rows,
+                row_count,
+                started,
+            } => {
+                if !started {
+                    write_vnd_json_head(rows.get_mut(), None)?;
+                }
+                rows.finish()?;
+                let mut tail = rows.into_inner();
+                write_vnd_json_tail(&mut tail, row_count, None)?;
+                Ok(tail)
+            }
+            Self::Csv { .. } => Ok(Vec::new()),
+        }
+    }
+}
+
+type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Streams the query result one input batch at a time, charging each encoded
+/// chunk against the query memory pool via `account`.
+fn sql_body_from_batches<S, B>(
     first: Option<B>,
     rest: S,
+    mut encoder: BodyEncoder,
     account: Arc<EgressAccount>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + Unpin + 'static,
-    B: SqlJsonBatch,
+    B: SqlBodyBatch,
 {
     let mut batches =
         futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
     try_stream! {
-        // One JSON-array writer drives the whole response: it emits the opening
-        // `[`, the inter-row/inter-batch commas, and the closing `]`, so the
-        // streamed bytes match `arrow_to_json` exactly. Drain its buffer after
-        // each write to yield a chunk (zero-copy — `mem::take` moves the `Vec`).
-        let mut writer = json_array_writer();
         while let Some(item) = batches.next().await {
             let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
-            writer
+            let chunk = encoder
                 .write(batch.as_record_batch())
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let chunk = std::mem::take(writer.get_mut());
             if !chunk.is_empty() {
                 let size = chunk.len();
                 account.reserve(size).await;
@@ -596,11 +882,9 @@ where
                 account.release(size);
             }
         }
-        // Closes the array (`]`), or emits `[]` for an empty result.
-        writer
+        let tail = encoder
             .finish()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let tail = std::mem::take(writer.get_mut());
         if !tail.is_empty() {
             let size = tail.len();
             account.reserve(size).await;
@@ -649,7 +933,7 @@ pub async fn to_http_response(
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
         ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
-            arrow_to_vnd_sql_json_v1(&data, meta)
+            arrow_to_vnd_sql_json_v1(&data, &meta)
         }
     };
 
@@ -824,29 +1108,47 @@ fn arrow_to_plain(
 /// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json / application/vnd.spiceai.nsql.v1+json format
 fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
-    meta: ResponseMetadata,
+    meta: &ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Calculate total row count across all batches
     let row_count = data.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-    let schema_json = if let Some(batch) = data.first() {
-        // Use built-in Arrow JSON schema representation: https://github.com/apache/arrow/blob/main/docs/source/format/Integration.rst#json-test-data-format
-        serde_json::to_value(batch.schema())?
-    } else {
-        serde_json::json!({})
-    };
+    let mut body = Vec::new();
+    write_vnd_json_head(&mut body, data.first().map(RecordBatch::schema).as_ref())?;
+    body.extend_from_slice(write_to_json_string(data)?.as_bytes());
+    write_vnd_json_tail(&mut body, row_count, meta.sql.as_deref())?;
 
-    let mut result = json!({
-        "row_count": row_count,
-        "schema": schema_json,
-        "data": write_to_json_value(data)?,
-    });
+    String::from_utf8(body).boxed()
+}
 
-    if let Some(sql) = meta.sql {
-        result["sql"] = serde_json::Value::String(sql);
+/// Writes the vnd JSON envelope up to its `data` array: `{"schema":…,"data":`.
+/// The schema uses the Arrow JSON schema representation
+/// (<https://github.com/apache/arrow/blob/main/docs/source/format/Integration.rst#json-test-data-format>);
+/// an empty result has the schema `{}`.
+fn write_vnd_json_head(out: &mut Vec<u8>, schema: Option<&SchemaRef>) -> Result<(), BoxedError> {
+    out.extend_from_slice(br#"{"schema":"#);
+    match schema {
+        Some(schema) => serde_json::to_writer(&mut *out, schema.as_ref())?,
+        None => out.extend_from_slice(b"{}"),
     }
+    out.extend_from_slice(br#","data":"#);
+    Ok(())
+}
 
-    serde_json::to_string(&result).boxed()
+/// Writes the vnd JSON envelope after its `data` array. `row_count` follows
+/// the rows so that the rows can stream before the count is known.
+fn write_vnd_json_tail(
+    out: &mut Vec<u8>,
+    row_count: usize,
+    sql: Option<&str>,
+) -> Result<(), BoxedError> {
+    out.extend_from_slice(br#","row_count":"#);
+    out.extend_from_slice(row_count.to_string().as_bytes());
+    if let Some(sql) = sql {
+        out.extend_from_slice(br#","sql":"#);
+        serde_json::to_writer(&mut *out, sql)?;
+    }
+    out.push(b'}');
+    Ok(())
 }
 
 #[cfg(test)]
@@ -952,6 +1254,83 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&streamed),
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A compression bomb is data the runtime will not process (422), and a query over
+    /// the request bound a request it will not send (400); both carry `{"error": …}`.
+    /// The answer is chosen by the error's type, so a reworded message still maps, and a
+    /// message that only mentions either refusal does not.
+    #[tokio::test]
+    async fn sql_error_response_answers_refusals_as_json() {
+        async fn answer(error: datafusion::error::DataFusionError) -> (StatusCode, Vec<u8>) {
+            let response =
+                sql_error_response(error.to_string(), SqlErrorKind::of_datafusion_error(&error));
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("the error body reads");
+            (status, body.to_vec())
+        }
+
+        let refusal = http_body_limit::Error::CompressionRatio {
+            codec: http_body_limit::Codec::Zstd,
+            input: http_body_limit::Input::Response,
+            decoded: 67_200_000,
+            received: 33_600,
+        };
+        // Any wording, a context and a share wrapping it: the type decides.
+        for message in [
+            "Failed to read the response from http://127.0.0.1:1 for dataset 'api': refused",
+            "a reworded refusal that names no codec, ratio or bomb",
+        ] {
+            let typed = http_body_limit::CompressionRefusal::new(message.to_string(), &refusal)
+                .expect("a compression refusal");
+            let bomb = datafusion::error::DataFusionError::Shared(std::sync::Arc::new(
+                datafusion::error::DataFusionError::Context(
+                    "scan".to_string(),
+                    Box::new(datafusion::error::DataFusionError::External(Box::new(
+                        typed,
+                    ))),
+                ),
+            ));
+            let bomb_text = bomb.to_string();
+            let (status, body) = answer(bomb).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{message}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+                json!({ "error": bomb_text })
+            );
+        }
+
+        // A query over the request bound is a 400 with a JSON body, by its type too.
+        let bound = datafusion::error::DataFusionError::External(Box::new(
+            data_components::http::provider::Error::TooManyRequests {
+                message: "a reworded request-bound refusal".to_string(),
+            },
+        ));
+        let bound_text = bound.to_string();
+        let (status, body) = answer(bound).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON body"),
+            json!({ "error": bound_text })
+        );
+
+        // Text alone is not a refusal.
+        let text_only = datafusion::error::DataFusionError::Plan(
+            "the response was refused as a compression bomb; set `max_request_partitions`"
+                .to_string(),
+        );
+        let text_only_message = text_only.to_string();
+        let (status, body) = answer(text_only).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, text_only_message.into_bytes());
+
+        let other = datafusion::error::DataFusionError::Plan("table 'x' not found".to_string());
+        let other_text = other.to_string();
+        let (status, body) = answer(other).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, other_text.into_bytes());
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and
@@ -1149,6 +1528,90 @@ mod tests {
         assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
     }
 
+    /// A transaction's final result is reserved from the query memory pool: a
+    /// 600 KB value fits a 1 MiB pool as JSON, but not with its rendered
+    /// `text/plain` table, and not as JSON in a 256 KiB pool.
+    #[tokio::test]
+    async fn transaction_result_is_reserved_from_the_query_memory_pool() {
+        let value = "x".repeat(600 * 1024);
+        let cases = [
+            (1 << 20, ResponseMimeType::Json, StatusCode::OK),
+            (
+                1 << 20,
+                ResponseMimeType::Plain,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                256 << 10,
+                ResponseMimeType::Json,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (8 << 20, ResponseMimeType::Plain, StatusCode::OK),
+        ];
+        // The rendered bytes are refused inside the transaction, before commit.
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .memory_limit(Some(1 << 20))
+            .build(),
+        );
+        let refused = run_transaction(&df, &["SELECT 1 AS v".to_string()], None, false, |_| {
+            2 << 20
+        })
+        .await;
+        assert!(matches!(
+            refused,
+            Err(TransactionError::Stream(
+                DataFusionError::ResourcesExhausted(_)
+            ))
+        ));
+
+        for (limit, format, expected) in cases {
+            let df = Arc::new(
+                DataFusionBuilder::new(
+                    RuntimeStatus::new(),
+                    Arc::new(AcceleratorEngineRegistry::new()),
+                    tokio::runtime::Handle::current(),
+                )
+                .memory_limit(Some(limit))
+                .build(),
+            );
+            let response = sql_to_http_response(
+                df,
+                Arc::from("BEGIN; SELECT $1 AS v; COMMIT"),
+                Some(ParamValues::from(vec![ScalarValue::Utf8(Some(
+                    value.clone(),
+                ))])),
+                format,
+                false,
+            )
+            .await;
+
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 16 << 20)
+                .await
+                .expect("body");
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, expected, "{format:?} in {limit} bytes");
+            if expected == StatusCode::OK {
+                // `text/plain` wraps a cell this wide over several lines.
+                assert_eq!(
+                    body.matches('x').count(),
+                    value.len(),
+                    "{format:?}: the value is returned"
+                );
+            } else {
+                assert!(
+                    body.contains("too large to buffer"),
+                    "{format:?}: the error names the cause"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_arrow_to_vnd_json_v1() {
         let schema = Arc::new(Schema::new(vec![
@@ -1165,7 +1628,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), ResponseMetadata::empty())
+            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), &ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",
@@ -1175,17 +1638,32 @@ mod tests {
         // Test conversion with SQL
         let metadata = ResponseMetadata::empty()
             .with_sql("SELECT customer_id, total_sales FROM sales_summary LIMIT 2;");
-        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], metadata).expect("to convert");
+        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], &metadata).expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_with_sql",
             serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
         );
     }
 
-    /// The chunked `/v1/sql` JSON body must be byte-identical to the buffered
-    /// `arrow_to_json` output across multi-batch, empty, and NULL cases.
+    /// Encodes a whole result the way the buffered `to_http_response` does.
+    type BufferedEncoding = fn(&[RecordBatch]) -> Result<String, BoxedError>;
+
+    /// The formats `/v1/sql` streams, with the buffered encoding each streamed
+    /// body must match byte for byte.
+    fn streamed_formats() -> [(ResponseMimeType, BufferedEncoding); 3] {
+        [
+            (ResponseMimeType::Json, arrow_to_json),
+            (ResponseMimeType::VndSqlJsonV1, |data| {
+                arrow_to_vnd_sql_json_v1(data, &ResponseMetadata::empty())
+            }),
+            (ResponseMimeType::Csv, arrow_to_csv),
+        ]
+    }
+
+    /// Each chunked `/v1/sql` body must be byte-identical to the buffered
+    /// encoding of its format across multi-batch, empty, and NULL cases.
     #[tokio::test]
-    async fn json_array_body_stream_matches_buffered_output() {
+    async fn streamed_body_matches_buffered_output() {
         use arrow::array::ArrayRef;
         use datafusion::error::DataFusionError;
         use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
@@ -1220,57 +1698,165 @@ mod tests {
             vec![make(vec![], vec![])],
         ];
 
-        for batches in cases {
-            let expected = write_to_json_string(&batches).expect("buffered json");
+        for (format, buffered) in streamed_formats() {
+            for batches in &cases {
+                let expected = buffered(batches).expect("buffered body");
+                if matches!(format, ResponseMimeType::VndSqlJsonV1) && batches.is_empty() {
+                    assert_eq!(expected, r#"{"schema":{},"data":[],"row_count":0}"#);
+                }
 
-            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-            let account = EgressAccount::register(&pool, "test_egress");
+                let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+                let account = EgressAccount::register(&pool, "test_egress");
 
-            let mut batches = batches.into_iter();
-            let first = batches.next();
-            let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
-                futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
-            ));
+                let mut batches = batches.clone().into_iter();
+                let first = batches.next();
+                let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
+                ));
+                let encoder = streamed_encoder(format, &schema).expect("a streamed format");
 
-            let mut body = std::pin::pin!(json_array_body_stream(first, rest, account));
-            let mut streamed = Vec::new();
-            while let Some(chunk) = body.next().await {
-                streamed.extend_from_slice(&chunk.expect("chunk"));
+                let mut body = std::pin::pin!(sql_body_from_batches(first, rest, encoder, account));
+                let mut streamed = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    streamed.extend_from_slice(&chunk.expect("chunk"));
+                }
+
+                assert_eq!(
+                    String::from_utf8(streamed).expect("utf8"),
+                    expected,
+                    "{format:?}: streamed body must match the buffered encoding"
+                );
             }
 
-            assert_eq!(
-                String::from_utf8(streamed).expect("utf8"),
-                expected,
-                "streamed JSON must match buffered arrow_to_json output"
+            // A complete small result is still a chunked body. Sending it whole with
+            // `Content-Length` is an HTTP framing change and needs an Enhancement.
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
+                    vec![Some(1)],
+                    vec![Some("a")],
+                )))),
+            ));
+            let response =
+                query_stream_to_http_response(data, CacheStatus::CacheMiss, format, pool).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.body().size_hint().exact().is_none(),
+                "{format:?} responses must stream; an exact size hint is a Content-Length body"
             );
         }
+    }
 
-        // A complete small result is still a chunked body. Sending it whole with
-        // `Content-Length` is an HTTP framing change and needs an Enhancement.
+    /// DECIMAL values keep every digit in each `/v1/sql` format, streamed and
+    /// buffered: a 38-digit value does not become a float.
+    #[tokio::test]
+    async fn decimal_values_keep_every_digit() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d38", DataType::Decimal128(38, 0), false),
+            Field::new("d19", DataType::Decimal128(19, 2), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        99_999_999_999_999_999_999_999_999_999_999_999_999_i128,
+                    ])
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal(38, 0)"),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![1_234_567_890_123_456_789_i128])
+                        .with_precision_and_scale(19, 2)
+                        .expect("decimal(19, 2)"),
+                ) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let row = r#"{"d38":99999999999999999999999999999999999999,"d19":12345678901234567.89}"#;
+
+        for (format, buffered) in streamed_formats() {
+            let buffered = buffered(std::slice::from_ref(&batch)).expect("buffered body");
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(batch.clone()))),
+            ));
+            let response =
+                query_stream_to_http_response(data, CacheStatus::CacheMiss, format, pool).await;
+            let streamed = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("streamed body");
+            let streamed = String::from_utf8(streamed.to_vec()).expect("utf8");
+
+            for body in [&buffered, &streamed] {
+                match format {
+                    ResponseMimeType::Json => assert_eq!(*body, format!("[{row}]")),
+                    ResponseMimeType::VndSqlJsonV1 => assert!(
+                        body.ends_with(&format!(r#","data":[{row}],"row_count":1}}"#)),
+                        "{format:?}: `{body}` must end with the exact rows and row count"
+                    ),
+                    ResponseMimeType::Csv => assert_eq!(
+                        *body,
+                        "d38,d19\n99999999999999999999999999999999999999,12345678901234567.89\n"
+                    ),
+                    other => panic!("{other:?} is not a streamed format"),
+                }
+            }
+        }
+    }
+
+    /// CSV cannot encode a nested column, so the request fails with an error
+    /// status rather than a `200` head over an empty body.
+    #[tokio::test]
+    async fn csv_with_a_nested_column_is_an_error_response() {
+        use arrow::array::{Array, ArrayRef, ListArray};
+        use arrow::datatypes::Int64Type;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list) as ArrayRef])
+            .expect("record batch");
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
-                vec![Some(1)],
-                vec![Some("a")],
-            )))),
+            schema,
+            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(batch))),
         ));
+
         let response = query_stream_to_http_response(
             data,
             CacheStatus::CacheMiss,
-            ResponseMimeType::Json,
+            ResponseMimeType::Csv,
             pool,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("error body");
         assert!(
-            response.body().size_hint().exact().is_none(),
-            "JSON responses must stream; an exact size hint is a Content-Length body"
+            String::from_utf8_lossy(&body).contains("not supported in CSV"),
+            "the error names the cause: `{}`",
+            String::from_utf8_lossy(&body)
         );
     }
 
-    /// HTTP JSON and buffered CSV from `QueryResult::from_cached_raw` must
+    /// HTTP JSON, vnd JSON and CSV from `QueryResult::from_cached_raw` must
     /// match the owned-stream path: same status, cache header, and body bytes.
     #[tokio::test]
     async fn cached_raw_http_response_matches_owned_stream() {
@@ -1306,7 +1892,11 @@ mod tests {
         ];
 
         for batches in cases {
-            for format in [ResponseMimeType::Json, ResponseMimeType::Csv] {
+            for format in [
+                ResponseMimeType::Json,
+                ResponseMimeType::VndSqlJsonV1,
+                ResponseMimeType::Csv,
+            ] {
                 let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
                 let owned = QueryResult::new(
                     Box::pin(RecordBatchStreamAdapter::new(
@@ -1349,6 +1939,164 @@ mod tests {
                     "{format:?}: body bytes must match the owned-stream path"
                 );
             }
+        }
+    }
+
+    /// `plain_text_size` measures the padded table `arrow_to_plain` renders,
+    /// including a value that spans lines, so its reservation covers the body.
+    #[test]
+    fn plain_text_size_matches_the_rendered_table() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+            .expect("record batch")
+        };
+        let data = vec![
+            batch(vec![Some(1), None], vec![Some("a"), Some("two\nlines")]),
+            batch(vec![Some(123_456)], vec![None]),
+        ];
+
+        let rendered = arrow_to_plain(&data).expect("plain body");
+        // Every rendered line, plus the line break the last line lacks.
+        assert_eq!(plain_text_size(&data).expect("size"), rendered.len() + 1);
+        assert_eq!(plain_text_size(&[]).expect("size"), 0);
+    }
+
+    /// Formats that buffer the whole result reserve it from the query memory
+    /// pool: a pool just large enough serves the usual response, one byte less
+    /// fails with 503, and the reservation is released either way.
+    #[tokio::test]
+    async fn buffered_formats_reserve_from_the_query_memory_pool() {
+        use arrow::array::{Array, Int32Array, ListArray, UnionArray};
+        use arrow::datatypes::{Int64Type, UnionFields};
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let single = |name: &str, array: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                name,
+                array.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![array]).expect("record batch")
+        };
+        let union = UnionArray::try_new(
+            UnionFields::try_new(vec![0], vec![Field::new("i", DataType::Int32, false)])
+                .expect("union fields"),
+            vec![0_i8, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("union array");
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let cases = [
+            (
+                ResponseMimeType::Plain,
+                vec![
+                    single("n", Arc::new(Int64Array::from(vec![1, 2]))),
+                    single("n", Arc::new(Int64Array::from(vec![3]))),
+                ],
+            ),
+            (
+                ResponseMimeType::Json,
+                vec![single("u", Arc::new(union) as ArrayRef)],
+            ),
+            (
+                ResponseMimeType::Csv,
+                vec![single("l", Arc::new(list) as ArrayRef)],
+            ),
+        ];
+
+        for (format, batches) in cases {
+            let schema = batches[0].schema();
+            let mut need: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+            if matches!(format, ResponseMimeType::Plain) {
+                need += plain_text_size(&batches).expect("size");
+            }
+            let (expected_status, _, expected_body) = to_http_response(
+                batches.clone(),
+                CacheStatus::CacheHit,
+                format,
+                ResponseMetadata::empty(),
+            )
+            .await;
+            assert!(
+                streamed_encoder(format, &schema).is_none(),
+                "{format:?} over {schema:?} buffers"
+            );
+
+            for raw in [false, true] {
+                for limit in [need, need - 1] {
+                    let greedy = Arc::new(GreedyMemoryPool::new(limit));
+                    let pool: Arc<dyn MemoryPool> = Arc::<GreedyMemoryPool>::clone(&greedy);
+                    let result = if raw {
+                        QueryResult::from_cached_raw(
+                            wrap_raw_batches(batches.clone()),
+                            Arc::clone(&schema),
+                            CacheStatus::CacheHit,
+                        )
+                    } else {
+                        QueryResult::new(
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema),
+                                futures::stream::iter(
+                                    batches.clone().into_iter().map(Ok::<_, DataFusionError>),
+                                ),
+                            )),
+                            CacheStatus::CacheHit,
+                        )
+                    };
+                    let response = query_result_to_http_response(result, format, pool).await;
+                    assert_eq!(greedy.reserved(), 0, "{format:?}: reservation released");
+
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .expect("body");
+                    let body = String::from_utf8_lossy(&body);
+                    if limit == need {
+                        assert_eq!(status, expected_status, "{format:?} raw={raw}: {body}");
+                        assert_eq!(body, expected_body, "{format:?} raw={raw}");
+                    } else {
+                        assert_eq!(
+                            status,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "{format:?} raw={raw}"
+                        );
+                        assert!(
+                            body.contains("too large to buffer"),
+                            "{format:?} raw={raw}: the error names the cause: `{body}`"
+                        );
+                    }
+                }
+            }
+
+            let unbounded: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = MemoryConsumer::new("test").register(&unbounded);
+            let data = collect_reserved(
+                futures::stream::iter(batches.clone().into_iter().map(Ok::<_, DataFusionError>)),
+                &reservation,
+            )
+            .await
+            .expect("collected");
+            assert_eq!(data, batches);
+            assert_eq!(
+                reservation.size(),
+                batches
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>()
+            );
         }
     }
 }

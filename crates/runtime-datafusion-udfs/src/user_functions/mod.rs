@@ -130,7 +130,7 @@ pub enum UserFunctionError {
     },
 
     #[cfg(feature = "wasm-functions")]
-    #[snafu(display("Failed to register function {name}: {source}"))]
+    #[snafu(display("Failed to load function '{name}' (wasm): {source}"))]
     Wasm {
         name: String,
         source: wasm::WasmBuildError,
@@ -551,6 +551,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         }
     }
 
@@ -812,6 +813,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: true,
+            build: None,
         };
         let built = build_function(&decl).await.expect("builds");
 

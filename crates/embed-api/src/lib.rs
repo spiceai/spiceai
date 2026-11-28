@@ -29,7 +29,6 @@ use async_openai::types::embeddings::{
 use async_trait::async_trait;
 use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use tokio::{runtime::Handle, task};
 
@@ -80,13 +79,19 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "When preparing an embedding model, an issue occurred with the Huggingface API. {source}. Verify the model configuration, and try again."
-    ))]
-    FailedWithHFApi { source: HfApiError },
+    /// Downloading the model from the Hugging Face Hub failed. The source names the model, the
+    /// cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
+    /// `from` is shown without the credentials a URL in it can carry: the message is logged
+    /// and reported in the embedding's status. It is redacted as a whole source, so a secret
+    /// with a space in it goes too.
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
+        "An unsupported model source was specified in the 'from' parameter: '{}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings",
+        redact::redact_source_credentials(from)
     ))]
     UnknownModelSource { from: String },
 
@@ -145,6 +150,26 @@ pub enum Error {
 
     #[snafu(display("Unsupported embedding input for {model}: {message}"))]
     UnsupportedEmbeddingInput { model: String, message: String },
+}
+
+impl Error {
+    /// Returns `true` when the error is a mistake in the model's Spicepod configuration, which no
+    /// retry can clear. A refusal or failure of the provider is not one.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownModelSource { .. }
+                | Self::ModelNotProvided { .. }
+                | Self::MissingParamError { .. }
+                | Self::InvalidParamError { .. }
+                | Self::InvalidPoolingMode { .. }
+                | Self::InvalidOpenAITier { .. }
+                | Self::LocalModelPathDoesNotExist { .. }
+                | Self::UnsupportedTaskForModel { .. }
+                | Self::RevisionPinningUnsupported { .. }
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -284,5 +309,63 @@ pub trait Embed: Debug + Sync + Send {
                 total_tokens: 0,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// The message is logged and reported in the embedding's status, so a credential in the
+    /// URL an embedding's `from` names stays out of it, and the rest of the source stays in.
+    #[test]
+    fn unknown_model_source_message_leaves_out_url_credentials() {
+        let error = Error::UnknownModelSource {
+            from: "https://alice:hunter2@models.example.com/v1?api_key=abc123&region=us"
+                .to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "An unsupported model source was specified in the 'from' parameter: 'https://models.example.com/v1?api_key=***&region=us'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
+        );
+    }
+
+    /// `from` is a whole source, so the URL in it runs to its end: a password, token or
+    /// query value with a space in it stays out of the message, after a connector prefix
+    /// too.
+    #[test]
+    fn unknown_model_source_message_leaves_out_credentials_with_spaces() {
+        let cases = [
+            (
+                "openai:https://alice:MY PASSWORD@models.example.invalid/v1",
+                "openai:https://models.example.invalid/v1",
+            ),
+            (
+                "custom:https://models.example.invalid/v1?api_key=MY KEY&region=us",
+                "custom:https://models.example.invalid/v1?api_key=***&region=us",
+            ),
+            (
+                "https://MY TOKEN@models.example.invalid/v1",
+                "https://models.example.invalid/v1",
+            ),
+        ];
+        let messages: Vec<String> = cases
+            .iter()
+            .map(|(from, _)| {
+                Error::UnknownModelSource {
+                    from: (*from).to_string(),
+                }
+                .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = cases
+            .iter()
+            .map(|(_, shown)| {
+                format!(
+                    "An unsupported model source was specified in the 'from' parameter: '{shown}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
+                )
+            })
+            .collect();
+        assert_eq!(messages, expected);
     }
 }

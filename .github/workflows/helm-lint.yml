@@ -9,10 +9,15 @@ on:
       - feature-*
   workflow_dispatch:
 
+# Least privilege by default; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   # merge_group can't path-filter, so gate the lint on a changed-files check
   # instead of running it for every merge-queue entry.
   changes:
+    environment: secret-free
     runs-on: ubuntu-latest
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
@@ -26,13 +31,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - id: check
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
               - 'deploy/chart/**'
 
   lint-helm:
+    environment: secret-free
     name: Helm Lint
     needs: changes
     # A helm template/lint over one chart.
@@ -46,7 +52,12 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v4.3.1
 
       - name: Lint Helm chart
         run: helm lint deploy/chart/
+
+      - name: Render the chart's test cases
+        run: sh deploy/chart/tests/run.sh

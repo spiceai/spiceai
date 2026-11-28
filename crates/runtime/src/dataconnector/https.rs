@@ -42,8 +42,7 @@ use data_components::http::auth::{
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
 use percent_encoding::percent_decode_str;
-use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use runtime_object_store::http_auth;
+use runtime_object_store::{http_auth, ssrf};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -51,7 +50,6 @@ use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -79,20 +77,52 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-fn parse_pagination_max_pages(value: &str) -> Option<usize> {
+/// `pagination_max_pages`: a positive number of pages, or `nolimit` (`Ok(None)`). Any
+/// other value is an error, so a limit the operator set is never silently dropped.
+fn parse_pagination_max_pages(value: &str) -> Result<Option<usize>, ()> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("nolimit") {
-        return None;
+        return Ok(None);
     }
+    match trimmed.parse::<usize>() {
+        Ok(max_pages) if max_pages > 0 => Ok(Some(max_pages)),
+        _ => Err(()),
+    }
+}
 
-    if let Ok(max_pages) = trimmed.parse::<usize>() {
-        Some(max_pages)
-    } else {
-        tracing::warn!(
-            "Invalid pagination_max_pages value '{}': expected a positive integer or 'nolimit'. The parameter will be ignored.",
-            value
-        );
-        Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES)
+/// `max_request_partitions`: a positive number of requests. Any other value is an error.
+fn parse_max_request_partitions(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|max| *max > 0)
+}
+
+/// Resolves the hosts a redirect introduced through [`ssrf::redirect_destination_guard`], so a
+/// redirect cannot reach an internal address by name. The dataset's own host and a proxy's
+/// resolve unchecked.
+#[derive(Default)]
+struct RedirectHostResolver {
+    redirect_hosts: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// `host` as [`RedirectHostResolver`] keys it: `example.com.` and `example.com` name the same host.
+fn redirect_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl reqwest::dns::Resolve for RedirectHostResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let guarded = self
+            .redirect_hosts
+            .lock()
+            .contains(&redirect_host_key(&host));
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> = if guarded {
+                ssrf::redirect_destination_guard().resolve(&host).await?
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect()
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -167,8 +197,6 @@ impl Https {
         }
 
         // Vortex is a structured columnar format handled by the listing connector.
-        // It is only built on non-Windows targets (see `get_file_format_and_extension`).
-        #[cfg(not(windows))]
         if file_format == "vortex" {
             return true;
         }
@@ -198,8 +226,6 @@ impl Https {
                 return true;
             }
 
-            // Vortex is only built on non-Windows targets.
-            #[cfg(not(windows))]
             if extension.as_deref() == Some("vortex") {
                 return true;
             }
@@ -320,7 +346,7 @@ struct HttpProviderParams {
     allowed_paths: Vec<String>,
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
-    max_request_partitions: Option<usize>,
+    max_request_partitions: usize,
     cache_max_size_bytes: usize,
     cache_fallback_ttl: Option<Duration>,
     health_probe: Option<String>,
@@ -498,13 +524,26 @@ impl Https {
             None => None,
         };
 
-        let max_request_partitions = self
+        // One request per combination of request filter values, so the bound always
+        // applies; a value that is not a positive integer is refused rather than dropped.
+        let max_request_partitions = match self
             .params
             .get("max_request_partitions")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+        {
+            Some(value) => parse_max_request_partitions(value).ok_or_else(|| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "`max_request_partitions` must be a positive integer, got '{value}'. Set it to the most requests one query may send, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                        data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS
+                    ),
+                }
+            })?,
+            None => data_components::http::provider::DEFAULT_MAX_REQUEST_PARTITIONS,
+        };
 
         let health_probe = self
             .params
@@ -551,15 +590,19 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let max_pages = self
-                .params
-                .get("pagination_max_pages")
-                .expose()
-                .ok()
-                .map_or(
-                    Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
-                    parse_pagination_max_pages,
-                );
+            let max_pages = match self.params.get("pagination_max_pages").expose().ok() {
+                Some(value) => parse_pagination_max_pages(value).map_err(|()| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!(
+                            "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                            data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES
+                        ),
+                    }
+                })?,
+                None => Some(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES),
+            };
 
             let data_map_to_array = self
                 .params
@@ -974,36 +1017,75 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
+        let from = Url::parse(dataset.from.as_str()).ok();
+        let origin_host = from
+            .as_ref()
+            .and_then(|url| url.host_str().map(redirect_host_key));
+        let resolver = RedirectHostResolver::default();
+        let redirect_hosts = Arc::clone(&resolver.redirect_hosts);
+        // `http_headers`, an OAuth2 token header that `auth_header_name` names other than
+        // `Authorization`, and enabled header filters (which send the headers a query names) are
+        // credentials reqwest does not remove when a redirect leaves the dataset's origin.
+        let sends_custom_header = param_is_set(&self.params, "http_headers")
+            || self
+                .params
+                .get("auth_header_name")
+                .expose()
+                .ok()
+                .map(str::trim)
+                .is_some_and(|name| {
+                    !name.is_empty() && !name.eq_ignore_ascii_case("authorization")
+                })
+            || self
+                .params
+                .get("request_header_filters")
+                .expose()
+                .ok()
+                .is_some_and(util::parse_enabled);
+        // The dataset URL's user info is sent as Basic credentials.
+        let sends_credentials = sends_custom_header
+            || any_oauth_param_set(&self.params)
+            || from
+                .as_ref()
+                .is_some_and(|url| !url.username().is_empty() || url.password().is_some());
+
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(connect_timeout)
             .timeout(client_timeout)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
                     return attempt.error("too many redirects");
                 }
+                if sends_custom_header
+                    && ssrf::redirect_leaves_origin(attempt.previous(), attempt.url())
+                {
+                    let refused = ssrf::DestinationRefused::off_origin(attempt.url());
+                    return attempt.error(refused);
+                }
+                if sends_credentials
+                    && ssrf::redirect_continues_off_origin(attempt.previous(), attempt.url())
+                {
+                    let refused = ssrf::DestinationRefused::redirect_chain(attempt.url());
+                    return attempt.error(refused);
+                }
                 // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target. Reuses the URL-table SSRF classifier so the
-                // two guards stay in lock-step — covering loopback, private/
-                // RFC1918, link-local (incl. the cloud-metadata endpoint),
-                // unique-local, CGNAT, unspecified, multicast, and reserved
-                // ranges for both IPv4 and IPv6, including IPv4-mapped IPv6
-                // forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
-                // `localhost`) can't be DNS-resolved in this synchronous
-                // closure, so well-known internal names are rejected by literal
-                // match; reqwest resolves any remaining hostnames at connect time.
-                let to_internal = match attempt.url().host() {
-                    Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
-                    Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
-                    Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
-                    None => false,
-                };
-                if to_internal {
+                // internal target, with the same classifier URL tables use.
+                if ssrf::redirect_target_is_internal(attempt.url()) {
                     return attempt.error("redirect to a private address is not allowed");
+                }
+                // This closure cannot resolve DNS, so the resolver checks the
+                // addresses of each new host a redirect names.
+                if let Some(url::Host::Domain(host)) = attempt.url().host() {
+                    let host = redirect_host_key(host);
+                    if origin_host.as_deref() != Some(host.as_str()) {
+                        redirect_hosts.lock().insert(host);
+                    }
                 }
                 attempt.follow()
             }))
+            .dns_resolver(Arc::new(resolver))
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
@@ -1016,7 +1098,9 @@ impl Https {
             builder = builder.use_rustls_tls().identity(identity);
         }
 
-        builder
+        // The provider decodes compressed bodies itself, so it can refuse one that
+        // expands like a compression bomb before it is held in memory.
+        http_body_limit::decode_manually(builder)
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -1477,9 +1561,8 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
 ];
 
 /// File formats served by the listing connector rather than the dynamic JSON
-/// API provider. `vortex` is handled separately because it is only built on
-/// non-Windows targets, and `json` because it is structured only when no
-/// dynamic-API param is set.
+/// API provider. `vortex` is handled separately, and `json` because it is
+/// structured only when no dynamic-API param is set.
 const STRUCTURED_FILE_FORMATS: &[&str] = &[
     "parquet", "csv", "tsv", "arrow", "avro", "jsonl", "ndjson", "ldjson", "soda", "socrata",
 ];
@@ -2016,7 +2099,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("max_request_headers_length")
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")
-            .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
+            .description("Maximum number of distinct requests one query may send to this dataset, one for each combination of request_path, request_query, request_body and request_headers values. Each request may fetch up to `pagination_max_pages` pages. Default: 1000."),
         ParameterSpec::runtime("response_cache_max_size_bytes")
             .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
         ParameterSpec::runtime("response_cache_fallback_ttl")
@@ -2036,7 +2119,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_data_pointer")
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
-            .description("Maximum number of pages to fetch for pagination. Default: 100. Set to 'nolimit' to disable the limit."),
+            .description("Maximum number of pages one request may fetch with pagination: a positive integer, or 'nolimit' to disable the limit. Default: 100."),
         ParameterSpec::runtime("pagination_data_map_to_array")
             .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
             .one_of(&["enabled", "disabled"]),
@@ -2250,6 +2333,16 @@ impl ListingTableConnector for HttpListingConnector {
         }
 
         let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        // The operator wrote `http://` in the dataset URL. That is the
+        // permission the object store's `allow_http` setting requires. An
+        // `https://` dataset stays HTTPS-only, so a redirect cannot switch
+        // the fetch to plaintext.
+        if u.scheme() == "http" {
+            if !fragment.is_empty() {
+                fragment.push('&');
+            }
+            fragment.push_str("allow_http=true");
+        }
         if !username.is_empty() || password.is_some() {
             let token = http_auth::register(
                 &u,
@@ -2373,6 +2466,23 @@ mod tests {
         });
 
         dataset
+    }
+
+    #[tokio::test]
+    async fn http_dataset_url_opts_into_plaintext() {
+        let dataset = test_dataset("http://example.com/data/", RefreshMode::Full, None).await;
+        let connector =
+            HttpListingConnector::new(test_params(&[]).await, tokio::runtime::Handle::current());
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("an http dataset URL is valid");
+        assert_eq!(url.fragment(), Some("allow_http=true"));
+
+        let https = test_dataset("https://example.com/data/", RefreshMode::Full, None).await;
+        let url = connector
+            .get_object_store_url(&https, None)
+            .expect("an https dataset URL is valid");
+        assert_eq!(url.fragment(), Some(""));
     }
 
     fn test_client_identity_pems() -> (String, String) {
@@ -3220,7 +3330,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_structured_format_detects_explicit_vortex() {
         let connector = test_connector(Some("vortex")).await;
@@ -3230,7 +3339,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_auto_structured_format_detects_vortex_extension() {
         let connector = test_connector(None).await;
@@ -3764,7 +3872,45 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             vec!["x-sandbox-id", "x-region"]
         );
         assert_eq!(params.request_filters.max_headers_length, 2048);
-        assert_eq!(params.max_request_partitions, Some(7000));
+        assert_eq!(params.max_request_partitions, 7000);
+    }
+
+    #[tokio::test]
+    async fn request_and_page_limits_default_and_refuse_values_they_cannot_use() {
+        let connector = test_connector_with(&[]).await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("defaults resolve");
+        assert_eq!(params.max_request_partitions, 1000);
+
+        for (value, shown) in [("0", "'0'"), ("1k", "'1k'"), ("-5", "'-5'")] {
+            let connector = test_connector_with(&[("max_request_partitions", value)]).await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("max_request_partitions {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`max_request_partitions` must be a positive integer, got {shown}. Set it to the most requests one query may send, or remove it to use the default of 1000. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
+
+        for value in ["1k", "0"] {
+            let connector =
+                test_connector_with(&[("pagination", "enabled"), ("pagination_max_pages", value)])
+                    .await;
+            let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+                panic!("pagination_max_pages {value} is refused");
+            };
+            assert!(
+                error.to_string().contains(&format!(
+                    "`pagination_max_pages` must be a positive integer or 'nolimit', got '{value}'. Set it to the most pages one request may fetch, or remove it to use the default of 100. See: https://spiceai.org/docs/components/data-connectors/https"
+                )),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4542,5 +4688,522 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
             "_fetched_at should have its base_table_schema type"
         );
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A gzip-compressed JSON object of `len` bytes, `{"a":"…"}`, whose string holds
+    /// `fill(i)` at offset `i`, built a block at a time so the whole is never held.
+    fn gzip_json(len: usize, fill: fn(usize) -> u8) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(br#"{"a":""#).expect("compress");
+        let mut offset = 0;
+        while offset < len - 8 {
+            let block: Vec<u8> = (offset..(offset + MIB).min(len - 8)).map(fill).collect();
+            encoder.write_all(&block).expect("compress");
+            offset += block.len();
+        }
+        encoder.write_all(br#""}"#).expect("compress");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// Zero-padded ascending eight-digit numbers separated by spaces, like an id column:
+    /// text that compresses a few times over, as real data does.
+    fn ids(i: usize) -> u8 {
+        let (number, position) = (i / 9, i % 9);
+        if position == 8 {
+            return b' ';
+        }
+        let place = 10usize.pow(u32::try_from(7 - position).expect("a digit place"));
+        b"0123456789"[number / place % 10]
+    }
+
+    /// Serve `body` as gzip-compressed JSON to every request, and count the requests
+    /// for `/data`.
+    async fn serve_gzip(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test origin");
+        let origin = format!(
+            "http://{}",
+            listener.local_addr().expect("test origin address")
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // The connector also probes the origin on a path of its own, in the
+                    // background; only requests for the dataset count.
+                    if request.starts_with(b"GET /data") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Encoding: gzip\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    // A client that refuses the body hangs up part way through it.
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (origin, requests)
+    }
+
+    /// Query `content` from a dynamic HTTP dataset at `{origin}/data`, through the
+    /// connector's own client, and count the requests the query made for it.
+    async fn query_content(
+        origin: &str,
+        requests: &std::sync::atomic::AtomicUsize,
+    ) -> (datafusion::error::Result<Vec<String>>, usize) {
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("request_query_filters", "enabled"),
+            ("client_timeout", "300"),
+        ])
+        .await;
+        let dataset = test_dataset(&format!("{origin}/data"), RefreshMode::Append, None).await;
+        let provider = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+            .expect("build the HTTP provider");
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("origin", provider)
+            .expect("register the table");
+
+        let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+        let rows = async {
+            let batches = ctx
+                .sql("SELECT content FROM origin")
+                .await?
+                .collect()
+                .await?;
+            Ok::<_, datafusion::error::DataFusionError>(
+                batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let content = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .expect("content is a string column");
+                        content
+                            .iter()
+                            .map(|value| value.unwrap_or_default().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            )
+        }
+        .await;
+        let made = requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+        (rows, made)
+    }
+
+    #[tokio::test]
+    async fn compression_bomb_is_refused_without_retrying() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
+        let body = gzip_json(len, |_| b'A');
+        assert!(
+            body.len() * http_body_limit::Codec::Gzip.max_ratio() < len,
+            "the response expands past gzip's ratio: {} bytes on the wire",
+            body.len()
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let message = match rows {
+            Err(error) => error.to_string(),
+            Ok(rows) => panic!(
+                "a compression bomb fails the query, but it returned rows of {:?} bytes",
+                rows.iter().map(String::len).collect::<Vec<_>>()
+            ),
+        };
+        let (prefix, rest) = message
+            .split_once(" received)")
+            .unwrap_or_else(|| panic!("no sizes in {message}"));
+        assert!(
+            prefix.contains(&format!(
+                "Failed to read the response from {origin} for dataset 'http_test': the \
+                 gzip-compressed response expanded more than 400:1 (64."
+            )),
+            "{message}"
+        );
+        assert_eq!(
+            rest,
+            ", far past what real data compresses to, so it was refused as a compression \
+             bomb. If the data is genuine, have the origin serve it uncompressed or at a lower \
+             compression level. See: https://spiceai.org/docs/components/data-connectors/https"
+        );
+
+        // The refusal is permanent: the origin is asked once, not once per retry.
+        assert_eq!(made, 1);
+    }
+
+    #[tokio::test]
+    async fn large_compressed_response_at_a_realistic_ratio_is_read_in_full() {
+        let len = http_body_limit::RATIO_CHECK_FLOOR_BYTES + 16 * MIB;
+        let body = gzip_json(len, ids);
+        let ratio = len / body.len();
+        assert!(
+            (2..http_body_limit::Codec::Gzip.max_ratio()).contains(&ratio),
+            "the response compresses {ratio}:1"
+        );
+        let (origin, requests) = serve_gzip(body).await;
+
+        let (rows, made) = query_content(&origin, &requests).await;
+        let rows = rows.expect("a large compressed response at a realistic ratio is read");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_bytes();
+        assert_eq!(row.len(), len);
+        assert_eq!(&row[..6], br#"{"a":""#);
+        assert_eq!(&row[len - 2..], br#""}"#);
+        assert!(
+            row[6..len - 2]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == ids(i)),
+            "the decoded response matches what was sent"
+        );
+        assert_eq!(made, 1);
+    }
+
+    /// Answer every request with `response` and count the requests.
+    async fn serve_fixed(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, requests)
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+
+    /// `localhost.` resolves to a loopback address but, with its trailing dot, is not a
+    /// well-known internal name, so only the resolved address shows that the redirect reaches
+    /// an internal host.
+    #[tokio::test]
+    async fn a_redirect_to_a_name_that_resolves_to_loopback_is_refused() {
+        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://127.0.0.1:{origin_port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let error = client
+            .get(&origin)
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message =
+            std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        assert!(
+            message.contains("Refused to connect to localhost."),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// The operator chose the dataset's host, so its resolved address is not checked.
+    #[tokio::test]
+    async fn the_dataset_host_may_resolve_to_loopback() {
+        let (port, requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let origin = format!("http://localhost.:{port}/data");
+        let connector = test_connector(Some("json")).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+
+        let response = client
+            .get(&origin)
+            .send()
+            .await
+            .expect("the origin answers");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Answers `/a` with a redirect to its own `/b`, and every other path with [`OK_RESPONSE`].
+    /// Counts the requests for `/b`.
+    async fn serve_chain_target() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let second_hops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&second_hops);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = if request.starts_with(b"GET /a ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    OK_RESPONSE
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, second_hops)
+    }
+
+    /// Requests a dataset at `http://{userinfo}localhost.:<port>/data` whose origin redirects to
+    /// `/a` on another port, which redirects to its own `/b`. Every hop keeps the dataset's host
+    /// name, so no hop is refused as internal. Returns the result, the number of requests for
+    /// `/b`, and the target's port.
+    async fn get_through_a_redirect_chain(
+        userinfo: &str,
+        extra: &[(&str, &str)],
+    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
+        let (target_port, second_hops) = serve_chain_target().await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/a\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://{userinfo}localhost.:{origin_port}/data");
+        let mut params = vec![("file_format", "json")];
+        params.extend_from_slice(extra);
+        let connector = test_connector_with(&params).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+        let result = client.get(&origin).send().await;
+        (
+            result,
+            second_hops.load(std::sync::atomic::Ordering::SeqCst),
+            target_port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
+     {
+        for (userinfo, extra) in [
+            ("svc:s3cret@", &[][..]),
+            (
+                "",
+                &[("auth_token_url", "https://example.com/oauth/token")][..],
+            ),
+        ] {
+            let (result, second_hops, target_port) =
+                get_through_a_redirect_chain(userinfo, extra).await;
+
+            let error = result.expect_err("the redirect chain is refused");
+            let chain = || {
+                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+            };
+            let message = chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            assert!(
+                message.contains(&format!(
+                    "Refused to connect to http://localhost.:{target_port}: {}",
+                    ssrf::REDIRECT_CHAIN_REFUSED
+                )),
+                "the refusal names only the target's origin with {userinfo:?} {extra:?}: {message}"
+            );
+            assert!(
+                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
+                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
+            );
+            assert_eq!(
+                second_hops, 0,
+                "the second hop on the target is never requested with {userinfo:?} {extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
+    {
+        let (result, second_hops, _) = get_through_a_redirect_chain("", &[]).await;
+
+        let response = result.expect("the redirect chain is followed");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(second_hops, 1);
+    }
+
+    /// Parameters that send a custom credential header.
+    const CUSTOM_HEADER_PARAMS: &[(&str, &str)] = &[
+        ("http_headers", "X-Api-Key: test-key"),
+        ("auth_header_name", "X-Api-Token"),
+        ("request_header_filters", "enabled"),
+    ];
+
+    /// Requests a dataset at `http://localhost.:<port>/data` whose origin redirects to `/data` on
+    /// another port of the same host. Returns the result, the number of requests the target
+    /// received, and the target's port.
+    async fn get_through_a_redirect_off_the_origin(
+        extra: &[(&str, &str)],
+    ) -> (reqwest::Result<reqwest::Response>, usize, u16) {
+        let (target_port, target_requests) = serve_fixed(OK_RESPONSE.to_string()).await;
+        let (origin_port, _) = serve_fixed(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost.:{target_port}/data\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let origin = format!("http://localhost.:{origin_port}/data");
+        let mut params = vec![("file_format", "json")];
+        params.extend_from_slice(extra);
+        let connector = test_connector_with(&params).await;
+        let dataset = test_dataset(&origin, RefreshMode::Append, None).await;
+        let client = connector
+            .build_http_client(&dataset)
+            .await
+            .expect("build the HTTP client");
+        let result = client.get(&origin).send().await;
+        (
+            result,
+            target_requests.load(std::sync::atomic::Ordering::SeqCst),
+            target_port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_a_custom_credential_header_does_not_follow_a_redirect_off_its_origin() {
+        for extra in CUSTOM_HEADER_PARAMS {
+            let (result, target_requests, target_port) =
+                get_through_a_redirect_off_the_origin(&[*extra]).await;
+
+            let error = result.expect_err("the redirect is refused");
+            let chain = || {
+                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+            };
+            let message = chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            assert!(
+                message.contains(&format!(
+                    "Refused to connect to http://localhost.:{target_port}: {}",
+                    ssrf::OFF_ORIGIN_REDIRECT_REFUSED
+                )),
+                "the refusal names the target's origin with {extra:?}: {message}"
+            );
+            assert!(
+                chain().any(|e| e.downcast_ref::<ssrf::DestinationRefused>().is_some()),
+                "the HTTP table provider shows the reason only for a DestinationRefused: {message}"
+            );
+            assert_eq!(
+                target_requests, 0,
+                "the redirect target is never requested with {extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_with_a_custom_credential_header_follows_a_redirect_within_its_origin() {
+        for extra in CUSTOM_HEADER_PARAMS {
+            let (port, second_hops) = serve_chain_target().await;
+            let url = format!("http://localhost.:{port}/a");
+            let connector = test_connector_with(&[("file_format", "json"), *extra]).await;
+            let dataset = test_dataset(&url, RefreshMode::Append, None).await;
+            let client = connector
+                .build_http_client(&dataset)
+                .await
+                .expect("build the HTTP client");
+
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
+
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                second_hops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dataset_without_a_custom_credential_header_follows_a_redirect_off_its_origin() {
+        for extra in [
+            &[][..],
+            &[("auth_token_url", "https://example.com/oauth/token")][..],
+            &[
+                ("auth_token_url", "https://example.com/oauth/token"),
+                ("auth_header_name", "authorization"),
+            ][..],
+        ] {
+            let (result, target_requests, _) = get_through_a_redirect_off_the_origin(extra).await;
+
+            let response =
+                result.unwrap_or_else(|e| panic!("the redirect is followed with {extra:?}: {e}"));
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(target_requests, 1, "{extra:?}");
+        }
     }
 }

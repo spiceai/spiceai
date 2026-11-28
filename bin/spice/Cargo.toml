@@ -18,7 +18,7 @@ clap.workspace = true
 clap_complete = "4"
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
 
 # Async utilities
 futures.workspace = true
@@ -32,12 +32,18 @@ tracing-subscriber.workspace = true
 
 # HTTP client
 reqwest = { workspace = true, features = ["stream"] }
+# Read the certificate error behind a failed TLS handshake
+rustls.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+# Splits a function's `build.command` the way a shell would, for `spice build`.
+shell-words.workspace = true
 secrecy.workspace = true
 zeroize = "1.8"
+# Reading a coding agent's own config for settings that outrank spice's
+toml = "1"
 
 # Environment files
 dotenv.workspace = true
@@ -47,6 +53,7 @@ dirs = "6"
 
 # Deterministic per-instance-directory service names (`spice cloud service`)
 sha2.workspace = true
+base64.workspace = true
 
 # Semver comparison
 semver = "1"
@@ -65,7 +72,7 @@ ansi_colors = { path = "../../crates/ansi_colors" }
 # Archive extraction
 flate2 = "1"
 tar = "0.4"
-zip = "7"
+zip = "9.1"
 
 # YAML parsing for spicepod
 yaml = { path = "../../crates/yaml" }
@@ -105,6 +112,7 @@ spice-cloud-client.workspace = true
 repl = { path = "../../crates/repl" }
 runtime-api-types = { path = "../../crates/runtime-api-types" }
 runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
+spiced-args = { path = "../../crates/spiced-args" }
 spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
@@ -116,6 +124,11 @@ opentelemetry.workspace = true
 
 # Unix signal handling, terminal tests, and local account inspection.
 [target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW`/`O_NONBLOCK` for reading credential files without following links.
+libc = "0.2"
+# Directory-descriptor file operations (`openat`, `mkdirat`, `renameat`) so
+# `spice add` never writes a package through a symbolic link.
+rustix = { version = "1.1", features = ["fs"] }
 nix = { version = "0.29", features = ["signal", "process", "term", "user"] }
 
 [build-dependencies]

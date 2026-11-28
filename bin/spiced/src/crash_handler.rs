@@ -106,8 +106,8 @@ pub fn install(version: &str) -> Result<(), InstallError> {
     resolve_image();
     // Formatted now, not in the handler: allocating there is not signal-safe, and a
     // pre-built line cannot crowd out the rest of the report's fixed buffer.
-    // The commit and target are their own fields: a `release` build's version omits
-    // the commit, and every architecture ships under one version.
+    // The commit and target are their own fields: `version` is passed without the
+    // commit, and every architecture ships under one version.
     let mut identity = format!(
         "spiced={version} commit={} target={}_{} features={} profile={}",
         env!("GIT_COMMIT_HASH"),
@@ -677,7 +677,8 @@ fn report(_cc: &crash_handler::CrashContext) {
     flush(&buf, position);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";
@@ -706,7 +707,7 @@ mod tests {
     extern "C" fn spiced_crash_handler_test_fault() {
         // SAFETY: a deliberate wild write — the behaviour under test.
         unsafe {
-            std::ptr::with_exposed_provenance_mut::<u8>(FAULT_ADDR).write(1);
+            std::ptr::with_exposed_provenance_mut::<u8>(std::hint::black_box(FAULT_ADDR)).write(1);
         }
     }
 

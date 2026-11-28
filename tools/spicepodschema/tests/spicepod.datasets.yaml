@@ -25,7 +25,7 @@ datasets:
     acceleration:
       enabled: true
       refresh_mode: full
-      engine: duckdb
+      engine: cayenne
 
   # Multiple postgres datasets to verify anyOf works
   - name: test_postgres_2

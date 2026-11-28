@@ -38,7 +38,11 @@ limitations under the License.
 
 use std::time::Duration;
 
-use aws_config::imds::client::Client;
+use aws_config::{
+    imds::client::{Builder, Client},
+    provider_config::ProviderConfig,
+};
+use aws_smithy_http_client::tls;
 use tokio::sync::OnceCell;
 
 /// Tight connect/read timeout, single attempt: this runs once at first table
@@ -88,11 +92,34 @@ pub(crate) async fn detect_instance_profile() -> Option<InstanceProfile> {
 /// Fetch the instance type string via the SDK's `IMDSv2` client. Any error (no
 /// route, non-2xx, timeout) yields `None`.
 async fn fetch_instance_type() -> Option<String> {
-    let client = Client::builder()
-        .connect_timeout(IMDS_TIMEOUT)
-        .read_timeout(IMDS_TIMEOUT)
-        .max_attempts(1)
-        .build();
+    instance_type(&client_builder()?.build()).await
+}
+
+/// The probe's `IMDSv2` client, before an endpoint is chosen.
+fn client_builder() -> Option<Builder> {
+    // The metadata service is plain HTTP, so the client trusts no certificates. The
+    // SDK's default client would first load the platform's root certificates, which
+    // reads the macOS keychain or the system CA bundle on the calling thread.
+    let tls_context = tls::TlsContext::builder()
+        .with_trust_store(tls::TrustStore::empty())
+        .build()
+        .ok()?;
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(tls::Provider::Rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .tls_context(tls_context)
+        .build_https();
+    Some(
+        Client::builder()
+            .configure(&ProviderConfig::default().with_http_client(http_client))
+            .connect_timeout(IMDS_TIMEOUT)
+            .read_timeout(IMDS_TIMEOUT)
+            .max_attempts(1),
+    )
+}
+
+async fn instance_type(client: &Client) -> Option<String> {
     let instance_type: String = client
         .get("/latest/meta-data/instance-type")
         .await
@@ -165,6 +192,73 @@ mod tests {
         assert_eq!(ebs_baseline_mbps("m7i.metal-48xl"), None);
         // Malformed input never panics.
         assert_eq!(ebs_baseline_mbps("garbage"), None);
+    }
+
+    /// The probe's transport, which trusts no certificates, still speaks `IMDSv2`
+    /// over plain HTTP: it fetches a session token, then presents it to read the
+    /// instance type.
+    #[tokio::test]
+    async fn reads_the_instance_type_over_plain_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the metadata service");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("request");
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let size = socket.read(&mut buffer).await.expect("request bytes");
+                    assert!(size > 0, "the client closed before its request ended");
+                    request.extend_from_slice(&buffer[..size]);
+                }
+                let request = String::from_utf8(request)
+                    .expect("HTTP headers")
+                    .to_ascii_lowercase();
+                let body = if request.starts_with("put /latest/api/token ") {
+                    "session-token"
+                } else {
+                    "m7i.large\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-aws-ec2-metadata-token-ttl-seconds: 21600\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+                requests.push(request);
+            }
+            requests
+        });
+        // Generous timeouts: this checks the transport, not the probe's deadline.
+        let client = client_builder()
+            .expect("probe client")
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(30))
+            .endpoint(&endpoint)
+            .expect("metadata endpoint")
+            .build();
+
+        assert_eq!(instance_type(&client).await.as_deref(), Some("m7i.large"));
+        let requests = tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("the metadata service saw both requests")
+            .expect("metadata service");
+        assert!(
+            requests[0].starts_with("put /latest/api/token "),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].starts_with("get /latest/meta-data/instance-type ")
+                && requests[1].contains("\r\nx-aws-ec2-metadata-token: session-token\r\n"),
+            "{requests:?}"
+        );
     }
 
     #[test]

@@ -37,8 +37,6 @@ use axum::{
 };
 use serde_json::json;
 
-use super::require_write_access;
-
 #[cfg(feature = "debezium")]
 use crate::dataconnector::cdc_ingest::{self, Error as IngestError};
 #[cfg(feature = "debezium")]
@@ -96,10 +94,6 @@ pub struct CdcIngestResponse {
     )
 ))]
 pub(crate) async fn post(Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Some(resp) = require_write_access().await {
-        return resp;
-    }
-
     #[cfg(not(feature = "debezium"))]
     {
         let _ = (name, headers, body);

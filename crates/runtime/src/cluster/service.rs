@@ -73,6 +73,7 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
+use crate::cluster::peer::{Advertised, authorize_executor_claim, registered_elsewhere_message};
 use crate::cluster::{
     ExecutorRegistry, TablePartitions,
     {SchedulerPeers, partition::partition_value_to_bytes},
@@ -81,6 +82,7 @@ use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use runtime_cluster::peer::PeerCertificate;
 use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
 
@@ -88,6 +90,9 @@ use telemetry::metrics_reader::MetricsReader;
 /// before it treats the executor as gone. Executors send a heartbeat every 10
 /// seconds.
 const CONTROL_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a refused control stream is described as, in the refusal.
+const OPEN_CONTROL_STREAM: &str = "open the control stream";
 
 /// Handle for sending messages to a connected executor.
 struct ExecutorStreamHandle {
@@ -308,7 +313,8 @@ struct ControlStreamOutbound {
     /// The task that reads the executor's messages. The response ends when it ends, so an
     /// executor the scheduler no longer reads (it sent nothing for
     /// `CONTROL_STREAM_IDLE_TIMEOUT` and was unregistered) sees its stream end and reconnects.
-    reader: Option<tokio::task::JoinHandle<()>>,
+    /// It ends with the status the stream was refused with, if it was.
+    reader: Option<tokio::task::JoinHandle<Option<Status>>>,
     _outbound_tx: mpsc::Sender<SchedulerControlMessage>,
 }
 
@@ -324,6 +330,10 @@ impl Stream for ControlStreamOutbound {
         }
         match this.reader.as_mut().map(|reader| Pin::new(reader).poll(cx)) {
             Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(Ok(Some(refusal)))) => {
+                this.reader = None;
+                Poll::Ready(Some(Err(refusal)))
+            }
             Some(Poll::Ready(_)) | None => {
                 this.reader = None;
                 Poll::Ready(None)
@@ -440,16 +450,28 @@ impl ClusterService for ClusterServiceImpl {
         );
 
         let secrets = Secrets::snapshot(&self.secrets).await;
-        // A reference through the `secrets:` sentinel keeps its normal
-        // "search every configured store in precedence order" resolution; a
-        // reference scoped to a specific store (e.g. `${ env:KEY }`) is
-        // restricted to that store, so a same-named key in an unrelated
-        // store can't answer in its place.
-        let lookup = if allowed_stores.contains(SECRETS) {
-            secrets.get_secret(&request.key).await
+        // A reference to a specific store (e.g. `${ aws:KEY }`) that the app
+        // makes is answered by that store alone, so a same-named key in an
+        // unrelated store can't answer in its place. Otherwise a key the app
+        // references through the `secrets:` sentinel keeps its normal "search
+        // every configured store in precedence order" resolution, and any
+        // other request is limited to the stores the app references the key
+        // through.
+        let store = request.store.as_str();
+        //
+        // The `_or_outage` lookups report a miss as an error when a consulted
+        // store failed, so the executor sees a retriable store error rather
+        // than a definitive "not found" (which would permanently fail a
+        // dataset whose secret lives in the store that is down).
+        let lookup = if store != SECRETS && allowed_stores.contains(store) {
+            secrets
+                .get_secret_from_stores_or_outage(&request.key, &HashSet::from([store.to_string()]))
+                .await
+        } else if allowed_stores.contains(SECRETS) {
+            secrets.get_secret_or_outage(&request.key).await
         } else {
             secrets
-                .get_secret_from_stores(&request.key, allowed_stores)
+                .get_secret_from_stores_or_outage(&request.key, allowed_stores)
                 .await
         };
         let Some(value) =
@@ -574,6 +596,7 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<Streaming<ExecutorControlMessage>>,
     ) -> Result<Response<Self::ControlStreamStream>, Status> {
+        let certificate = PeerCertificate::from_request(&request);
         let mut inbound = request.into_inner();
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
@@ -595,36 +618,38 @@ impl ClusterService for ClusterServiceImpl {
         let metrics_node_id = self.advertise_address.clone();
         let state_location = self.state_location().await;
         let reader = tokio::spawn(async move {
-            let (executor_id, process_id) = match inbound.next().await {
+            let (executor_id, process_id, first_message) = match inbound.next().await {
                 Some(Ok(msg)) => {
-                    let executor_id = msg.executor_id.clone();
+                    let executor_id = msg.executor_id;
                     if executor_id.is_empty() {
                         tracing::warn!("Executor connected with empty executor_id, closing stream");
-                        return;
+                        return None;
                     }
                     tracing::debug!("Executor control stream connected: {executor_id}");
-
-                    // Handle the first message if it contains data.
-                    if let Some(message) = msg.message {
-                        handle_executor_message(
-                            &executor_id,
-                            &msg.process_id,
-                            &message,
-                            &datafusion,
-                        )
-                        .await;
-                    }
-                    (executor_id, msg.process_id)
+                    (executor_id, msg.process_id, msg.message)
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Error receiving first executor control message: {e}");
-                    return;
+                    return None;
                 }
                 None => {
                     tracing::debug!("Executor control stream closed before sending any messages");
-                    return;
+                    return None;
                 }
             };
+
+            // Nothing the stream carries is acted on before it is known to come
+            // from the node that registered the executor.
+            if let Err(refusal) = authorize_executor_claim(
+                &executor_registry,
+                certificate.as_ref(),
+                &executor_id,
+                None,
+                OPEN_CONTROL_STREAM,
+            ) {
+                return Some(refusal);
+            }
+            let identity = certificate.as_ref().map(|c| c.identity().clone());
 
             // Register the executor with the registry.
             let Registered {
@@ -632,9 +657,27 @@ impl ClusterService for ClusterServiceImpl {
                 registration,
                 connection,
             } = executor_registry
-                .register(executor_id.clone(), &process_id, outbound_tx_for_registry)
+                .register(
+                    executor_id.clone(),
+                    &process_id,
+                    identity.clone(),
+                    outbound_tx_for_registry,
+                )
                 .await;
             match registration {
+                ExecutorRegistration::IdentityMismatch => {
+                    let registered = executor_registry
+                        .registered_identity_conflict(&executor_id, identity.as_ref())
+                        .flatten();
+                    let message = registered_elsewhere_message(
+                        OPEN_CONTROL_STREAM,
+                        &executor_id,
+                        identity.as_ref(),
+                        registered.as_ref(),
+                    );
+                    tracing::warn!("{message}");
+                    return Some(Status::permission_denied(message));
+                }
                 ExecutorRegistration::Duplicate => {
                     tracing::error!(
                         "{}",
@@ -646,7 +689,7 @@ impl ClusterService for ClusterServiceImpl {
                     // Keep the stream open and ignore it, so the duplicate does not
                     // reconnect and register again.
                     while let Some(Ok(_)) = inbound.next().await {}
-                    return;
+                    return None;
                 }
                 ExecutorRegistration::Restarted => {
                     tracing::info!(
@@ -668,6 +711,10 @@ impl ClusterService for ClusterServiceImpl {
                     }
                 }
                 ExecutorRegistration::New | ExecutorRegistration::Reconnected => {}
+            }
+
+            if let Some(message) = first_message.as_ref() {
+                handle_executor_message(&executor_id, &process_id, message, &datafusion).await;
             }
 
             // Update active executor count metric.
@@ -734,14 +781,24 @@ impl ClusterService for ClusterServiceImpl {
                                             }
                                         }
                                         ExecutorMessage::FlightEndpoint(endpoint) => {
-                                            register_executor_flight_endpoint(
+                                            if authorize_executor_claim(
                                                 &executor_registry,
-                                                &datafusion,
+                                                certificate.as_ref(),
                                                 &executor_id,
-                                                &endpoint.executor_url,
-                                                &process_id,
+                                                Some(Advertised::Address(&endpoint.executor_url)),
+                                                "register the Flight endpoint",
                                             )
-                                            .await;
+                                            .is_ok()
+                                            {
+                                                register_executor_flight_endpoint(
+                                                    &executor_registry,
+                                                    &datafusion,
+                                                    &executor_id,
+                                                    &endpoint.executor_url,
+                                                    &process_id,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         ExecutorMessage::Shutdown(_) => {
                                             handle_executor_message(
@@ -785,7 +842,7 @@ impl ClusterService for ClusterServiceImpl {
             // connection under its id replaced this one.
             if !executor_registry.unregister(&executor_id, connection).await {
                 tracing::debug!("Replaced executor control stream ended: {executor_id}");
-                return;
+                return None;
             }
 
             // Update active executor count metric.
@@ -803,6 +860,7 @@ impl ClusterService for ClusterServiceImpl {
             }
 
             tracing::debug!("Executor control stream ended: {executor_id}");
+            None
         });
 
         let stream = ControlStreamOutbound {
@@ -819,6 +877,7 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
+        let certificate = PeerCertificate::from_request(&request);
         let AllocateInitialPartitionsRequest {
             executor_url,
             executor_id,
@@ -835,6 +894,14 @@ impl ClusterService for ClusterServiceImpl {
         } else {
             executor_id.as_str()
         };
+
+        authorize_executor_claim(
+            &self.executor_registry,
+            certificate.as_ref(),
+            executor_id,
+            Some(Advertised::Address(&executor_url)),
+            "allocate partitions",
+        )?;
 
         // Gate on dataset readiness. Partition-expression serialization needs
         // every accelerated table's schema to be in the SessionContext; if a
@@ -986,7 +1053,6 @@ impl ClusterService for ClusterServiceImpl {
 
             // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
             // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
-            #[cfg(not(windows))]
             for table_ref in discover_cayenne_tables(&self.datafusion).await {
                 partition_map.entry(table_ref).or_default();
             }
@@ -1128,10 +1194,18 @@ async fn handle_executor_message(
             } else {
                 shutdown.reason.clone()
             };
-            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty() {
+            // An executor reports its own shutdown; its Ballista registration uses
+            // the same id.
+            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty()
+                || shutdown.ballista_executor_id == executor_id
+            {
                 executor_id
             } else {
-                shutdown.ballista_executor_id.as_str()
+                tracing::warn!(
+                    "Executor '{executor_id}' reported the shutdown of executor '{}' on its control stream; only its own shutdown is applied",
+                    shutdown.ballista_executor_id
+                );
+                executor_id
             };
             tracing::info!(
                 executor_id = %executor_id,
@@ -1377,7 +1451,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     // dataset registration can have created a canonical-key entry alongside
     // the registered bare key, and every resolve-equal entry must reach
     // `Ready` for `/v1/ready` to flip.
-    let matching: Vec<(TableReference, crate::status::ComponentStatus)> = datafusion
+    let matching: Vec<(TableReference, runtime_status::ComponentStatus)> = datafusion
         .runtime_status
         .get_dataset_statuses()
         .into_iter()
@@ -1389,7 +1463,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         .collect();
     let pending: Vec<TableReference> = matching
         .iter()
-        .filter(|(_, status)| !matches!(status, crate::status::ComponentStatus::Ready))
+        .filter(|(_, status)| !matches!(status, runtime_status::ComponentStatus::Ready))
         .map(|(key, _)| key.clone())
         .collect();
 
@@ -1434,12 +1508,12 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         if pending.is_empty() {
             datafusion
                 .runtime_status
-                .update_dataset(table, crate::status::ComponentStatus::Ready);
+                .update_dataset(table, runtime_status::ComponentStatus::Ready);
         } else {
             for key in pending {
                 datafusion
                     .runtime_status
-                    .update_dataset(&key, crate::status::ComponentStatus::Ready);
+                    .update_dataset(&key, runtime_status::ComponentStatus::Ready);
             }
         }
     }
@@ -1484,7 +1558,6 @@ pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
 /// fully qualified [`TableReference`]s for each table found. These are used to
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
-#[cfg(not(windows))]
 pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;
@@ -1804,7 +1877,7 @@ mod tests {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
                 tokio::runtime::Handle::current(),
             )
@@ -1950,11 +2023,12 @@ mod tests {
     }
 
     /// Serves `service` on a loopback port built like the internal cluster port and returns
-    /// its address. Plain TCP stands in for the transport: the port's gate reads only
-    /// whether the port runs cluster mTLS.
+    /// its address. Plain TCP stands in for the transport; the gate uses the node's
+    /// mTLS and insecure connection settings.
     async fn spawn_cluster_server(
         service: ClusterServiceImpl,
         mtls_enabled: bool,
+        allow_insecure_connections: bool,
     ) -> (std::net::SocketAddr, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1966,7 +2040,7 @@ mod tests {
         let shutdown_signal = shutdown.clone();
 
         tokio::spawn(async move {
-            internal_cluster_server(mtls_enabled)
+            internal_cluster_server(mtls_enabled, allow_insecure_connections)
                 .add_service(ClusterServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     shutdown_signal.cancelled().await;
@@ -1982,8 +2056,10 @@ mod tests {
     async fn serve_on_cluster_port(
         service: ClusterServiceImpl,
         mtls_enabled: bool,
+        allow_insecure_connections: bool,
     ) -> (Channel, CancellationToken) {
-        let (address, shutdown) = spawn_cluster_server(service, mtls_enabled).await;
+        let (address, shutdown) =
+            spawn_cluster_server(service, mtls_enabled, allow_insecure_connections).await;
         let channel = Channel::from_shared(format!("http://{address}"))
             .expect("test cluster service address should be a valid URI")
             .connect()
@@ -1993,11 +2069,11 @@ mod tests {
         (channel, shutdown)
     }
 
-    /// Serves `service` on a cluster port that runs cluster mTLS.
+    /// Serves `service` on a cluster port that explicitly allows insecure connections.
     async fn serve_test_service(
         service: ClusterServiceImpl,
     ) -> (ClusterServiceClient<Channel>, CancellationToken) {
-        let (channel, shutdown) = serve_on_cluster_port(service, true).await;
+        let (channel, shutdown) = serve_on_cluster_port(service, false, true).await;
         (ClusterServiceClient::new(channel), shutdown)
     }
 
@@ -2052,8 +2128,9 @@ mod tests {
             .await
             .expect("spicepod should load");
         let service = make_test_service_with(Some(Arc::new(app)), Secrets::default()).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
-        let app_json = service
+        let app_json = client
             .get_app_definition(Request::new(GetAppDefinitionRequest {
                 executor_id: "executor-1".to_string(),
             }))
@@ -2072,6 +2149,7 @@ mod tests {
             serde_json::from_str(&app_json).expect("app definition should deserialize");
         assert_eq!(definition.datasets.len(), 1);
         assert_eq!(definition.datasets[0].name, "orders");
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2087,6 +2165,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect("referenced secret should expand");
@@ -2109,6 +2188,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "AWS_SECRET_ACCESS_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("unreferenced secret must be denied");
@@ -2153,6 +2233,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "API_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect("store-scoped key referenced by the app should expand");
@@ -2161,13 +2242,13 @@ mod tests {
     }
 
     /// Every RPC on the internal cluster port, the Ballista scheduler's included, is
-    /// refused when the port does not run cluster mTLS.
+    /// refused without cluster mTLS or an explicit insecure opt-in.
     #[tokio::test]
-    async fn cluster_port_refuses_every_rpc_without_mtls() {
+    async fn cluster_port_refuses_every_rpc_without_mtls_or_insecure_opt_in() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
         let service = make_test_service_full(Some(app), secrets, None, &["trace-a"]).await;
-        let (channel, shutdown) = serve_on_cluster_port(service, false).await;
+        let (channel, shutdown) = serve_on_cluster_port(service, false, false).await;
         let mut client = ClusterServiceClient::new(channel.clone());
         let mut scheduler = SchedulerGrpcClient::new(channel);
 
@@ -2185,6 +2266,7 @@ mod tests {
                     .expand_secret(ExpandSecretRequest {
                         executor_id: "executor-1".to_string(),
                         key: "PG_PASS".to_string(),
+                        store: String::new(),
                     })
                     .await
                     .map(drop),
@@ -2277,16 +2359,19 @@ mod tests {
             .build();
         let secrets = secrets_with(&[("API_KEY", "runtime-api-key")]);
         let service = make_test_service_with(Some(Arc::new(app)), secrets).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
-        let err = service
+        let err = client
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "API_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("a key only runtime.auth references must not expand");
 
         assert_eq!(err.code(), tonic::Code::NotFound);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2298,6 +2383,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("ExpandSecret without app must be denied");
@@ -2315,6 +2401,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: String::new(),
+                store: String::new(),
             }))
             .await
             .expect_err("empty key must be denied");
@@ -2333,6 +2420,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("missing allowlisted secret must fail");
@@ -2366,6 +2454,7 @@ mod tests {
         let executor_secrets = Secrets::new_for_cluster_executor(
             Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
             "executor-1".to_string(),
+            Vec::new(),
         );
 
         // Not referenced by the app, so the scheduler declines it even though
@@ -2395,6 +2484,53 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A reference to a store the spicepod names resolves on an executor from
+    /// that store on the scheduler, even when another store holds the same key.
+    #[tokio::test]
+    async fn executor_secrets_resolve_references_to_named_stores() {
+        let mut ds = Dataset::new("memory:data", "orders");
+        ds.params = Some(Params::from_string_map(HashMap::from([
+            ("pg_pass".to_string(), "${ aws:PG_PASS }".to_string()),
+            ("api_key".to_string(), "${ vault:PG_PASS }".to_string()),
+            ("token".to_string(), "${ secrets:TOKEN }".to_string()),
+        ])));
+        let app = Arc::new(AppBuilder::new("test").with_dataset(ds).build());
+        let lookups = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut secrets = Secrets::new();
+        for (store, value) in [("aws", "from-aws"), ("vault", "from-vault")] {
+            secrets.register_store(
+                store,
+                Arc::new(RecordingSecretStore {
+                    values: HashMap::from([
+                        ("PG_PASS".to_string(), value.to_string()),
+                        ("TOKEN".to_string(), format!("token-{value}")),
+                    ]),
+                    lookups: Arc::clone(&lookups),
+                }),
+            );
+        }
+        let service = make_test_service_with(Some(app), secrets).await;
+        let (client, shutdown) = serve_test_service(service).await;
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
+            "executor-1".to_string(),
+            vec!["aws".to_string(), "vault".to_string()],
+        );
+
+        let expanded = executor_secrets
+            .inject_secrets(
+                "params",
+                runtime_secrets::ParamStr("${ aws:PG_PASS } ${ vault:PG_PASS } ${ secrets:TOKEN }"),
+            )
+            .await;
+        assert_eq!(
+            expanded.expose_secret(),
+            "from-aws from-vault token-from-aws"
+        );
+
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn executor_secrets_report_unreachable_scheduler_as_error() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -2412,6 +2548,7 @@ mod tests {
                 ClusterServiceClient::new(channel),
             )),
             "executor-1".to_string(),
+            Vec::new(),
         );
 
         let err = executor_secrets
@@ -2492,7 +2629,7 @@ mod tests {
 
         let service = make_test_service().await;
         let registry = service.executor_registry();
-        let (scheduler, shutdown) = spawn_cluster_server(service, true).await;
+        let (scheduler, shutdown) = spawn_cluster_server(service, true, false).await;
         // The executor reaches the scheduler through this relay, so the test can cut the
         // connection as a killed process does, while its stream of messages stays open.
         let relay = TcpListener::bind("127.0.0.1:0")
@@ -2544,7 +2681,7 @@ mod tests {
     /// An executor that sends nothing for longer than the idle timeout, while its connection
     /// stays open (its process paused), is unregistered and its control stream ends, so it
     /// reconnects when it resumes.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_control_stream_of_an_idle_executor_ends() {
         use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
 
@@ -2571,11 +2708,16 @@ mod tests {
             "the executor registers"
         );
 
+        // Real socket readiness must establish registration before virtual time
+        // advances; otherwise the registration wait can expire ahead of TCP I/O.
+        tokio::time::pause();
         tokio::time::sleep(CONTROL_STREAM_IDLE_TIMEOUT).await;
         assert!(
             eventually(async || registry.connected_executors().await.is_empty()).await,
             "the idle executor is unregistered"
         );
+        // Receiving the end of the gRPC stream also requires real socket I/O.
+        tokio::time::resume();
         let end = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next()).await;
         assert!(
             matches!(end, Ok(None)),
@@ -2732,6 +2874,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_history_refuses_other_sql() {
         let service = make_test_service_with_task_history(&["trace-a"]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
         let table = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
 
         for sql in [
@@ -2747,7 +2890,7 @@ mod tests {
             format!("DELETE FROM {table}"),
             format!("CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS SELECT * FROM {table}"),
         ] {
-            let Err(err) = service
+            let Err(err) = client
                 .get_task_history(Request::new(GetTaskHistoryRequest { sql: sql.clone() }))
                 .await
             else {
@@ -2755,6 +2898,7 @@ mod tests {
             };
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{sql}: {err:?}");
         }
+        shutdown.cancel();
     }
 
     #[test]
@@ -2823,7 +2967,7 @@ mod tests {
     #[test]
     fn test_encode_batches_to_ipc_empty_is_empty() {
         let encoded = encode_batches_to_ipc(&[]).expect("encoding empty slice should succeed");
-        assert!(encoded.is_empty());
+        assert_eq!(encoded, [] as [u8; 0]);
     }
 
     /// Round-trips multiple batches through a single IPC stream. This both

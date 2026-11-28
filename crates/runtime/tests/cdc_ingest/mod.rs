@@ -67,7 +67,8 @@ fn cdc_orders_dataset() -> Dataset {
     on_conflict.insert("id".to_string(), OnConflictBehavior::Upsert);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
+        mode: spicepod::acceleration::Mode::Memory,
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some("id".to_string()),
         on_conflict,
@@ -404,7 +405,6 @@ const CAYENNE_MEMORY_TABLE: &str = "orders_cayenne_memory";
 /// `crates/runtime/tests/acceleration/cayenne_memory.rs`, where the equivalent
 /// negative control does flip.
 #[tokio::test]
-#[cfg(not(target_os = "windows"))]
 async fn cdc_ingest_delete_removes_a_cayenne_memory_mode_row() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

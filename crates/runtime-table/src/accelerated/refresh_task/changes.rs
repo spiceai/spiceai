@@ -15,6 +15,7 @@ limitations under the License.
 */
 mod ingress;
 mod policy;
+mod snapshot;
 
 use super::DatasetMetricLabels;
 use super::RefreshTask;
@@ -54,7 +55,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 #[cfg(test)]
 use futures::StreamExt;
 use futures::stream;
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 use runtime_acceleration::change_sink::provider::partitioned_widening_refusal;
 #[cfg(test)]
 use runtime_acceleration::change_sink::provider::{
@@ -79,7 +80,7 @@ use runtime_datafusion::error::find_datafusion_root;
 use runtime_datafusion::error::format_datafusion_error;
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
@@ -223,6 +224,27 @@ impl SourceDurabilityObserver {
 
 #[async_trait::async_trait]
 impl DurabilityObserver for SourceDurabilityObserver {
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The newest committer at or below the fence holds the furthest position
+        // it covers. Only its owned write is taken under the lock.
+        let record = {
+            let queue = self.queue.lock().await;
+            queue
+                .iter()
+                .take_while(|(epoch, _)| *epoch <= fence)
+                .filter_map(|(_, committers)| committers.last())
+                .last()
+                .and_then(|committer| committer.record_position())
+        };
+        match record {
+            Some(record) => record.await.map_err(Into::into),
+            None => Ok(()),
+        }
+    }
+
     async fn on_durable(&self, fence: u64) {
         self.durable_fence.fetch_max(fence, Ordering::AcqRel);
         self.durability_known.store(true, Ordering::Release);
@@ -1016,6 +1038,21 @@ pub(crate) fn cdc_config_overlay(
     }
 }
 
+/// The CDC tunables one dataset runs with: the process-global [`CdcConfig`]
+/// with that dataset's `acceleration.params` `cdc_*` overrides layered on.
+/// Everything that sizes or paces a dataset's changes path reads this rather
+/// than [`cdc_config`], so a per-dataset override reaches every consumer.
+#[must_use]
+pub(crate) fn dataset_cdc_config(
+    dataset_params: Option<&std::collections::HashMap<String, String>>,
+) -> CdcConfig {
+    let base = cdc_config();
+    match dataset_params {
+        Some(params) => cdc_config_overlay(base, params),
+        None => base,
+    }
+}
+
 fn overlay_usize(
     params: &std::collections::HashMap<String, String>,
     key: &'static str,
@@ -1115,14 +1152,8 @@ impl RefreshTask {
         refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
-        // Effective CDC config = global (already env+default folded) with any
-        // per-dataset `cdc_*` overrides layered on top.
-        let mut effective = cdc_config();
-        if let Some(overrides) = self.cdc_param_overrides.as_ref() {
-            effective = cdc_config_overlay(effective, overrides);
-        }
         self.start_changes_stream_with_config(
-            effective,
+            dataset_cdc_config(self.cdc_param_overrides.as_deref()),
             refresh,
             changes_stream,
             caching,
@@ -1220,6 +1251,46 @@ impl RefreshTask {
             context.dataset_name,
         );
         true
+    }
+
+    /// Reload the partitions this executor serves after they changed, as one
+    /// atomic replacement through the partition-filtered full refresh — the same
+    /// path [`Self::rebuild_from_source`] takes. The change stream is already
+    /// scoped to the new partitions, and changes received during the reload
+    /// apply after it, so the acceleration converges on the new partitions.
+    ///
+    /// Returns `None` when the change stream must stop, and `Some(false)` when the
+    /// reload failed but streaming continues: the scheduler sends the partitions
+    /// again, which requests another reload.
+    async fn reload_served_partitions(&self, context: &mut ApplyContext<'_>) -> Option<bool> {
+        if !self.prepare_rebuild(context).await {
+            return None;
+        }
+        let mut refresh = context.refresh.read().await.clone();
+        refresh.mode = RefreshMode::Full;
+        if let Err(e) = self.run(refresh).await {
+            tracing::warn!(
+                "Failed to reload the partitions this executor serves for dataset {}, so it does not report them loaded and keeps streaming changes: {e}",
+                context.dataset_name,
+            );
+            return Some(false);
+        }
+        if let Some(cache_provider_ref) = context.caching
+            && let Some(cache_provider) = cache_provider_ref.upgrade()
+            && let Err(e) = cache_provider
+                .invalidate_for_refresh(context.dataset_name.clone())
+                .await
+        {
+            tracing::warn!(
+                "Failed to invalidate cached query plans and search results for dataset {} after reloading its partitions, so they may reflect the previous partitions until they expire: {e}",
+                context.dataset_name
+            );
+        }
+        tracing::info!(
+            "Dataset {}: reloaded the partitions this executor serves; resuming change streaming.",
+            context.dataset_name,
+        );
+        Some(true)
     }
 
     /// Replace the accelerator from a [`cdc::ChangeBatch::rebuild_from_this_batch`]
@@ -1517,12 +1588,12 @@ impl RefreshTask {
         if history_unavailable {
             let listing_rebuild = parts
                 .iter()
-                .any(|(_, batch, _, _)| batch.rebuild_from_this_batch());
+                .any(|(_, batch, _, _, _)| batch.rebuild_from_this_batch());
             if listing_rebuild {
                 let rebuild_batches: Vec<RecordBatch> = parts
                     .iter()
-                    .filter(|(_, batch, _, _)| batch.rebuild_from_this_batch())
-                    .map(|(_, batch, _, _)| batch.data_batch())
+                    .filter(|(_, batch, _, _, _)| batch.rebuild_from_this_batch())
+                    .map(|(_, batch, _, _, _)| batch.data_batch())
                     .collect();
                 let schema = rebuild_batches
                     .first()
@@ -1545,7 +1616,7 @@ impl RefreshTask {
         let mut rebuild_committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
         let mut committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = Vec::new();
         let mut batches: Vec<ChangeBatch> = Vec::new();
-        for (committer, batch, _is_ready, _history_unavailable) in parts {
+        for (committer, batch, _is_ready, _history_unavailable, _snapshot_rows) in parts {
             if batch.rebuild_from_this_batch() {
                 rebuild_committers.push(committer);
             } else {
@@ -1927,12 +1998,9 @@ impl RefreshTask {
     /// without threading config through the write path. Floored at 1 so
     /// `chunks()` never sees a zero.
     fn cdc_delete_subbatch_max(&self) -> usize {
-        let base = cdc_config();
-        let effective = match self.cdc_param_overrides.as_ref() {
-            Some(overrides) => cdc_config_overlay(base, overrides),
-            None => base,
-        };
-        effective.delete_subbatch_max.max(1)
+        dataset_cdc_config(self.cdc_param_overrides.as_deref())
+            .delete_subbatch_max
+            .max(1)
     }
 }
 
@@ -2489,7 +2557,6 @@ mod tests {
     // arms. Dropping the `file_update` arm was a real defect: `recreates_on_schema_mismatch`
     // makes a restart rebuild the table in that mode, and telling those operators a restart
     // will not help sends them to unnecessary manual recovery.
-    #[cfg(not(windows))]
     #[test]
     fn partitioned_widening_refusal_names_both_recovery_arms() {
         let msg = partitioned_widening_refusal("sales.orders", "column `total` widened i32 -> i64");
@@ -3307,6 +3374,7 @@ mod tests {
     /// a test can pin `cdc_delete_subbatch_max` regardless of the process-global
     /// [`CdcConfig`].
     fn make_refresh_task_with_cdc_params(
+        name: &str,
         accelerator: Arc<dyn TableProvider>,
         cdc_params: std::collections::HashMap<String, String>,
     ) -> RefreshTask {
@@ -3318,7 +3386,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::common::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -3659,6 +3727,7 @@ mod tests {
                 delete_plan_calls: Arc::clone(&delete_plan_calls),
             }) as Arc<dyn TableProvider>;
             let task = make_refresh_task_with_cdc_params(
+                "test",
                 provider,
                 std::collections::HashMap::from([(
                     "cdc_delete_subbatch_max".to_string(),
@@ -4563,7 +4632,6 @@ mod tests {
     /// The cross-epoch drain collapse: a coalescable dataset's whole
     /// `epoch <= durable` prefix folds to ONE commit carrying the max value —
     /// O(epochs) work becomes a single ack.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn slot_advancer_collapses_coalescable_epochs_to_one_commit() {
         let log = Arc::new(TokioMutex::new(Vec::new()));
@@ -4598,7 +4666,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_durable_path_required_for_delete_truncate_and_unknown() {
         let upsert = create_test_change_batch(
@@ -4624,7 +4691,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_delete_burst_stays_on_mem_path_when_sink_absorbs() {
         // A keyed delete-bearing burst stays on the mem path when the sink
@@ -4669,7 +4735,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_memory_cdc_deferral_requires_every_committer_to_support_deferral() {
         let log = CommitLog::new();
@@ -4699,7 +4764,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_slot_advancer_requeues_failed_deferred_committers() {
         let log = CommitLog::new();
@@ -5045,8 +5109,12 @@ mod tests {
 
         // The write must land far inside the 60s linger window. A 5s deadline is
         // generous for the immediate write yet nowhere near the buggy 60s wait.
+        // Wait for the envelope's commit, not the write counter: `CountingExec`
+        // counts when the insert plan starts executing, and the commit follows
+        // only once that write has finished, so asserting the commit log as soon
+        // as the counter moves races the write.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+        while log.ids().await.is_empty() {
             assert!(
                 std::time::Instant::now() <= deadline,
                 "over-budget burst was held by the linger window instead of writing immediately",
@@ -5081,6 +5149,125 @@ mod tests {
             initial_load_completed,
         )
         .await
+    }
+
+    // -- Per-dataset prefetch depth -------------------------------------------
+
+    /// A per-dataset `cdc_prefetch_buffer` that differs from the process-wide
+    /// value, so a queue sized from the process-wide value reads differently.
+    const DATASET_PREFETCH_BUFFER: u16 = 1024;
+
+    fn dataset_prefetch_params() -> std::collections::HashMap<String, String> {
+        assert_ne!(
+            cdc_config().prefetch_buffer,
+            usize::from(DATASET_PREFETCH_BUFFER),
+            "the per-dataset value must differ from the process-wide one, or the capacity cannot tell them apart"
+        );
+        std::collections::HashMap::from([(
+            "cdc_prefetch_buffer".to_string(),
+            DATASET_PREFETCH_BUFFER.to_string(),
+        )])
+    }
+
+    /// `dataset_acceleration_cdc_prefetch_buffer_capacity` as scraped for `dataset`.
+    fn scraped_prefetch_capacity(dataset: &str) -> Option<f64> {
+        super::super::test_prometheus_registry()
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "dataset_acceleration_cdc_prefetch_buffer_capacity")
+            .flat_map(|family| family.get_metric().iter())
+            .find(|series| {
+                series
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "dataset" && label.value() == dataset)
+            })
+            .and_then(|series| {
+                series
+                    .get_gauge()
+                    .as_ref()
+                    .map(prometheus::proto::Gauge::value)
+            })
+    }
+
+    async fn wait_for_commits(log: &CommitLog, expected: &[i32]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids = log.ids().await;
+            if ids == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "expected commits {expected:?} within 10s, saw {ids:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A dataset's own `cdc_prefetch_buffer` sizes the queue its changes wait
+    /// in before the accelerator write, on the path `spiced` builds: an
+    /// accelerated table in `refresh_mode: changes` hands its change sink to
+    /// the refresher.
+    #[tokio::test]
+    async fn an_accelerated_tables_change_queue_takes_the_dataset_prefetch_buffer() {
+        use crate::accelerated::refresh::Refresh;
+        use crate::federated::FederatedTable;
+        use tokio::runtime::Handle;
+
+        let dataset = "dataset_prefetch_buffer_table";
+        let log = CommitLog::new();
+        let mut builder = crate::accelerated::Builder::new(
+            runtime_status::RuntimeStatus::new(),
+            datafusion::common::TableReference::bare(dataset),
+            Arc::new(FederatedTable::new_unchecked(make_mem_table())),
+            "mem_table".to_string(),
+            make_mem_table() as Arc<dyn TableProvider>,
+            Refresh::new(RefreshMode::Changes),
+            Handle::current(),
+        );
+        builder.changes_stream(make_changes_stream(vec![Ok(make_tracked_envelope(
+            1,
+            Arc::clone(&log),
+            false,
+        ))]));
+        builder.cdc_param_overrides(Some(Arc::new(dataset_prefetch_params())));
+        let _table = builder.build().await.expect("accelerated table builds");
+
+        wait_for_commits(&log, &[1]).await;
+        assert_eq!(
+            scraped_prefetch_capacity(dataset),
+            Some(f64::from(DATASET_PREFETCH_BUFFER))
+        );
+    }
+
+    /// The same, for a refresh task that builds its own change sink because
+    /// none was handed to it.
+    #[tokio::test]
+    async fn a_refresh_tasks_own_change_queue_takes_the_dataset_prefetch_buffer() {
+        let dataset = "dataset_prefetch_buffer_task";
+        let task = make_refresh_task_with_cdc_params(
+            dataset,
+            make_mem_table() as Arc<dyn TableProvider>,
+            dataset_prefetch_params(),
+        );
+        let log = CommitLog::new();
+        let stream =
+            make_changes_stream(vec![Ok(make_tracked_envelope(1, Arc::clone(&log), false))]);
+
+        run_changes_stream(&task, stream, None, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("start_changes_stream should succeed");
+
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "the change must reach the accelerator"
+        );
+        assert_eq!(
+            scraped_prefetch_capacity(dataset),
+            Some(f64::from(DATASET_PREFETCH_BUFFER))
+        );
     }
 
     // -- Correctness: ordering ------------------------------------------------
@@ -5354,7 +5541,7 @@ mod tests {
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
             if self
                 .failures_remaining
-                .fetch_update(
+                .try_update(
                     AtomicOrdering::SeqCst,
                     AtomicOrdering::SeqCst,
                     |remaining| remaining.checked_sub(1),
@@ -5912,19 +6099,12 @@ mod tests {
 
     // -- Partitioned Cayenne: a widened CDC batch is refused, never acked -----
 
-    #[cfg(not(windows))]
     use data_accelerator_api::upsert_dedup::wrap_with_upsert_dedup_if_needed;
-    #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
-    #[cfg(not(windows))]
     use datafusion::common::Constraints;
-    #[cfg(not(windows))]
     use datafusion::logical_expr::TableProviderFilterPushDown;
-    #[cfg(not(windows))]
     use datafusion::scalar::ScalarValue;
-    #[cfg(not(windows))]
     use runtime_table_partition::creator::{Error as PartitionCreatorError, PartitionCreator};
-    #[cfg(not(windows))]
     use runtime_table_partition::{Partition, expression::PartitionedBy};
 
     /// A [`PartitionCreator`] that starts empty and backs each new partition
@@ -5938,13 +6118,11 @@ mod tests {
     ///
     /// `direct_writes` selects the partition write behavior independently of the
     /// sink's schema-evolution capability.
-    #[cfg(not(windows))]
     #[derive(Debug)]
     struct MemPartitionCreator {
         direct_writes: bool,
     }
 
-    #[cfg(not(windows))]
     #[async_trait]
     impl PartitionCreator for MemPartitionCreator {
         fn accepts_direct_partition_writes(&self) -> bool {
@@ -5982,7 +6160,6 @@ mod tests {
     ///
     /// Writes must pass through every layer, including deduplication. Schema
     /// policy comes from the sink bound to this composed target.
-    #[cfg(not(windows))]
     async fn partitioned_accelerator(dedup: bool, direct_writes: bool) -> Arc<dyn TableProvider> {
         let partitioned = Arc::new(
             PartitionTableProvider::new(
@@ -6017,7 +6194,6 @@ mod tests {
     ///
     /// Reads through the whole provider stack the CDC apply writes to, so it sees
     /// what a query against the dataset would see.
-    #[cfg(not(windows))]
     async fn accelerator_row_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i32> {
         let ctx = SessionContext::new();
         let scan = accelerator
@@ -6049,7 +6225,6 @@ mod tests {
     /// Apply one widened single-upsert CDC envelope under `on_schema_change:
     /// append_new_columns`, and report `(run applied, committed envelope ids,
     /// dataset status is error)`.
-    #[cfg(not(windows))]
     async fn apply_widened_envelope(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
@@ -6072,7 +6247,6 @@ mod tests {
     /// `seed` is applied through the ordinary CDC write path rather than written
     /// behind it, so a test asserting the acceleration is unmutated is asserting
     /// against rows the apply loop itself put there.
-    #[cfg(not(windows))]
     async fn apply_widened_burst(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
@@ -6189,7 +6363,6 @@ mod tests {
     ///
     /// Run for both stack shapes: the upsert-dedup wrapper must not hide the
     /// partition provider from the refusal.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_cdc_batch_on_partitioned_cayenne_is_never_acked() {
         for dedup in [false, true] {
@@ -6237,7 +6410,6 @@ mod tests {
     /// satisfied by the broken behavior, since a burst that refuses mid-way
     /// acknowledges nothing either. The row-level assertion is the one that fails
     /// without the preflight.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_refused_widening_burst_leaves_the_partitioned_acceleration_intact() {
         for (case, ops) in [
@@ -6295,7 +6467,6 @@ mod tests {
     /// This is the boundary of the preflight above rather than incidental: the
     /// preflight is reached by every burst, so without the upsert gate a
     /// delete-only burst would start classifying, which no burst shape did before.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_delete_only_burst_still_applies_to_a_partitioned_cayenne() {
         for (case, ops) in [("delete_only", ["d"]), ("truncate_only", ["t"])] {
@@ -6338,7 +6509,6 @@ mod tests {
     /// partitions from any other engine's. Without these, the test above would
     /// also pass if the refusal fired for every dataset, or for every
     /// partitioned one.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_widened_cdc_batch_outside_a_partitioned_cayenne_still_commits() {
         for (case, accelerator) in [
@@ -6383,7 +6553,7 @@ mod tests {
         .await
         .expect("must not hang on empty stream");
         res.expect("must return Ok on empty stream");
-        assert!(log.ids().await.is_empty());
+        assert_eq!(log.ids().await, [] as [i32; 0]);
     }
 
     #[tokio::test]
@@ -6637,6 +6807,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         assert!(
             task.apply_envelope_run(&mut context, vec![signal]).await,
@@ -6741,6 +6912,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         assert!(
             task.apply_envelope_run(&mut context, vec![signal]).await,
@@ -6757,6 +6929,197 @@ mod tests {
             refresh_duration_samples(&registry, dataset, "full"),
             1,
             "a listing-driven replace is still one full refresh of '{dataset}'"
+        );
+    }
+
+    /// Stops before each write until the test has read the table, so a test can
+    /// query the accelerator between the writes of one apply.
+    #[derive(Debug)]
+    struct PausingWrites {
+        inner: Arc<dyn TableProvider>,
+        paused: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for PausingWrites {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            self.paused.send(resume).map_err(|_| {
+                DataFusionError::Execution("the test stopped reading the writes".to_string())
+            })?;
+            resumed.await.map_err(|_| {
+                DataFusionError::Execution("the test did not resume the write".to_string())
+            })?;
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    /// The `(id, name)` rows of `table`, sorted.
+    async fn id_name_rows(table: Arc<dyn TableProvider>) -> Vec<(i32, String)> {
+        let batches = SessionContext::new()
+            .read_table(table)
+            .expect("read table")
+            .collect()
+            .await
+            .expect("collect table");
+        let mut rows: Vec<(i32, String)> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .clone();
+                let names = batch
+                    .column_by_name("name")
+                    .expect("name")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("name is Utf8")
+                    .clone();
+                (0..ids.len()).map(move |i| (ids.value(i), names.value(i).to_string()))
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// A reload of a ready dataset arrives as one replacement envelope (the
+    /// `spice.ai` append stream stages it until its snapshot ends). A query
+    /// that runs before, between or after the writes that apply it sees the old
+    /// rows or the new ones, never anything in between. Applying the same
+    /// reload as a truncate and then its rows would show the empty table
+    /// between those two writes, so each write is held until the table has
+    /// been read.
+    #[tokio::test]
+    async fn a_staged_reload_is_seen_whole_or_not_at_all() {
+        let dataset = "staged_reload_swaps_atomically";
+        let schema = Arc::new(create_test_data_schema());
+        let old_ids = [1, 2, 3];
+        let new_ids = [1, 2, 3, 4, 5];
+        let old_names = ["old"; 3];
+        let new_names = ["new"; 5];
+        let federated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        );
+        let accelerator: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&old_ids, &old_names)]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let (paused, mut paused_writes) = tokio::sync::mpsc::unbounded_channel();
+        let task = make_refresh_task_with_source(
+            dataset,
+            Arc::clone(&federated) as Arc<dyn TableProvider>,
+            Arc::new(PausingWrites {
+                inner: Arc::clone(&accelerator),
+                paused,
+            }) as Arc<dyn TableProvider>,
+        );
+        let dataset_name = TableReference::bare(dataset);
+        let metric_labels = DatasetMetricLabels::new(&dataset_name);
+        let initial_load_completed = Arc::new(AtomicBool::new(true));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            refresh: &refresh,
+            dataset_name: &dataset_name,
+            metric_labels: &metric_labels,
+            caching: None,
+            refresh_completion: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+        let rows_of = |ids: &[i32], names: &[&str]| -> Vec<(i32, String)> {
+            ids.iter()
+                .zip(names)
+                .map(|(id, name)| (*id, (*name).to_string()))
+                .collect()
+        };
+        let old_rows = rows_of(&old_ids, &old_names);
+        let new_rows = rows_of(&new_ids, &new_names);
+        assert_eq!(
+            id_name_rows(Arc::clone(&accelerator)).await,
+            old_rows,
+            "the old snapshot before the reload"
+        );
+
+        let reload = cdc::ChangeEnvelope::from_parts(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &id_name_batch(&new_ids, &new_names))
+                .expect("reload wraps")
+                .with_rebuild_from_this_batch(true),
+            true,
+            true,
+            false,
+        );
+        let apply = task.apply_envelope_run(&mut context, vec![reload]);
+        tokio::pin!(apply);
+        let mut reads_before_writes = Vec::new();
+        let applied = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    applied = &mut apply => break applied,
+                    Some(resume) = paused_writes.recv() => {
+                        reads_before_writes.push(id_name_rows(Arc::clone(&accelerator)).await);
+                        resume.send(()).expect("the write waits for the read");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the reload is applied");
+        assert!(applied, "the reload is applied");
+        assert!(
+            !reads_before_writes.is_empty(),
+            "the reload is written to the accelerator"
+        );
+        assert!(
+            reads_before_writes
+                .iter()
+                .all(|rows| *rows == old_rows || *rows == new_rows),
+            "a query between two writes of the reload saw a partly reloaded table: {reads_before_writes:?}"
+        );
+        assert_eq!(
+            id_name_rows(Arc::clone(&accelerator)).await,
+            new_rows,
+            "the new snapshot after the reload"
         );
     }
 
@@ -6834,6 +7197,7 @@ mod tests {
                 .with_rebuild_from_this_batch(true),
             false,
             true,
+            false,
         );
         let later = make_tracked_envelope(2, Arc::clone(&log), false);
 
@@ -7849,5 +8213,116 @@ mod tests {
             "each envelope builds once"
         );
         assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
+    /// A partition update on a cluster executor reloads the partitions a change
+    /// stream serves: the acceleration is replaced through the partition-filtered
+    /// full refresh, and the waiter for that request is answered once it landed.
+    #[tokio::test]
+    async fn a_reload_request_replaces_the_acceleration_with_the_served_partitions() {
+        let dataset = "reload_served_partitions";
+        let schema = Arc::new(create_test_data_schema());
+        let federated = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(
+                    &[1, 2, 3, 4, 5, 6],
+                    &["a", "b", "c", "d", "e", "f"],
+                )]],
+            )
+            .expect("federated mem table"),
+        );
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![id_name_batch(&[5], &["no longer served"])]],
+            )
+            .expect("accelerator mem table"),
+        );
+        let task = make_refresh_task_with_source(
+            dataset,
+            federated as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator) as Arc<dyn TableProvider>,
+        );
+        let (trigger, requests) = tokio::sync::mpsc::channel(8);
+        *task.reload_requests.lock() = Some(requests);
+
+        let mut sql = crate::accelerated::refresh::RefreshSQL::new(
+            TableReference::bare(dataset),
+            crate::accelerated::refresh::RefreshSQLColumns::All,
+            vec![],
+            None,
+        );
+        sql.set_partition_filters(Some(vec![
+            datafusion::prelude::col("id").lt(datafusion::prelude::lit(4)),
+        ]));
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            sql: Some(sql),
+            ..Refresh::default()
+        }));
+        let completion = RefreshCompletion::new();
+        let (changes, source) =
+            tokio::sync::mpsc::channel::<Result<ChangeEnvelope, cdc::StreamError>>(1);
+        let running = tokio::spawn({
+            let completion = completion.clone();
+            async move {
+                task.start_changes_stream(
+                    refresh,
+                    tokio_stream::wrappers::ReceiverStream::new(source).boxed(),
+                    None,
+                    Some(completion),
+                    Arc::new(AtomicBool::new(true)),
+                )
+                .await
+            }
+        });
+
+        let id = completion.issue();
+        let waiter = completion.waiter_for(id);
+        trigger
+            .send(id)
+            .await
+            .expect("the change stream takes reload requests");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), waiter.wait())
+            .await
+            .expect("the reload must be answered");
+        assert_eq!(
+            outcome,
+            crate::accelerated::refresh_completion::RefreshCompletionOutcome::Answered
+        );
+
+        let batches = SessionContext::new()
+            .read_table(Arc::clone(&accelerator) as Arc<dyn TableProvider>)
+            .expect("read accelerator")
+            .collect()
+            .await
+            .expect("collect accelerator");
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .expect("id")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "the acceleration must hold exactly the served partitions' rows"
+        );
+
+        drop(changes);
+        drop(trigger);
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the change stream ends once its source ends")
+            .expect("join")
+            .expect("the change stream ends cleanly");
     }
 }

@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use super::composite_flight_service::CompositeFlightService;
+use super::peer::ClusterPeerLayer;
+use super::scheduler_grpc::ClusterSchedulerGrpc;
 use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
@@ -29,7 +31,7 @@ use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use runtime_tls::flight_incoming::tls_incoming;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -55,16 +57,30 @@ async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, 
     })
 }
 
-/// Refuses every request on the internal cluster port unless the port runs cluster mTLS,
-/// whose handshake requires a client certificate signed by the cluster CA.
-#[derive(Clone, Copy)]
-pub(crate) struct ClusterMtlsGate {
-    mtls_enabled: bool,
+/// The address a registered executor's Flight server binds: the port it registered at
+/// `node_bind_ip`, the address `--node-bind-address` names and registration bound;
+/// `fallback` when it has registered no port that fits a port number.
+fn registered_bind_address(
+    node_bind_ip: IpAddr,
+    registered_port: Option<u32>,
+    fallback: SocketAddr,
+) -> SocketAddr {
+    match registered_port.and_then(|port| u16::try_from(port).ok()) {
+        Some(port) => SocketAddr::new(node_bind_ip, port),
+        None => fallback,
+    }
 }
 
-impl Interceptor for ClusterMtlsGate {
+/// Requires cluster mTLS unless the node explicitly allows insecure connections.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterConnectionGate {
+    mtls_enabled: bool,
+    allow_insecure_connections: bool,
+}
+
+impl Interceptor for ClusterConnectionGate {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        if self.mtls_enabled {
+        if self.mtls_enabled || self.allow_insecure_connections {
             Ok(request)
         } else {
             Err(Status::permission_denied(
@@ -75,11 +91,15 @@ impl Interceptor for ClusterMtlsGate {
 }
 
 /// The server builder for the internal cluster port. Every service added to it is behind
-/// [`ClusterMtlsGate`].
+/// [`ClusterConnectionGate`].
 pub(crate) fn internal_cluster_server(
     mtls_enabled: bool,
-) -> Server<Stack<InterceptorLayer<ClusterMtlsGate>, Identity>> {
-    Server::builder().layer(InterceptorLayer::new(ClusterMtlsGate { mtls_enabled }))
+    allow_insecure_connections: bool,
+) -> Server<Stack<InterceptorLayer<ClusterConnectionGate>, Identity>> {
+    Server::builder().layer(InterceptorLayer::new(ClusterConnectionGate {
+        mtls_enabled,
+        allow_insecure_connections,
+    }))
 }
 
 /// Starts the internal cluster gRPC server for scheduler mode.
@@ -109,7 +129,10 @@ pub async fn start_internal_cluster_server(
 
     let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let mtls_enabled = cluster_server_config.is_some();
-    let mut server = internal_cluster_server(mtls_enabled);
+    let mut server = internal_cluster_server(
+        mtls_enabled,
+        rt.df.cluster_config.allow_insecure_connections(),
+    );
 
     if mtls_enabled {
         tracing::info!("Cluster mTLS enabled for internal cluster server");
@@ -118,15 +141,17 @@ pub async fn start_internal_cluster_server(
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),
         });
-    } else {
-        tracing::warn!(
-            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set); cluster RPCs are refused"
-        );
     }
 
-    let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
-        .max_decoding_message_size(usize::MAX)
-        .max_encoding_message_size(usize::MAX);
+    // Requests on this port are executors' reports — task statuses, shuffle output
+    // locations — never plans: the scheduler's own query path calls the job
+    // methods in process. Responses carry the tasks' plans, so they stay unbounded.
+    let scheduler_grpc_server = SchedulerGrpcServer::new(ClusterSchedulerGrpc::new(
+        scheduler,
+        Arc::clone(&executor_registry),
+    ))
+    .max_decoding_message_size(SCHEDULER_MAX_DECODING_MESSAGE_SIZE)
+    .max_encoding_message_size(usize::MAX);
 
     let advertise_address = rt
         .df
@@ -207,6 +232,16 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
+/// The largest message the scheduler's cluster port accepts. Executors send the
+/// scheduler reports, not plans: a poll for work carries the statuses of the
+/// tasks that finished since the last one, each with one entry (about 150 bytes)
+/// per output partition, and a control-stream message carries metrics,
+/// statistics or partition acknowledgements. A poll reporting a thousand tasks
+/// that each wrote a thousand partitions is under 150 MiB, so this bound leaves
+/// headroom over any report while keeping a peer from making the scheduler
+/// buffer and decode an arbitrarily large message.
+pub(crate) const SCHEDULER_MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
 /// Upper bound on h2 pending-accept resets the executor Flight server tolerates
 /// before tripping Rapid-Reset flood protection. Set well above any realistic
 /// shuffle cancellation burst; see `start_executor_flight_server` for rationale.
@@ -228,14 +263,6 @@ pub async fn start_executor_flight_server(
     let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
 
-    // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
-    // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
-    if !has_flight_auth && cluster_server_config.is_none() {
-        return Err(Error::InsecureConfiguration {
-            message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
-        });
-    }
-
     // The executor Flight server is the cluster shuffle endpoint: reducer partitions
     // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
     // stage cancellation resets the in-flight fetch streams in bursts. Those legitimate
@@ -256,10 +283,6 @@ pub async fn start_executor_flight_server(
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),
         });
-    } else {
-        tracing::warn!(
-            "Cluster mTLS disabled for executor flight server (--allow-insecure-connections flag is set)"
-        );
     }
 
     if !has_flight_auth {
@@ -274,7 +297,15 @@ pub async fn start_executor_flight_server(
         rt.datafusion().data_update_broadcaster(),
     );
     let session_store = spice_service.session_store();
-    let composite_service = CompositeFlightService::new(spice_service);
+    // The executor's shuffle work directory, so the composite service can confine
+    // peer shuffle fetches to it (a peer fetches output by file path).
+    let shuffle_work_dir = rt
+        .df
+        .executor
+        .read()
+        .ok()
+        .and_then(|executor| executor.as_ref().map(|e| e.work_dir().to_string()));
+    let composite_service = CompositeFlightService::new(spice_service, shuffle_work_dir);
 
     // Wrap the auth in session-awareness to accept session IDs as bearer tokens
     let session_aware_auth = session_auth::with_session_awareness(
@@ -289,13 +320,20 @@ pub async fn start_executor_flight_server(
     let job_executor = rt.job_executor();
     let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
 
-    // Add middleware layers for request context, auth, and rate limiting
+    // Add middleware layers for request context, the sending cluster node, auth,
+    // and rate limiting
     let rate_limits = &rt.rate_limits;
     let mut server = server
         .layer(
             RequestContextLayer::new(rt.app(), rt.datafusion(), rt.secrets())
                 .with_job_executor(job_executor),
         )
+        .layer(ClusterPeerLayer::new(
+            rt.df
+                .cluster_config
+                .tls_config()
+                .map(|tls| Arc::clone(tls.scheduler_identities())),
+        ))
         .layer(auth_layer)
         .layer(FlightSessionLayer::new(
             rt.datafusion(),
@@ -308,27 +346,29 @@ pub async fn start_executor_flight_server(
         ));
 
     let server = server.add_service(
+        // Every cluster client — the scheduler's forwarded writes and scans, peer
+        // executors' shuffle fetches and broadcast-join scans — sends messages no
+        // larger than `flight_client::MAX_ENCODING_MESSAGE_SIZE`, so no larger
+        // message is accepted. Responses carry shuffle data and stay unbounded.
         arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)
-            .max_decoding_message_size(usize::MAX)
+            .max_decoding_message_size(flight_client::MAX_ENCODING_MESSAGE_SIZE)
             .max_encoding_message_size(usize::MAX),
     );
 
-    // Use the executor's bound address if it was dynamically assigned during registration.
-    #[expect(clippy::cast_possible_truncation)]
-    let bind_address = match rt.df.executor.read().ok().and_then(|maybe_executor| {
-        maybe_executor
-            .as_ref()
-            .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
-    }) {
-        Some((host, port)) => match tokio::net::lookup_host((&*host, port)).await {
-            Ok(mut addrs) => addrs.next().unwrap_or(bind_address),
-            Err(e) => {
-                tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
-                bind_address
-            }
-        },
-        None => bind_address,
-    };
+    // Serve where the executor registered: its port, which differs from the configured
+    // one when registration fell back to a dynamic port, at the node bind address.
+    // The registered host is the advertise address, where peers reach this executor:
+    // behind NAT or a published container port it is not an address of this machine,
+    // and binding it fails with "Cannot assign requested address".
+    let bind_address = registered_bind_address(
+        rt.df.cluster_config.node_bind_address().ip(),
+        rt.df
+            .executor
+            .read()
+            .ok()
+            .and_then(|maybe_executor| maybe_executor.as_ref().map(|e| e.metadata.port)),
+        bind_address,
+    );
 
     let serve_result = if let Some(server_config) = cluster_server_config {
         let listener = bind_cluster_listener(bind_address).await?;
@@ -367,4 +407,28 @@ pub async fn start_executor_flight_server(
     tracing::debug!("Spice Runtime executor Flight stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registered_bind_address;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn binds_the_node_bind_address_at_the_registered_port() {
+        let every = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let flight: SocketAddr = "127.0.0.1:50051".parse().expect("address");
+        // The advertise host never enters it: a peer-facing address need not be local.
+        assert_eq!(
+            registered_bind_address(every, Some(29160), flight),
+            SocketAddr::new(every, 29160)
+        );
+        // A dynamic port that registration fell back to.
+        assert_eq!(
+            registered_bind_address(every, Some(41234), flight),
+            SocketAddr::new(every, 41234)
+        );
+        assert_eq!(registered_bind_address(every, None, flight), flight);
+        assert_eq!(registered_bind_address(every, Some(70_000), flight), flight);
+    }
 }

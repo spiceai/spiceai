@@ -16,7 +16,7 @@ limitations under the License.
 
 //! The `Server-Timing` field a `/v1/sql` caller reads its server time from.
 //!
-//! A buffered response carries it in the head. A streamed JSON response is not
+//! A buffered response carries it in the head. A streamed response is not
 //! complete when its head is sent, so it carries the field as a trailer, when
 //! the request allows one. The exact wire bytes are what a driver reads, so the
 //! streamed cases go over a raw connection rather than through a client that
@@ -124,8 +124,8 @@ type BufferedCase = (
 );
 
 /// Every response whose body is complete before its head is sent carries the
-/// server time in the head — each buffered format, and the errors, which are
-/// the responses a caller most wants timed. The value is a server measurement,
+/// server time in the head — the buffered `text/plain` format, and the errors,
+/// which are the responses a caller most wants timed. The value is a server measurement,
 /// so it can never exceed what the client itself waited.
 #[tokio::test]
 async fn a_buffered_sql_response_carries_its_server_time_in_the_head() -> Result<(), String> {
@@ -135,16 +135,8 @@ async fn a_buffered_sql_response_carries_its_server_time_in_the_head() -> Result
         .scope(async {
             let (rt, base_url) = start().await?;
 
-            let cases: [BufferedCase; 5] = [
-                ("csv", "SELECT 1 AS n", Some("text/csv"), None, 200),
+            let cases: [BufferedCase; 3] = [
                 ("plain", "SELECT 1 AS n", Some("text/plain"), None, 200),
-                (
-                    "vnd json",
-                    "SELECT 1 AS n",
-                    Some("application/vnd.spiceai.sql.v1+json"),
-                    None,
-                    200,
-                ),
                 (
                     "query error",
                     "SELECT * FROM no_such_table",
@@ -185,7 +177,7 @@ async fn a_buffered_sql_response_carries_its_server_time_in_the_head() -> Result
         .await
 }
 
-/// The streamed JSON body has not finished when its head is sent, so the head
+/// A streamed body has not finished when its head is sent, so the head
 /// must not carry a number that would read as the total. Without `TE: trailers`
 /// an HTTP/1.1 response cannot carry a trailer either, so it announces none.
 #[tokio::test]
@@ -266,8 +258,8 @@ fn header_line<'a>(section: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(&format!("{name}: ")))
 }
 
-/// With `TE: trailers` the streamed body ends with the total as a trailer the
-/// head declared, and its rows are unchanged by it.
+/// With `TE: trailers` each streamed format's body ends with the total as a
+/// trailer the head declared, and its rows are unchanged by it.
 #[tokio::test]
 async fn a_streamed_sql_response_sends_its_server_time_as_a_trailer() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -278,35 +270,48 @@ async fn a_streamed_sql_response_sends_its_server_time_as_a_trailer() -> Result<
             let sql = "SELECT 1 AS n";
             let host = base_url.trim_start_matches("http://");
 
-            let started = Instant::now();
-            let response = raw_http1(
-                &base_url,
-                &format!(
-                    "POST /v1/sql HTTP/1.1\r\nHost: {host}\r\nContent-Type: text/plain\r\nTE: trailers\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sql}",
-                    sql.len()
+            let formats = [
+                ("application/json", r#"[{"n":1}]"#),
+                (
+                    "application/vnd.spiceai.sql.v1+json",
+                    r#"{"schema":{"fields":[{"name":"n","data_type":"Int64","nullable":false,"dict_id":0,"dict_is_ordered":false,"metadata":{}}],"metadata":{}},"data":[{"n":1}],"row_count":1}"#,
                 ),
-            )
-            .await;
-            let client_ms = started.elapsed().as_secs_f64() * 1000.0;
+                ("text/csv", "n\n1\n"),
+            ];
+            for (accept, rows) in formats {
+                let started = Instant::now();
+                let response = raw_http1(
+                    &base_url,
+                    &format!(
+                        "POST /v1/sql HTTP/1.1\r\nHost: {host}\r\nContent-Type: text/plain\r\nAccept: {accept}\r\nTE: trailers\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sql}",
+                        sql.len()
+                    ),
+                )
+                .await;
+                let client_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-            let (head, body, trailers) = split_chunked(&response);
-            assert!(head.starts_with("http/1.1 200"), "status line: {head}");
-            assert_eq!(header_line(&head, "server-timing"), None, "no total in the head");
-            assert_eq!(
-                header_line(&head, "trailer"),
-                Some("server-timing"),
-                "the head declares the trailer"
-            );
-            assert_eq!(body, r#"[{"n":1}]"#, "the rows are unchanged");
-            let server_ms = parse_total(
-                header_line(&trailers, "server-timing")
-                    .unwrap_or_else(|| panic!("no `server-timing` trailer in `{trailers}`")),
-            );
-            assert!(
-                server_ms > 0.0 && server_ms <= client_ms,
-                "the server time {server_ms} ms must be positive and within the {client_ms} ms \
-                 the client waited"
-            );
+                let (head, body, trailers) = split_chunked(&response);
+                assert!(head.starts_with("http/1.1 200"), "{accept}: status line: {head}");
+                assert_eq!(
+                    header_line(&head, "server-timing"),
+                    None,
+                    "{accept}: no total in the head"
+                );
+                assert_eq!(
+                    header_line(&head, "trailer"),
+                    Some("server-timing"),
+                    "{accept}: the head declares the trailer"
+                );
+                assert_eq!(body, rows, "{accept}: the rows are unchanged");
+                let server_ms = parse_total(header_line(&trailers, "server-timing").unwrap_or_else(
+                    || panic!("{accept}: no `server-timing` trailer in `{trailers}`"),
+                ));
+                assert!(
+                    server_ms > 0.0 && server_ms <= client_ms,
+                    "{accept}: the server time {server_ms} ms must be positive and within the \
+                     {client_ms} ms the client waited"
+                );
+            }
 
             // The same request without `TE: trailers` ends with an empty trailer
             // section rather than an announced field that never arrives.

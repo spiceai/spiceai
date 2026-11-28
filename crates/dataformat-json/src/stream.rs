@@ -932,6 +932,7 @@ pub fn soda_schema_from_meta(
 pub struct SodaReader {
     inner: io::Cursor<Vec<u8>>,
     schema: Schema,
+    row_count: usize,
 }
 
 impl SodaReader {
@@ -1057,6 +1058,7 @@ impl SodaReader {
         Ok(Self {
             inner: io::Cursor::new(ndjson),
             schema,
+            row_count: data.len(),
         })
     }
 
@@ -1064,6 +1066,12 @@ impl SodaReader {
     #[must_use]
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Returns how many rows the response's `data` array holds.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.row_count
     }
 }
 
@@ -3093,7 +3101,7 @@ mod tests {
             let input = Cursor::new(b"[]".to_vec());
             let mut adapter = ArrayToNdjson::try_new(input).expect("should parse empty array");
             let lines = read_all_lines(&mut adapter).expect("should read lines");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         /// JSON array with a single element
@@ -3607,7 +3615,7 @@ mod tests {
                 // Either we get an error or we get partial results
                 if let Ok(lines) = result {
                     // If it somehow succeeded, we should at least have the valid element
-                    assert!(!lines.is_empty());
+                    assert_ne!(lines, [] as [String; 0]);
                 }
             }
         }
@@ -3869,7 +3877,7 @@ mod tests {
             let mut output = String::new();
             let mut reader = soda;
             std::io::Read::read_to_string(&mut reader, &mut output).expect("should read");
-            assert!(output.trim().is_empty());
+            assert_eq!(output.trim(), "");
         }
 
         #[test]
@@ -5257,7 +5265,7 @@ mod tests {
             let lines =
                 ndjson_lines(&empty).expect("whitespace in an empty array must still parse");
             let elapsed = started.elapsed();
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
             assert!(
                 elapsed < limit,
                 "skipping {SPACES} empty-array bytes took {elapsed:?}"
@@ -5313,10 +5321,9 @@ mod tests {
         let mut empty = vec![b'['];
         empty.resize(empty.len() + 1024 * 1024, b' ');
         empty.push(b']');
-        assert!(
-            push_chunked(&empty, 4096)
-                .expect("gap in an empty array")
-                .is_empty()
+        assert_eq!(
+            push_chunked(&empty, 4096).expect("gap in an empty array"),
+            [] as [String; 0]
         );
 
         let mut small = br"[1".to_vec();
@@ -5458,6 +5465,12 @@ mod tests {
     }
 
     /// One push of many small elements must not copy the tail once per element.
+    ///
+    /// Copying the tail per element makes the single 2 MiB push quadratic,
+    /// while 4 KiB pushes cap each copy at the chunk. The whole-body push is
+    /// therefore timed against the chunked one on the same host rather than
+    /// against a fixed budget, which a contended runner misses. The fastest of
+    /// three rounds per size drops stalls caused by other load.
     #[test]
     fn push_reader_does_not_copy_the_tail_once_per_element() {
         let elem = br#"{"id":1},"#;
@@ -5470,7 +5483,7 @@ mod tests {
         }
         body.push(b']');
         let expected_rows = (body.len() - 1) / elem.len();
-        for chunk_size in [body.len(), 4096] {
+        let push_all = |chunk_size: usize| {
             let mut adapter = ArrayToNdjsonPush::new();
             let started = std::time::Instant::now();
             for chunk in body.chunks(chunk_size) {
@@ -5478,11 +5491,6 @@ mod tests {
             }
             adapter.finish().expect("finish");
             let elapsed = started.elapsed();
-            assert!(
-                elapsed < std::time::Duration::from_secs(2),
-                "chunk size {chunk_size} took {elapsed:?}"
-            );
-            eprintln!("2 MiB chunk_size={chunk_size} elapsed={elapsed:?}");
             let ReadResult::Ready(rows) = adapter.try_read() else {
                 panic!("expected all rows before end of stream");
             };
@@ -5494,7 +5502,19 @@ mod tests {
             );
             assert!(matches!(adapter.try_read(), ReadResult::Eof));
             assert_eq!(adapter.buffered_len(), 0);
+            elapsed
+        };
+        let mut whole = std::time::Duration::MAX;
+        let mut chunked = std::time::Duration::MAX;
+        for _ in 0..3 {
+            whole = whole.min(push_all(body.len()));
+            chunked = chunked.min(push_all(4096));
         }
+        eprintln!("2 MiB whole push={whole:?} 4 KiB pushes={chunked:?}");
+        assert!(
+            whole < chunked * 10,
+            "one 2 MiB push took {whole:?}, more than 10x the {chunked:?} of 4 KiB pushes"
+        );
     }
 
     mod file_jsonl_tests {
@@ -5604,7 +5624,7 @@ mod tests {
             let adapter =
                 ArrayToNdjson::try_new(Cursor::new(data)).expect("should parse empty array");
             let lines = read_all_lines(adapter).expect("should read");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         #[test]
@@ -5631,7 +5651,10 @@ mod tests {
             assert_eq!(r0["meta"]["version"], 1);
 
             let r2: serde_json::Value = serde_json::from_str(&lines[2]).expect("parse");
-            assert!(r2["tags"].as_array().expect("tags").is_empty());
+            assert_eq!(
+                r2["tags"].as_array().expect("tags").as_slice(),
+                [] as [serde_json::Value; 0]
+            );
         }
 
         #[test]
@@ -5669,7 +5692,7 @@ mod tests {
         fn test_file_array_empty_auto_detect() {
             let data = load_fixture("array_empty.json");
             let lines = auto_detect_and_read(&data).expect("auto-detect empty array");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
 
         #[test]
@@ -6049,7 +6072,7 @@ mod tests {
         fn test_file_soda_empty_data_auto_detect() {
             let data = load_fixture("soda_empty_data.json");
             let lines = auto_detect_and_read(&data).expect("auto-detect empty SODA");
-            assert!(lines.is_empty());
+            assert_eq!(lines, [] as [String; 0]);
         }
     }
 

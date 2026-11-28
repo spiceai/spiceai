@@ -1,0 +1,907 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Time-bounded retention: readers never write, and GC needs no generations.
+//!
+//! Removed objects are deleted a fixed retention `T` after GC observes their
+//! removal, and the removal stays recorded in durable state until then. Uploads
+//! that never committed are deleted once the head's `LastModified` is `T_O`
+//! past theirs. A writer references only objects live in its CAS base or its
+//! own uploads it has never published, while its base's store time is less
+//! than `T_O - M` past a lower bound on the upload's. Every age is a
+//! difference of two store timestamps; object timestamps may lag that lower
+//! bound by up to `DRIFT`. Every object has a fresh name. A query starts from
+//! a head confirmed within `S` of when its request was sent.
+//!
+//! With `remote-gc`, GC runs on another node under its own lease: its empty
+//! commit is a CAS that races the writer's, a second GC node can take the
+//! lease over, and deletes the first node already issued land afterwards.
+//! With `checkpoint`, removals are durable only as records after the floor
+//! and as the checkpoint root's pending-removals list; a checkpoint moves the
+//! floor and drops the records below it, and a GC restart rebuilds its
+//! pending set from the root and the records after the floor.
+use stateright::{Model, Property};
+
+const N: usize = 2;
+/// Reader retention.
+const T: u8 = 3;
+/// Reader staleness bound: a query starts from a state confirmed this recently.
+const S: u8 = 1;
+/// Age at which an unreferenced upload may be collected.
+const T_O: u8 = 4;
+/// Store timestamp error between servers.
+const DRIFT: u8 = 1;
+const HORIZON: u8 = 9;
+const SHORT_HORIZON: u8 = 7;
+const VERSIONS: u8 = 6;
+
+#[derive(Clone, Debug)]
+pub(crate) struct Protocol {
+    mode: String,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum Sweep {
+    #[default]
+    Idle,
+    Listed,
+    Selected,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent finite-state protocol facts and witness flags"
+)]
+pub(crate) struct State {
+    /// The store's clock, which GC and readers also use for their timers.
+    now: u8,
+    /// How far the store's clock ran ahead of the writer's own clock.
+    lag: u8,
+    version: u8,
+    /// The head's `LastModified`.
+    head_time: u8,
+    leases: u8,
+    used: [bool; N],
+    present: [bool; N],
+    /// Store `LastModified`.
+    modified: [u8; N],
+    /// The current writer's own unpublished uploads, each with a lower bound
+    /// on its store time.
+    started: [Option<u8>; N],
+    live: [bool; N],
+    /// Durable record of each removal not yet deleted, with when GC observed it.
+    removed: [Option<u8>; N],
+    /// A delete of a removed object, issued and not yet applied.
+    collecting: [bool; N],
+    inflight: Option<(usize, u8)>,
+    sweep: Sweep,
+    candidates: [bool; N],
+    sweeps: u8,
+    bumped: bool,
+    /// A head GET: when its request was sent and what it read.
+    confirming: Option<(u8, [bool; N])>,
+    confirmed: Option<(u8, [bool; N])>,
+    query: Option<(u8, [bool; N])>,
+    read: [bool; N],
+    result: Option<bool>,
+    bad_rows: bool,
+    bad_availability: bool,
+    orphan_collected: bool,
+    idle_orphan_collected: bool,
+    removed_collected: bool,
+    collected_young_upload: bool,
+    refused: bool,
+    late_error: bool,
+    late_response: bool,
+    restarted_timers: bool,
+    /// GC's empty commit in flight: whether the head is still the version it
+    /// read (its CAS condition), and the live set it read.
+    gc_inflight: Option<(bool, [bool; N])>,
+    gc_lost: bool,
+    gc_retried: bool,
+    gc_leases: u8,
+    /// A delete issued by a GC node that has since lost its lease.
+    stale: [bool; N],
+    /// The new GC node has listed since it took over.
+    gc_moved: bool,
+    stale_landed: bool,
+    /// A removal recorded in a record after the floor.
+    logged: [bool; N],
+    /// A removal in the checkpoint root's pending-removals list.
+    rooted: [bool; N],
+    checkpoints: u8,
+    rebuilt_from_root: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Action {
+    Tick,
+    /// The store's clock jumps ahead of the writer's own clock.
+    Jump,
+    /// An upload whose `LastModified` lags the writer's lower bound by the skew.
+    Upload(usize, u8),
+    Dispatch(usize),
+    Refuse(usize),
+    Land,
+    Remove(usize),
+    Bump,
+    /// A remote GC node sends its empty commit, conditioned on the head it read.
+    GcDispatch,
+    GcLand,
+    /// Another GC node takes over the GC lease.
+    GcTakeover,
+    /// The writer moves the floor to a new checkpoint root.
+    Checkpoint,
+    Takeover,
+    Expire(usize),
+    Collect(usize),
+    List,
+    Select,
+    Delete(usize),
+    Confirm,
+    Respond,
+    Start,
+    Get(usize),
+}
+impl Protocol {
+    pub(crate) fn new(mode: &str) -> Self {
+        Self { mode: mode.into() }
+    }
+    fn has(&self, flag: &str) -> bool {
+        self.mode.contains(flag)
+    }
+    /// The reader graph adds one query; the writer graph adds store
+    /// timestamp skew and checks only references.
+    fn readers(&self) -> bool {
+        self.has("readers")
+    }
+    /// The reader graph ends once its query has a result or can no longer
+    /// start; references are checked in the writer graph.
+    fn settled(&self, s: &State) -> bool {
+        s.result.is_some()
+            || (s.query.is_none()
+                && !self.has("stale-start")
+                && s.confirmed.is_some_and(|(at, _)| s.now - at > S))
+    }
+    fn retention(&self) -> u8 {
+        if self.has("no-retention") { 0 } else { T }
+    }
+    /// The reader graphs with remote GC or checkpoints stop the clock earlier
+    /// to stay tractable, and the one with both earlier still; an aged upload,
+    /// a removal, a checkpoint and a takeover still fit before the horizon.
+    fn horizon(&self) -> u8 {
+        match (self.readers(), self.remote_gc(), self.checkpoint()) {
+            (true, true, true) => SHORT_HORIZON - 1,
+            (true, true, false) | (true, false, true) => SHORT_HORIZON,
+            _ => HORIZON,
+        }
+    }
+    /// The writer may reference its upload only while its base is less than
+    /// `T_O - M` past the upload by the store's clock.
+    fn young(&self, s: &State, started: u8) -> bool {
+        let margin = if self.has("no-margin") { 0 } else { DRIFT };
+        if self.has("no-age-check") {
+            return true;
+        }
+        if self.has("writer-clock") {
+            // Its own monotonic clock, which a jump of the store's clock does not move.
+            return (s.now - s.lag).saturating_sub(started) < T_O - margin;
+        }
+        s.head_time.saturating_sub(started) < T_O - margin
+    }
+    fn referenceable(&self, s: &State, o: usize) -> Option<u8> {
+        if s.live[o] || !s.present[o] {
+            return None;
+        }
+        if self.has("reuse-found") && s.started[o].is_none() && s.removed[o].is_none() {
+            // Deduplicate by finding an object already at the address.
+            return Some(s.now);
+        }
+        s.started[o]
+    }
+    /// GC's age of an object: the head's `LastModified` minus the object's.
+    fn old(&self, s: &State, o: usize) -> bool {
+        let at = if self.has("list-date") {
+            s.now
+        } else {
+            s.head_time
+        };
+        at.saturating_sub(s.modified[o]) >= T_O
+    }
+    fn head_write(s: &mut State) {
+        s.version += 1;
+        s.head_time = s.now;
+        if let Some((current, _)) = &mut s.gc_inflight {
+            // GC's pending empty commit is now conditioned on a stale version.
+            *current = false;
+        }
+    }
+    fn remote_gc(&self) -> bool {
+        self.has("remote-gc")
+    }
+    fn checkpoint(&self) -> bool {
+        self.has("checkpoint")
+    }
+    /// Whether durable state still lists a removal as pending: the root's
+    /// list with the records after the floor applied.
+    fn durable_removal(&self, s: &State, o: usize) -> bool {
+        let root = s.rooted[o] && !s.live[o] && !self.has("tail-only");
+        root || s.logged[o]
+    }
+    /// A new GC instance: its pending set comes from durable state, and every
+    /// timer restarts on its own clock.
+    fn restart_gc(&self, s: &State, n: &mut State) {
+        if self.has("volatile-removals") {
+            // The removals lived only in the predecessor's memory.
+            n.removed = [None; N];
+        }
+        if self.checkpoint() {
+            for o in 0..N {
+                let durable = self.durable_removal(s, o);
+                n.rebuilt_from_root |=
+                    durable && s.rooted[o] && !s.logged[o] && s.present[o] && !s.collecting[o];
+                n.removed[o] = durable.then(|| s.removed[o].unwrap_or(s.now));
+            }
+        }
+        for r in n.removed.iter_mut().flatten() {
+            if self.has("keep-timestamps") {
+                // The predecessor's clock read one tick ahead.
+                *r = r.saturating_sub(1);
+            } else {
+                n.restarted_timers |= *r < s.now;
+                *r = s.now;
+            }
+        }
+    }
+}
+impl Model for Protocol {
+    type State = State;
+    type Action = Action;
+    fn init_states(&self) -> Vec<State> {
+        vec![State::default()]
+    }
+    fn actions(&self, s: &State, a: &mut Vec<Action>) {
+        if self.readers() && self.settled(s) {
+            return;
+        }
+        if s.now < self.horizon() {
+            a.push(Action::Tick);
+        }
+        if self.has("writer-clock") && s.lag == 0 && s.now + T_O <= HORIZON {
+            a.push(Action::Jump);
+        }
+        for o in 0..N {
+            // Names are interchangeable, so uploads take them in order.
+            if !s.used[o] && (o == 0 || s.used[o - 1]) {
+                a.push(Action::Upload(o, 0));
+                if !self.readers() && s.now >= DRIFT {
+                    a.push(Action::Upload(o, DRIFT));
+                }
+            }
+            if s.inflight.is_none() && s.version < VERSIONS {
+                if let Some(started) = self.referenceable(s, o) {
+                    if self.young(s, started) {
+                        a.push(Action::Dispatch(o));
+                    } else if s.started[o].is_some() {
+                        a.push(Action::Refuse(o));
+                    }
+                }
+                if s.live[o] {
+                    a.push(Action::Remove(o));
+                }
+            }
+            if s.removed[o].is_some() && s.present[o] && !s.collecting[o] {
+                a.push(Action::Expire(o));
+            }
+            if s.collecting[o] {
+                a.push(Action::Collect(o));
+            }
+            if s.sweep == Sweep::Selected && s.candidates[o] {
+                a.push(Action::Delete(o));
+            }
+            if self.readers()
+                && s.query.is_some()
+                && s.result.is_none()
+                && s.query.is_some_and(|q| q.1[o])
+                && !s.read[o]
+            {
+                a.push(Action::Get(o));
+            }
+        }
+        if s.inflight.is_some() {
+            a.push(Action::Land);
+        }
+        // With remote GC, a writer takeover leaves GC's timers alone and is
+        // otherwise checked in the in-process graph; the GC takeover replaces it.
+        if s.leases == 0 && s.version < VERSIONS && !self.remote_gc() {
+            a.push(Action::Takeover);
+        }
+        match s.sweep {
+            Sweep::Idle if s.sweeps < 2 => a.push(Action::List),
+            Sweep::Listed => {
+                a.push(Action::Select);
+                // GC's empty commit, so an idle head's time advances.
+                if !s.bumped && s.version < VERSIONS {
+                    if !self.remote_gc() {
+                        a.push(Action::Bump);
+                    } else if s.gc_inflight.is_none() {
+                        a.push(Action::GcDispatch);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if s.gc_inflight.is_some() {
+            a.push(Action::GcLand);
+        }
+        if self.remote_gc() && s.gc_leases == 0 {
+            a.push(Action::GcTakeover);
+        }
+        if self.checkpoint()
+            && s.checkpoints == 0
+            && s.inflight.is_none()
+            && s.version < VERSIONS
+            && s.logged.contains(&true)
+        {
+            a.push(Action::Checkpoint);
+        }
+        // A head with nothing live cannot start a query.
+        if self.readers()
+            && s.confirmed.is_none()
+            && (s.confirming.is_some() || s.live.contains(&true))
+        {
+            a.push(if s.confirming.is_none() {
+                Action::Confirm
+            } else {
+                Action::Respond
+            });
+        }
+        if s.query.is_none() && s.confirmed.is_some() {
+            a.push(Action::Start);
+        }
+        crate::prune_for_simulation(self, s, a);
+    }
+    fn next_state(&self, s: &State, a: Action) -> Option<State> {
+        let mut n = s.clone();
+        match a {
+            Action::Tick => n.now += 1,
+            Action::Jump => {
+                n.now += T_O;
+                n.lag = T_O;
+            }
+            Action::Upload(o, skew) => {
+                n.used[o] = true;
+                n.present[o] = true;
+                n.modified[o] = s.now - skew;
+                n.started[o] = Some(if self.has("writer-clock") {
+                    s.now - s.lag
+                } else {
+                    s.now
+                });
+            }
+            Action::Dispatch(o) => n.inflight = Some((o, s.version)),
+            Action::Refuse(o) => {
+                n.started[o] = None;
+                n.refused = !self.readers();
+            }
+            Action::Land => {
+                let (o, base) = s.inflight?;
+                n.inflight = None;
+                if base == s.version {
+                    Self::head_write(&mut n);
+                    n.live[o] = true;
+                    n.removed[o] = None;
+                    n.logged[o] = false;
+                    if !self.has("reref-published") {
+                        // Published: from now on it is referenced only while live.
+                        n.started[o] = None;
+                    }
+                }
+            }
+            Action::Remove(o) => {
+                Self::head_write(&mut n);
+                n.live[o] = false;
+                n.removed[o] = Some(s.now);
+                n.logged[o] = self.checkpoint();
+            }
+            Action::Bump => {
+                Self::head_write(&mut n);
+                n.bumped = true;
+            }
+            Action::GcDispatch => {
+                // Only the blind write needs the live set it read.
+                let read = if self.has("blind-commit") {
+                    s.live
+                } else {
+                    [false; N]
+                };
+                n.gc_inflight = Some((true, read));
+            }
+            Action::GcLand => {
+                let (current, read) = s.gc_inflight?;
+                n.gc_inflight = None;
+                if self.has("blind-commit") {
+                    // An unconditional PUT of the head GC read.
+                    Self::head_write(&mut n);
+                    n.live = read;
+                    n.bumped = true;
+                } else if current {
+                    Self::head_write(&mut n);
+                    n.bumped = true;
+                    n.gc_retried |= s.gc_lost;
+                } else {
+                    // Lost to the writer's commit; GC may read the head again.
+                    n.gc_lost = !self.readers();
+                }
+            }
+            Action::GcTakeover => {
+                n.gc_leases += 1;
+                // The old node's selected deletes are already issued and land
+                // whenever the store applies them; its listing is gone.
+                for o in 0..N {
+                    if s.sweep == Sweep::Selected && s.candidates[o] {
+                        n.collecting[o] = true;
+                    }
+                    // Tracked for the witness, in the writer graph only.
+                    n.stale[o] = n.collecting[o] && !self.readers();
+                }
+                n.sweep = Sweep::Idle;
+                n.candidates = [false; N];
+                self.restart_gc(s, &mut n);
+            }
+            Action::Checkpoint => {
+                Self::head_write(&mut n);
+                n.checkpoints += 1;
+                for o in 0..N {
+                    // The root lists every removal not yet deleted, and the
+                    // records below the new floor are dropped.
+                    n.rooted[o] =
+                        !self.has("root-omits") && self.durable_removal(s, o) && s.present[o];
+                }
+                n.logged = [false; N];
+            }
+            Action::Takeover => {
+                Self::head_write(&mut n);
+                n.leases += 1;
+                n.started = [None; N];
+                if !self.remote_gc() {
+                    // GC runs in the writer's process.
+                    self.restart_gc(s, &mut n);
+                }
+            }
+            Action::Expire(o) => {
+                if s.now < s.removed[o]? + self.retention() {
+                    return None;
+                }
+                n.collecting[o] = true;
+                // Without the publication rule, its writer could still reference it.
+                n.collected_young_upload |=
+                    !self.readers() && s.head_time.saturating_sub(s.modified[o]) < T_O - DRIFT;
+            }
+            Action::Collect(o) => {
+                n.collecting[o] = false;
+                n.present[o] = false;
+                n.removed_collected |= s.removed[o].is_some();
+                n.stale[o] = false;
+                n.stale_landed |= s.stale[o] && s.gc_moved;
+            }
+            Action::List => {
+                n.candidates = s.present;
+                if !n.candidates.contains(&true) {
+                    return None;
+                }
+                n.sweep = Sweep::Listed;
+                n.sweeps += 1;
+                n.bumped = false;
+                n.gc_moved |= s.gc_leases > 0 && !self.readers();
+            }
+            Action::Select => {
+                for o in 0..N {
+                    n.candidates[o] = s.candidates[o]
+                        && s.present[o]
+                        && !s.live[o]
+                        && (s.removed[o].is_none() || self.has("sweep-removed"))
+                        && self.old(s, o);
+                }
+                n.sweep = if n.candidates.contains(&true) {
+                    Sweep::Selected
+                } else {
+                    Sweep::Idle
+                };
+            }
+            Action::Delete(o) => {
+                n.candidates[o] = false;
+                n.present[o] = false;
+                n.orphan_collected = true;
+                n.idle_orphan_collected |= !self.readers() && s.bumped;
+                if !n.candidates.contains(&true) {
+                    n.sweep = Sweep::Idle;
+                }
+            }
+            Action::Confirm => n.confirming = Some((s.now, s.live)),
+            Action::Respond => {
+                let (requested, set) = s.confirming?;
+                n.confirming = None;
+                n.late_response |= s.now > requested;
+                let at = if self.has("response-time") {
+                    s.now
+                } else {
+                    requested
+                };
+                n.confirmed = Some((at, set));
+            }
+            Action::Start => {
+                let (at, set) = s.confirmed?;
+                if !self.has("stale-start") && s.now - at > S {
+                    return None;
+                }
+                if !set.contains(&true) {
+                    return None;
+                }
+                n.query = Some((s.now, set));
+                // Its time no longer matters once the query has started.
+                n.confirmed = Some((0, set));
+            }
+            Action::Get(o) => {
+                let (start, set) = s.query?;
+                n.read[o] = true;
+                if !s.present[o] {
+                    n.bad_availability |= s.now - start < T - S;
+                    if self.has("missing-as-empty") {
+                        n.bad_rows = true;
+                    } else {
+                        n.result = Some(false);
+                        n.late_error = true;
+                        return Some(n);
+                    }
+                }
+                if (0..N).all(|p| !set[p] || n.read[p]) {
+                    n.result = Some(true);
+                }
+            }
+        }
+        if n == *s { None } else { Some(n) }
+    }
+    fn format_action(&self, action: &Action) -> String {
+        match action {
+            Action::Tick => "the store clock ticks".into(),
+            Action::Jump => "the store clock jumps ahead of the writer's clock".into(),
+            Action::Upload(o, 0) => format!("the writer uploads object {o}"),
+            Action::Upload(o, skew) => {
+                format!("the writer uploads object {o} (timestamp lags by {skew})")
+            }
+            Action::Dispatch(o) => format!("the writer sends a commit referencing object {o}"),
+            Action::Refuse(o) => format!("the writer refuses to reference object {o} (too old)"),
+            Action::Land => "the writer's commit arrives".into(),
+            Action::Remove(o) => format!("a commit removes object {o} from the head"),
+            Action::Bump => "an empty commit moves the head".into(),
+            Action::GcDispatch => "remote GC sends its empty commit".into(),
+            Action::GcLand => "remote GC's commit arrives".into(),
+            Action::GcTakeover => "another node takes over the GC lease".into(),
+            Action::Checkpoint => "the writer writes a checkpoint (moves the floor)".into(),
+            Action::Takeover => "a writer takeover".into(),
+            Action::Expire(o) => {
+                format!("object {o}'s removal passes retention; GC issues its delete")
+            }
+            Action::Collect(o) => format!("the delete of object {o} lands"),
+            Action::List => "GC lists stored objects".into(),
+            Action::Select => "GC selects old unreferenced uploads".into(),
+            Action::Delete(o) => format!("GC deletes orphan object {o}"),
+            Action::Confirm => "the reader sends a head GET".into(),
+            Action::Respond => "the head GET responds".into(),
+            Action::Start => "a query starts from the confirmed head".into(),
+            Action::Get(o) => format!("the query reads object {o}"),
+        }
+    }
+    fn format_step(&self, last_state: &State, action: Action) -> Option<String> {
+        let s = self.next_state(last_state, action)?;
+        Some(crate::explorer::summary(&[
+            format!(
+                "retention T = {T}, staleness S = {S}, upload age T_O = {T_O}, timestamp error {DRIFT}"
+            ),
+            format!(
+                "store clock {} (ahead of writer by {}); head version {} written at {}; writer leases {}, GC leases {}",
+                s.now, s.lag, s.version, s.head_time, s.leases, s.gc_leases
+            ),
+            format!("checkpoints {}; sweeps {}", s.checkpoints, s.sweeps),
+            crate::explorer::flags(&[
+                ("orphan collected", s.orphan_collected),
+                ("removed object collected", s.removed_collected),
+                ("GC timers restarted", s.restarted_timers),
+                ("GC lost its commit", s.gc_lost),
+                ("GC retried", s.gc_retried),
+                ("stale delete landed", s.stale_landed),
+                ("pending set rebuilt from root", s.rebuilt_from_root),
+                ("late GET response", s.late_response),
+                ("query error after retention", s.late_error),
+                ("BAD rows", s.bad_rows),
+                ("BAD availability", s.bad_availability),
+                ("BAD young upload collected", s.collected_young_upload),
+            ]),
+        ]))
+    }
+    fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+        use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+        let last = path.last_state().clone();
+        let mut boxes = vec![(
+            format!(
+                "HEAD (version {}, written at {})",
+                last.version, last.head_time
+            ),
+            vec![
+                format!(
+                    "live: {}",
+                    (0..N)
+                        .filter(|o| last.live[*o])
+                        .map(|o| format!("object {o}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!("store clock {}", last.now),
+            ],
+            Tone::Live,
+        )];
+        for o in 0..N {
+            if !last.used[o] {
+                continue;
+            }
+            let mut lines = vec![format!(
+                "{} (LastModified {})",
+                if last.present[o] { "stored" } else { "deleted" },
+                last.modified[o]
+            )];
+            if let Some(at) = last.removed[o] {
+                lines.push(format!(
+                    "removed at {at}; deletable at {}",
+                    at + self.retention()
+                ));
+            }
+            if let Some(at) = last.started[o] {
+                lines.push(format!("writer's own upload, started >= {at}"));
+            }
+            if last.collecting[o] {
+                lines.push("delete issued, not landed".into());
+            }
+            if last.stale[o] {
+                lines.push("delete issued by a GC node that lost its lease".into());
+            }
+            if last.logged[o] {
+                lines.push("removal recorded after the floor".into());
+            }
+            if last.rooted[o] {
+                lines.push("removal listed in the checkpoint root".into());
+            }
+            let tone = if !last.present[o] {
+                if last.live[o] { Tone::Bad } else { Tone::Gone }
+            } else if last.live[o] {
+                Tone::Live
+            } else {
+                Tone::Staged
+            };
+            boxes.push((format!("OBJECT {o}"), lines, tone));
+        }
+        if let Some((start, set)) = last.query {
+            let needs: Vec<String> = (0..N).filter(|o| set[*o]).map(|o| format!("{o}")).collect();
+            boxes.push((
+                format!("QUERY (started {start})"),
+                vec![
+                    format!("reads objects {}", needs.join(", ")),
+                    crate::explorer::query_outcome(
+                        last.result,
+                        last.bad_availability,
+                        last.bad_rows,
+                    )
+                    .0
+                    .into(),
+                ],
+                crate::explorer::query_outcome(last.result, last.bad_availability, last.bad_rows).1,
+            ));
+        }
+        let (writer, head, gc, store, reader) = (0, 1, 2, 3, 4);
+        let lanes = ["writer", "head", "GC", "object store", "reader"]
+            .map(String::from)
+            .to_vec();
+        let mut events = vec![];
+        for (before, action, after) in steps(path) {
+            let label = self.format_action(&action);
+            let event = match action {
+                Action::Tick | Action::Jump => {
+                    Event::on(store, format!("clock -> {}", after.now)).tone(Tone::Gone)
+                }
+                Action::Upload(..) => Event::on(writer, label).to(store).tone(Tone::Staged),
+                Action::Dispatch(_) => Event::on(writer, label).to(head).tone(Tone::Staged),
+                Action::Refuse(_) => Event::on(writer, label).tone(Tone::Gone),
+                Action::Land => {
+                    let ok = after.version > before.version;
+                    Event::on(
+                        writer,
+                        if ok {
+                            "commit lands"
+                        } else {
+                            "commit refused (head moved)"
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::Remove(_) | Action::Bump | Action::Checkpoint | Action::Takeover => {
+                    Event::on(writer, label).to(head)
+                }
+                Action::GcDispatch => Event::on(gc, label).to(head).tone(Tone::Staged),
+                Action::GcLand => {
+                    let ok = after.version > before.version;
+                    Event::on(
+                        gc,
+                        if ok {
+                            "GC commit lands"
+                        } else {
+                            "GC commit lost the race"
+                        },
+                    )
+                    .to(head)
+                    .tone(if ok { Tone::Live } else { Tone::Gone })
+                }
+                Action::GcTakeover => Event::on(gc, label).tone(Tone::Actor),
+                Action::Expire(_) | Action::Delete(_) | Action::List | Action::Select => {
+                    Event::on(gc, label).to(store)
+                }
+                Action::Collect(_) => Event::on(store, label),
+                Action::Confirm => Event::on(reader, label).to(head).tone(Tone::Staged),
+                Action::Respond => Event::on(head, label).to(reader),
+                Action::Start => Event::on(reader, label).tone(Tone::Actor),
+                Action::Get(o) => {
+                    let (text, tone) = crate::explorer::fetch_event(
+                        o,
+                        before.present[o],
+                        after.bad_availability && !before.bad_availability,
+                        after.bad_rows && !before.bad_rows,
+                        label,
+                    );
+                    Event::on(reader, text).to(store).tone(tone)
+                }
+            };
+            events.push(event.breaking(&crate::explorer::broken(self, &before, &after)));
+        }
+        Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+    }
+    fn properties(&self) -> Vec<Property<Self>> {
+        let mut properties = vec![
+            Property::always(
+                "committed state references only present objects",
+                |_, s: &State| (0..N).all(|o| !s.live[o] || s.present[o]),
+            ),
+            Property::always("rows or an error", |_, s: &State| {
+                s.result != Some(true) || !s.bad_rows
+            }),
+            Property::always(
+                "a query within the retention never fails",
+                |_, s: &State| !s.bad_availability,
+            ),
+            Property::sometimes("never-committed upload collected by age", |_, s: &State| {
+                s.orphan_collected
+            }),
+            Property::sometimes(
+                "removed object collected after retention",
+                |_, s: &State| s.removed_collected,
+            ),
+            Property::sometimes("takeover restarts removal timers", |_, s: &State| {
+                s.restarted_timers
+            }),
+        ];
+        if self.readers() {
+            properties.extend([
+                Property::sometimes("query past the retention errors", |_, s: &State| {
+                    s.late_error
+                }),
+                Property::sometimes("head response arrives after its request", |_, s: &State| {
+                    s.late_response && s.query.is_some()
+                }),
+            ]);
+        } else {
+            properties.extend([
+                Property::sometimes(
+                    "upload collected after GC's empty commit",
+                    |_, s: &State| s.idle_orphan_collected,
+                ),
+                Property::sometimes(
+                    "removed object collected while its upload is still young",
+                    |_, s: &State| s.collected_young_upload,
+                ),
+                Property::sometimes("old upload refused at commit", |_, s: &State| s.refused),
+            ]);
+        }
+        if self.remote_gc() && !self.readers() {
+            properties.extend([
+                Property::sometimes(
+                    "GC empty commit loses a race and retries",
+                    |_, s: &State| s.gc_retried,
+                ),
+                Property::sometimes(
+                    "stale GC node's delete lands after takeover",
+                    |_, s: &State| s.stale_landed,
+                ),
+            ]);
+        }
+        if self.checkpoint() {
+            properties.push(Property::sometimes(
+                "takeover rebuilds a removal from the checkpoint root",
+                |_, s: &State| s.rebuilt_from_root,
+            ));
+        }
+        properties
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use crate::explorer::{Tone, fetch_event, query_outcome};
+
+    /// A read that finds its object deleted after the retention has passed
+    /// breaks no property, so the timeline draws a plain grey miss.
+    #[test]
+    fn late_miss_is_not_drawn_as_a_violation() {
+        use super::{Action, Protocol};
+        use stateright::{Model, Path};
+        let model = Protocol::new("retention-readers");
+        let init = model.init_states().remove(0);
+        let actions = [
+            Action::Upload(0, 0),
+            Action::Dispatch(0),
+            Action::Land,
+            Action::Confirm,
+            Action::Respond,
+            Action::Start,
+            Action::Remove(0),
+            Action::Tick,
+            Action::Tick,
+            Action::Tick,
+            Action::Expire(0),
+            Action::Collect(0),
+            Action::Get(0),
+        ];
+        let path = Path::from_actions(&model, init, &actions).expect("enabled trace");
+        assert!(!path.last_state().bad_availability);
+        let svg = model.as_svg(path).expect("retention draws");
+        assert!(svg.contains("object 0 is missing"), "{svg}");
+        assert!(!svg.contains("BREAKS"), "{svg}");
+        assert!(!svg.contains("is MISSING"), "{svg}");
+    }
+
+    /// Only an outcome the properties forbid is drawn as a violation, and the
+    /// two violations are named apart: a missing object read as empty returns
+    /// wrong rows even after the window, which is not a failure within it.
+    #[test]
+    fn only_forbidden_query_outcomes_are_violations() {
+        let cases = [
+            (
+                (Some(false), false, false),
+                ("error after the window (allowed)", Tone::Gone),
+            ),
+            (
+                (Some(false), true, false),
+                ("FAILED within the window", Tone::Bad),
+            ),
+            (
+                (Some(true), false, true),
+                ("WRONG ROWS (a missing object read as empty)", Tone::Bad),
+            ),
+            (
+                (Some(true), true, true),
+                (
+                    "FAILED within the window and returned WRONG ROWS",
+                    Tone::Bad,
+                ),
+            ),
+            ((Some(true), false, false), ("rows", Tone::Actor)),
+            ((None, false, false), ("running", Tone::Actor)),
+        ];
+        for ((result, unavailable, wrong_rows), expected) in cases {
+            assert_eq!(query_outcome(result, unavailable, wrong_rows), expected);
+        }
+        assert_eq!(
+            fetch_event(0, false, false, true, String::new()),
+            (
+                "object 0 missing, read as empty: WRONG ROWS".to_string(),
+                Tone::Bad
+            )
+        );
+    }
+}

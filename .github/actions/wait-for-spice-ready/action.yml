@@ -9,13 +9,24 @@ inputs:
     required: false
     default: '.'
   url:
-    description: 'Readiness endpoint to poll'
+    description: |
+      Readiness endpoint to poll. Empty polls `/v1/ready` at the HTTP endpoint
+      `allocate-spice-ports` exported for this job (SPICE_HTTP_ENDPOINT), or at
+      spiced's default port 8090 on localhost when the job allocated none.
     required: false
-    default: 'http://localhost:8090/v1/ready'
+    default: ''
   timeout:
     description: 'Seconds to wait before failing'
     required: false
     default: '300'
+  datasets:
+    description: |
+      Space-separated dataset names that must also report `Ready` in
+      /v1/datasets?status=true. Set it when a step adds a dataset to a runtime
+      that is already running: /v1/ready can still answer "ready" from before
+      the new dataset started initializing. Needs jq.
+    required: false
+    default: ''
 runs:
   using: 'composite'
   steps:
@@ -25,6 +36,7 @@ runs:
       env:
         SPICE_READY_URL: ${{ inputs.url }}
         SPICE_READY_TIMEOUT: ${{ inputs.timeout }}
+        SPICE_READY_DATASETS: ${{ inputs.datasets }}
       # The script owns the timeout so it can diagnose before exiting; a step-level
       # `timeout-minutes` would kill it before it printed anything, which is the
       # behaviour being fixed.

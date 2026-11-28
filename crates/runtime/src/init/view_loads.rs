@@ -29,6 +29,10 @@ limitations under the License.
 //! has not begun yet — the startup load reads its app before it initializes the
 //! accelerators, and a change can land in between — never begins:
 //! [`ViewLoads::begin`] refuses a view that has been superseded.
+//!
+//! A view the runtime registers again on its own
+//! ([`ViewLoads::begin_replacement`]) is tracked the same way, so a later
+//! Spicepod change stops that registration too.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -64,7 +68,7 @@ struct Pending {
     ended: CancellationToken,
 }
 
-/// A pending startup registration of a view, until it is dropped.
+/// A pending startup or replacement registration of a view, until it is dropped.
 pub(crate) struct ViewLoad {
     loads: Arc<ViewLoads>,
     name: ResolvedTableReference,
@@ -84,6 +88,14 @@ impl ViewLoads {
         if state.superseded.contains(&name) || state.pending.contains_key(&name) {
             return None;
         }
+        Some(self.insert_pending(&mut state, name))
+    }
+
+    fn insert_pending(
+        self: &Arc<Self>,
+        state: &mut State,
+        name: ResolvedTableReference,
+    ) -> ViewLoad {
         let id = state.next_id;
         state.next_id += 1;
         let cancel = CancellationToken::new();
@@ -96,13 +108,42 @@ impl ViewLoads {
                 ended: ended.clone(),
             },
         );
-        Some(ViewLoad {
+        ViewLoad {
             loads: Arc::clone(self),
             name,
             id,
             cancel,
             _ended: ended.drop_guard(),
-        })
+        }
+    }
+
+    /// Begins a registration of `name` that replaces the view outside a Spicepod
+    /// change, as when a view is registered again for a plan its registration did
+    /// not match. It takes the view over as a change does: a pending registration
+    /// is stopped first, and the startup one never begins. A later Spicepod change
+    /// stops this one as it stops a startup registration.
+    pub(crate) async fn begin_replacement(self: &Arc<Self>, name: &TableReference) -> ViewLoad {
+        let name = resolve_table_reference(name.clone());
+        loop {
+            let pending = {
+                let mut state = self.state.lock();
+                state.superseded.insert(name.clone());
+                match state.pending.remove(&name) {
+                    Some(pending) => pending,
+                    None => return self.insert_pending(&mut state, name),
+                }
+            };
+            pending.cancel.cancel();
+            pending.ended.cancelled().await;
+        }
+    }
+
+    /// Whether a startup or replacement registration of `name` is pending.
+    pub(crate) fn is_pending(&self, name: &TableReference) -> bool {
+        self.state
+            .lock()
+            .pending
+            .contains_key(&resolve_table_reference(name.clone()))
     }
 
     /// Stops the startup registration of `name` for good: a pending one is

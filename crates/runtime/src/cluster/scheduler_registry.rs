@@ -1070,9 +1070,9 @@ mod tests {
     use super::*;
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::datafusion::builder::DataFusionBuilder;
-    use crate::status;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use runtime_status as status;
 
     #[tokio::test]
     async fn registry_runner_basic_register_and_shutdown() {
@@ -3128,7 +3128,10 @@ mod tests {
                 .expect("list alive")
                 .contains("test:50051")
         );
-        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(
+            peer_reaper.tick().await.expect("tick").evicted,
+            [] as [String; 0]
+        );
 
         // Its next beat writes the file again.
         tokio::time::advance(Duration::from_secs(10)).await;
@@ -3147,7 +3150,10 @@ mod tests {
                 .expect("list alive")
                 .contains("test:50051")
         );
-        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(
+            peer_reaper.tick().await.expect("tick").evicted,
+            [] as [String; 0]
+        );
         assert_eq!(
             snap.schedulers
                 .get("test:50051")

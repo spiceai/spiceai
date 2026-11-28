@@ -27,8 +27,6 @@ const _: () = assert!(
     "Spice runtime requires a 64-bit platform (usize must be at least 8 bytes)"
 );
 
-use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
@@ -71,11 +69,6 @@ const fn get_allocator_name() -> Option<&'static str> {
     }
 }
 
-/// Whether `id` was given on the command line, rather than falling back to its default.
-fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
-    matches.value_source(id) == Some(ValueSource::CommandLine)
-}
-
 /// The line every run opens with: it names the build every later line came from,
 /// plus the allocator when one was compiled in over the default.
 fn log_startup_banner() {
@@ -94,30 +87,15 @@ fn main() {
     // crash is not a panic: without this the process dies silently with exit 139.
     // Attaching runs before the banner but reports after it, so the banner stays the
     // first line of the log. The version goes in so a report names the build that
-    // produced it.
-    let crash_reporting = spiced::crash_handler::install(&get_version_string());
+    // produced it, without the commit, which a crash report has as a field of its own.
+    let crash_reporting = spiced::crash_handler::install(&version_without_commit());
 
-    let (mut args, open_telemetry_deprecated, flight_chosen, http_chosen) = {
-        let mut matches = spiced::Args::command().get_matches();
-        let open_telemetry_deprecated =
-            matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
-        // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
-        // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
-        // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
-        // that endpoint reaches. See #11005.
-        let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
-        let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
-        let args =
-            spiced::Args::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
-        (args, open_telemetry_deprecated, flight_chosen, http_chosen)
-    };
-    // Mutable extraction removes typed values from `ArgMatches`; ending its
-    // scope here also drops clap's remaining parse state before startup. The
-    // enrollment key is left only in the zeroizing `Args` value, which the
-    // Cloud Connect bootstrap removes immediately.
-    args.open_telemetry_deprecated = open_telemetry_deprecated;
-    args.repl_config.http_endpoint_may_be_another_runtime =
-        repl::http_endpoint_unpaired(flight_chosen, http_chosen);
+    // `spice run` parses the arguments it starts this process with through the
+    // same function, so both read them alike. Ending the parse here also drops
+    // clap's parse state before startup: the enrollment key is left only in the
+    // zeroizing `Args` value, which the Cloud Connect bootstrap removes
+    // immediately.
+    let args = spiced::try_parse_args(std::env::args_os()).unwrap_or_else(|err| err.exit());
 
     if args.version {
         println!("{}", get_version_string());
@@ -125,6 +103,9 @@ fn main() {
     }
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
+    // jsonwebtoken panics on first use when Cargo feature unification enables
+    // more than one of its crypto backends, so select one explicitly.
+    let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
 
     if args.repl {
         if let Err(err) = &crash_reporting {
@@ -145,10 +126,15 @@ fn main() {
         return;
     }
 
+    // Before the runtime opens a listener or an acceleration file, so every file
+    // and connection it holds counts against the raised limit. Logged by `run`
+    // once its subscriber, and the verbosity it is configured with, is installed.
+    let open_file_limit = spiced::open_file_limit::raise();
+
     // Nothing may log before this: the banner dates the run and names the build, so
     // a line above it belongs to a build the reader cannot identify. Anything that
-    // resolves earlier — the crash-handler attach above, the spicepod, the CPU
-    // budget — reports here or later.
+    // resolves earlier — the crash-handler attach above, the open file limit, the
+    // spicepod, the CPU budget — reports here or later.
     in_tracing_context(|| {
         log_startup_banner();
         if let Err(err) = &crash_reporting {
@@ -156,7 +142,7 @@ fn main() {
         }
     });
 
-    let runtime_failed = match load_and_run(args) {
+    let runtime_failed = match load_and_run(args, open_file_limit) {
         Ok(()) => false,
         Err(err) => {
             in_tracing_context(|| {
@@ -188,7 +174,10 @@ fn main() {
 /// parsed before the pool exists. It is loaded here on a throwaway
 /// current-thread runtime and handed to `spiced::run`, so it is read exactly
 /// once and all three configuration surfaces resolve through one path.
-fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+fn load_and_run(
+    mut args: spiced::Args,
+    open_file_limit: Option<spiced::open_file_limit::OpenFileLimit>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Claimed before anything this process does can be observed from outside
     // it: a second runtime in one instance directory must refuse before it
     // redeems an enrollment key, binds a listener, or dials the gateway. Held
@@ -216,6 +205,14 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
         let bootstrap = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        // The Cloud Connect state directory is checked, and state an earlier
+        // version kept in the config directory moved into it, before anything
+        // reads or writes it: the bootstrap below and the deployment read in
+        // `build_app` both do.
+        if let Err(err) = bootstrap.block_on(spiced::cloud_connect_prepare_state(&args)) {
+            tracing::error!("{err}");
+            std::process::exit(1);
+        }
         // Cloud Connect `--token` bootstrap: enrollment must be durable
         // before the runtime is built, any listener binds, or readiness is
         // reachable — so it runs first, on the throwaway runtime. A terminal
@@ -237,25 +234,21 @@ fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>
         .worker_threads(cpu_budget::cpu_budget().main_runtime_worker_threads())
         .enable_all()
         .build()?;
-    tokio_runtime.block_on(spiced::run(args, app_bundle))?;
+    tokio_runtime.block_on(spiced::run(args, app_bundle, open_file_limit))?;
     Ok(())
 }
 
+/// The version `--version` prints and every run opens with, naming the commit it
+/// was built from: `v2.5.0+models (6c9b6e4a7e)`.
 fn get_version_string() -> String {
-    if cfg!(feature = "release") {
-        format!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata())
-    } else {
-        let mut version = format!(
-            "v{}-build.{}",
-            env!("CARGO_PKG_VERSION"),
-            env!("GIT_COMMIT_HASH")
-        );
-        if cfg!(feature = "dev") {
-            version.push_str("-dev");
-        }
-        version.push_str(build_metadata());
-        version
-    }
+    format!("{} ({})", version_without_commit(), env!("GIT_COMMIT_HASH"))
+}
+
+/// The semver version of this build, without the commit: `v2.5.0+models`, or
+/// `v2.5.0-unstable-dev+models` for a `dev` build.
+fn version_without_commit() -> String {
+    let dev = if cfg!(feature = "dev") { "-dev" } else { "" };
+    format!("v{}{dev}{}", env!("CARGO_PKG_VERSION"), build_metadata())
 }
 
 /// Build metadata conforming to <https://semver.org/#spec-item-10>

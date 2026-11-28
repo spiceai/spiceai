@@ -84,7 +84,38 @@ impl UserAgent {
             None => Self::Raw(Raw(Arc::from(s))),
         }
     }
+
+    /// The `client` metric label: the name of a known Spice client, or `other`
+    /// for any other user agent. Callers choose the header, so it never reaches
+    /// a label verbatim.
+    #[must_use]
+    pub fn metric_client(&self) -> Option<&'static str> {
+        match self {
+            Self::Absent => None,
+            Self::Raw(_) => Some(OTHER_CLIENT),
+            Self::Parsed(parsed) => Some(
+                KNOWN_CLIENTS
+                    .iter()
+                    .find(|&&client| client == &*parsed.client_name)
+                    .copied()
+                    .unwrap_or(OTHER_CLIENT),
+            ),
+        }
+    }
 }
+
+const KNOWN_CLIENTS: [&str; 8] = [
+    "spice",
+    "repl",
+    "spicepy",
+    "spice-rs",
+    "gospice",
+    "spice.js",
+    "spice-java",
+    "spice-dotnet",
+];
+
+const OTHER_CLIENT: &str = "other";
 
 impl fmt::Display for UserAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -197,16 +228,6 @@ fn get_os_version_internal() -> Result<String, GenericError> {
     let version = String::from_utf8(output.stdout)?;
 
     Ok(version)
-}
-
-#[cfg(target_family = "windows")]
-fn get_os_version_internal() -> Result<String, GenericError> {
-    use winver::WindowsVersion;
-    if let Some(version) = WindowsVersion::detect() {
-        Ok(version.to_string())
-    } else {
-        Ok("unknown".to_string())
-    }
 }
 
 #[must_use]
@@ -391,21 +412,21 @@ mod tests {
     #[test]
     fn test_os_type() {
         let result = os_type();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         assert_ne!(result, "unknown");
     }
 
     #[test]
     fn test_os_arch() {
         let result = os_arch();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
         assert_ne!(result, "unknown");
     }
 
     #[test]
     fn test_get_runtime_os_string() {
         let result = get_runtime_os_string();
-        assert!(!result.is_empty());
+        assert_ne!(result, "");
 
         // Should contain OS type
         assert!(result.contains(os_type()));

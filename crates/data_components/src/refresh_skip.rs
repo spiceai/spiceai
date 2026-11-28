@@ -49,6 +49,11 @@ pub trait RefreshSkipTableProvider: TableProvider {
     /// skip state so this defaults to a no-op only for providers that keep none.
     async fn reset_skip_state(&self) {}
 
+    /// Records that the refresh which followed a [`Self::should_skip_refresh`] returning
+    /// `false` loaded the source. Until then the version that check saw is not the one the
+    /// acceleration holds, so a refresh that fails is not skipped on its retry.
+    async fn commit_skip_state(&self) {}
+
     /// Returns a reference to self as a `RefreshSkipTableProvider` trait object.
     /// This enables dynamic dispatch without requiring knowledge of the concrete type.
     fn as_refresh_skip_provider(&self) -> &dyn RefreshSkipTableProvider
@@ -151,5 +156,36 @@ pub async fn reset_refresh_skip_state_for_table_provider(
         && let Some(inner) = adaptor.table_provider.as_ref()
     {
         Box::pin(reset_refresh_skip_state_for_table_provider(inner.as_ref())).await;
+    }
+}
+
+/// Commits the refresh-skip state of the provided table provider if it implements
+/// [`RefreshSkipTableProvider`], peeling the same wrapper providers as
+/// [`should_skip_refresh_for_table_provider`] so the inner provider is reached. A no-op for
+/// providers that do not support refresh skipping.
+///
+/// Call this once a refresh that read the source after the skip check has written its rows.
+pub async fn commit_refresh_skip_state_for_table_provider(
+    table_provider: &(dyn TableProvider + Send + Sync),
+) {
+    let any = table_provider as &dyn std::any::Any;
+
+    if let Some(provider) = any.downcast_ref::<crate::s3_single_file_cached::S3SingleFileCached>() {
+        provider.commit_skip_state().await;
+        return;
+    }
+
+    if let Some(table) = any.downcast_ref::<spice_table::SpiceTable>() {
+        Box::pin(commit_refresh_skip_state_for_table_provider(
+            table.below().as_ref(),
+        ))
+        .await;
+        return;
+    }
+
+    if let Some(adaptor) = any.downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner) = adaptor.table_provider.as_ref()
+    {
+        Box::pin(commit_refresh_skip_state_for_table_provider(inner.as_ref())).await;
     }
 }

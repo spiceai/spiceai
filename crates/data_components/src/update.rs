@@ -51,6 +51,133 @@ pub trait UpdateValidator: Send + Sync + std::fmt::Debug {
     ) -> Result<(), DataFusionError>;
 }
 
+/// Plans that can check updated rows before any table is written.
+///
+/// A sink that updates several tables in one statement ([`prepare_update_plan`])
+/// runs this on every plan before executing any, so a collision one table
+/// refuses changes no table.
+#[async_trait::async_trait]
+pub trait PreparableUpdate: Send + Sync {
+    /// Materialize the updated rows and check them, without changing the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading the rows, or the validator's.
+    async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError>;
+}
+
+/// Check `plan`'s updated rows when it implements [`PreparableUpdate`].
+///
+/// Known concrete types: [`UpdateExec`] and [`PreparableUpdateExec`]. Engine
+/// UPDATE plans that are not [`UpdateExec`] wrap themselves in
+/// [`PreparableUpdateExec`] so a multi-table sink can find them without
+/// depending on the engine crate.
+///
+/// # Errors
+///
+/// Returns the error reading the rows, or the validator's.
+pub async fn prepare_update_plan(
+    plan: &dyn ExecutionPlan,
+    context: Arc<TaskContext>,
+) -> Result<(), DataFusionError> {
+    if let Some(update) = plan.downcast_ref::<UpdateExec>() {
+        return update.prepare(context).await;
+    }
+    if let Some(update) = plan.downcast_ref::<PreparableUpdateExec>() {
+        return update.prepare(context).await;
+    }
+    Ok(())
+}
+
+/// Wraps an engine-specific UPDATE plan so [`prepare_update_plan`] can find it.
+pub struct PreparableUpdateExec {
+    inner: Arc<dyn ExecutionPlan>,
+    prepare: Arc<dyn PreparableUpdate>,
+}
+
+impl PreparableUpdateExec {
+    /// Wrap `plan` so a multi-table sink can [`PreparableUpdate::prepare`] it
+    /// before writing any table.
+    #[must_use]
+    pub fn wrap<T>(plan: Arc<T>) -> Self
+    where
+        T: ExecutionPlan + PreparableUpdate + 'static,
+    {
+        Self {
+            inner: Arc::clone(&plan) as Arc<dyn ExecutionPlan>,
+            prepare: plan,
+        }
+    }
+
+    /// Materialize and check the inner plan's updated rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading the rows, or the validator's.
+    pub async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        self.prepare.prepare(context).await
+    }
+}
+
+impl std::fmt::Debug for PreparableUpdateExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparableUpdateExec")
+            .field("inner", &self.inner.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for PreparableUpdateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PreparableUpdateExec({})", self.inner.name())
+    }
+}
+
+impl ExecutionPlan for PreparableUpdateExec {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.inner.properties()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.is_empty() {
+            return Ok(self);
+        }
+        Err(DataFusionError::Internal(
+            "PreparableUpdateExec does not take plan children".to_string(),
+        ))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.inner.execute(partition, context)
+    }
+}
+
 /// An execution plan that implements UPDATE as delete + insert.
 ///
 /// 1. Materializes the updated rows from the source plan.
@@ -124,6 +251,13 @@ impl UpdateExec {
         .await?;
         *self.prepared.lock().await = Some(rows);
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparableUpdate for UpdateExec {
+    async fn prepare(&self, context: Arc<TaskContext>) -> Result<(), DataFusionError> {
+        UpdateExec::prepare(self, context).await
     }
 }
 

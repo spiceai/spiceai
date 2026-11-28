@@ -23,6 +23,11 @@ limitations under the License.
 //! It is its own integration binary because it installs a global allocator,
 //! and it is one test because the counter is process-wide.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};

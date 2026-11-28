@@ -90,8 +90,13 @@ pub struct S3SingleFileCached {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     file_path: ObjectStorePath,
+    /// The file version the acceleration was last loaded from.
     cached_metadata: RwLock<Option<object_store::ObjectMeta>>,
+    /// A changed version the last check saw, recorded as loaded once its refresh succeeds.
+    pending_metadata: RwLock<Option<object_store::ObjectMeta>>,
     dataset_name: String,
+    /// Checks scans for registered columns the file no longer carries.
+    schema_drift_guard: Option<crate::file_schema_drift::FileSchemaDriftGuard>,
 }
 
 impl S3SingleFileCached {
@@ -124,8 +129,45 @@ impl S3SingleFileCached {
             object_store,
             file_path,
             cached_metadata: RwLock::new(None),
+            pending_metadata: RwLock::new(None),
             dataset_name,
+            schema_drift_guard: None,
         })
+    }
+
+    /// Checks every scan with `guard`, so a registered column the file no longer carries
+    /// fails a refresh scan and warns on any other scan. See
+    /// [`crate::file_schema_drift`].
+    #[must_use]
+    pub fn with_schema_drift_guard(
+        mut self,
+        guard: crate::file_schema_drift::FileSchemaDriftGuard,
+    ) -> Self {
+        self.schema_drift_guard = Some(guard);
+        self
+    }
+
+    /// Checks a scan with the schema-drift guard, if any. A rejected scan forgets the cached
+    /// file metadata: the refresh-skip check already recorded this version of the file, and
+    /// the next refresh must check it again rather than skip it and report the dataset
+    /// up to date.
+    async fn check_schema_drift(
+        &self,
+        state: &dyn Session,
+        projection: Option<&[usize]>,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> DataFusionResult<()> {
+        let Some(guard) = &self.schema_drift_guard else {
+            return Ok(());
+        };
+        let checked = guard
+            // A single file: no predicate or limit can leave a file out of the scan.
+            .check_scan(state, &self.inner.schema(), projection, true, plan)
+            .await;
+        if checked.is_err() {
+            self.reset_skip_state().await;
+        }
+        checked
     }
 
     /// Fetches the current metadata (`ETag`, Version ID, size, `last_modified`) for the file from S3.
@@ -147,7 +189,10 @@ impl S3SingleFileCached {
     /// Returns `true` if the file is unchanged and can be skipped.
     async fn is_file_unchanged(&self) -> DataFusionResult<bool> {
         let Some(current_metadata) = self.fetch_current_metadata().await? else {
-            return Ok(false); // Can't determine, assume changed
+            // Can't determine, assume changed. The refresh that follows can replace the
+            // accelerated rows and still fail, so no version counts as loaded.
+            self.reset_skip_state().await;
+            return Ok(false);
         };
 
         let cached_metadata = {
@@ -175,8 +220,10 @@ impl S3SingleFileCached {
             return Ok(true);
         }
 
-        // Update cache with new metadata
-        *self.cached_metadata.write().await = Some(current_metadata);
+        // The refresh that reads the changed file can replace the accelerated rows and still
+        // fail, so no version counts as loaded until it succeeds.
+        *self.cached_metadata.write().await = None;
+        *self.pending_metadata.write().await = Some(current_metadata);
 
         Ok(false)
     }
@@ -201,6 +248,13 @@ impl RefreshSkipTableProvider for S3SingleFileCached {
         // Drop the cached file metadata so the next `should_skip_refresh` treats the file as
         // changed and re-materializes the full source (see `reset_skip_state` on the trait).
         *self.cached_metadata.write().await = None;
+        *self.pending_metadata.write().await = None;
+    }
+
+    async fn commit_skip_state(&self) {
+        if let Some(loaded) = self.pending_metadata.write().await.take() {
+            *self.cached_metadata.write().await = Some(loaded);
+        }
     }
 }
 
@@ -258,7 +312,10 @@ impl TableProvider for S3SingleFileCached {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Always delegate to inner ListingTable
         // The metadata check happens during refresh, not during scan
-        self.inner.scan(state, projection, filters, limit).await
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        self.check_schema_drift(state, projection.map(Vec::as_slice), &plan)
+            .await?;
+        Ok(plan)
     }
 
     async fn scan_with_args<'a>(
@@ -266,7 +323,11 @@ impl TableProvider for S3SingleFileCached {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
+        let projection = args.projection();
+        let result = self.inner.scan_with_args(state, args).await?;
+        self.check_schema_drift(state, projection, result.plan())
+            .await?;
+        Ok(result)
     }
 
     async fn delete_from(
@@ -355,17 +416,132 @@ mod tests {
             object_store: store,
             file_path,
             cached_metadata: RwLock::new(cached_meta),
+            pending_metadata: RwLock::new(None),
             dataset_name: "test_dataset".to_string(),
+            schema_drift_guard: None,
         }
     }
 
+    async fn assert_rejected_drift_forgets_cached_version(
+        table: S3SingleFileCached,
+        cached_location: &str,
+    ) {
+        use crate::file_schema_drift::mark_acceleration_refresh;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        *table.cached_metadata.write().await =
+            Some(make_meta(cached_location, 1, 1, Some("e"), None));
+
+        let mut session = SessionConfig::new();
+        mark_acceleration_refresh(&mut session);
+        let ctx = SessionContext::new_with_config(session);
+        ctx.register_table("base", Arc::new(table) as Arc<dyn TableProvider>)
+            .expect("register");
+        let scanned = ctx
+            .sql("SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await;
+        assert!(
+            matches!(scanned, Err(ref e) if e.to_string().contains("'amount_cents'")),
+            "the refresh scan must be rejected: {scanned:?}"
+        );
+
+        let provider = ctx.table_provider("base").await.expect("provider");
+        let table = provider
+            .downcast_ref::<S3SingleFileCached>()
+            .expect("the registered table");
+        assert!(
+            table.cached_metadata.read().await.is_none(),
+            "the next refresh must check the file again instead of skipping it"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_drift_scan_forgets_the_cached_file_version() {
+        use crate::file_schema_drift::FileSchemaDriftGuard;
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.parquet");
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amt", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, file_schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let registered = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amount_cents", DataType::Int64, true),
+        ]));
+        let format = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(Arc::clone(&format) as _))
+            .with_schema(Arc::clone(&registered));
+        let listing = Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+        let table = S3SingleFileCached::try_new(listing, store, "base".to_string())
+            .expect("single file")
+            .with_schema_drift_guard(FileSchemaDriftGuard::new("base", registered, format));
+        assert_rejected_drift_forgets_cached_version(table, "base.parquet").await;
+    }
+
+    #[tokio::test]
+    async fn rejected_csv_drift_scan_forgets_the_cached_file_version() {
+        use crate::csv_header_projection::HeaderProjectedCsvFormat;
+        use crate::file_schema_drift::FileSchemaDriftGuard;
+        use arrow::datatypes::{DataType, Field};
+        use datafusion::datasource::file_format::csv::CsvFormat;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.csv");
+        std::fs::write(&path, "id,amt\n1,2\n").expect("write csv");
+
+        let registered = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amount_cents", DataType::Int64, true),
+        ]));
+        let format =
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)));
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(Arc::clone(&format)))
+            .with_schema(Arc::clone(&registered));
+        let listing = Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+        let table = S3SingleFileCached::try_new(listing, store, "base".to_string())
+            .expect("single file")
+            .with_schema_drift_guard(FileSchemaDriftGuard::new("base", registered, format));
+        assert_rejected_drift_forgets_cached_version(table, "base.csv").await;
+    }
+
     #[derive(Debug)]
+    /// Answers each HEAD with the next response; `None` fails that HEAD.
     struct HeadOnlyObjectStore {
-        responses: Mutex<VecDeque<object_store::ObjectMeta>>,
+        responses: Mutex<VecDeque<Option<object_store::ObjectMeta>>>,
     }
 
     impl HeadOnlyObjectStore {
         fn new(responses: Vec<object_store::ObjectMeta>) -> Self {
+            Self::with_failures(responses.into_iter().map(Some).collect())
+        }
+
+        fn with_failures(responses: Vec<Option<object_store::ObjectMeta>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
             }
@@ -422,6 +598,7 @@ mod tests {
             let mut guard = self.responses.lock().await;
             let meta = guard
                 .pop_front()
+                .flatten()
                 .ok_or_else(|| not_implemented("get_opts"))?;
             Ok(object_store::GetResult {
                 payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::empty())),
@@ -489,11 +666,14 @@ mod tests {
         );
     }
 
+    /// A refresh that reads a changed file can fail after the check, so the next
+    /// refresh must read the file again until one that read it succeeds.
     #[tokio::test]
-    async fn test_should_update_cache_when_metadata_changes() {
+    async fn a_changed_file_is_skipped_only_after_a_refresh_that_read_it_succeeds() {
         let old_meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
         let new_meta = make_meta("file", 256, 20, Some("etag2"), Some("v2"));
         let store = Arc::new(HeadOnlyObjectStore::new(vec![
+            new_meta.clone(),
             new_meta.clone(),
             new_meta.clone(),
         ])) as Arc<dyn ObjectStore>;
@@ -503,13 +683,74 @@ mod tests {
             !cached_table
                 .should_skip_refresh()
                 .await
-                .expect("first attempt")
+                .expect("first attempt"),
+            "a changed file is read"
         );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("retry after a failed refresh"),
+            "a changed file whose refresh did not succeed is read again"
+        );
+        cached_table.commit_skip_state().await;
         assert!(
             cached_table
                 .should_skip_refresh()
                 .await
-                .expect("second attempt")
+                .expect("after a successful refresh"),
+            "a file loaded by a successful refresh is skipped"
+        );
+    }
+
+    /// When the file's version cannot be read, the refresh that follows can replace the
+    /// accelerated rows and then fail, so the version loaded before no longer counts as loaded.
+    #[tokio::test]
+    async fn a_failed_version_check_forgets_the_version_loaded_before() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::with_failures(vec![
+            None,
+            Some(meta.clone()),
+        ])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("failed version check")
+        );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("unchanged file after a failed version check"),
+            "the version loaded before a refresh that could not check the file is read again"
+        );
+    }
+
+    /// A refresh of a changed file can replace the accelerated rows and then fail, so
+    /// the version loaded before it no longer counts as loaded if the file returns to it.
+    #[tokio::test]
+    async fn a_failed_refresh_of_a_changed_file_forgets_the_version_loaded_before() {
+        let old_meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let new_meta = make_meta("file", 256, 20, Some("etag2"), Some("v2"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![new_meta, old_meta.clone()]))
+            as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(old_meta));
+
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("changed file")
+        );
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("file restored to the version loaded before"),
+            "a version loaded before a failed refresh of a changed file is read again"
         );
     }
 
@@ -587,7 +828,8 @@ mod tests {
             "refresh must re-materialize after reset even when the source is unchanged"
         );
 
-        // And it becomes skippable again once the cache is repopulated.
+        // And it becomes skippable again once the refresh that read it succeeds.
+        cached_table.commit_skip_state().await;
         assert!(
             cached_table
                 .should_skip_refresh()

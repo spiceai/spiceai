@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::{Arc, LazyLock};
 
 use arrow_schema::DataType;
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
-use datafusion::logical_expr::{Cast, Expr, TryCast};
+use datafusion::logical_expr::{Cast, Expr, Operator, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
@@ -237,6 +237,9 @@ static DUCKDB_DIALECT: LazyLock<Arc<dyn Dialect>> = LazyLock::new(new_duckdb_dia
 /// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`]).
 #[must_use]
 pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> bool {
+    if call.func.name() == SUBSTR_NAME && !substr_positions_agree_in_duckdb(&call.args) {
+        return false;
+    }
     if call.func.name() == CONCAT_NAME
         && !duckdb::concat_arguments_are_renderable(&call.args, scope)
     {
@@ -291,29 +294,364 @@ pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
 /// `DataFusion` does. `duckdb::cast_is_renderable` says which casts into text or
 /// binary are refused, and why; [`integer_cast_is_renderable`] refuses one from
 /// a fractional value into an integer, which `DuckDB` rounds where `DataFusion`
-/// truncates; and `duckdb::literal_is_renderable` refuses a binary literal,
-/// which the unparser spells in a form `DuckDB` reads as text.
+/// truncates; `duckdb::literal_is_renderable` refuses a binary literal,
+/// which the unparser spells in a form `DuckDB` reads as text; and
+/// [`divides_a_decimal`] refuses a `/` over a decimal, which `DuckDB` answers
+/// as a `DOUBLE`; [`divides_by_a_possible_zero`] refuses a `/` or `%` whose
+/// divisor could be zero, which `DuckDB` answers as `NULL`; and
+/// [`like_escapes_alike_in_duckdb`] refuses a `LIKE` whose pattern could hold a
+/// backslash, which `DuckDB` reads literally.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     duckdb::literal_is_renderable(expr)
         && duckdb::cast_is_renderable(expr, scope)
         && integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
+        && !divides_by_a_possible_zero(expr)
+        && like_escapes_alike_in_duckdb(expr)
 }
 
-/// Whether `PostgreSQL` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast from a fractional value into an integer is
-/// the one shape it does not (see [`integer_cast_is_renderable`]).
+/// `DataFusion`'s name for `substr`, which is also what `substring(...)` plans to.
+const SUBSTR_NAME: &str = "substr";
+
+/// The largest `SUBSTRING` offset and length `DuckDB` accepts; past it the
+/// query fails with `Substring offset outside of supported range`.
+const DUCKDB_SUBSTRING_MAX: i128 = u32::MAX as i128;
+
+/// Whether `DuckDB` answers this `substr(str, start[, length])` the way
+/// `DataFusion` does.
+///
+/// They agree on a start of 1 or more: both count characters from 1. Below
+/// that they part. `DataFusion` reads a start below 1 as a position before the
+/// string, so `substr('abcd', -2, 4)` is `'a'` (positions -2..1), while
+/// `DuckDB` counts a negative start from the end, so the same call answers
+/// `'cd'`. A negative length fails in `DataFusion` and is a backwards count in
+/// `DuckDB`. Measured on `DuckDB` v1.4.4. Only literal positions inside that
+/// agreement, and inside `DuckDB`'s own range, federate; a column position
+/// stays local, because it might be negative in some row.
+fn substr_positions_agree_in_duckdb(args: &[Expr]) -> bool {
+    let in_range = |position: Option<&Expr>, low: i128| {
+        position
+            .and_then(literal_value)
+            .as_ref()
+            .and_then(integer_value)
+            .is_some_and(|value| (low..=DUCKDB_SUBSTRING_MAX).contains(&value))
+    };
+    match args {
+        [_, start] => in_range(Some(start), 1),
+        [_, start, length] => in_range(Some(start), 1) && in_range(Some(length), 0),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a `/` or `%` whose divisor might be zero, which `DuckDB`
+/// and `MySQL` answer differently from `DataFusion`.
+///
+/// `DataFusion` fails an integer `x / 0` and `x % 0` with a divide-by-zero
+/// error and answers a float `x / 0.0` with an infinity; `DuckDB` and `MySQL`
+/// answer `NULL` for all of them, `MySQL`'s `DIV` included. A filter
+/// `x / 0 > 1` then keeps no row where the local engine keeps every positive
+/// `x`, and `n / (k - 3)` returns rows where `DataFusion` fails the query
+/// (measured on `DuckDB` v1.4.4 and `MySQL` 9.7). Whether a divisor is zero is
+/// known only for a literal, so a `/` or `%` federates only when its divisor
+/// is a non-zero, finite integer or float literal. A signed `-1` is refused
+/// too: `i64::MIN / -1` overflows, and the engines need not report it the same
+/// way. Truncation agrees, measured: `DuckDB` answers `-7 // 2 = -3` and
+/// `-7 % 2 = -1`, and `MySQL` `-7 DIV 2 = -3` and `MOD(-7, 2) = -1`, as
+/// `DataFusion` does.
+#[must_use]
+pub(crate) fn divides_by_a_possible_zero(expr: &Expr) -> bool {
+    let Expr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if !matches!(binary.op, Operator::Divide | Operator::Modulo) {
+        return false;
+    }
+    let Some(divisor) = literal_value(&binary.right) else {
+        return true;
+    };
+    if let Some(value) = integer_value(&divisor) {
+        return value == 0 || value == -1;
+    }
+    match divisor {
+        ScalarValue::Float32(Some(value)) => !value.is_finite() || value == 0.0,
+        ScalarValue::Float64(Some(value)) => !value.is_finite() || value == 0.0,
+        _ => true,
+    }
+}
+
+/// Whether `DuckDB` reads this `LIKE` or `ILIKE` pattern the way `DataFusion`
+/// does.
+///
+/// With no `ESCAPE` clause `DataFusion` treats a backslash as the escape
+/// character, so `'a%c' LIKE 'a\%c'` is `true`; `DuckDB` has no default escape
+/// and reads the backslash literally, answering `false`. A `LIKE` with an
+/// explicit `ESCAPE` is unparsed with it and agrees. One without federates
+/// only when its pattern is a string literal holding no backslash; any other
+/// pattern, a column included, stays local, because it might hold one.
+#[must_use]
+pub(crate) fn like_escapes_alike_in_duckdb(expr: &Expr) -> bool {
+    let Expr::Like(like) = expr else {
+        return true;
+    };
+    if like.escape_char.is_some() {
+        return true;
+    }
+    match literal_value(&like.pattern) {
+        Some(
+            ScalarValue::Utf8(Some(pattern))
+            | ScalarValue::LargeUtf8(Some(pattern))
+            | ScalarValue::Utf8View(Some(pattern)),
+        ) => !pattern.contains('\\'),
+        _ => false,
+    }
+}
+
+/// The value of `expr` when it is a literal, a negated literal, or a cast of
+/// one: the shapes a constant takes after type coercion. The cast is
+/// evaluated with `DataFusion`'s own rules, so the value is the one the
+/// engine would compute. `None` for anything else.
+fn literal_value(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(value, _) => Some(value.clone()),
+        Expr::Negative(operand) => literal_value(operand)?.arithmetic_negate().ok(),
+        Expr::Cast(Cast { expr, field }) => literal_value(expr)?.cast_to(field.data_type()).ok(),
+        _ => None,
+    }
+}
+
+/// A non-null integer scalar's value, widened so every integer type fits.
+fn integer_value(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a `/` whose operands are not both known to be
+/// non-decimal, which no SQL source divides with `DataFusion`'s precision.
+///
+/// The `DuckDB` dialect unparses every `DataFusion` `Divide` as `//` so that
+/// integer `/` stays integer division (#3155). On a `DECIMAL`, both `//` and
+/// `/` answer a `DOUBLE` (~16 significant digits). Federation then casts that
+/// double back to a decimal, so digits past the mantissa look exact and are
+/// wrong. `SQLite` has no decimal type and computes `/` in `REAL`. `MySQL`
+/// rounds the last digit of a decimal quotient where `DataFusion` truncates it,
+/// and `PostgreSQL` keeps more digits than `DataFusion`'s scale.
+///
+/// Either operand being a decimal is enough: `amt / 3` is decimal division
+/// after type coercion. An operand whose type cannot be read is refused rather
+/// than assumed integral, matching [`integer_cast_is_renderable`]. Integer and
+/// floating `/` are not this check's to refuse.
+#[must_use]
+pub(crate) fn divides_a_decimal(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let Expr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if binary.op != Operator::Divide {
+        return false;
+    }
+    let scope = scope.unwrap_or_else(|| DFSchema::empty_ref());
+    [binary.left.as_ref(), binary.right.as_ref()]
+        .into_iter()
+        .any(|operand| operand_type(operand, scope).is_none_or(|data_type| data_type.is_decimal()))
+}
+
+/// Whether `PostgreSQL` evaluates this expression node the way `DataFusion`
+/// does. [`integer_cast_is_renderable`] refuses a cast from a fractional value
+/// into an integer, which `PostgreSQL` rounds where `DataFusion` truncates;
+/// [`string_timestamp_cast_is_renderable`] refuses a string read as a
+/// timestamp; [`divides_a_decimal`] refuses a decimal `/`, which `DataFusion`
+/// truncates at 4 more digits of scale than the dividend while `PostgreSQL`
+/// keeps at least 16 significant digits (`dd / e` is `-6.575402` against
+/// `-6.5754026354319180`), and a `/` whose operand types cannot be read; and
+/// [`window_distinct_is_renderable`] refuses a window function with
+/// `DISTINCT`.
 #[must_use]
 pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
+        && window_distinct_is_renderable(expr)
+}
+
+/// Whether this is anything but a window function with `DISTINCT`, such as
+/// `count(DISTINCT x) OVER (PARTITION BY g)`. `DataFusion` evaluates one;
+/// `MySQL` refuses it (1235) and `PostgreSQL` fails it with `DISTINCT is not
+/// implemented for window functions` (measured on `MySQL` 9.7 and
+/// `PostgreSQL` 17).
+fn window_distinct_is_renderable(expr: &Expr) -> bool {
+    !matches!(expr, Expr::WindowFunction(window) if window.params.distinct)
 }
 
 /// Whether `MySQL` evaluates this non-function expression node the way
-/// `DataFusion` does — today, a cast from a fractional value into an integer is
-/// the one shape it does not (see [`integer_cast_is_renderable`]).
+/// `DataFusion` does. [`integer_cast_is_renderable`] refuses a cast from a
+/// fractional value into an integer, which `MySQL` rounds where `DataFusion`
+/// truncates; [`string_timestamp_cast_is_renderable`] refuses a string read as
+/// a timestamp; [`divides_a_decimal`] refuses a decimal `/`, whose last digit
+/// `MySQL` rounds where `DataFusion` truncates (`-1.00 / 6.00` is `-0.166667`
+/// against `-0.166666`), and a `/` whose operand types cannot be read, which
+/// the unparser writes as `MySQL`'s exact `/` rather than the integer `DIV`
+/// it needs if the quotient is an integer; [`divides_by_a_possible_zero`]
+/// refuses a `/` or `%` whose divisor could be zero, which `MySQL` answers as
+/// `NULL`; [`distinct_is_renderable_in_mysql`] refuses a `DISTINCT`
+/// aggregate `MySQL` cannot parse; [`compares_a_decimal_with_a_float`]
+/// refuses a comparison of a decimal with a float, which `MySQL` makes in
+/// `DOUBLE` where `DataFusion` makes it in decimal; and
+/// [`holds_a_backslash_string`] refuses a string with a backslash, which
+/// `MySQL` reads as an escape.
 #[must_use]
 pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     integer_cast_is_renderable(expr, scope)
+        && string_timestamp_cast_is_renderable(expr, scope)
+        && !divides_a_decimal(expr, scope)
+        && !divides_by_a_possible_zero(expr)
+        && distinct_is_renderable_in_mysql(expr)
+        && !compares_a_decimal_with_a_float(expr, scope)
+        && !holds_a_backslash_string(expr)
+}
+
+/// Whether `expr` is a string literal that holds a backslash, or a `LIKE`,
+/// `ILIKE` or `SIMILAR TO` whose escape character is a backslash.
+///
+/// `MySQL` reads a backslash in a string literal as an escape, and the unparser
+/// writes the value unchanged, so `MySQL` would read different text: `C:\new`
+/// holds a newline, and a backslash before a quote, or at the end of the value,
+/// ends the literal somewhere else. Writing `\\` instead is wrong on a server
+/// with `NO_BACKSLASH_ESCAPES`, so such a node is evaluated locally.
+fn holds_a_backslash_string(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => value_holds_a_backslash(value),
+        Expr::Like(like) | Expr::SimilarTo(like) => like.escape_char == Some('\\'),
+        _ => false,
+    }
+}
+
+fn value_holds_a_backslash(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => s.contains('\\'),
+        ScalarValue::Dictionary(_, inner) | ScalarValue::RunEndEncoded(_, _, inner) => {
+            value_holds_a_backslash(inner)
+        }
+        _ if value.data_type().is_nested() => value.to_string().contains('\\'),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a comparison (`=`, `<`, `IS DISTINCT FROM`, `BETWEEN`,
+/// `IN`, …) with a decimal operand and a floating-point one.
+///
+/// `DataFusion` compares the two as decimals: it casts the float to a decimal
+/// wide enough for both, rounding at that scale. `MySQL` compares them as
+/// `DOUBLE`, and a float literal it is sent is a `DOUBLE` (`6E-2`), so
+/// `disc <= 6E-2 + 1E-2` drops the rows at `0.07` that `DataFusion` keeps.
+/// A constant float is folded to the decimal `DataFusion` compares it as before
+/// federation (`DecimalComparisonFloatConstant`), so what reaches this check is
+/// a float that is not a constant, such as a `DOUBLE` column, or a constant that
+/// does not fit the decimal. An operand whose type cannot be read does not
+/// refuse the comparison: that is every comparison's operand in such a scope,
+/// not a sign of this one.
+fn compares_a_decimal_with_a_float(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let operands: Vec<&Expr> = match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            vec![binary.left.as_ref(), binary.right.as_ref()]
+        }
+        Expr::Between(between) => vec![
+            between.expr.as_ref(),
+            between.low.as_ref(),
+            between.high.as_ref(),
+        ],
+        Expr::InList(in_list) => std::iter::once(in_list.expr.as_ref())
+            .chain(in_list.list.iter())
+            .collect(),
+        _ => return false,
+    };
+    let scope = scope.unwrap_or_else(|| DFSchema::empty_ref());
+    let types: Vec<DataType> = operands
+        .into_iter()
+        .filter_map(|operand| operand_type(operand, scope))
+        .collect();
+    types.iter().any(DataType::is_decimal) && types.iter().any(DataType::is_floating)
+}
+
+/// Whether `MySQL` accepts this aggregate's `DISTINCT`.
+///
+/// It does for `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. Any other aggregate
+/// with `DISTINCT` — `STDDEV_SAMP(DISTINCT x)`, `VAR_POP(DISTINCT x)`,
+/// `BIT_XOR(DISTINCT x)` — is a syntax error (1064), so a federated query
+/// fails where `DataFusion` answers it (measured on `MySQL` 9.7). A window
+/// function takes no `DISTINCT` at all ([`window_distinct_is_renderable`]).
+fn distinct_is_renderable_in_mysql(expr: &Expr) -> bool {
+    match expr {
+        Expr::AggregateFunction(AggregateFunction { func, params }) => {
+            !params.distinct || matches!(func.name(), "count" | "sum" | "avg" | "min" | "max")
+        }
+        _ => window_distinct_is_renderable(expr),
+    }
+}
+
+/// Whether an engine parses the string this cast reads into the instant
+/// `DataFusion` reads out of it.
+///
+/// `DataFusion` reads an ISO 8601 string's UTC offset (`-07:00`, `Z`) and its
+/// nanoseconds, and reads a string without an offset as UTC. The engines this
+/// crate unparses a `CAST(s AS Timestamp)` for do not: `DuckDB` is handed
+/// `TO_TIMESTAMP(EPOCH(CAST(s AS TIMESTAMP)))`, which drops the offset and
+/// truncates to microseconds, `PostgreSQL`'s and `MySQL`'s `TIMESTAMP` ignore
+/// the offset (`MySQL` rejects some spellings outright), and `SQLite` reads a
+/// string without an offset in the host's time zone. A filter over the cast
+/// would then select different rows than the same filter evaluated locally —
+/// for a retention or refresh-window filter, live rows deleted or expired rows
+/// kept — so it stays local. A string *literal* is folded by `DataFusion` before
+/// any pushdown and carries no column's spelling, so it is not refused; an
+/// operand whose type cannot be read is, matching [`integer_cast_is_renderable`].
+#[must_use]
+pub(crate) fn string_timestamp_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    if !matches!(field.data_type(), DataType::Timestamp(_, _)) {
+        return true;
+    }
+    if let Expr::Literal(..) = operand.as_ref() {
+        return true;
+    }
+    let empty = DFSchema::empty();
+    operand_type(operand, scope.unwrap_or(&empty)).is_some_and(|data_type| {
+        !(data_type.is_string()
+            || data_type.is_null()
+            || matches!(&data_type, DataType::Dictionary(_, value) if value.is_string()))
+    })
 }
 
 /// Whether an engine that rounds a fractional value on its way into an integer
@@ -481,7 +819,7 @@ mod tests {
         bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
         duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
         integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
-        postgres_can_evaluate_expression,
+        postgres_can_evaluate_expression, string_timestamp_cast_is_renderable,
     };
     use crate::function_support::bigquery_can_evaluate_expression;
     use arrow_schema::{DataType, Field, Schema};
@@ -832,6 +1170,59 @@ mod tests {
         }
     }
 
+    /// A cast from a string column into a timestamp stays local on every engine
+    /// that parses the string differently: `DuckDB` drops the UTC offset and the
+    /// nanoseconds, `PostgreSQL` and `MySQL` drop the offset. A timestamp literal
+    /// spelled as a cast of a string literal, a cast from a non-string column,
+    /// and a cast of a string into anything else still federate; an operand
+    /// whose type cannot be read is refused.
+    #[test]
+    fn a_string_to_timestamp_cast_stays_local_where_the_engine_parses_it_differently() {
+        use arrow_schema::TimeUnit;
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("l", DataType::LargeUtf8),
+            ("v", DataType::Utf8View),
+            ("t", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("d", DataType::Date32),
+        ]);
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let utc = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let engines: [(&str, CanEvaluateExpression); 4] = [
+            ("DuckDB", duckdb_can_evaluate_expression),
+            ("PostgreSQL", postgres_can_evaluate_expression),
+            ("MySQL", mysql_can_evaluate_expression),
+            ("gate", string_timestamp_cast_is_renderable),
+        ];
+        for (engine, can_evaluate) in engines {
+            for expr in [
+                cast(col("s"), nanos.clone()),
+                try_cast(col("l"), nanos.clone()),
+                cast(col("v"), utc.clone()),
+                cast(col("t.s"), nanos.clone()),
+                cast(upper(col("s")), nanos.clone()),
+            ] {
+                assert!(
+                    !can_evaluate(&expr, Some(&scope)),
+                    "{engine} parses {expr} differently, so it must stay local"
+                );
+            }
+            assert!(!can_evaluate(&cast(col("s"), nanos.clone()), None));
+            for expr in [
+                cast(lit("2021-05-02T00:00:00Z"), nanos.clone()),
+                cast(col("t"), nanos.clone()),
+                cast(col("d"), utc.clone()),
+                cast(col("s"), DataType::Date32),
+                col("s").gt_eq(lit("2021-05-01")),
+            ] {
+                assert!(
+                    can_evaluate(&expr, Some(&scope)),
+                    "{engine} must still be handed {expr}"
+                );
+            }
+        }
+    }
+
     /// The complement: the refusal costs only the casts it is about. A cast
     /// from an integer, a boolean or a string into an integer, and a cast from
     /// a fractional value into anything but an integer, federate as before.
@@ -865,6 +1256,109 @@ mod tests {
             assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
             assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
         }
+    }
+
+    /// A string with a backslash stays local on `MySQL`, which reads the
+    /// backslash as an escape: `C:\new` would hold a newline, and `a\'b` or
+    /// `trail\` would end the literal somewhere else. So does a `LIKE` or
+    /// `SIMILAR TO` whose escape character is a backslash.
+    #[test]
+    fn mysql_keeps_a_backslash_string_local() {
+        use datafusion::logical_expr::expr::Like;
+
+        let like = |escape_char: Option<char>| {
+            Like::new(
+                false,
+                Box::new(col("s")),
+                Box::new(lit("a!%")),
+                escape_char,
+                false,
+            )
+        };
+        for value in ["a\\'b", "trail\\", "C:\\new", "a\\\\'b", "\\"] {
+            for literal in [
+                lit(value),
+                lit(ScalarValue::LargeUtf8(Some(value.to_string()))),
+                lit(ScalarValue::Utf8View(Some(value.to_string()))),
+                lit(ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::from(value)),
+                )),
+            ] {
+                assert!(!mysql_can_evaluate_expression(&literal, None), "{literal}");
+            }
+        }
+        let nested = ScalarValue::List(ScalarValue::new_list_nullable(
+            &[ScalarValue::from("plain"), ScalarValue::from("a\\'b")],
+            &DataType::Utf8,
+        ));
+        let run_end = ScalarValue::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Utf8, true)),
+            Box::new(ScalarValue::from("trail\\")),
+        );
+        for expr in [lit(nested), lit(run_end)] {
+            assert!(!mysql_can_evaluate_expression(&expr, None), "{expr}");
+        }
+        for expr in [
+            Expr::Like(like(Some('\\'))),
+            Expr::SimilarTo(like(Some('\\'))),
+        ] {
+            assert!(!mysql_can_evaluate_expression(&expr, None), "{expr}");
+        }
+        for expr in [
+            lit("plain"),
+            lit("x''y"),
+            lit("a\"b"),
+            lit(ScalarValue::Utf8(None)),
+            Expr::Like(like(None)),
+            Expr::Like(like(Some('!'))),
+        ] {
+            assert!(mysql_can_evaluate_expression(&expr, None), "{expr}");
+        }
+    }
+
+    /// Decimal `/` stays local on `DuckDB`: the dialect unparses every
+    /// `Divide` as `//`, and `DuckDB` answers that as a `DOUBLE`. Integer `/`
+    /// and float `/` federate, including a qualified integer column resolved
+    /// against the scan's own schema.
+    #[test]
+    fn duckdb_declines_decimal_division() {
+        let scope = scope_of(&[
+            ("d", DataType::Decimal128(38, 10)),
+            ("n", DataType::Int64),
+            ("f", DataType::Float64),
+        ]);
+        for expr in [
+            col("d") / lit(3_i64),
+            col("n") / col("d"),
+            col("t.d") / lit(3_i64),
+        ] {
+            assert!(
+                !duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} must stay local"
+            );
+        }
+        for expr in [
+            col("n") / lit(2_i64),
+            col("t.n") / lit(2_i64),
+            col("f") / lit(2.0_f64),
+            lit(7_i64) / lit(2_i64),
+            col("d") + lit(1_i64),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} must federate"
+            );
+        }
+        assert!(!duckdb_can_evaluate_expression(
+            &(col("d") / lit(3_i64)),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &(lit(7_i64) / lit(2_i64)),
+            None
+        ));
     }
 
     /// The scan's own filter pushdown resolves against the scan's unqualified

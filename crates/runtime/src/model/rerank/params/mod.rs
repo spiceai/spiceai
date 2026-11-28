@@ -65,7 +65,7 @@ impl FromStr for Truncation {
             "none" => Ok(Truncation::None),
             "end" => Ok(Truncation::End),
             "start" => Ok(Truncation::Start),
-            other => Err(format!("must be one of: none, end, start. Found '{other}'")),
+            _ => Err("must be one of: none, end, start".to_string()),
         }
     }
 }

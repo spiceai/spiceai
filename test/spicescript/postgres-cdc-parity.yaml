@@ -1,0 +1,378 @@
+name: postgres-cdc-parity
+duration: 607s
+description: >
+  Postgres CDC converges to the source after inserts, updates, deletes, key
+  changes and large transactions, across a clean restart and a kill: Cayenne
+  under each deletion mode, with file CDC durability, and
+  partitioned on its key, and in memory. With object-native data, the
+  datasets' files are in the state location, and an instance that loses its
+  directory serves the same rows from the location while the source is down,
+  then resumes CDC once it is back.
+
+sources:
+  src: { kind: postgres }
+  # The state location of object-native-rustfs and object-native-s3.
+  lake: { kind: rustfs }
+  # The same, 20 ms away (object-native-s3-latency).
+  slow-lake: { kind: rustfs, latency: 20ms }
+
+variants:
+  sqlite-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
+  sqlite-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  # The prototype object-native metastore: a head log in a local directory,
+  # with no SQL metastore. The in-memory CDC tier flushes on every 1 s tick
+  # instead of waiting for 32 MiB or 10 s, so the catalog commits (and the head
+  # log seals and checkpoints) many times in a short run.
+  object-native-key:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  object-native-position:
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # `object-native-rustfs`: `object-native-key`'s settings with the state
+  # location in an S3-compatible store, so the head log and the data files are
+  # both in the location's `cayenne/v1/` folder. It differs from
+  # `object-native-s3` only in flushing the in-memory CDC tier on every tick,
+  # which is its point: the log commits, seals and checkpoints many times
+  # against a real object store within a short run.
+  object-native-rustfs:
+    spicepod:
+      runtime:
+        params: { cayenne_vnext: enabled }
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # The same flush cadence on SQLite, so the comparison isolates the metastore.
+  sqlite-key-flush:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # CDC batches written to files before the source is acknowledged, instead
+  # of the default in-memory tier.
+  file-durability:
+    datasets: { '*': { acceleration: { params: { cayenne_cdc_durability: file } } } }
+  # File accelerations partitioned on the primary key (#14947).
+  partitioned:
+    datasets:
+      orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
+      customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
+  # `partitioned` with `cayenne_vnext` enabled fails to load (config-errors
+  # checks the message), so it has no variant here until the object-native
+  # metastore supports `partition_by` (#16308).
+  cayenne-memory:
+    datasets: { '*': { acceleration: { mode: memory } } }
+  # Object-native data (#16131): data files in the state location, which an
+  # instance that loses its directory serves again without the source.
+  object-native: object-native
+  object-native-s3: object-native-s3
+  object-native-s3-latency: object-native-s3-latency
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-parity
+  datasets:
+    - from: postgres:public.orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+        on_conflict: { o_id: upsert }
+    - from: postgres:public.customers
+      name: customers
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: c_id
+        on_conflict: { c_id: upsert }
+
+defaults:
+  expect: { oracle: src }
+  # Every query is checked against its instance's own source. The instances do
+  # not end with the same rows: the timed churn and the writes under readers
+  # below run on some variants only, for a number of rounds that depends on
+  # timing, so their final answers are not compared with one another.
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE customers (
+          c_id      integer PRIMARY KEY,
+          c_name    text NOT NULL,
+          c_segment varchar(16),
+          c_balance numeric(15, 2),
+          c_active  boolean,
+          c_since   date
+        );
+        CREATE TABLE orders (
+          o_id       bigint PRIMARY KEY,
+          o_custkey  integer,
+          o_status   char(1),
+          o_total    numeric(15, 2),
+          o_qty      smallint,
+          o_weight   double precision,
+          o_ratio    real,
+          o_note     text,
+          o_placed   timestamp,
+          o_updated  timestamptz,
+          o_payload  bytea
+        );
+        INSERT INTO customers
+          SELECT i, 'Customer#' || i, (ARRAY['AUTO', 'BUILDING', 'FURNITURE', NULL])[1 + i % 4],
+                 (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + i
+          FROM generate_series(1, 500) AS i;
+        INSERT INTO orders
+          SELECT i, 1 + i % 500, (ARRAY['O', 'F', 'P'])[1 + i % 3], (i * 7919 % 1000000) / 100.0,
+                 (i % 50)::smallint, i * 0.125, (i % 97) / 7.0, CASE WHEN i % 10 = 0 THEN NULL ELSE 'note ' || i END,
+                 TIMESTAMP '2024-01-01 00:00:00' + i * INTERVAL '37 minutes',
+                 TIMESTAMPTZ '2024-01-01 00:00:00+00' + i * INTERVAL '41 seconds',
+                 decode(lpad(to_hex(i), 8, '0'), 'hex')
+          FROM generate_series(1, 20000) AS i;
+
+  - start: {}
+
+  # Bootstrap: the initial snapshot matches the source.
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # Single-row changes on every path.
+  - source-exec:
+      src:
+        - INSERT INTO customers VALUES (501, 'Customer#501', 'AUTO', 12.50, true, DATE '2024-02-29')
+        - UPDATE customers SET c_balance = -c_balance, c_segment = NULL WHERE c_id % 50 = 0
+        - UPDATE orders SET o_note = NULL, o_total = o_total + 0.01 WHERE o_id % 101 = 0
+        - DELETE FROM orders WHERE o_id % 97 = 0
+        # A primary-key change is a delete of the old key and an insert of the new one.
+        - UPDATE orders SET o_id = o_id + 1000000 WHERE o_id BETWEEN 100 AND 120
+        # Delete and re-insert the same keys inside one transaction.
+        - |
+          BEGIN;
+          DELETE FROM orders WHERE o_id BETWEEN 200 AND 260;
+          INSERT INTO orders (o_id, o_custkey, o_status, o_note) SELECT i, 1, 'X', 'reinserted' FROM generate_series(200, 260) AS i;
+          COMMIT;
+  - query: SELECT * FROM orders
+    eventually: 60s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # One large transaction touching most rows.
+  - source-exec:
+      src: UPDATE orders SET o_qty = (o_qty + 1) % 50, o_updated = o_updated + INTERVAL '1 day' WHERE o_id % 3 = 0
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  # Sustained changes: one committed transaction a second for 90 s, so the
+  # metastore commits often enough to seal and checkpoint its log before the
+  # restart and the kill below.
+  - source-exec:
+      src: |
+        DO $$
+        BEGIN
+          FOR i IN 1..90 LOOP
+            UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 90 = i % 90;
+            UPDATE customers SET c_balance = c_balance + 1 WHERE c_id % 90 = i % 90;
+            COMMIT;
+            PERFORM pg_sleep(1);
+          END LOOP;
+        END $$;
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # The rustfs variant's metastore is in its bucket, under the state location's
+  # cayenne/v1/ folder: the name registry's head, and each dataset's own log
+  # (datasets/<name>-<id>/) with its head, sealed batches, checkpoints and
+  # data files.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /head, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /wal/, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /checkpoints/, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: object-native-rustfs
+
+  # Changes made while spiced is stopped arrive after it starts again.
+  - stop: {}
+  - source-exec:
+      src:
+        - DELETE FROM customers WHERE c_id BETWEEN 10 AND 30
+        - INSERT INTO orders (o_id, o_custkey, o_status) SELECT i, 7, 'N' FROM generate_series(2000000, 2000500) AS i
+        - UPDATE orders SET o_status = 'S' WHERE o_custkey = 7
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  # The same after a kill, with changes in flight when it dies.
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - kill-spiced: {}
+  - source-exec:
+      src:
+        - DELETE FROM orders WHERE o_id % 11 = 0
+        - UPDATE customers SET c_active = NOT c_active
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+  - query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status NULLS LAST
+    eventually: 30s
+  # Both tables replicated to the same point.
+  - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
+    eventually: 30s
+
+  # Data in an S3 state location: deletion vectors are objects in the bucket,
+  # none is on local disk, and nothing is at a local `s3:` path.
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, min: 1 }
+    only: object-native-s3
+  - assert-files: { lacks: ['(^|/)s3:', '\.arrow$'] }
+    only: object-native-s3
+
+  # 180 s of CDC updates and deletes at a fixed rate: the dataset's objects in
+  # the state location, sampled every 10 s, stay under a bound, the data files
+  # and deletion vectors stay within their bounds afterwards, and the table
+  # still matches the source (#16133). The samples also trend upward, which
+  # the ledger records: a retired file is deleted only after the one-hour data
+  # file retention, so every file the churn retires is still stored when the
+  # samples are taken.
+  - background:
+      id: churn
+      source-exec: { src: "UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 97 = ${round} % 97; DELETE FROM orders WHERE o_id % 991 = ${round} % 991" }
+      every: 1s
+    only: object-native-s3
+  - sample-objects:
+      source: lake
+      prefix: state/cayenne/v1/datasets/orders-
+      contains: /data/
+      every: 10s
+      for: 180s
+      max-objects: 600
+    only: object-native-s3
+  - stop-background: { id: churn }
+    only: object-native-s3
+  - query: SELECT * FROM orders
+    eventually: 90s
+    only: object-native-s3
+  # After 20 s with no further change.
+  - sleep: 20s
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .vortex, max: 400 }
+    only: object-native-s3
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: .arrow, max: 200 }
+    only: object-native-s3
+  - assert-log: { lacks: ['falling back to full snapshot rewrite'] }
+    only: object-native-s3
+
+  # Object-native data (#16131): each dataset's files are in the state
+  # location, under its log's data/ folder, and none at a local `s3:` path.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/orders-[^/]+/data/' }
+    only: object-native
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: object-native-s3
+  - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/orders-, contains: /data/, min: 1 }
+    only: object-native-s3-latency
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: &object-native-data [object-native, object-native-s3, object-native-s3-latency]
+
+  # An instance that loses its directory serves the same rows from the
+  # location alone: the source is down, so it cannot load them again.
+  # Expected failures (ledger): a `refresh_mode: changes` dataset is not
+  # registered while its source cannot be reached, so its copy in the location
+  # is not served until the source is back ("table … not found" on every
+  # object-native-data variant; #14611).
+  - query: SELECT * FROM orders
+    id: orders-before-wipe
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    id: customers-before-wipe
+    only: *object-native-data
+  - stop: {}
+    only: *object-native-data
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data
+  - assert-files: { lacks: '^\.spice/' }
+    only: *object-native-data
+  - stop-source: src
+  - start: { ready: false }
+    only: *object-native-data
+  - query: SELECT * FROM orders
+    expect: { same-as: orders-before-wipe }
+    eventually: 60s
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    expect: { same-as: customers-before-wipe }
+    eventually: 30s
+    only: *object-native-data
+  - assert-files: { lacks: '(^|/)s3:' }
+    only: *object-native-data
+
+  # With the source back, CDC resumes from the position the location holds.
+  - start-source: src
+  - source-exec:
+      src: UPDATE orders SET o_status = 'W' WHERE o_id % 7 = 0
+    only: *object-native-data
+  - query: SELECT * FROM orders
+    eventually: 90s
+    only: *object-native-data
+  - query: SELECT * FROM customers
+    eventually: 30s
+    only: *object-native-data
+
+  # Readers while the change stream writes (#16132): with the data in an
+  # object-store location, with or without 20 ms of latency, no query fails,
+  # and the table still matches the source afterwards.
+  - background:
+      id: cdc-writes
+      source-exec: { src: "UPDATE orders SET o_total = o_total + 1 WHERE o_id % 13 = ${round} % 13" }
+      every: 200ms
+    only: &object-native-data-in-store [object-native-s3, object-native-s3-latency]
+  - background:
+      id: readers
+      query: SELECT count(*), sum(o_total) FROM orders
+      concurrency: 4
+    only: *object-native-data-in-store
+  - sleep: 30s
+    only: *object-native-data-in-store
+  - stop-background: { id: cdc-writes }
+    only: *object-native-data-in-store
+  - stop-background: { id: readers }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 60s
+    only: *object-native-data-in-store
+
+  # Losing the directory again, now with the source up and the deletion
+  # vectors of the writes above in the location: the datasets open from the
+  # location and are ready within 60 s, with or without 20 ms of store latency.
+  - stop: {}
+    only: *object-native-data-in-store
+  - wipe-instance-dir: { keep: [state] }
+    only: *object-native-data-in-store
+  - start: { ready-timeout: 60s }
+    only: *object-native-data-in-store
+  - query: SELECT * FROM orders
+    eventually: 30s
+    only: *object-native-data-in-store

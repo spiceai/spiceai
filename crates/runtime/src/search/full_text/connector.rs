@@ -152,6 +152,10 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.initialization()
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
+    }
+
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
     }
@@ -182,6 +186,10 @@ impl DataConnector for FullTextConnector {
 
     fn supports_changes_stream(&self) -> bool {
         self.inner_connector.supports_changes_stream()
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
     }
 
     fn supports_durable_write_back_delivery(&self) -> bool {

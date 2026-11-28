@@ -43,8 +43,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   check-git-push-noninteractive:
+    environment: secret-free
     name: Every CI git push is non-interactive
     # GitHub-hosted on purpose: this is a sub-second check and must not queue behind the
     # self-hosted pool whose credential helpers it is about.

@@ -96,7 +96,7 @@ impl Operation {
 /// Codes AWS returns when it does not accept the identity behind the request at all — the
 /// access key is unknown to AWS, no key reached it, or the session token has expired. Retrying
 /// cannot help; the credentials themselves have to change.
-const CREDENTIALS_REJECTED_CODES: &[&str] = &[
+pub(super) const CREDENTIALS_REJECTED_CODES: &[&str] = &[
     "UnrecognizedClientException",
     "InvalidClientTokenId",
     "MissingAuthenticationToken",
@@ -109,7 +109,7 @@ const CREDENTIALS_REJECTED_CODES: &[&str] = &[
 /// a host clock more than a few minutes out makes the signature expire, and a signature scoped
 /// to the wrong region is rejected as mismatched. Telling those operators to replace their keys
 /// is advice that cannot work, which is worse than saying nothing.
-const SIGNATURE_REJECTED_CODES: &[&str] = &[
+pub(super) const SIGNATURE_REJECTED_CODES: &[&str] = &[
     "InvalidSignatureException",
     "IncompleteSignature",
     "RequestExpired",
@@ -131,12 +131,12 @@ const SIGNATURE_REMEDY: &str = concat!(
 ///
 /// `NotAuthorized` is from AWS's common-error set rather than Bedrock's own modelled errors, so
 /// it arrives unmodelled exactly as the credential codes do.
-const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "NotAuthorized"];
+pub(super) const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "NotAuthorized"];
 
 /// The code AWS returns when the *account* is not subscribed to the service, rather than the
 /// identity lacking a permission. An IAM grant cannot resolve it, and suggesting one would
 /// broaden access while Bedrock stays unavailable — so it is deliberately not an access denial.
-const NOT_SUBSCRIBED_CODES: &[&str] = &["OptInRequired"];
+pub(super) const NOT_SUBSCRIBED_CODES: &[&str] = &["OptInRequired"];
 
 const NOT_SUBSCRIBED_REMEDY: &str = concat!(
     "Amazon Bedrock is not enabled for this AWS account in the region set by `aws_region`. ",

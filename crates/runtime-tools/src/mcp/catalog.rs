@@ -49,12 +49,15 @@ use tokio::{
     sync::RwLock,
     time::{MissedTickBehavior, interval},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
 use super::{
-    Error, MCPConfig, Result, UnderlyingTransportSnafu,
+    Error, MAX_TOOL_RESULT_SIZE, MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT,
+    MCPConfig, Result, UnderlyingTransportSnafu,
+    http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
 };
@@ -72,23 +75,7 @@ const DANGEROUS_PATH_PATTERNS: &[&str] = &[
 
 /// Parent variables a stdio MCP server inherits; Spicepod `env` adds to these.
 /// Matches the MCP Python SDK so secrets in the `spiced` environment do not leak.
-#[cfg(not(windows))]
 const INHERITED_STDIO_ENV_VARS: &[&str] = &["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
-#[cfg(windows)]
-const INHERITED_STDIO_ENV_VARS: &[&str] = &[
-    "APPDATA",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "LOCALAPPDATA",
-    "PATH",
-    "PATHEXT",
-    "PROCESSOR_ARCHITECTURE",
-    "SYSTEMDRIVE",
-    "SYSTEMROOT",
-    "TEMP",
-    "USERNAME",
-    "USERPROFILE",
-];
 
 /// Pre-compiled glob set for path validation
 static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
@@ -112,14 +99,6 @@ fn forward_stderr(tool_name: String, stderr: ChildStderr) {
             tracing::debug!(tool = %tool_name, "MCP server stderr: {line}");
         }
     });
-}
-
-/// Check if a hostname is localhost
-fn is_localhost(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    )
 }
 
 pub(crate) struct McpToolCatalog {
@@ -442,7 +421,7 @@ impl McpToolCatalog {
                 // The read lock is held during the heartbeat call. The underlying
                 // McpClient wraps a RunningService which is not Clone, so we cannot
                 // clone the client to release the lock before the network call.
-                // This is acceptable because the call timeout is bounded.
+                // This is acceptable because `MCP_REQUEST_TIMEOUT` bounds each probe.
                 let heartbeat_result = {
                     let client_guard = client_clone.read().await;
                     client_guard.heartbeat().await
@@ -552,6 +531,20 @@ impl McpToolCatalog {
     }
 
     async fn create_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
+        // An attempt that ends without a client (its handshake timed out or failed, or the load
+        // was stopped) cancels `abandoned`, which ends the requests its handshake left open.
+        let abandoned = CancellationToken::new();
+        let release_on_drop = abandoned.clone().drop_guard();
+        let client = Self::connect_client(cfg, tool_name, &abandoned).await?;
+        release_on_drop.disarm();
+        Ok(client)
+    }
+
+    async fn connect_client(
+        cfg: &MCPConfig,
+        tool_name: &str,
+        abandoned: &CancellationToken,
+    ) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security constants
@@ -614,10 +607,13 @@ impl McpToolCatalog {
                 }
 
                 Ok(McpClient::Stdio(
-                    ().serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        ().serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
             MCPConfig::StreamableHttp {
@@ -638,21 +634,33 @@ impl McpToolCatalog {
 
                 // Security: Warn if using http (unencrypted) for non-localhost
                 let host = url.host_str().unwrap_or("<unknown>");
-                if url.scheme() == "http" && !is_localhost(host) {
+                if url.scheme() == "http" && !util::net::is_loopback_host(host) {
                     tracing::warn!(
                         "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
                         host,
-                        url
+                        redact::redact_url_credentials(url.as_str())
                     );
                 }
 
+                let http_client =
+                    BoundedHttpClient::new(tool_name, abandoned.clone()).map_err(|e| {
+                        Error::CouldNotConstructTool {
+                            name: "mcp_streamable_http".to_string(),
+                            e: format!(
+                                "Failed to create the HTTP client for '{}': {e}",
+                                redact::redact_url_credentials(url.as_str())
+                            ),
+                        }
+                    })?;
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.to_string())
-                        .custom_headers(headers.clone());
+                        .custom_headers(headers.clone())
+                        .max_sse_event_size(MAX_TOOL_RESULT_SIZE);
                 if let Some(auth_token) = auth_token {
                     transport_config = transport_config.auth_header(auth_token.expose_secret());
                 }
-                let transport = StreamableHttpClientTransport::from_config(transport_config);
+                let transport =
+                    StreamableHttpClientTransport::with_client(http_client, transport_config);
 
                 let client_info = InitializeRequestParams::new(
                     ClientCapabilities::default(),
@@ -661,11 +669,13 @@ impl McpToolCatalog {
                 .with_protocol_version(ProtocolVersion::V_2026_07_28);
 
                 Ok(McpClient::Http(
-                    client_info
-                        .serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        client_info.serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
         }
@@ -945,6 +955,30 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
+/// Waits at most `timeout` for an MCP request. On timeout the request future is dropped.
+async fn bounded<T>(
+    timeout: Duration,
+    request: impl Future<Output = std::result::Result<T, ServiceError>>,
+) -> std::result::Result<T, ServiceError> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .unwrap_or(Err(ServiceError::Timeout { timeout }))
+}
+
+/// Waits at most [`MCP_HANDSHAKE_TIMEOUT`] for an MCP client to start. Dropping the start
+/// future on timeout drops its transport, which stops a stdio server's child process.
+async fn handshake<T>(tool_name: &str, start: impl Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(MCP_HANDSHAKE_TIMEOUT, start)
+        .await
+        .map_err(|_| Error::CouldNotConstructTool {
+            name: tool_name.to_string(),
+            e: format!(
+                "The MCP server did not complete its handshake within {} seconds",
+                MCP_HANDSHAKE_TIMEOUT.as_secs()
+            ),
+        })
+}
+
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
     Http(RunningService<RoleClient, InitializeRequestParams>),
@@ -968,8 +1002,8 @@ impl McpClient {
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.list_tools(params).await,
-            McpClient::Http(s) => s.list_tools(params).await,
+            McpClient::Stdio(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
+            McpClient::Http(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
                 scripted.list_calls.fetch_add(1, Ordering::SeqCst);
@@ -986,8 +1020,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool(params).await,
-            McpClient::Http(s) => s.call_tool(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1003,8 +1037,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResponse, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool_once(params).await,
-            McpClient::Http(s) => s.call_tool_once(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1013,14 +1047,20 @@ impl McpClient {
     pub async fn ping(&self) -> Result<(), ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(_) => return Err(ServiceError::UnexpectedResponse),
@@ -1056,14 +1096,20 @@ impl McpClient {
     async fn list_tools_uncached(&self) -> Result<ListToolsResult, ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
@@ -1193,6 +1239,57 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
+    /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way, once its first
+    /// request has reached the server. rmcp sends that request outside its own cancellation, so
+    /// without that each retry against a server that never answers would leave one more
+    /// connection, and the task waiting on it, open.
+    #[tokio::test]
+    async fn test_abandoned_handshake_closes_its_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the handshake");
+            // Read the request and never answer. A read of 0 bytes is the client closing.
+            let mut buf = [0_u8; 4096];
+            if socket.read(&mut buf).await.is_ok_and(|read| read > 0) {
+                let _ = requested_tx.send(());
+                while socket.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            }
+            let _ = closed_tx.send(());
+        });
+        let cfg = MCPConfig::StreamableHttp {
+            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+
+        // Give up only once the request is in flight, however long a loaded host takes to send
+        // it: an attempt given up before it connects has no connection to close.
+        let mut attempt = Box::pin(McpToolCatalog::create_client(&cfg, "silent"));
+        tokio::select! {
+            _ = &mut attempt => panic!("an unresponsive server must not connect"),
+            requested = tokio::time::timeout(Duration::from_secs(60), requested_rx) => assert!(
+                matches!(requested, Ok(Ok(()))),
+                "the handshake request never reached the server"
+            ),
+        }
+        drop(attempt);
+
+        let closed = tokio::time::timeout(Duration::from_secs(30), closed_rx).await;
+        server.abort();
+        assert!(
+            matches!(closed, Ok(Ok(()))),
+            "the abandoned handshake left its connection open"
+        );
+    }
+
     #[test]
     fn test_dangerous_patterns_reject_parent_traversal() {
         // Unix-style parent directory traversal
@@ -1270,23 +1367,6 @@ mod tests {
             !DANGEROUS_PATH_GLOB_SET.is_match("./script.sh"),
             "./script.sh should be allowed"
         );
-    }
-
-    #[test]
-    fn test_is_localhost_ipv4() {
-        assert!(is_localhost("127.0.0.1"));
-        assert!(is_localhost("localhost"));
-        assert!(is_localhost("0.0.0.0"));
-        assert!(!is_localhost("192.168.1.1"));
-        assert!(!is_localhost("example.com"));
-    }
-
-    #[test]
-    fn test_is_localhost_ipv6() {
-        assert!(is_localhost("::1"));
-        assert!(is_localhost("[::1]"));
-        assert!(!is_localhost("::2"));
-        assert!(!is_localhost("2001:db8::1"));
     }
 
     fn sample_listed_tool(name: &'static str) -> rmcp::model::Tool {

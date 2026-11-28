@@ -62,11 +62,12 @@ impl Schedule {
     pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
         let task = Arc::clone(&self.task);
         let handle = tokio::spawn(async move {
+            // The triggers wait for this notice before they schedule the next run, so it is
+            // sent on drop: a run that panics still lets the schedule continue.
+            let _completion = CompletionNotice(notifier);
             if (task.execute().await).is_err() {
                 // Log or handle the error when retry stategy is implemented
             }
-
-            notifier.notify_waiters();
 
             Ok(())
         });
@@ -80,7 +81,10 @@ impl Schedule {
     }
 
     async fn finalise_running_task(task: RunningTask) {
-        match task.consume_for_handle().await {
+        let Some(handle) = task.consume_for_handle() else {
+            return;
+        };
+        match handle.await {
             Ok(Ok(())) => {
                 tracing::debug!("Task executed successfully");
             }
@@ -133,7 +137,7 @@ impl Schedule {
                                                 Self::finalise_running_task(task).await;
                                             }
                                             (false, true) => {
-                                                task.handle.abort();
+                                                task.abort();
                                                 Self::finalise_running_task(task).await;
                                             }
                                             _ => {
@@ -162,5 +166,14 @@ impl Schedule {
 
             Ok(())
         })
+    }
+}
+
+/// Notifies the schedule's triggers that a run ended when dropped.
+struct CompletionNotice(Arc<Notify>);
+
+impl Drop for CompletionNotice {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
     }
 }

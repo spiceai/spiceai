@@ -48,6 +48,13 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
+/// Whether a component in `Error` holds back [`RuntimeStatus`] readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnhealthyComponents {
+    Block,
+    Allow,
+}
+
 /// Why a readiness wait returned.
 ///
 /// Every `wait_for_*` helper races the awaited status against the runtime's
@@ -109,6 +116,24 @@ pub struct RuntimeStatus {
     /// another status. [`Self::release_dataset_ready`] applies those and
     /// returns to `None`.
     dataset_ready_hold: Arc<RwLock<Option<HashSet<TableReference>>>>,
+    /// Outbound Spice Cloud management connection. Kept out of the component
+    /// readiness map so a failed Cloud export cannot flip `/v1/ready`.
+    management: Arc<RwLock<Option<ManagementConnectionStatus>>>,
+    /// Datasets that skipped at least one CDC change event because it could not
+    /// be decoded. [`ComponentStatus::Ready`] is ignored for these until
+    /// [`Self::clear_changes_decode_degraded`] (a successful full refresh or
+    /// snapshot) or process restart, so a later valid event cannot hide the gap.
+    changes_decode_degraded: Arc<RwLock<HashSet<String>>>,
+}
+
+/// Status of the outbound Spice Cloud management connection.
+///
+/// Recorded for diagnostics and tests. Not part of [`RuntimeStatus::is_ready`]:
+/// query serving must stay up if Cloud export fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagementConnectionStatus {
+    pub status: ComponentStatus,
+    pub endpoint: String,
 }
 
 impl Default for RuntimeStatus {
@@ -122,6 +147,8 @@ impl Default for RuntimeStatus {
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
             dataset_ready_hold: Arc::new(RwLock::new(None)),
+            management: Arc::new(RwLock::new(None)),
+            changes_decode_degraded: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
@@ -179,6 +206,30 @@ impl RuntimeStatus {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(component_name.to_string());
         }
+    }
+
+    /// Records the outbound Spice Cloud management connection.
+    ///
+    /// Does not register a readiness component. A failed export must not take
+    /// `/v1/ready` down.
+    pub fn update_management(&self, status: ComponentStatus, endpoint: impl Into<String>) {
+        *self
+            .management
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ManagementConnectionStatus {
+                status,
+                endpoint: endpoint.into(),
+            });
+    }
+
+    /// Returns the Spice Cloud management connection when one has been recorded.
+    #[must_use]
+    pub fn management_connection(&self) -> Option<ManagementConnectionStatus> {
+        self.management
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
@@ -326,11 +377,46 @@ impl RuntimeStatus {
 
     /// Apply a dataset status without consulting [`Self::dataset_ready_hold`].
     fn apply_dataset_status_now(&self, dataset: &TableReference, status: ComponentStatus) {
+        if status == ComponentStatus::Ready && self.is_changes_decode_degraded(dataset) {
+            return;
+        }
         let ds_name = dataset.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
         runtime_metrics::datasets::STATUS
             .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+    }
+
+    /// Record that `dataset` skipped a CDC change event that could not be decoded.
+    ///
+    /// Sets dataset status to [`ComponentStatus::Error`] with `message` (which must
+    /// not contain payload or field values) and ignores later `Ready` updates until
+    /// [`Self::clear_changes_decode_degraded`].
+    pub fn mark_changes_decode_degraded(&self, dataset: &TableReference, message: String) {
+        self.changes_decode_degraded
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dataset.to_string());
+        self.update_dataset(dataset, ComponentStatus::error_with_message(message));
+    }
+
+    /// Allow `dataset` to become [`ComponentStatus::Ready`] again after a successful
+    /// full refresh, snapshot load, or equivalent resnapshot. Does not set `Ready`;
+    /// the caller does that after this returns.
+    pub fn clear_changes_decode_degraded(&self, dataset: &TableReference) {
+        self.changes_decode_degraded
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&dataset.to_string());
+    }
+
+    /// Whether `dataset` is holding a sticky CDC decode-error condition.
+    #[must_use]
+    pub fn is_changes_decode_degraded(&self, dataset: &TableReference) -> bool {
+        self.changes_decode_degraded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&dataset.to_string())
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
@@ -433,6 +519,42 @@ impl RuntimeStatus {
     /// - The runtime is in the process of shutting down.
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        self.is_ready_with(UnhealthyComponents::Block)
+    }
+
+    /// Like [`Self::is_ready`], but a component currently in `Error` does not
+    /// hold readiness back under `OnLoad`: the runtime counts as ready once
+    /// every other component has been ready at least once, so a single failed
+    /// dataset no longer keeps the whole runtime out of service. A component
+    /// still on its first load (`Initializing`, or `Refreshing` before it was
+    /// ever ready) still blocks. Under `OnRegistration` this is the same as
+    /// [`Self::is_ready`], which already treats `Error` as ready-enough.
+    ///
+    /// One guard: under `OnLoad`, when the Spicepod has at least one (non-disabled)
+    /// dataset and every dataset is in `Error`, the runtime stays not ready, so
+    /// a runtime with nothing to serve is never routed to. A partly broken
+    /// runtime serves.
+    ///
+    /// Backs `GET /v1/ready?allow_unhealthy=true`, which an orchestrator can use
+    /// as its readiness probe to route traffic to the healthy components of a
+    /// runtime whose load has settled with some components failed, while
+    /// `GET /v1/ready` keeps reporting full readiness.
+    #[must_use]
+    pub fn is_ready_allowing_unhealthy(&self) -> bool {
+        self.is_ready_with(UnhealthyComponents::Allow)
+    }
+
+    /// Whether scheduled work, such as a SQL worker, may run: every component has been
+    /// `Ready` at least once ([`Self::is_ready`], which stays true after a component fails),
+    /// or every component not in `Error` has, unless every dataset is in `Error`
+    /// ([`Self::is_ready_allowing_unhealthy`]), since a component that failed before it loaded
+    /// may never load.
+    #[must_use]
+    pub fn is_ready_for_scheduled_work(&self) -> bool {
+        self.is_ready() || self.is_ready_allowing_unhealthy()
+    }
+
+    fn is_ready_with(&self, unhealthy: UnhealthyComponents) -> bool {
         if self.is_shutdown() {
             return false;
         }
@@ -469,11 +591,36 @@ impl RuntimeStatus {
                     Err(poisoned) => poisoned.into_inner(),
                 };
 
+                // Tolerating failed components must not report a runtime ready when it has
+                // nothing to serve: if the Spicepod has datasets and every one of them failed,
+                // stay not ready.
+                if unhealthy == UnhealthyComponents::Allow {
+                    let mut datasets = statuses
+                        .iter()
+                        .filter(|(component, state)| {
+                            component.starts_with("dataset:")
+                                && !matches!(state.status, ComponentStatus::Disabled)
+                        })
+                        .peekable();
+                    if datasets.peek().is_some()
+                        && datasets
+                            .all(|(_, state)| matches!(state.status, ComponentStatus::Error(_)))
+                    {
+                        return false;
+                    }
+                }
+
                 // OnLoad readiness: a component counts as ready if it has been ready at least once.
-                // All registered components must appear in the ever-ready set before we report ready.
+                // All registered components must appear in the ever-ready set before we report ready,
+                // except disabled ones: a component removed from the Spicepod never loads.
                 statuses
-                    .keys()
-                    .all(|component| ever_ready.contains(component))
+                    .iter()
+                    .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
+                    .filter(|(_, state)| {
+                        unhealthy == UnhealthyComponents::Block
+                            || !matches!(state.status, ComponentStatus::Error(_))
+                    })
+                    .all(|(component, _)| ever_ready.contains(component))
             }
             // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
             // Only components in ShuttingDown state block overall readiness.
@@ -750,6 +897,15 @@ impl RuntimeStatus {
         self.wait_for_component_ready(&component_name).await
     }
 
+    /// Waits for a dataset's load to end, whether it became `Ready` or failed.
+    pub async fn wait_for_dataset_loaded_or_failed(&self, dataset: &TableReference) -> WaitOutcome {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_status(&component_name, |status| {
+            matches!(status, ComponentStatus::Ready | ComponentStatus::Error(_))
+        })
+        .await
+    }
+
     /// Waits for a dataset to be registered (any status other than
     /// `Initializing`). Useful when the caller only needs the table
     /// provider to exist, not for the dataset to be fully loaded — e.g.
@@ -908,6 +1064,34 @@ mod tests {
     }
 
     #[test]
+    fn management_error_does_not_block_readiness() {
+        let status = RuntimeStatus::new();
+        status.update_dataset(&TableReference::bare("orders"), ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        status.update_management(
+            ComponentStatus::error_with_message(
+                "Missing required secret: api_key. Specify a value.",
+            ),
+            "N/A",
+        );
+
+        assert!(
+            status.is_ready(),
+            "a failed Spice Cloud management connection must not flip /v1/ready"
+        );
+        let management = status
+            .management_connection()
+            .expect("management status is recorded");
+        assert!(management.status.is_error());
+        assert_eq!(management.endpoint, "N/A");
+        assert_eq!(
+            management.status.error_message(),
+            Some("Missing required secret: api_key. Specify a value.")
+        );
+    }
+
+    #[test]
     fn test_is_ready_false_while_dataset_ready_hold_is_active_on_registration() {
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
@@ -1024,6 +1208,138 @@ mod tests {
         // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
         assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_load_ignores_a_removed_component_that_never_loaded() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&bad, ComponentStatus::error_with_message("file not found"));
+        assert!(!status.is_ready());
+
+        // Removing `bad` from the Spicepod disables it.
+        status.update_dataset(&bad, ComponentStatus::Disabled);
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_skips_a_failed_component_on_load() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let slow = TableReference::bare("slow");
+        let bad = TableReference::bare("bad");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&slow, ComponentStatus::Initializing);
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        // A dataset still on its first load blocks both checks.
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        status.update_dataset(&slow, ComponentStatus::Ready);
+        // Settled with one failed dataset: full readiness stays false, the
+        // unhealthy-tolerant check passes.
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+
+        // A retry that puts the failed dataset back on its first load blocks again.
+        status.update_dataset(&bad, ComponentStatus::Initializing);
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        // Recovery makes both checks pass.
+        status.update_dataset(&bad, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn scheduled_work_is_not_held_back_by_a_component_that_failed() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let loaded = TableReference::bare("loaded");
+        let never_loaded = TableReference::bare("never_loaded");
+
+        status.update_dataset(&loaded, ComponentStatus::Initializing);
+        assert!(!status.is_ready_for_scheduled_work());
+
+        status.update_dataset(&loaded, ComponentStatus::Ready);
+        status.update_dataset(
+            &never_loaded,
+            ComponentStatus::error_with_message("source unreachable"),
+        );
+        assert!(status.is_ready_for_scheduled_work());
+
+        // Every dataset in `Error`, each after it loaded: the data is still served.
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_dataset(&loaded, ComponentStatus::Ready);
+        status.update_dataset(
+            &loaded,
+            ComponentStatus::error_with_message("source unreachable"),
+        );
+        assert!(status.is_ready_for_scheduled_work());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_requires_a_registered_component_and_respects_shutdown() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(
+            &bad,
+            ComponentStatus::error_with_message("secret not found"),
+        );
+        assert!(status.is_ready_allowing_unhealthy());
+
+        status.mark_shutdown();
+        assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_stays_not_ready_when_every_dataset_failed() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        let a = TableReference::bare("a");
+        let b = TableReference::bare("b");
+
+        status.update_dataset(&a, ComponentStatus::error_with_message("secret not found"));
+        status.update_dataset(&b, ComponentStatus::error_with_message("bucket not found"));
+        // A ready non-dataset component does not make up for every dataset failing.
+        status.update_component_status("model:m", ComponentStatus::Ready);
+        assert!(!status.is_ready());
+        assert!(!status.is_ready_allowing_unhealthy());
+
+        // One dataset recovers: the runtime has something to serve.
+        status.update_dataset(&a, ComponentStatus::Ready);
+        assert!(status.is_ready_allowing_unhealthy());
+
+        // A disabled dataset is not counted: the only remaining dataset failed.
+        status.update_dataset(&a, ComponentStatus::Disabled);
+        assert!(!status.is_ready_allowing_unhealthy());
+    }
+
+    #[test]
+    fn test_is_ready_allowing_unhealthy_without_datasets_tolerates_a_failed_component() {
+        let status = RuntimeStatus::new();
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+        status.update_component_status("model:ok", ComponentStatus::Ready);
+        status.update_component_status("model:bad", ComponentStatus::error_with_message("x"));
+        assert!(!status.is_ready());
+        assert!(status.is_ready_allowing_unhealthy());
     }
 
     #[tokio::test]
@@ -1517,5 +1833,73 @@ mod tests {
         assert_eq!(status.unavailable_embedding_reason("m"), None);
         assert!(status.unavailable_embedding_reason("e").is_some());
         assert_eq!(status.unavailable_model_reason("e"), None);
+    }
+
+    #[test]
+    fn changes_decode_error_stays_error_until_cleared() {
+        const SECRET: &str = "s3cr3t-token-value";
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+        let message = "Failed to decode a change event for dataset 'orders' from Kafka topic 't' partition 0 offset 1, so that event was skipped and the dataset is Error until a full refresh or restart. Cause: missing_required_field. See: https://spiceai.org/docs/components/data-connectors/debezium";
+        assert!(
+            !message.contains(SECRET),
+            "the sticky Error message must not include payload values"
+        );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.mark_changes_decode_degraded(&dataset, message.to_string());
+
+        assert!(status.is_changes_decode_degraded(&dataset));
+        let error = status.get_dataset_status(&dataset).expect("status");
+        assert!(error.is_error());
+        assert_eq!(error.error_message(), Some(message));
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        let still_error = status.get_dataset_status(&dataset).expect("status");
+        assert!(
+            still_error.is_error(),
+            "Ready must not clear a sticky CDC decode error, got {still_error:?}"
+        );
+        assert_eq!(still_error.error_message(), Some(message));
+
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Refreshing)
+        );
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Refreshing),
+            "Ready is ignored while the sticky decode error is set, so a refresh in progress stays Refreshing"
+        );
+
+        status.clear_changes_decode_degraded(&dataset);
+        assert!(!status.is_changes_decode_degraded(&dataset));
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn releasing_held_ready_does_not_clear_a_decode_error() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.mark_changes_decode_degraded(
+            &dataset,
+            "Failed to decode a change event for dataset 'orders' from Kafka topic 't' partition 0 offset 1, so that event was skipped and the dataset is Error until a full refresh or restart. Cause: json_parse. See: https://spiceai.org/docs/components/data-connectors/debezium".to_string(),
+        );
+        status.release_dataset_ready();
+
+        let error = status.get_dataset_status(&dataset).expect("status");
+        assert!(
+            error.is_error(),
+            "a held Ready applied on release must not hide a sticky decode error"
+        );
     }
 }

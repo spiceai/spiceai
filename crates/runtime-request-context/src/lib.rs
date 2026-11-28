@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod baggage;
-pub use baggage::*;
 pub mod cache_control;
 pub use cache_control::*;
 pub mod cache_namespace;

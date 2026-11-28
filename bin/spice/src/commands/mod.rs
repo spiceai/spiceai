@@ -18,10 +18,12 @@ limitations under the License.
 
 pub mod acceleration;
 pub mod add;
+pub mod build;
 pub mod catalogs;
 pub mod chat;
 pub mod cloud;
 pub mod cluster;
+pub mod coding_agent;
 pub mod completions;
 pub mod component;
 pub mod connect;
@@ -38,6 +40,7 @@ pub mod query;
 pub mod refresh;
 pub mod run;
 pub mod search;
+pub mod set_value;
 pub mod sql;
 pub mod status;
 pub mod trace;

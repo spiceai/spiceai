@@ -28,10 +28,12 @@ use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
-    consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, RebalanceProtocol, StreamConsumer},
+    error::KafkaError,
     message::{BorrowedMessage, Timestamp},
     metadata::MetadataPartition,
     topic_partition_list::TopicPartitionList,
+    types::{RDKafkaErrorCode, RDKafkaRespErr},
     util::get_rdkafka_version,
 };
 pub use runtime_checkpoint_api::kafka::KafkaOffset;
@@ -40,10 +42,9 @@ use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tonic::async_trait;
 
@@ -56,10 +57,26 @@ pub use rdkafka;
 // the local buffer, eliminating per-tombstone seek overhead.
 const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
-// Brief pause before retrying a transient poll error during schema peek
-// (`fetch_latest_message`). Long enough to avoid tight spin on a reconnecting
-// broker; short enough to stay within the peek timeout budget.
-const PEEK_TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
+// Brief pause before polling again after a transient consumption error, in the
+// schema peek (`fetch_latest_message`) and in `next_json`. Long enough to avoid
+// a tight spin on a reconnecting broker; short enough to stay within either
+// caller's time budget.
+const TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
+
+// How long `next_json` keeps polling after a transient consumption error before
+// it returns that error. librdkafka reports a failed connection attempt as a
+// consumption error and then tries the next resolved address or reconnects on
+// its own, so the first such error says nothing about whether a message will
+// arrive. Shorter than the Debezium connector's 30 s schema inference timeout,
+// so a broker that stays unreachable surfaces its own error rather than that
+// timeout's "no message" one.
+const NEXT_MESSAGE_TRANSIENT_BUDGET: Duration = Duration::from_secs(20);
+
+// How long one attempt to read a topic's end offsets waits for each broker reply.
+const END_OFFSETS_TIMEOUT: Duration = Duration::from_secs(10);
+
+// The longest wait between attempts to read a topic's end offsets.
+const END_OFFSETS_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,8 +92,15 @@ pub enum Error {
     #[snafu(display("Unable to receive message from Kafka: {source}"))]
     UnableToReceiveMessage { source: rdkafka::error::KafkaError },
 
-    #[snafu(display("Unable to deserialize JSON message from Kafka: {source}"))]
-    UnableToDeserializeJsonMessage { source: serde_json::Error },
+    #[snafu(display(
+        "Unable to deserialize JSON message from Kafka topic '{topic}' partition {partition} offset {offset}"
+    ))]
+    UnableToDeserializeJsonMessage {
+        topic: String,
+        partition: i32,
+        offset: i64,
+        source: serde_json::Error,
+    },
 
     #[snafu(display("Unable to mark Kafka message as being processed: {source}"))]
     UnableToCommitMessage { source: rdkafka::error::KafkaError },
@@ -90,14 +114,11 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Unable to restore Kafka offsets {message}: {source}"))]
-    UnableToRestoreOffsets {
-        source: rdkafka::error::KafkaError,
-        message: String,
-    },
-
     #[snafu(display("The metadata for topic {topic} was not found."))]
     MetadataTopicNotFound { topic: String },
+
+    #[snafu(display("Unable to read the end offsets of Kafka topic '{topic}': {source}"))]
+    UnableToReadEndOffsets { topic: String, source: KafkaError },
 
     #[snafu(display("Received empty batch from Kafka topic. The consumer will retry."))]
     EmptyBatch,
@@ -116,6 +137,42 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// JSON deserialize failures are skipped per event, not fatal to the poll chunk.
+    #[must_use]
+    pub fn is_change_decode_error(&self) -> bool {
+        matches!(self, Self::UnableToDeserializeJsonMessage { .. })
+    }
+
+    /// Payload-free kind for a skipped JSON deserialize failure.
+    #[must_use]
+    pub fn change_decode_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::UnableToDeserializeJsonMessage { .. } => Some("json_parse"),
+            _ => None,
+        }
+    }
+
+    /// Topic, partition, and offset of a skipped JSON message, when known.
+    #[must_use]
+    pub fn kafka_location(&self) -> Option<(&str, i32, i64)> {
+        match self {
+            Self::UnableToDeserializeJsonMessage {
+                topic,
+                partition,
+                offset,
+                ..
+            }
+            | Self::MessageMissingPayload {
+                topic,
+                partition,
+                offset,
+            } => Some((topic.as_str(), *partition, *offset)),
+            _ => None,
+        }
+    }
+}
 
 /// Returns `true` when `e` indicates the topic does not exist on the broker yet.
 #[must_use]
@@ -257,33 +314,149 @@ pub struct KafkaMetrics {
     pub records_consumed: AtomicU64,
     /// Total bytes consumed
     pub bytes_consumed: AtomicU64,
-    /// Set to true the first time the rdkafka stats callback fires with at
-    /// least one valid partition. Until this flips, `records_lag == 0` only
-    /// means "we haven't observed any stats yet", not "the consumer is
-    /// caught up".
-    pub has_received_stats: AtomicBool,
-    /// Notified by the stats callback whenever the consumer is observed to
-    /// be caught up (received at least one valid stats sample with
-    /// `total_lag == 0`). Used by CDC connectors to emit a synthetic
-    /// ready-signal envelope on quiet topics without polling.
-    pub caught_up: Notify,
 }
 
 struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
-    /// Offsets to seek to on the first partition assignment (restored from sidecar).
-    /// Populated at construction so the stash is in place before `subscribe()` can
-    /// trigger a rebalance. The first `Rebalance::Assign` takes the value; later
-    /// rebalances see `None` and fall back to the group-committed offset.
-    restore_offsets: std::sync::Mutex<Option<TopicPartitionList>>,
+    /// The dataset this consumer reads for, named in the lines it logs.
+    dataset: String,
+    /// Where each partition starts when it is assigned. Set at construction so it is in
+    /// place before `subscribe()` can trigger a rebalance.
+    start_offsets: std::sync::Mutex<StartOffsets>,
+}
+
+/// Where a partition starts reading when it is assigned to a consumer, in place of the
+/// group-committed offset.
+enum StartOffsets {
+    /// The offset to resume each `(topic, partition)` from, restored from the sidecar.
+    /// The first assignment of a partition takes its entry and commits it; a partition
+    /// with no entry starts from the group-committed offset.
+    Restore(HashMap<(String, i32), i64>),
+    /// Each partition starts after the last offset this consumer stored for it, or at
+    /// the beginning of its topic if it has stored none. The group-committed offset is
+    /// never used: it can be one an earlier run left ahead of what this run has read,
+    /// and resuming there would skip the messages in between. Holds the next offset to
+    /// read of each partition this consumer has stored an offset for.
+    Stored(HashMap<(String, i32), i64>),
 }
 
 impl KafkaConsumerContext {
-    fn new(metrics: Arc<KafkaMetrics>, restore_offsets: Option<TopicPartitionList>) -> Self {
+    fn new(metrics: Arc<KafkaMetrics>, dataset: String, start_offsets: StartOffsets) -> Self {
         Self {
             metrics,
-            restore_offsets: std::sync::Mutex::new(restore_offsets),
+            dataset,
+            start_offsets: std::sync::Mutex::new(start_offsets),
         }
+    }
+
+    fn lock_start_offsets(&self) -> std::sync::MutexGuard<'_, StartOffsets> {
+        self.start_offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the start offset of each partition of `assignment` that has one, and
+    /// returns the partitions resumed at a restored offset with their offsets.
+    fn apply_start_offsets(
+        &self,
+        assignment: &mut TopicPartitionList,
+    ) -> Option<TopicPartitionList> {
+        match &mut *self.lock_start_offsets() {
+            StartOffsets::Restore(restore) => self.apply_restore_offsets(restore, assignment),
+            StartOffsets::Stored(stored) => {
+                self.apply_stored_offsets(stored, assignment);
+                None
+            }
+        }
+    }
+
+    /// Sets each partition of `assignment` to start at its next offset in `stored`, or
+    /// at [`Offset::Beginning`] if it has none.
+    fn apply_stored_offsets(
+        &self,
+        stored: &HashMap<(String, i32), i64>,
+        assignment: &TopicPartitionList,
+    ) {
+        let dataset = &self.dataset;
+        for mut elem in assignment.elements() {
+            let key = (elem.topic().to_string(), elem.partition());
+            let offset = stored
+                .get(&key)
+                .map_or(Offset::Beginning, |&next| Offset::Offset(next));
+            if let Err(e) = elem.set_offset(offset) {
+                let (topic, partition) = key;
+                tracing::error!(
+                    "Failed to start dataset '{dataset}' at {offset:?} of Kafka topic '{topic}' partition {partition}, so it starts at the consumer group's committed offset and may not load the messages before it. Restart Spice to retry. See: https://spiceai.org/docs/components/data-connectors/kafka. Cause: {e}"
+                );
+            }
+        }
+    }
+
+    /// Records that this consumer stored `offset` for a partition, so a later
+    /// assignment of the partition starts after it.
+    fn record_stored_offset(&self, topic: &str, partition: i32, offset: i64) {
+        if let StartOffsets::Stored(stored) = &mut *self.lock_start_offsets() {
+            let next = offset.saturating_add(1);
+            stored
+                .entry((topic.to_string(), partition))
+                .and_modify(|current| *current = (*current).max(next))
+                .or_insert(next);
+        }
+    }
+
+    /// Sets the restored offset on each partition of `assignment` that has one, so
+    /// librdkafka starts fetching it there instead of at the group-committed offset,
+    /// and returns those partitions with their offsets.
+    ///
+    /// This has to happen before `assign`: once a partition is assigned without an
+    /// offset, librdkafka asks the group coordinator for the committed one and refuses
+    /// a seek until that answer arrives. The group commit is asynchronous and can be
+    /// lost (for example while the broker restarts), so the committed offset can lag
+    /// what the acceleration already holds; starting from it would read those
+    /// messages a second time.
+    fn apply_restore_offsets(
+        &self,
+        restore: &mut HashMap<(String, i32), i64>,
+        assignment: &mut TopicPartitionList,
+    ) -> Option<TopicPartitionList> {
+        if restore.is_empty() {
+            return None;
+        }
+        let dataset = &self.dataset;
+        let assigned: Vec<(String, i32)> = assignment
+            .elements()
+            .iter()
+            .map(|e| (e.topic().to_string(), e.partition()))
+            .collect();
+        let mut restored = TopicPartitionList::new();
+        for (topic, partition) in assigned {
+            let Some(offset) = restore.remove(&(topic.clone(), partition)) else {
+                continue;
+            };
+            match assignment
+                .set_partition_offset(&topic, partition, Offset::Offset(offset))
+                .and_then(|()| {
+                    restored.add_partition_offset(&topic, partition, Offset::Offset(offset))
+                }) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "Resuming dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, restored from its acceleration"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to resume dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, so it starts at the consumer group's committed offset and may append messages its acceleration already holds a second time. Cause: {e}"
+                    );
+                }
+            }
+        }
+        if restored.count() == 0 {
+            return None;
+        }
+        tracing::info!(
+            "Resuming dataset '{dataset}' from the Kafka offsets stored in its acceleration"
+        );
+        Some(restored)
     }
 }
 
@@ -303,24 +476,6 @@ impl KafkaMetrics {
 
     pub fn update_bytes_consumed(&self, bytes: u64) {
         self.bytes_consumed.store(bytes, Ordering::Relaxed);
-    }
-
-    /// Returns true once the consumer has received at least one statistics
-    /// callback that reported valid partitions and the most recent total lag
-    /// across those partitions is zero.
-    ///
-    /// Uses Acquire ordering on `has_received_stats` so that an observer that
-    /// sees the flag set is guaranteed to also see the matching Release-stored
-    /// `records_lag` value from the same stats callback (and not a stale
-    /// default 0).
-    ///
-    /// Used by CDC connectors to decide when to emit a synthetic
-    /// `is_dataset_ready=true` envelope on quiet topics. See the
-    /// [`crate::cdc::ChangesStream`] readiness contract.
-    #[must_use]
-    pub fn is_caught_up(&self) -> bool {
-        self.has_received_stats.load(Ordering::Acquire)
-            && self.records_lag.load(Ordering::Relaxed) == 0
     }
 }
 
@@ -343,21 +498,7 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 
         // Update total lag only if we have valid partitions to avoid misleading data
         if has_valid_partitions {
-            // Pair these stores with the Acquire load in `is_caught_up`:
-            // store the lag first (Relaxed is sufficient since the Release
-            // store below acts as the release fence), then publish the
-            // "stats received" flag with Release so any observer that sees
-            // the flag set also sees this exact lag value.
             self.metrics.update_records_lag(total_lag);
-            self.metrics
-                .has_received_stats
-                .store(true, Ordering::Release);
-            if total_lag == 0 {
-                // Wake any task waiting on `KafkaMetrics::caught_up` (e.g.
-                // the CDC ready-signal wrapper). Cheap and idempotent: if no
-                // one is waiting, the permit is stored for the next waiter.
-                self.metrics.caught_up.notify_one();
-            }
         }
 
         self.metrics
@@ -383,31 +524,64 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 }
 
 impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
-    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
-        if let Rebalance::Assign(_) = rebalance {
-            // On first assignment after subscribe, seek to sidecar offsets if available.
-            // Take the offsets so this only fires once on success.
-            let offsets = self
-                .restore_offsets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-
-            if let Some(tpl) = offsets {
-                match base_consumer.seek_partitions(tpl.clone(), Duration::from_secs(5)) {
-                    Ok(_) => {
-                        tracing::info!("Restored Kafka consumer offsets from sidecar");
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to seek to restored offsets: {e}");
-                        // Re-insert offsets so the next rebalance retries the seek.
-                        *self
-                            .restore_offsets
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tpl);
-                    }
+    /// The default rebalance, with the start offsets of the assigned partitions set
+    /// before the assignment is applied (see [`KafkaConsumerContext::apply_start_offsets`]).
+    fn rebalance(
+        &self,
+        base_consumer: &BaseConsumer<Self>,
+        err: RDKafkaRespErr,
+        tpl: &mut TopicPartitionList,
+    ) {
+        let dataset = &self.dataset;
+        let cooperative = matches!(
+            base_consumer.rebalance_protocol(),
+            RebalanceProtocol::Cooperative
+        );
+        let result = match err {
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
+                let restored = self.apply_start_offsets(tpl);
+                let assigned = if cooperative {
+                    base_consumer.incremental_assign(tpl)
+                } else {
+                    base_consumer.assign(tpl)
+                };
+                // Bring the group's committed offsets up to the restored ones. A
+                // partition assigned at an explicit offset never fetches its committed
+                // offset, and librdkafka measures consumer lag from it, so without this
+                // commit the partition's lag stays unknown until a new message is
+                // committed.
+                if let (Ok(()), Some(restored)) = (&assigned, restored)
+                    && let Err(e) = base_consumer.commit(&restored, CommitMode::Async)
+                {
+                    tracing::error!(
+                        "Failed to commit the Kafka offsets dataset '{dataset}' resumed from, so its consumer lag is not reported until a new message arrives. Cause: {e}"
+                    );
+                }
+                assigned
+            }
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                if cooperative {
+                    base_consumer.incremental_unassign(tpl)
+                } else {
+                    base_consumer.unassign()
                 }
             }
+            _ => {
+                let code: RDKafkaErrorCode = err.into();
+                tracing::error!(
+                    "Kafka consumer group rebalance failed for dataset '{dataset}': {code}"
+                );
+                if cooperative {
+                    base_consumer.incremental_unassign(tpl)
+                } else {
+                    base_consumer.unassign()
+                }
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to apply a Kafka consumer group rebalance for dataset '{dataset}', so it may not read the partitions it was assigned until the next rebalance. Cause: {e}"
+            );
         }
     }
 }
@@ -416,6 +590,8 @@ pub struct KafkaConsumer {
     group_id: String,
     consumer: StreamConsumer<KafkaConsumerContext>,
     metrics: Arc<KafkaMetrics>,
+    /// The topic passed to [`KafkaConsumer::subscribe`].
+    topic: OnceLock<String>,
 }
 
 /// How a polled offset relates to the current backward-scan window end.
@@ -481,14 +657,25 @@ fn merge_latest_by_timestamp<K, V>(
 fn deserialize_kafka_json<K: DeserializeOwned, V: DeserializeOwned>(
     key: Option<&[u8]>,
     payload: &[u8],
+    topic: &str,
+    partition: i32,
+    offset: i64,
 ) -> Result<(Option<K>, V)> {
     let key = match key {
-        Some(key_bytes) => {
-            Some(serde_json::from_slice(key_bytes).context(UnableToDeserializeJsonMessageSnafu)?)
-        }
+        Some(key_bytes) => Some(serde_json::from_slice(key_bytes).context(
+            UnableToDeserializeJsonMessageSnafu {
+                topic,
+                partition,
+                offset,
+            },
+        )?),
         None => None,
     };
-    let value = serde_json::from_slice(payload).context(UnableToDeserializeJsonMessageSnafu)?;
+    let value = serde_json::from_slice(payload).context(UnableToDeserializeJsonMessageSnafu {
+        topic,
+        partition,
+        offset,
+    })?;
     Ok((key, value))
 }
 
@@ -498,7 +685,13 @@ fn parse_non_tombstone_message<K: DeserializeOwned, V: DeserializeOwned>(
     let Some(payload) = msg.payload() else {
         return Ok(None);
     };
-    let (key, value) = deserialize_kafka_json(msg.key(), payload)?;
+    let (key, value) = deserialize_kafka_json(
+        msg.key(),
+        payload,
+        msg.topic(),
+        msg.partition(),
+        msg.offset(),
+    )?;
     Ok(Some((key, value, kafka_record_timestamp(msg.timestamp()))))
 }
 
@@ -507,23 +700,34 @@ impl KafkaConsumer {
     /// offsets from the sidecar before any rebalance can fire. Pass an empty
     /// slice for `restore_offsets` when there is nothing to restore.
     pub fn create_with_existing_group_id(
+        dataset: &str,
         group_id: impl Into<String>,
         kafka_config: &KafkaConfig,
         restore_offsets: &[KafkaOffset],
     ) -> Result<Self> {
-        let restore = Self::build_restore_tpl(restore_offsets)?;
-        Self::create(group_id.into(), kafka_config, restore)
+        Self::create(
+            dataset,
+            group_id.into(),
+            kafka_config,
+            StartOffsets::Restore(Self::restore_map(restore_offsets)),
+            true,
+        )
     }
 
+    /// Construct a consumer for a dataset with no stored offsets. Each partition starts
+    /// at the beginning of its topic, whatever the consumer group has committed, and
+    /// after a later assignment resumes after the last offset this consumer stored.
     pub fn create_for_dataset(
         dataset: &str,
         group_id: Option<String>,
         kafka_config: &KafkaConfig,
     ) -> Result<Self> {
         Self::create(
+            dataset,
             group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
             kafka_config,
-            None,
+            StartOffsets::Stored(HashMap::new()),
+            true,
         )
     }
 
@@ -532,18 +736,64 @@ impl KafkaConsumer {
         &self.group_id
     }
 
+    /// Subscribe to `topic`. A consumer reads one topic, so only the first call's
+    /// topic is the one [`KafkaConsumer::catch_up`] measures.
     pub fn subscribe(&self, topic: &str) -> Result<()> {
         self.consumer
             .subscribe(&[topic])
-            .context(UnableToSubscribeToTopicSnafu { topic })
+            .context(UnableToSubscribeToTopicSnafu { topic })?;
+        let _ = self.topic.set(topic.to_string());
+        Ok(())
     }
 
     /// Receive a JSON message from the Kafka topic.
+    ///
+    /// Transient consumption errors (a refused connection, all brokers
+    /// briefly down) are polled through. Once one has been seen, the wait for a
+    /// message ends [`NEXT_MESSAGE_TRANSIENT_BUDGET`] after the call started and
+    /// returns the last such error; until then it waits for a message as long
+    /// as it takes.
     pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
     ) -> Result<Option<KafkaMessage<'_, K, V>>> {
+        self.next_json_within(NEXT_MESSAGE_TRANSIENT_BUDGET).await
+    }
+
+    async fn next_json_within<K: DeserializeOwned, V: DeserializeOwned>(
+        &self,
+        transient_budget: Duration,
+    ) -> Result<Option<KafkaMessage<'_, K, V>>> {
+        let deadline = tokio::time::Instant::now() + transient_budget;
         let mut stream = Box::pin(self.stream_json::<K, V>());
-        stream.next().await.transpose()
+        let mut last_transient = None;
+        loop {
+            let next = match last_transient.take() {
+                None => stream.next().await,
+                Some(source) => match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_elapsed) => return Err(Error::UnableToReceiveMessage { source }),
+                },
+            };
+            match next {
+                // Reaching the end of a partition is not a message; keep waiting.
+                Some(Err(Error::UnableToReceiveMessage {
+                    source: KafkaError::PartitionEOF(_),
+                })) => {}
+                Some(Err(Error::UnableToReceiveMessage { source }))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Error::UnableToReceiveMessage { source });
+                    }
+                    tracing::debug!(
+                        "Transient Kafka error while waiting for a message, polling again: {source}"
+                    );
+                    tokio::time::sleep(TRANSIENT_POLL_BACKOFF).await;
+                    last_transient = Some(source);
+                }
+                next => return next.transpose(),
+            }
+        }
     }
 
     /// Stream JSON messages from the Kafka topic.
@@ -556,11 +806,20 @@ impl KafkaConsumer {
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
             };
 
+            let topic = msg.topic().to_string();
+            let partition = msg.partition();
+            let offset = msg.offset();
+
             let key = match msg.key() {
                 Some(key_bytes) => match serde_json::from_slice(key_bytes) {
                     Ok(key) => Some(key),
                     Err(e) => {
-                        return Some(Err(Error::UnableToDeserializeJsonMessage { source: e }));
+                        return Some(Err(Error::UnableToDeserializeJsonMessage {
+                            topic,
+                            partition,
+                            offset,
+                            source: e,
+                        }));
                     }
                 },
                 None => None,
@@ -569,17 +828,30 @@ impl KafkaConsumer {
             let payload = msg.payload()?;
             let value = match serde_json::from_slice(payload) {
                 Ok(value) => value,
-                Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
+                Err(e) => {
+                    return Some(Err(Error::UnableToDeserializeJsonMessage {
+                        topic,
+                        partition,
+                        offset,
+                        source: e,
+                    }));
+                }
             };
 
-            Some(Ok(KafkaMessage::new(&self.consumer, msg, key, value)))
+            Some(Ok(KafkaMessage::new(msg, key, value)))
         })
     }
 
+    /// Stores `offset` as the last processed offset of a partition, to be committed by
+    /// [`KafkaConsumer::commit_stored_offsets`].
     pub fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> Result<()> {
         self.consumer
             .store_offset(topic, partition, offset)
-            .context(UnableToCommitMessageSnafu)
+            .context(UnableToCommitMessageSnafu)?;
+        self.consumer
+            .context()
+            .record_stored_offset(topic, partition, offset);
+        Ok(())
     }
 
     pub fn commit_stored_offsets(&self) -> Result<()> {
@@ -588,28 +860,12 @@ impl KafkaConsumer {
             .context(UnableToCommitConsumerStateSnafu)
     }
 
-    /// Build a [`TopicPartitionList`] from sidecar offsets. Returns `None` when
-    /// the slice is empty so callers can pass the result straight into
-    /// [`KafkaConsumer::create`] for the no-restore case.
-    fn build_restore_tpl(offsets: &[KafkaOffset]) -> Result<Option<TopicPartitionList>> {
-        if offsets.is_empty() {
-            return Ok(None);
-        }
-
-        let mut topic_partition_list = TopicPartitionList::new();
-        for offset in offsets {
-            topic_partition_list
-                .add_partition_offset(
-                    &offset.topic,
-                    offset.partition,
-                    Offset::Offset(offset.next_read_offset()),
-                )
-                .context(UnableToRestoreOffsetsSnafu {
-                    message: "Failed to build topic partition list".to_string(),
-                })?;
-        }
-
-        Ok(Some(topic_partition_list))
+    /// The offset each sidecar `(topic, partition)` resumes reading from.
+    fn restore_map(offsets: &[KafkaOffset]) -> HashMap<(String, i32), i64> {
+        offsets
+            .iter()
+            .map(|o| ((o.topic.clone(), o.partition), o.next_read_offset()))
+            .collect()
     }
 
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
@@ -705,15 +961,82 @@ impl KafkaConsumer {
         Ok(false)
     }
 
+    /// The high watermark of each partition of `topic` that holds a message. A topic
+    /// the broker does not know has none.
+    fn fetch_end_offsets(&self, topic: &str, timeout: Duration) -> Result<HashMap<i32, i64>> {
+        let metadata = self
+            .consumer
+            .fetch_metadata(Some(topic), timeout)
+            .context(UnableToReadEndOffsetsSnafu { topic })?;
+        let Some(topic_metadata) = metadata.topics().iter().find(|t| t.name() == topic) else {
+            return Ok(HashMap::new());
+        };
+        if let Some(err) = topic_metadata.error() {
+            let code = RDKafkaErrorCode::from(err);
+            if code == RDKafkaErrorCode::UnknownTopicOrPartition {
+                return Ok(HashMap::new());
+            }
+            return Err(Error::UnableToReadEndOffsets {
+                topic: topic.to_string(),
+                source: KafkaError::MetadataFetch(code),
+            });
+        }
+        let mut end_offsets = HashMap::new();
+        for partition in topic_metadata.partitions() {
+            let (low, high) = self
+                .consumer
+                .fetch_watermarks(topic, partition.id(), timeout)
+                .context(UnableToReadEndOffsetsSnafu { topic })?;
+            if high > low {
+                end_offsets.insert(partition.id(), high);
+            }
+        }
+        Ok(end_offsets)
+    }
+
+    /// What this consumer must read before its dataset is ready: every message on its
+    /// topic now. Retries until the broker answers, so a dataset whose topic cannot be
+    /// measured stays not ready rather than reporting ready early.
+    async fn catch_up(&'static self) -> CatchUp {
+        let Some(topic) = self.topic.get() else {
+            return CatchUp::new(HashMap::new());
+        };
+        let dataset = &self.consumer.context().dataset;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let read = match tokio::task::spawn_blocking(move || {
+                self.fetch_end_offsets(topic, END_OFFSETS_TIMEOUT)
+            })
+            .await
+            {
+                Ok(read) => read,
+                Err(source) => Err(Error::TaskJoin { source }),
+            };
+            match read {
+                Ok(end_offsets) => return CatchUp::new(end_offsets),
+                Err(e) => tracing::warn!(
+                    "Failed to read the end offsets of Kafka topic '{topic}', so dataset '{dataset}' stays not ready until they are read; retrying in {backoff:?}. Cause: {e}"
+                ),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(END_OFFSETS_MAX_BACKOFF);
+        }
+    }
+
     #[must_use]
     pub fn metrics(&self) -> &Arc<KafkaMetrics> {
         &self.metrics
     }
 
+    /// `report_partition_end` turns on librdkafka's end-of-partition events
+    /// (`enable.partition.eof`), which [`CatchUp`] needs and every reader of the
+    /// consumer's stream must then skip or handle.
     fn create(
+        dataset: &str,
         group_id: String,
         kafka_config: &KafkaConfig,
-        restore_offsets: Option<TopicPartitionList>,
+        start_offsets: StartOffsets,
+        report_partition_end: bool,
     ) -> Result<Self> {
         tracing::debug!("Using kafka group_id: {}", group_id);
 
@@ -738,6 +1061,14 @@ impl KafkaConsumer {
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
+            .set(
+                "enable.partition.eof",
+                if report_partition_end {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .set("security.protocol", &kafka_config.security_protocol);
 
         if kafka_config.security_protocol.to_lowercase() != "plaintext" {
@@ -783,7 +1114,8 @@ impl KafkaConsumer {
             .set_log_level(RDKafkaLogLevel::Debug)
             .create_with_context(KafkaConsumerContext::new(
                 Arc::clone(&metrics),
-                restore_offsets,
+                dataset.to_string(),
+                start_offsets,
             ))
             .context(UnableToCreateConsumerSnafu)?;
 
@@ -791,6 +1123,7 @@ impl KafkaConsumer {
             group_id,
             consumer,
             metrics,
+            topic: OnceLock::new(),
         })
     }
 
@@ -848,7 +1181,7 @@ impl KafkaConsumer {
                 Ok(Some(Err(e)))
                     if is_transient_kafka_consumption_error(&e) && Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(PEEK_TRANSIENT_POLL_BACKOFF).await;
+                    tokio::time::sleep(TRANSIENT_POLL_BACKOFF).await;
                 }
                 Ok(Some(Err(e))) => {
                     return Err(Error::UnableToReceiveMessage { source: e });
@@ -934,6 +1267,7 @@ impl KafkaConsumer {
     /// partition (skipping tombstones by seeking backward), and returns the message
     /// with the newest record timestamp across all partitions.
     pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
+        dataset: &str,
         topic: &str,
         kafka_config: &KafkaConfig,
         timeout: Duration,
@@ -946,7 +1280,13 @@ impl KafkaConsumer {
         // that block the calling thread for up to `remaining` (the schema-peek
         // budget, up to ~30s). Run them on the blocking pool so this
         // registration-time path doesn't stall the async runtime thread.
-        let temp_consumer = Arc::new(Self::create(temp_group_id, &peek_config, None)?);
+        let temp_consumer = Arc::new(Self::create(
+            dataset,
+            temp_group_id,
+            &peek_config,
+            StartOffsets::Restore(HashMap::new()),
+            false,
+        )?);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let partition_ids: Vec<i32> = {
@@ -1041,25 +1381,14 @@ impl KafkaConsumer {
 }
 
 pub struct KafkaMessage<'a, K, V> {
-    consumer: &'a StreamConsumer<KafkaConsumerContext>,
     msg: BorrowedMessage<'a>,
     key: Option<K>,
     value: V,
 }
 
 impl<'a, K, V> KafkaMessage<'a, K, V> {
-    fn new(
-        consumer: &'a StreamConsumer<KafkaConsumerContext>,
-        msg: BorrowedMessage<'a>,
-        key: Option<K>,
-        value: V,
-    ) -> Self {
-        Self {
-            consumer,
-            msg,
-            key,
-            value,
-        }
+    fn new(msg: BorrowedMessage<'a>, key: Option<K>, value: V) -> Self {
+        Self { msg, key, value }
     }
 
     pub fn key(&self) -> Option<&K> {
@@ -1081,17 +1410,6 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
     pub fn offset(&self) -> i64 {
         self.msg.offset()
     }
-
-    pub fn mark_processed(&self) -> Result<()> {
-        self.consumer
-            .store_offset_from_message(&self.msg)
-            .context(UnableToCommitMessageSnafu)
-    }
-
-    /// Consume the message and return owned key/value data.
-    pub fn into_key_value(self) -> (Option<K>, V) {
-        (self.key, self.value)
-    }
 }
 
 pub struct MessageBatchCommitter {
@@ -1110,6 +1428,26 @@ impl MessageBatchCommitter {
                 .iter()
                 .map(|msg| (msg.topic(), msg.partition(), msg.offset())),
         );
+
+        Self {
+            consumer,
+            offsets,
+            offset_commit_hook: None,
+        }
+    }
+
+    /// Build a committer from explicit topic/partition/offset positions.
+    ///
+    /// Used when a poll chunk mixed successfully decoded messages with events
+    /// that were skipped: both sets must still be committed so a poison-pill
+    /// offset is not re-read.
+    #[must_use]
+    pub fn from_offsets(
+        consumer: &'static KafkaConsumer,
+        positions: impl IntoIterator<Item = (String, i32, i64)>,
+    ) -> Self {
+        let owned: Vec<(String, i32, i64)> = positions.into_iter().collect();
+        let offsets = max_kafka_offsets(owned.iter().map(|(t, p, o)| (t.as_str(), *p, *o)));
 
         Self {
             consumer,
@@ -1167,6 +1505,17 @@ impl CommitChange for MessageBatchCommitter {
 
         Ok(())
     }
+
+    /// The offsets this batch acknowledges, saved by the dataset's offset hook
+    /// only. [`Self::commit`] runs the hook again, which keeps the higher offset
+    /// and so changes nothing, and then commits the offsets to Kafka.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        let hook = Arc::clone(self.offset_commit_hook.as_ref()?);
+        let offsets = self.offsets.clone();
+        Some(Box::pin(async move { hook.commit_offsets(&offsets).await }))
+    }
 }
 
 pub struct Kafka {
@@ -1220,46 +1569,73 @@ impl Kafka {
         self
     }
 
-    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
         let consumer = self.consumer;
-        let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
-        let inner = self
-            .consumer
-            .consumer
-            .stream()
-            .chunks_timeout(self.batching.0, self.batching.1)
-            .map(move |msgs| {
-                let schema = Arc::clone(&schema);
-
-                // Collect all successful messages, fail on first error
-                let messages: Vec<_> = msgs
-                    .into_iter()
-                    .map(|msg| msg.context(UnableToReceiveMessageSnafu))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(cdc::StreamError::Kafka)?;
-
-                if messages.is_empty() {
-                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
-                }
-
+        let batching = self.batching;
+        changes_after_catch_up(consumer, Arc::clone(&self.schema), move |mut catch_up| {
+            let signal_schema = Arc::clone(&schema);
+            let to_envelope = move |messages: &[BorrowedMessage<'static>],
+                                    catch_up: &mut CatchUp| {
                 let change_batch =
-                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
+                    messages_to_change_batch(messages, flatten_json.as_ref(), &schema)?;
 
-                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages)
+                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, messages)
                     .with_offset_commit_hook(offset_commit_hook.clone());
 
-                Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
-            });
+                Ok(ChangeEnvelope::new(
+                    Box::new(committer),
+                    change_batch,
+                    catch_up.mark_ready(),
+                ))
+            };
+            let chunks = consumer
+                .consumer
+                .stream()
+                .chunks_timeout(batching.0, batching.1);
+            // A batch can hold a consumption error between messages: a broker
+            // reconnect reports one while the fetches after it already return
+            // messages. The consumer's fetch position has moved past every message
+            // in the batch, so each one is delivered here or never again; the error
+            // goes out between the envelopes on either side of it, in order.
+            futures::StreamExt::flat_map(chunks, move |msgs| {
+                if msgs.is_empty() {
+                    return futures::stream::iter(vec![Err(cdc::StreamError::Kafka(
+                        Error::EmptyBatch,
+                    ))]);
+                }
 
-        Box::pin(inject_ready_signal_on_caught_up(
-            inner,
-            metrics,
-            Arc::clone(&self.schema),
-        ))
+                let mut items = Vec::new();
+                let mut messages = Vec::new();
+                for msg in msgs {
+                    match msg {
+                        Ok(msg) => {
+                            catch_up.observe_message(msg.partition(), msg.offset());
+                            messages.push(msg);
+                        }
+                        Err(KafkaError::PartitionEOF(partition)) => {
+                            catch_up.observe_partition_end(partition);
+                        }
+                        Err(source) => {
+                            if !messages.is_empty() {
+                                items.push(to_envelope(&messages, &mut catch_up));
+                                messages.clear();
+                            }
+                            items.push(Err(cdc::StreamError::Kafka(
+                                Error::UnableToReceiveMessage { source },
+                            )));
+                        }
+                    }
+                }
+                if !messages.is_empty() {
+                    items.push(to_envelope(&messages, &mut catch_up));
+                }
+                items.extend(catch_up.ready_signal(&signal_schema));
+                futures::stream::iter(items)
+            })
+        })
     }
 }
 
@@ -1276,9 +1652,15 @@ fn messages_to_change_batch(
     if let Some(delimiter) = flatten_json {
         let values = payloads
             .into_iter()
-            .map(|payload| {
+            .zip(messages.iter())
+            .map(|(payload, message)| {
                 serde_json::from_slice::<Value>(payload).map_err(|e| {
-                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage {
+                        topic: message.topic().to_string(),
+                        partition: message.partition(),
+                        offset: message.offset(),
+                        source: e,
+                    })
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1444,11 +1826,11 @@ fn json_bytes_to_change_batch(
     // to avoid silently dropping rows beyond the first batch.
     let reader = ReaderBuilder::new(Arc::clone(schema))
         .build(std::io::Cursor::new(json))
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     let batches: Vec<_> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+        .map_err(|e| cdc::StreamError::Arrow(redact_json_decode_error(&e)))?;
 
     if batches.is_empty() {
         return Err(cdc::StreamError::Arrow(
@@ -1461,6 +1843,65 @@ fn json_bytes_to_change_batch(
 
     cdc::wrap_data_as_change_batch(schema, &rb)
         .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+}
+
+/// Describes a JSON-to-Arrow decode failure without the message values.
+///
+/// The Arrow JSON reader quotes the offending value (`failed to parse "<v>" as
+/// Int64`, `expected { got <v>`) and passes value-carrying parse errors through
+/// unchanged. Kafka payloads are source rows that can hold credentials, and
+/// stream errors are logged verbatim, so only the field path and the kind of
+/// failure are kept.
+fn redact_json_decode_error(err: &arrow::error::ArrowError) -> String {
+    use arrow::error::ArrowError;
+
+    const NOT_SHOWN: &str = "the value is not shown";
+    let message = match err {
+        ArrowError::JsonError(message) => message,
+        ArrowError::ParseError(_)
+        | ArrowError::CastError(_)
+        | ArrowError::ComputeError(_)
+        | ArrowError::InvalidArgumentError(_) => {
+            return format!(
+                "Failed to decode a Kafka message: a value could not be converted to its column type ({NOT_SHOWN})"
+            );
+        }
+        other => return other.to_string(),
+    };
+
+    let mut rest = message.as_str();
+    let mut path = Vec::new();
+    while let Some(after) = rest.strip_prefix("whilst decoding field '")
+        && let Some(end) = after.find("': ")
+    {
+        path.push(&after[..end]);
+        rest = &after[end + 3..];
+    }
+
+    let kind = if rest.starts_with("failed to parse") {
+        format!("a value could not be parsed as the column's type ({NOT_SHOWN})")
+    } else if let Some(expected) = rest
+        .strip_prefix("expected ")
+        .and_then(|r| r.split_once(" got "))
+        .map(|(expected, _)| expected)
+    {
+        format!("expected {expected} but found a different JSON value ({NOT_SHOWN})")
+    } else if path.is_empty() {
+        // Structural reader errors (malformed JSON, schema mismatches) name
+        // characters, fields or types, never a decoded value.
+        return err.to_string();
+    } else {
+        format!("the value could not be decoded ({NOT_SHOWN})")
+    };
+
+    if path.is_empty() {
+        format!("Failed to decode a Kafka message: {kind}")
+    } else {
+        format!(
+            "Failed to decode field '{}' of a Kafka message: {kind}",
+            path.join(".")
+        )
+    }
 }
 
 // Public wrappers for benchmarking the two JSON decode paths head-to-head.
@@ -1488,7 +1929,12 @@ pub mod bench_wrappers {
             .iter()
             .map(|p| {
                 serde_json::from_slice::<Value>(p).map_err(|e| {
-                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage {
+                        topic: String::new(),
+                        partition: 0,
+                        offset: 0,
+                        source: e,
+                    })
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1520,82 +1966,105 @@ impl TableProvider for Kafka {
     }
 }
 
-/// Wraps an inner Kafka-derived `ChangesStream` and emits a single synthetic
-/// `is_dataset_ready=true` [`ChangeEnvelope`] (built via
-/// [`cdc::build_ready_signal_envelope`]) once the underlying consumer reports
-/// it has caught up to the source (`KafkaMetrics::caught_up` is notified by
-/// the stats callback when `total_lag == 0`). The wrapper stops watching
-/// after the first ready signal (whether emitted by the wrapper or carried
-/// by a real change envelope).
+/// Which partitions of a consumer's topic still hold messages that were there when
+/// its changes stream started and have not been handed to the refresh task yet.
 ///
-/// This satisfies the [`cdc::ChangesStream`] readiness contract for quiet
-/// topics where no actual change events are available to flip the
-/// `is_dataset_ready` flag (e.g. on restart against an already-populated
-/// accelerator). See <https://github.com/spiceai/spiceai/issues/5201>.
-pub(crate) fn inject_ready_signal_on_caught_up<S>(
-    inner: S,
-    metrics: Arc<KafkaMetrics>,
+/// The end of a partition is its high watermark when the stream starts. A partition
+/// is read once the stream hands over a message at or past its last offset, or once
+/// librdkafka reports reaching the partition's end. The second covers a partition
+/// with nothing left to deliver: one resumed at its end, or one whose last records
+/// are tombstones or transaction markers that never become change rows. On a busy
+/// topic the first ends the wait at the offsets captured at the start, however far
+/// the producers have moved on since. librdkafka reports an end only after fetching
+/// from where the consumer was last positioned, so on a consumer rewound before its
+/// stream starts, a reported end can come before the stream but never before the
+/// rewind: every message on the topic at the rewind is handed over first.
+///
+/// A message that fails to convert counts as read: the stream reports it as an
+/// error, and waiting for it would keep the dataset not ready until a restart.
+///
+/// A dataset is ready once no partition is pending, carried by the envelope that
+/// hands over the last pending message, or by a ready signal when nothing is left to
+/// hand over. That is the [`cdc::ChangesStream`] readiness contract.
+#[derive(Debug)]
+pub(crate) struct CatchUp {
+    /// The end offset of each partition not yet read.
+    pending: HashMap<i32, i64>,
+    /// Whether an envelope saying the dataset is ready has been sent.
+    signalled: bool,
+}
+
+impl CatchUp {
+    fn new(end_offsets: HashMap<i32, i64>) -> Self {
+        Self {
+            pending: end_offsets,
+            signalled: false,
+        }
+    }
+
+    /// Record that the message at `offset` on `partition` is being handed over.
+    pub(crate) fn observe_message(&mut self, partition: i32, offset: i64) {
+        if self
+            .pending
+            .get(&partition)
+            .is_some_and(|end| offset.saturating_add(1) >= *end)
+        {
+            self.pending.remove(&partition);
+        }
+    }
+
+    /// Record that librdkafka reached the end of `partition`, after every message
+    /// on it before that point was handed over.
+    pub(crate) fn observe_partition_end(&mut self, partition: i32) {
+        self.pending.remove(&partition);
+    }
+
+    #[must_use]
+    pub(crate) fn is_caught_up(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The readiness of an envelope about to be sent with the messages observed so
+    /// far.
+    pub(crate) fn mark_ready(&mut self) -> bool {
+        let ready = self.is_caught_up();
+        self.signalled |= ready;
+        ready
+    }
+
+    /// A zero-row envelope saying the dataset is ready, when it is and no envelope has
+    /// said so yet.
+    pub(crate) fn ready_signal(
+        &mut self,
+        schema: &SchemaRef,
+    ) -> Option<Result<ChangeEnvelope, cdc::StreamError>> {
+        if self.signalled || !self.is_caught_up() {
+            return None;
+        }
+        self.signalled = true;
+        Some(cdc::build_ready_signal_envelope(schema).map_err(|e| {
+            cdc::StreamError::Arrow(format!("failed to build Kafka ready-signal envelope: {e}"))
+        }))
+    }
+}
+
+/// Reads the end offsets of `consumer`'s topic, then streams what `changes` builds
+/// from them, after a ready signal when the topic held nothing to read.
+pub(crate) fn changes_after_catch_up<S>(
+    consumer: &'static KafkaConsumer,
     schema: SchemaRef,
-) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>>
+    changes: impl FnOnce(CatchUp) -> S + Send + 'static,
+) -> ChangesStream
 where
     S: Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> + Send + 'static,
 {
-    async_stream::stream! {
-        let mut inner = Box::pin(inner);
-        let mut ready_emitted = false;
-
-        loop {
-            tokio::select! {
-                biased;
-                next = inner.next() => match next {
-                    Some(item) => {
-                        if !ready_emitted
-                            && let Ok(ref env) = item
-                            && env.is_dataset_ready()
-                        {
-                            ready_emitted = true;
-                        }
-                        yield item;
-                    }
-                    None => break,
-                },
-                () = metrics.caught_up.notified(), if !ready_emitted => {
-                    // Re-check under the same memory ordering as the
-                    // notifier; `notified()` may wake spuriously if the
-                    // notifier raced with another waiter.
-                    if metrics.is_caught_up() {
-                        match cdc::build_ready_signal_envelope(&schema) {
-                            Ok(env) => {
-                                ready_emitted = true;
-                                tracing::debug!(
-                                    "Kafka consumer reports zero lag; emitting synthetic ready signal envelope"
-                                );
-                                yield Ok(env);
-                            }
-                            Err(e) => {
-                                // Building the envelope is schema-driven and
-                                // therefore deterministic: a failure here
-                                // will repeat on every wake-up. Surface it
-                                // as a stream error and stop the synthetic
-                                // ready-signal path so we don't spam logs
-                                // forever — the inner stream still runs and
-                                // can deliver readiness via a real envelope
-                                // if any change event ever arrives.
-                                tracing::error!(
-                                    "Failed to build Kafka ready-signal envelope; \
-                                     synthetic readiness disabled for this stream: {e}"
-                                );
-                                ready_emitted = true;
-                                yield Err(cdc::StreamError::Arrow(format!(
-                                    "failed to build Kafka ready-signal envelope: {e}"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    Box::pin(futures::StreamExt::flatten(futures::stream::once(
+        async move {
+            let mut catch_up = consumer.catch_up().await;
+            let ready = catch_up.ready_signal(&schema);
+            futures::stream::iter(ready).chain(changes(catch_up))
+        },
+    )))
 }
 
 #[cfg(test)]
@@ -1604,6 +2073,50 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use serde_json::json;
     use std::sync::Arc;
+
+    fn assignment(partitions: &[i32]) -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        for &partition in partitions {
+            tpl.add_partition("t", partition);
+        }
+        tpl
+    }
+
+    fn offsets(tpl: &TopicPartitionList) -> Vec<(i32, Offset)> {
+        tpl.elements()
+            .iter()
+            .map(|e| (e.partition(), e.offset()))
+            .collect()
+    }
+
+    /// A partition this consumer has stored no offset for starts at the beginning,
+    /// and one it has stored an offset for resumes after it, so a re-assignment
+    /// neither skips messages nor re-reads the ones this run already processed.
+    #[test]
+    fn stored_offsets_set_start_of_reassigned_partitions() {
+        let context = KafkaConsumerContext::new(
+            Arc::new(KafkaMetrics::new()),
+            "ds".to_string(),
+            StartOffsets::Stored(HashMap::new()),
+        );
+
+        let mut first = assignment(&[0, 1]);
+        assert!(context.apply_start_offsets(&mut first).is_none());
+        assert_eq!(
+            offsets(&first),
+            vec![(0, Offset::Beginning), (1, Offset::Beginning)]
+        );
+
+        context.record_stored_offset("t", 0, 9);
+        context.record_stored_offset("t", 0, 4);
+
+        let mut second = assignment(&[0, 1]);
+        assert!(context.apply_start_offsets(&mut second).is_none());
+        assert_eq!(
+            offsets(&second),
+            vec![(0, Offset::Offset(10)), (1, Offset::Beginning)]
+        );
+    }
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1802,6 +2315,37 @@ mod tests {
         );
     }
 
+    /// A message whose value does not match its column must not put the value
+    /// in the error: payloads are source rows that can hold credentials, and
+    /// stream errors are logged verbatim. The field name must still appear.
+    #[test]
+    fn decode_errors_never_show_message_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = test_schema(); // id Int64, name Utf8
+        let cases = [
+            json!({"id": FAKE_SECRET, "name": "app"}),
+            json!({"id": 1, "name": {"api_key": FAKE_SECRET}}),
+            json!({"id": [FAKE_SECRET], "name": "app"}),
+        ];
+        for value in cases {
+            let payload = value.to_string();
+            for err in [
+                values_to_change_batch(std::iter::once(&value), None, &schema)
+                    .expect_err("a mistyped value must be refused"),
+                payloads_to_change_batch(&[payload.as_bytes()], &schema)
+                    .expect_err("a mistyped value must be refused"),
+            ] {
+                for rendered in [err.to_string(), format!("{err:?}")] {
+                    assert!(!rendered.contains(FAKE_SECRET), "value leaked: {rendered}");
+                    assert!(
+                        rendered.contains("field 'id'") || rendered.contains("field 'name'"),
+                        "the field must be named: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_change_batch_has_correct_structure() {
         let schema = test_schema();
@@ -1895,53 +2439,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ready_signal_emitted_when_caught_up_on_quiet_stream() {
-        // Inner stream that produces nothing (quiet topic).
-        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
-
-        let metrics = Arc::new(KafkaMetrics::default());
-        // Simulate a stats callback observing zero lag: flip the flag and
-        // notify the wrapper.
-        metrics
-            .has_received_stats
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        metrics.caught_up.notify_one();
-
-        let schema = test_schema();
-        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
-
-        // Should yield a ready envelope essentially immediately.
-        let next = tokio::time::timeout(Duration::from_secs(1), Box::pin(stream).next())
-            .await
-            .expect("ready envelope should be emitted promptly after notification")
-            .expect("stream produced an item")
-            .expect("item is Ok");
-
-        assert!(next.is_dataset_ready(), "envelope must flag dataset ready");
-        assert!(
-            next.is_empty(),
-            "ready signal envelope must carry zero rows"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ready_signal_not_emitted_before_stats_received() {
-        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
-
-        let metrics = Arc::new(KafkaMetrics::default());
-        // No stats callback yet — nothing notified, has_received_stats=false.
-
-        let schema = test_schema();
-        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
-
-        let res = tokio::time::timeout(Duration::from_millis(500), Box::pin(stream).next()).await;
-        assert!(
-            res.is_err(),
-            "no ready envelope must be emitted before stats are received"
-        );
-    }
-
     #[test]
     fn window_collect_action_orders_offsets() {
         assert_eq!(
@@ -2003,41 +2500,544 @@ mod tests {
     #[test]
     fn deserialize_kafka_json_parses_key_and_value() {
         let (key, value): (Option<String>, serde_json::Value) =
-            deserialize_kafka_json(Some(br#""pk""#), br#"{"id":1}"#).expect("deserialize");
+            deserialize_kafka_json(Some(br#""pk""#), br#"{"id":1}"#, "t", 0, 1)
+                .expect("deserialize");
         assert_eq!(key.as_deref(), Some("pk"));
         assert_eq!(value, json!({"id": 1}));
 
         let (no_key, value): (Option<String>, serde_json::Value) =
-            deserialize_kafka_json(None, br#"{"id":2}"#).expect("deserialize");
+            deserialize_kafka_json(None, br#"{"id":2}"#, "t", 0, 2).expect("deserialize");
         assert!(no_key.is_none());
         assert_eq!(value, json!({"id": 2}));
     }
 
     #[test]
     fn deserialize_kafka_json_rejects_invalid_payload() {
-        let err = deserialize_kafka_json::<String, serde_json::Value>(None, b"not-json")
-            .expect_err("invalid json");
-        assert!(matches!(err, Error::UnableToDeserializeJsonMessage { .. }));
+        let err = deserialize_kafka_json::<String, serde_json::Value>(
+            None,
+            b"s3cr3t-token-value not json",
+            "t",
+            0,
+            7,
+        )
+        .expect_err("invalid json");
+        assert!(matches!(
+            err,
+            Error::UnableToDeserializeJsonMessage {
+                ref topic,
+                partition: 0,
+                offset: 7,
+                ..
+            } if topic == "t"
+        ));
+        let displayed = err.to_string();
+        assert!(
+            !displayed.contains("s3cr3t-token-value"),
+            "deserialize error must not include the payload, got: {displayed}"
+        );
+        assert!(displayed.contains("topic 't'"));
+        assert!(displayed.contains("partition 0"));
+        assert!(displayed.contains("offset 7"));
     }
 
+    /// A one-broker mock cluster holding one message on topic `t`, with the
+    /// broker taken down, and a consumer subscribed to `t` that has not yet
+    /// connected.
+    fn consumer_of_a_downed_broker() -> (
+        rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+        KafkaConsumer,
+    ) {
+        let cluster = cluster_holding_one_message();
+        cluster.broker_down(-1).expect("take broker down");
+        let consumer = consumer_subscribed_to_t(&cluster);
+        (cluster, consumer)
+    }
+
+    /// A one-broker mock cluster holding one message, `{"id": 1}`, on topic `t`.
+    fn cluster_holding_one_message()
+    -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        cluster_holding(r#"{"id": 1}"#)
+    }
+
+    /// A one-broker mock cluster holding one message, `payload`, on topic `t`.
+    fn cluster_holding(
+        payload: &str,
+    ) -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        cluster_holding_payloads(&[payload])
+    }
+
+    /// A one-broker mock cluster holding `payloads`, in order, on topic `t`.
+    fn cluster_holding_payloads(
+        payloads: &[&str],
+    ) -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+        let cluster = MockCluster::new(1).expect("mock cluster");
+        cluster.create_topic("t", 1, 1).expect("create topic");
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .expect("producer");
+        for payload in payloads {
+            producer
+                .send(BaseRecord::<(), str>::to("t").payload(*payload))
+                .map_err(|(e, _)| e)
+                .expect("enqueue message");
+        }
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("flush messages");
+        cluster
+    }
+
+    /// Produce `{"id": n}` to topic `t` of `cluster` for each `n` in `ids`.
+    fn produce_ids(
+        cluster: &rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+        ids: std::ops::RangeInclusive<i64>,
+    ) {
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .expect("producer");
+        for id in ids {
+            let payload = format!(r#"{{"id": {id}}}"#);
+            producer
+                .send(BaseRecord::<(), str>::to("t").payload(&payload))
+                .map_err(|(e, _)| e)
+                .expect("enqueue message");
+        }
+        producer
+            .flush(Duration::from_secs(10))
+            .expect("flush messages");
+    }
+
+    fn mock_cluster_config(
+        cluster: &rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+    ) -> KafkaConfig {
+        KafkaConfig {
+            brokers: cluster.bootstrap_servers(),
+            security_protocol: "plaintext".to_string(),
+            sasl_mechanism: String::new(),
+            sasl_username: None,
+            sasl_password: None,
+            ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password: None,
+            enable_ssl_certificate_verification: false,
+            ssl_endpoint_identification_algorithm: SslIdentification::None,
+            consumer_group_id: None,
+            metrics_store: None,
+        }
+    }
+
+    /// A consumer of topic `t` on `cluster`, subscribed but not yet connected.
+    fn consumer_subscribed_to_t(
+        cluster: &rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+    ) -> KafkaConsumer {
+        let consumer = KafkaConsumer::create_for_dataset("t", None, &mock_cluster_config(cluster))
+            .expect("consumer");
+        consumer.subscribe("t").expect("subscribe");
+        consumer
+    }
+
+    /// The next envelope of `stream`.
+    async fn next_envelope(stream: &mut ChangesStream) -> ChangeEnvelope {
+        tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .expect("an envelope within 15s")
+            .expect("the stream continues")
+            .expect("no stream error")
+    }
+
+    fn id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    /// The dataset is ready with the envelope that hands over the last message on the
+    /// topic when the stream started: not with an earlier batch, and not later because
+    /// producers keep writing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn spurious_notify_without_caught_up_does_not_emit() {
-        // Verifies the re-check guard inside the wrapper: a stale notify
-        // permit must not cause a false ready signal if the consumer is no
-        // longer caught up.
-        let inner = futures::stream::pending::<Result<ChangeEnvelope, cdc::StreamError>>();
+    async fn ready_with_the_last_message_on_the_topic_at_start() {
+        let cluster = cluster_holding_one_message();
+        produce_ids(&cluster, 2..=5);
+        let kafka = Kafka::new(id_schema(), consumer_subscribed_to_t(&cluster))
+            .with_batching((1, Duration::from_secs(1)));
+        let mut stream = kafka.stream_changes();
 
-        let metrics = Arc::new(KafkaMetrics::default());
-        // Notify but leave has_received_stats=false (e.g. callback never ran).
-        metrics.caught_up.notify_one();
+        let mut ready = Vec::new();
+        while ready.len() < 10 {
+            let envelope = next_envelope(&mut stream).await;
+            assert_eq!(
+                envelope.num_rows_hint(),
+                1,
+                "after {ready:?}, got an envelope with no message"
+            );
+            ready.push(envelope.is_dataset_ready());
+            if ready.len() == 1 {
+                produce_ids(&cluster, 6..=10);
+            }
+        }
 
-        let schema = test_schema();
-        let stream = inject_ready_signal_on_caught_up(inner, Arc::clone(&metrics), schema);
+        assert_eq!(
+            ready,
+            [
+                false, false, false, false, true, true, true, true, true, true
+            ],
+            "readiness of each of the 10 messages; the first 5 were on the topic at start"
+        );
+    }
 
-        let res = tokio::time::timeout(Duration::from_millis(500), Box::pin(stream).next()).await;
+    /// A consumer resuming at the end of its topic has nothing to hand over, and
+    /// reports the dataset ready once librdkafka reaches the end of the partition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_without_messages_when_resumed_at_the_topic_end() {
+        let cluster = cluster_holding_one_message();
+        let consumer = KafkaConsumer::create_with_existing_group_id(
+            "t",
+            "resumed",
+            &mock_cluster_config(&cluster),
+            &[KafkaOffset {
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 0,
+            }],
+        )
+        .expect("consumer");
+        consumer.subscribe("t").expect("subscribe");
+        let kafka = Kafka::new(id_schema(), consumer).with_batching((1, Duration::from_secs(1)));
+        let mut stream = kafka.stream_changes();
+
+        let envelope = next_envelope(&mut stream).await;
+        assert_eq!(
+            (envelope.num_rows_hint(), envelope.is_dataset_ready()),
+            (0, true),
+            "the only message was already read, so the first envelope is the ready signal"
+        );
+    }
+
+    /// A broker that refuses the first connection attempts must not fail the
+    /// first read: librdkafka reports each refusal as a consumption error and
+    /// then retries, as it does when `localhost` resolves to `::1` first and the
+    /// broker listens on IPv4 only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_json_waits_through_a_broker_that_is_down_at_startup() {
+        const BROKER_DOWN_FOR: Duration = Duration::from_secs(3);
+        let (cluster, consumer) = consumer_of_a_downed_broker();
+
+        // `MockCluster` is neither `Send` nor `Sync`, so the broker comes back
+        // from a future polled on this task rather than from another thread.
+        let started = Instant::now();
+        let (message, ()) = tokio::join!(
+            tokio::time::timeout(
+                NEXT_MESSAGE_TRANSIENT_BUDGET,
+                consumer.next_json::<Value, Value>(),
+            ),
+            async {
+                tokio::time::sleep(BROKER_DOWN_FOR).await;
+                cluster.broker_up(-1).expect("bring broker up");
+            },
+        );
+        let message = message
+            .expect("a message within the transient budget")
+            .expect("no error once the broker is back")
+            .expect("a message");
+
+        assert_eq!(message.value(), &json!({"id": 1}));
         assert!(
-            res.is_err(),
-            "spurious notify without is_caught_up must not produce a ready envelope"
+            started.elapsed() >= BROKER_DOWN_FOR,
+            "the message arrived before the broker came back up, so the test never exercised a transient error"
+        );
+    }
+
+    /// A broker that never comes back still fails the read, with the broker's
+    /// own error, once the transient budget has passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_json_returns_the_transient_error_once_the_budget_passes() {
+        const BUDGET: Duration = Duration::from_secs(2);
+        let (_cluster, consumer) = consumer_of_a_downed_broker();
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            consumer.next_json_within::<Value, Value>(BUDGET),
+        )
+        .await
+        .expect("next_json_within returns once the budget passes");
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(Error::UnableToReceiveMessage { source }) => assert!(
+                is_transient_kafka_consumption_error(&source),
+                "expected a transient broker error, got {source}"
+            ),
+            Err(e) => panic!("expected UnableToReceiveMessage, got {e}"),
+            Ok(m) => panic!(
+                "expected an error, got a message: {:?}",
+                m.map(|m| m.value().clone())
+            ),
+        }
+        assert!(
+            elapsed >= BUDGET,
+            "returned after {elapsed:?}, before the {BUDGET:?} budget passed"
+        );
+    }
+
+    /// A transient consumption error and a message fetched in the same batching
+    /// window must not cost the message. The consumer's fetch position has
+    /// already moved past it, so a message dropped with the error is never
+    /// delivered again until the consumer is recreated from its committed
+    /// offsets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_changes_keeps_the_messages_batched_with_a_transient_error() {
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        // Long enough that the disconnect's error and the message fetched after
+        // the reconnect land in one batch.
+        const BATCH_WINDOW: Duration = Duration::from_secs(5);
+        let cluster = cluster_holding_one_message();
+        // The broker drops the connection that sends the first fetch, as a
+        // broker restart does mid-stream, and the consumer reconnects and
+        // fetches again. Injecting the disconnect keeps the error's timing
+        // independent of how long a platform takes to report a refused
+        // connection.
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR__TRANSPORT],
+        );
+        let consumer = consumer_subscribed_to_t(&cluster);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let kafka = Kafka::new(schema, consumer).with_batching((10_000, BATCH_WINDOW));
+        let mut stream = kafka.stream_changes();
+
+        let mut errors_at = Vec::new();
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW * 3;
+        let rows_at = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(Err(cdc::StreamError::Kafka(Error::UnableToReceiveMessage {
+                    source,
+                }))))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    errors_at.push(Instant::now());
+                }
+                Ok(Some(Err(e))) => panic!("unexpected stream error: {e}"),
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => {
+                    assert_eq!(envelope.num_rows_hint(), 1, "one message was produced");
+                    break Some(Instant::now());
+                }
+                Ok(Some(Ok(_ready_signal))) => {}
+            }
+        };
+
+        let rows_at = rows_at.expect(
+            "the message fetched after the reconnect was never delivered; \
+             it was dropped with the transient error in its batch",
+        );
+        let last_error_at = errors_at
+            .last()
+            .expect("the broker dropped the first fetch, so the stream reports a transient error");
+        assert!(
+            rows_at.duration_since(*last_error_at) < BATCH_WINDOW / 2,
+            "the error and the message arrived {:?} apart, so they were not batched together \
+             and the test did not exercise a mixed batch",
+            rows_at.duration_since(*last_error_at)
+        );
+    }
+
+    /// A Debezium change fetched in one batching window with a transient consumption
+    /// error is handed over, and the dataset is not reported ready before it.
+    #[cfg(feature = "debezium")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debezium_hands_over_the_change_batched_with_a_transient_error() {
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        // Long enough that the disconnect's error and the message fetched after
+        // the reconnect land in one batch.
+        const BATCH_WINDOW: Duration = Duration::from_secs(5);
+        let cluster = cluster_holding(r#"{"payload": {"after": {"id": 1}, "op": "c"}}"#);
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR__TRANSPORT],
+        );
+        let debezium = crate::debezium_kafka::DebeziumKafka::new(
+            id_schema(),
+            vec!["id".to_string()],
+            consumer_subscribed_to_t(&cluster),
+            (10_000, BATCH_WINDOW),
+            None,
+        );
+        let mut stream = debezium.stream_changes();
+
+        let mut last_error_at = None;
+        let mut ready_before_the_change = false;
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW * 3;
+        let change = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => panic!(
+                    "the change fetched after the reconnect was never handed over; \
+                     it was dropped with the transient error in its batch"
+                ),
+                Ok(Some(Err(cdc::StreamError::Kafka(Error::UnableToReceiveMessage {
+                    source,
+                }))))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    last_error_at = Some(Instant::now());
+                }
+                Ok(Some(Err(e))) => panic!("unexpected stream error: {e}"),
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => break envelope,
+                Ok(Some(Ok(signal))) => ready_before_the_change |= signal.is_dataset_ready(),
+            }
+        };
+
+        let last_error_at = last_error_at
+            .expect("the broker dropped the first fetch, so the stream reports a transient error");
+        assert!(
+            last_error_at.elapsed() < BATCH_WINDOW / 2,
+            "the error and the change arrived {:?} apart, so they were not batched together \
+             and the test did not exercise a mixed batch",
+            last_error_at.elapsed()
+        );
+        assert!(
+            !ready_before_the_change,
+            "the dataset was reported ready before the change on the topic at start was handed over"
+        );
+        assert_eq!(
+            (change.num_rows_hint(), change.is_dataset_ready()),
+            (1, true),
+            "the one change on the topic at start, handed over with the readiness it completes"
+        );
+    }
+
+    #[cfg(feature = "debezium")]
+    const SECRET: &str = "s3cr3t-token-value";
+
+    #[cfg(feature = "debezium")]
+    fn debezium_create_payload(id: i64) -> String {
+        format!(r#"{{"payload": {{"after": {{"id": {id}}}, "op": "c"}}}}"#)
+    }
+
+    #[cfg(feature = "debezium")]
+    fn change_ids(envelope: &ChangeEnvelope) -> Vec<i64> {
+        use arrow::array::{Array, Int64Array, StructArray};
+
+        let batch = envelope.change_batch().expect("change batch");
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data column")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("data is a struct");
+        let id = data
+            .column_by_name("id")
+            .expect("id field")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        id.iter().flatten().collect()
+    }
+
+    /// A poll chunk with a valid event, a bad event, and another valid event
+    /// applies both valid events in order, increments the decode-error metric,
+    /// marks the dataset Error, and never puts the payload in the status message.
+    #[cfg(feature = "debezium")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debezium_applies_valid_events_when_a_chunk_contains_a_bad_event() {
+        const BATCH_WINDOW: Duration = Duration::from_secs(2);
+        let bad = format!(r#"{{"payload": {{"after": {{"secret": "{SECRET}"}}, "op": "c"}}}}"#);
+        let cluster = cluster_holding_payloads(&[
+            &debezium_create_payload(1),
+            &bad,
+            &debezium_create_payload(3),
+        ]);
+        let dataset = datafusion::common::TableReference::bare("orders");
+        let runtime_status = runtime_status::RuntimeStatus::new();
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        let before = runtime_metrics::acceleration::cdc_decode_errors_recorded();
+        let debezium = crate::debezium_kafka::DebeziumKafka::new(
+            id_schema(),
+            vec!["id".to_string()],
+            consumer_subscribed_to_t(&cluster),
+            (10_000, BATCH_WINDOW),
+            None,
+        )
+        .with_dataset_name(dataset.to_string())
+        .with_runtime_status(Arc::clone(&runtime_status));
+        let mut stream = debezium.stream_changes();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut ids = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    let displayed = e.to_string();
+                    assert!(
+                        !displayed.contains(SECRET),
+                        "stream error must not include the payload, got: {displayed}"
+                    );
+                    panic!("decode of one event must not fail the poll chunk: {e}");
+                }
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => {
+                    ids.extend(change_ids(&envelope));
+                    if ids.len() >= 2 {
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+
+        assert_eq!(ids, vec![1, 3], "both valid events must apply, in order");
+        assert_eq!(
+            runtime_metrics::acceleration::cdc_decode_errors_recorded(),
+            before + 1,
+            "the skipped event must increment dataset_acceleration_cdc_decode_errors"
+        );
+        assert!(
+            runtime_status.is_changes_decode_degraded(&dataset),
+            "a skipped event must set the sticky decode-error condition"
+        );
+        let status = runtime_status
+            .get_dataset_status(&dataset)
+            .expect("dataset status");
+        assert!(
+            status.is_error(),
+            "dataset status must be Error after a skipped event, got {status:?}"
+        );
+        let message = status.error_message().unwrap_or("");
+        assert!(
+            !message.contains(SECRET),
+            "status message must not include the payload, got: {message}"
+        );
+        assert!(
+            message.contains("missing_required_field"),
+            "status message must name the error kind, got: {message}"
+        );
+        assert!(
+            message.contains("topic 't'"),
+            "status message must name the Kafka topic, got: {message}"
+        );
+
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        assert!(
+            runtime_status
+                .get_dataset_status(&dataset)
+                .expect("status")
+                .is_error(),
+            "Ready from a later valid CDC apply must not clear the sticky decode error"
+        );
+        runtime_status.clear_changes_decode_degraded(&dataset);
+        runtime_status.update_dataset(&dataset, runtime_status::ComponentStatus::Ready);
+        assert_eq!(
+            runtime_status.get_dataset_status(&dataset),
+            Some(runtime_status::ComponentStatus::Ready)
         );
     }
 }

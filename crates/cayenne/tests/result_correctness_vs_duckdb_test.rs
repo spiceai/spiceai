@@ -14,10 +14,10 @@
 
 //! # Result correctness (not performance)
 //!
-//! Asserts **Spice Cayenne** and **standalone DuckDB** (out-of-Spice `duckdb`
-//! crate) return **equivalent query results** for the same SQL on identical data.
-//! Separate from Criterion `vs_duckdb_*` benches and from
-//! `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` (latency/throughput).
+//! Asserts **Spice Cayenne** and **standalone DuckDB** (an installed DuckDB over
+//! ADBC, through `duckdb-oracle`) return **equivalent query results** for the
+//! same SQL on identical data.
+//! Separate from the Criterion `vs_duckdb_*` benches (latency/throughput).
 //!
 //! Requires `--features result-correctness-duckdb` (not `duckdb-bench`).
 //! See `tests/correctness/README.md`.
@@ -48,7 +48,7 @@ use crate::support;
 use std::path::{Path, PathBuf};
 
 use arrow::array::RecordBatch;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use support::inventory::{build_inventory, fixture};
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
@@ -76,12 +76,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
 }
 
 fn duckdb_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .map_err(|e| format!("query_arrow: {e}"))?
-        .collect();
-    Ok(batches)
+    conn.query(sql).map_err(|e| e.to_string())
 }
 
 fn load_duckdb_from_parquet(
@@ -422,8 +417,9 @@ const TPCDS_TABLES: &[&str] = &[
 ];
 
 /// Needs network for `INSTALL tpcds`, unlike the TPC-H fixture `support::tpch_data`
-/// generates in-process.
-fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
+/// generates in-process. Returns `false` when the extension cannot be installed;
+/// `support::ensure_fixture` stamps the fixture only after this returns `true`.
+fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> bool {
     // The generation database is temporary and fresh per run. `dsdgen` populates
     // a schema and cannot be run twice against the same database — a reused one
     // fails with `Table with name "call_center" already exists` the moment
@@ -441,7 +437,7 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     // fixture into a passing exclusion.
     if let Err(e) = conn.execute_batch("INSTALL tpcds;") {
         eprintln!("TPC-DS fixture unavailable: {e}");
-        return None;
+        return false;
     }
     conn.execute_batch("LOAD tpcds;")
         .expect("load DuckDB's tpcds extension, which installed successfully");
@@ -455,16 +451,18 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
 
     // Export every base table that exists after dsdgen.
-    let mut stmt = conn
-        .prepare(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'",
-        )
-        .expect("list tables");
-    let names: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .expect("query tables")
-        .filter_map(Result::ok)
+    let batches = conn.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_type = 'BASE TABLE'").expect("list tables");
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("table names")
+                .iter()
+                .map(|name| name.expect("non-null table name").to_owned())
+        })
         .collect();
     for table in names {
         let path = out_dir.join(format!("{table}.parquet"));
@@ -502,19 +500,38 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
         out_dir.display()
     );
 
-    // Stamped only now, with every table exported. A run killed part-way leaves
-    // the directory populated but unstamped, so the next one regenerates instead
-    // of reading a fixture that is missing tables — where the queries against
-    // those tables fail on both engines, far from the cause.
-    support::mark_fixture_complete(out_dir, TPCDS_FIXTURE_REVISION);
-    Some(out_dir.to_path_buf())
+    // Stamped by `ensure_fixture` only once this returns, with every table
+    // exported. A run killed part-way leaves the directory populated but
+    // unstamped, so the next one regenerates instead of reading a fixture that
+    // is missing tables — where the queries against those tables fail on both
+    // engines, far from the cause.
+    true
 }
 
-/// Revision for the TPC-DS fixture. Unlike SSB and TPC-H the generator is
-/// DuckDB's `dsdgen`, not code in this repo, so there is no source to digest;
-/// the stamp is carried for its completeness half, and this bumps only if the
-/// export set or the extension pin changes.
-const TPCDS_FIXTURE_REVISION: &str = "duckdb-dsdgen-1";
+/// Revision for the TPC-DS fixture: the DuckDB release whose `dsdgen` writes
+/// it. Unlike SSB and TPC-H the generator is DuckDB's, not code in this repo, so
+/// there is no source to digest. Naming the release regenerates a fixture another
+/// release wrote, so the rows reported as this DuckDB's came from it. Bump the
+/// prefix if the export set changes.
+fn tpcds_fixture_revision() -> String {
+    use arrow::array::Array as _;
+    let conn = Connection::open_in_memory().expect("open the DuckDB oracle to read its version");
+    let batches = conn
+        .query("SELECT version()")
+        .expect("read the DuckDB oracle's version");
+    let version = batches
+        .first()
+        .filter(|b| b.num_rows() == 1)
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+        })
+        .filter(|a| !a.is_null(0))
+        .map(|a| a.value(0).to_owned())
+        .expect("DuckDB reports one version");
+    format!("duckdb-dsdgen-1-{version}")
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_and_clickbench_parity_vs_duckdb() {
@@ -529,8 +546,10 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     // Reuse only a stamped fixture. Two sentinel files said nothing about the
     // other twenty-two, so a directory left behind by an interrupted dsdgen was
     // read as complete and its missing tables became `Excluded` — a pass.
-    let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, TPCDS_FIXTURE_REVISION)
-        && generate_tpcds_parquet(&tpcds_dir, sf).is_none();
+    let tpcds_fixture_missing =
+        !support::ensure_fixture(&tpcds_dir, &tpcds_fixture_revision(), |dir| {
+            generate_tpcds_parquet(dir, sf)
+        });
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)
@@ -705,9 +724,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write tpcds/clickbench log");
 
-    let coverage_path = scratch.join("parity_coverage.md");
-    // Merge micro + tpch outcomes if present from prior tests in same process? No —
-    // write what we have plus inventory dump.
+    // Each lane writes its own coverage report: lanes run concurrently and share
+    // the scratch tree, so a shared report file would be overwritten mid-write.
+    let coverage_path = scratch.join("parity_coverage_tpcds_clickbench.md");
     write_coverage_report(&coverage_path, &results).expect("coverage report");
     eprintln!("{}", summary_line(&results));
     eprintln!("coverage report: {}", coverage_path.display());
@@ -1046,7 +1065,7 @@ async fn sqllancer_corpus_parity_vs_duckdb() {
     log.push_str(&summary_line(&results));
     log.push('\n');
     std::fs::write(&log_path, &log).expect("write sqllancer log");
-    write_coverage_report(&scratch.join("parity_coverage.md"), &results).ok();
+    write_coverage_report(&scratch.join("parity_coverage_sqllancer.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
     let fails = support::report::unexplained(&results, &build_inventory(), &[]);

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
@@ -23,6 +24,9 @@ use scheduler::Result;
 use scheduler::task::ScheduledTask;
 use tonic::async_trait;
 use tracing_futures::Instrument;
+
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext, SystemPrincipal};
+use runtime_request_context::{Protocol, RequestContext};
 
 use crate::Runtime;
 use crate::http::v1::run_sql;
@@ -53,9 +57,13 @@ impl ScheduledTask for WorkerPromptTask {
             let prompt = Arc::clone(&self.prompt);
             let runtime = Arc::clone(&self.runtime);
 
-            let workers_lock = Arc::clone(&runtime.workers);
-            let workers = workers_lock.read().await;
-            let Some(worker) = workers.get(&worker_name.to_string()) else {
+            let Some(worker) = runtime
+                .workers
+                .read()
+                .await
+                .get(worker_name.as_ref())
+                .cloned()
+            else {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
                 return Ok(());
             };
@@ -64,7 +72,7 @@ impl ScheduledTask for WorkerPromptTask {
                 "Executing worker prompt task for worker: {worker_name}, prompt: {prompt}",
             );
 
-            let Some(model) = Arc::clone(worker).as_model() else {
+            let Some(model) = worker.as_model() else {
                 tracing::debug!(
                     "Worker is not a model worker, skipping prompt execution: {worker_name}",
                 );
@@ -92,7 +100,20 @@ impl ScheduledTask for WorkerPromptTask {
                 return Ok(());
             };
 
-            if let Err(e) = model.chat_request(chat_request).await {
+            // The prompt is the operator's, configured in the Spicepod, so it runs as the
+            // runtime acting for the operator: with write access, so its model may call the
+            // read-write tools (an MCP server's, `store_memory`) the operator gave it. With no
+            // principal it could only read.
+            let outcome: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
+                async {
+                    let context = Arc::new(RequestContext::builder(Protocol::Internal).build());
+                    let principal: AuthPrincipalRef = Arc::new(SystemPrincipal);
+                    context.set_auth_principal(principal)?;
+                    context.scope(model.chat_request(chat_request)).await?;
+                    Ok(())
+                }
+                .await;
+            if let Err(e) = outcome {
                 tracing::error!(
                     "Failed to execute worker prompt task for worker '{worker_name}': {e}",
                 );
@@ -109,6 +130,8 @@ pub struct WorkerSqlTask {
     runtime: Arc<Runtime>,
     worker_name: Arc<str>,
     sql: Arc<str>,
+    /// Whether the run before this one was skipped, so a run of skips warns once.
+    skipped: AtomicBool,
 }
 
 impl WorkerSqlTask {
@@ -117,6 +140,7 @@ impl WorkerSqlTask {
             runtime,
             worker_name,
             sql,
+            skipped: AtomicBool::new(false),
         }
     }
 }
@@ -131,15 +155,17 @@ impl ScheduledTask for WorkerSqlTask {
             let sql = Arc::clone(&self.sql);
             let runtime = Arc::clone(&self.runtime);
 
-            if !runtime.status.is_ready() {
-                tracing::debug!("Runtime is not ready, skipping worker SQL task execution for worker: {worker_name}");
+            if !runtime.status.is_ready_for_scheduled_work() {
+                if self.skipped.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("Worker '{worker_name}' skipped a scheduled run: the runtime is not ready.");
+                } else {
+                    tracing::warn!("Worker '{worker_name}' skipped a scheduled run: the runtime is not ready. It runs at the first scheduled time after the runtime is ready.");
+                }
                 return Ok(());
             }
+            self.skipped.store(false, Ordering::Relaxed);
 
-            let workers_lock = Arc::clone(&runtime.workers);
-            let workers = workers_lock.read().await;
-            // we don't actually need the worker, but validate that it still exists
-            if !workers.contains_key(&worker_name.to_string()) {
+            if !runtime.workers.read().await.contains_key(worker_name.as_ref()) {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
                 return Ok(());
             }

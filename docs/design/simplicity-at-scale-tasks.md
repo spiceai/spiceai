@@ -17,8 +17,8 @@ Sequence: internal primitive -> conditional WAL/OCC -> MVCC/checkpoints and read
 protection -> object-backed engine integration. Provider qualification gates that
 path. In parallel, qualify embedded persistence for object-free on-prem and build
 Cayenne's memory path; they do not depend on cloud qualification. Then migrate
-existing data and retire non-Cayenne accelerators. Turso may remain an internal
-Cayenne metastore. Runtime consumer migration and the operating-experience review
+existing data and retire non-Cayenne accelerators. SQLite remains Cayenne's internal
+metastore. Runtime consumer migration and the operating-experience review
 can proceed alongside the engine work.
 
 ## Conditional state primitive
@@ -103,7 +103,7 @@ In-memory-only tests cannot establish cloud semantics or filesystem durability.
 ### Dependencies & Sequencing
 
 Depends on the primitive. Gates production use of the object-store adapter;
-embedded Turso qualification is a separate path and does not require a cloud test.
+embedded SQLite qualification is a separate path and does not require a cloud test.
 
 ### Open Questions / Risks
 
@@ -239,12 +239,12 @@ for unresolved attempts without discarding evidence that is still required.
 ### Problem
 
 Production on-prem deployments must work without object storage. Removing all
-Cayenne SQL metastores would preempt the decision to retain embedded Turso for
+Cayenne SQL metastores would remove the embedded SQLite metastore that serves
 that purpose; standalone accelerator retirement is a separate concern.
 
 ### Proposed Solution
 
-Qualify Turso behind Cayenne's domain read/write/transaction operations with
+Qualify SQLite behind Cayenne's domain read/write/transaction operations with
 durable local files, native transactions, recovery, checkpointing, and reader
 lifetimes. Compare it with an alternative file adapter only if that removes
 operating work while meeting the same requirements. Select the embedded backend
@@ -254,8 +254,8 @@ instead of emulating object APIs or duplicating the object WAL.
 ### Scope & Non-Goals
 
 No mandatory object-store service, cloud credentials, or separately operated
-metadata database. No inferred shared-filesystem safety, replicated Turso
-deployment, or automatic multi-node failover. No commitment to remove Turso.
+metadata database. No inferred shared-filesystem safety, replicated SQLite
+deployment, or automatic multi-node failover. No commitment to replace the SQLite metastore.
 
 ### Acceptance Criteria
 
@@ -268,7 +268,7 @@ deployment, or automatic multi-node failover. No commitment to remove Turso.
 ### Alternatives Considered
 
 Requiring customers to install an S3-compatible service violates object-free
-on-prem support. Keeping Turso as a separate accelerator retains an engine choice;
+on-prem support. Keeping SQLite as a separate accelerator retains an engine choice;
 embedding it inside Cayenne does not.
 
 ### Dependencies & Sequencing
@@ -431,7 +431,7 @@ before optimizing reclamation.
 
 The direction requires a supported file/object destination for existing Cayenne
 data. Its metastore contains inline data and transaction state. Redundant backends
-can retire after migration, but Turso may remain the embedded on-prem backend.
+can retire after migration, and SQLite remains the embedded on-prem backend.
 
 ### Proposed Solution
 
@@ -445,7 +445,7 @@ conversion to the object protocol.
 ### Scope & Non-Goals
 
 No permanent dual-write authorities, mandatory migration to object storage, or
-unconditional Turso removal. Accelerator retirement has its own task. Keep
+unconditional removal of the embedded SQLite metastore. Accelerator retirement has its own task. Keep
 database connectors and differential-test oracles.
 
 ### Acceptance Criteria
@@ -455,7 +455,7 @@ database connectors and differential-test oracles.
 - [ ] Engine row/value comparisons and checkpoint checks agree before and after.
 - [ ] Old binaries cannot open a new generation as if it were legacy state.
 - [ ] Rollback after new writes has a defined lossless procedure.
-- [ ] Object-free on-prem fixtures migrate/upgrade without object-store access; retained Turso databases stay supported.
+- [ ] Object-free on-prem fixtures migrate/upgrade without object-store access; embedded SQLite metastores stay supported.
 - [ ] Removed settings, old paths, release notes, and cookbook changes match the reviewed surface.
 
 ### Alternatives Considered
@@ -496,7 +496,7 @@ configuration and packaging, and dependencies no retained capability uses.
 
 All alternative accelerators are in scope, including DuckDB. Keep source
 connectors, Arrow data structures/kernels, useful independent test oracles, and
-Turso if used internally by Cayenne. No dependency purge by name, silent engine
+SQLite as Cayenne's internal metastore. No dependency purge by name, silent engine
 substitution, or source reload where replayability has not been established.
 
 ### Acceptance Criteria
@@ -587,7 +587,7 @@ transcripts, live status/error messages, and old-version behavior. Quantify user
 actions and required concepts for each lifecycle. Propose one production
 engine, Cayenne, with memory and persistent file/object storage and automatic
 maintenance. Preserve necessary resource limits and truthful diagnostics. Include
-an object-free production on-prem flow and keep any embedded Turso choice internal.
+an object-free production on-prem flow and keep the embedded SQLite metastore internal.
 
 ### Scope & Non-Goals
 

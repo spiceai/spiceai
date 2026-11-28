@@ -17,7 +17,7 @@ limitations under the License.
 //! Regression bench: cross-table CDC throughput ceiling from the
 //! single-connection metastore mutex.
 //!
-//! Older versions of `SqliteMetastore` and `TursoMetastore` held one
+//! Older versions of `SqliteMetastore` held one
 //! `tokio::sync::Mutex<Connection>` for the whole catalog:
 //!
 //! ```ignore
@@ -42,7 +42,6 @@ limitations under the License.
 //! `try_lock_owned` acquisition pattern. SQLite-WAL allows concurrent
 //! readers + one writer, so the K connections do not serialize at the
 //! SQLite level — only the in-process Rust mutex did, and that's gone.
-//! Turso's MVCC supports `BEGIN CONCURRENT` so it gains even more.
 //!
 //! ## What this bench measures
 //!
@@ -72,7 +71,7 @@ limitations under the License.
 //!   in parallel, the current floor.
 //!
 //! The bench exercises two RTTs (`rtt_1ms` for local SQLite with WAL+normal-sync,
-//! `rtt_10ms` for a network metastore like Turso) so the ceiling is legible in
+//! `rtt_10ms` for a network metastore) so the ceiling is legible in
 //! both deployment shapes.
 
 #![allow(clippy::expect_used)]
@@ -90,7 +89,7 @@ use tokio::sync::Mutex;
 /// realistic shapes:
 /// - 1 ms: local SQLite, WAL mode, NORMAL sync (Cayenne's default
 ///   tokio-rusqlite config — see `metastore/sqlite.rs:97-108`).
-/// - 10 ms: same-zone network metastore (Turso, managed Postgres).
+/// - 10 ms: same-zone network metastore.
 const RTTS: &[(&str, Duration)] = &[
     ("rtt_1ms", Duration::from_millis(1)),
     ("rtt_10ms", Duration::from_millis(10)),

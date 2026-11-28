@@ -35,6 +35,8 @@ use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::ParameterSpec;
 
+pub use runtime_object_store::ssrf::RedirectScope;
+
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
 use crate::parameters::{ConnectorContext, ConnectorParams};
@@ -43,28 +45,39 @@ use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-/// Request timeout of the client [`default_spice_client`] builds. Connectors
+/// Request timeout of the client [`default_spice_client_builder`] builds. Connectors
 /// that use that client derive rate-control defaults from it, the same way the
 /// HTTPS connector derives them from its `client_timeout` parameter.
 pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Creates a default reqwest client with standard Spice settings.
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be built.
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+/// Redirects the client [`default_spice_client_builder`] builds follows before a request fails.
+const DEFAULT_SPICE_CLIENT_MAX_REDIRECTS: usize = 10;
+
+/// A reqwest client builder with standard Spice settings: the Spice user agent, a
+/// 10-second connect timeout, a [`DEFAULT_SPICE_CLIENT_TIMEOUT`] request timeout, and
+/// `content_type` as the default `Content-Type`. Its client follows only the redirects
+/// `redirects` allows, and refuses a redirect that leaves the request's host for a private,
+/// loopback, or link-local address, so a caller must not set its own redirect policy or DNS
+/// resolver on it.
+pub fn default_spice_client_builder(
+    content_type: &'static str,
+    redirects: RedirectScope,
+) -> reqwest::ClientBuilder {
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
     let mut headers = HeaderMap::new();
     headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
-        .default_headers(headers)
-        .build()
+        .default_headers(headers);
+    runtime_object_store::ssrf::guard_redirects(
+        builder,
+        DEFAULT_SPICE_CLIENT_MAX_REDIRECTS,
+        redirects,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +273,18 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether a cluster executor can keep an acceleration refreshed by this
+    /// connector's change stream to the partitions it serves.
+    ///
+    /// That takes a change stream that applies by primary key and resumes after
+    /// a replacement of the acceleration by a full read of the federated table,
+    /// which must read the source's current rows; and one that rebuilds from
+    /// the source an acceleration reported as [`AccelerationContents::Unknown`].
+    /// Without it, every executor applies every change.
+    fn supports_partitioned_changes(&self) -> bool {
+        false
+    }
+
     /// The CDC stream for `dataset`, if this connector produces one.
     ///
     /// `async` so that anything the stream needs from `context` — a checkpoint
@@ -430,6 +455,12 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         ComponentInitialization::default()
     }
 
+    /// The OAuth client ID whose user tokens, sent with a request, initialize a data
+    /// connector that initializes on trigger.
+    fn user_token_client_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns whether the data connector should be initialized on startup or on trigger,
     /// with dataset-specific logic.
     ///
@@ -447,5 +478,147 @@ pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
 impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.metrics_provider()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RedirectScope, default_spice_client_builder};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    /// Answers every request with `respond(path)` and counts the requests.
+    async fn serve(respond: impl Fn(&str) -> String + Send + 'static) -> (u16, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let _ = socket.write_all(respond(path).as_bytes()).await;
+            }
+        });
+        (port, requests)
+    }
+
+    fn error_chain(error: &reqwest::Error) -> String {
+        std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |e| {
+            e.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_host_to_a_loopback_address_is_refused() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let target = format!("http://127.0.0.1:{target_port}/graphql");
+        let (origin_port, origin_requests) = serve({
+            let target = target.clone();
+            move |_| redirect_to(&target)
+        })
+        .await;
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
+            .expect("build the client");
+
+        let error = client
+            .post(format!("http://localhost:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message = error_chain(&error);
+        assert!(
+            message.contains(&format!("Refused to connect to {target}: a redirect off the request's host to a private, loopback, or link-local address is not followed")),
+            "unexpected error: {message}"
+        );
+        assert_eq!(origin_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// `localhost.` resolves to a loopback address but, with its trailing dot, is not a
+    /// well-known internal name, so only its resolved address shows that the redirect reaches
+    /// an internal host.
+    #[tokio::test]
+    async fn a_redirect_off_the_host_to_a_name_that_resolves_to_loopback_is_refused() {
+        let (target_port, target_requests) = serve(|_| OK_RESPONSE.to_string()).await;
+        let (origin_port, _) =
+            serve(move |_| redirect_to(&format!("http://localhost.:{target_port}/graphql"))).await;
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
+            .expect("build the client");
+
+        let error = client
+            .post(format!("http://127.0.0.1:{origin_port}/graphql"))
+            .send()
+            .await
+            .expect_err("the redirect is refused");
+
+        let message = error_chain(&error);
+        assert!(
+            message.contains("Refused to connect to localhost.: a redirect off the request's host to a private, loopback, or link-local address is not followed"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            target_requests.load(Ordering::SeqCst),
+            0,
+            "the redirect target is never reached"
+        );
+    }
+
+    /// The operator chose the request's host, so a redirect within it is followed even when it
+    /// is a loopback address.
+    #[tokio::test]
+    async fn a_redirect_within_the_host_is_followed() {
+        let (port, requests) = serve(|path| {
+            if path == "/graphql" {
+                redirect_to("/graphql/")
+            } else {
+                OK_RESPONSE.to_string()
+            }
+        })
+        .await;
+        let client = default_spice_client_builder("application/json", RedirectScope::PublicHosts)
+            .build()
+            .expect("build the client");
+
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/graphql"))
+            .send()
+            .await
+            .expect("the redirect is followed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.url().path(), "/graphql/");
+        assert_eq!(response.text().await.expect("the body is read"), "{}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }

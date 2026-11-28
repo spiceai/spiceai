@@ -29,7 +29,7 @@ use std::path::PathBuf;
 /// Describes the storage layout of an accelerator's data on disk.
 ///
 /// Different accelerators store their data in different ways:
-/// - File-based (`DuckDB`, `SQLite`, Turso): Single database file
+/// - File-based (`DuckDB`, `SQLite`): Single database file
 /// - Directory-based (Cayenne): Multiple directories (metadata + data)
 ///
 /// This enum is used for both snapshot operations and size metrics.

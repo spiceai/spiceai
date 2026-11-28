@@ -77,8 +77,10 @@ mod test {
 
     #[test]
     fn test_get_user_agent() {
+        // The OS version is `uname -r` on Unix, which can contain `+` or `~`
+        // (e.g. `6.12.94+`), so accept any token up to the space before the arch.
         let matching_regex = regex::Regex::new(
-            r"repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
+            r"repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[^\s/)]+ (x86_64|aarch64|i386)\)",
         )
         .expect("regex should be constructed");
 

@@ -33,7 +33,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{runtime::Handle, sync::RwLock};
 
@@ -44,7 +44,8 @@ use crate::{
     dataaccelerator::spice_sys,
     parameters::Parameters,
 };
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_parameters::Diagnostics;
+use runtime_secrets::{Secrets, secret_sources_from_templates, try_get_params_with_secrets};
 
 use super::{ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError};
 use crate::dataconnector::{ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR, SCYLLADB_FEATURE};
@@ -104,6 +105,14 @@ impl ConnectorContext for RuntimeConnectorContext {
         Arc::clone(&self.app)
     }
 
+    fn role(&self) -> Role {
+        self.runtime.role()
+    }
+
+    fn runtime_status(&self) -> Arc<crate::status::RuntimeStatus> {
+        self.runtime.status()
+    }
+
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
         self.runtime.http_rate_control_registry()
     }
@@ -118,6 +127,13 @@ impl ConnectorContext for RuntimeConnectorContext {
 
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef> {
         super::sink::accelerated_checkpoint_schema(&self.bind(dataset)).await
+    }
+
+    async fn shared_location_id(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        spice_sys::shared_location_id(&self.bind(dataset)).await
     }
 
     async fn blob_checkpoint_store(
@@ -188,7 +204,7 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters) = match &self.component {
+        let (params, prefix, parameters, secret_sources) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let (prefix, parameters) = {
                     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -204,10 +220,13 @@ impl ConnectorParamsBuilder {
                     (factory.prefix(), factory.parameters())
                 };
 
+                // Strict: an unresolved `${ store:key }` fails the catalog
+                // rather than loading it with an empty value.
                 (
-                    get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
+                    try_get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await?,
                     prefix,
                     parameters,
+                    secret_sources_from_templates(&catalog.params),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -239,18 +258,31 @@ impl ConnectorParamsBuilder {
                     (factory.prefix(), factory.parameters())
                 };
 
-                let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
+                // Strict: an unresolved `${ store:key }` fails the dataset
+                // rather than substituting the empty string, which can change
+                // what the connector reads (an empty `file_format` loaded a
+                // CSV as a one-row document table) and serve wrong results
+                // while the dataset reports Ready.
+                let params =
+                    try_get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await?;
 
-                (params, prefix, parameters)
+                (
+                    params,
+                    prefix,
+                    parameters,
+                    secret_sources_from_templates(&dataset.params),
+                )
             }
         };
 
-        let parameters = Parameters::try_new(
+        let parameters = Parameters::try_new_with_secret_sources(
             &format!("connector {name}"),
             params.into_iter().collect(),
             prefix,
             secrets,
             parameters,
+            Diagnostics::Report,
+            Some(secret_sources),
         )
         .await?;
 

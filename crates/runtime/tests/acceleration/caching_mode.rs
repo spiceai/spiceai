@@ -34,15 +34,14 @@ limitations under the License.
 //!
 //! ## Accelerator Support
 //!
-//! All accelerators (`DuckDB`, Cayenne, Arrow/MemTable) support caching mode with
+//! All accelerators (`Cayenne`, Cayenne, Arrow/MemTable) support caching mode with
 //! the same behavior - data is cached per unique filter combination.
 //!
 //! ## Tests
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB`
-//! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `Cayenne`
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
 
@@ -281,7 +280,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 /// due to the `ColumnReference` sorting limitation in datafusion-table-providers.
 /// This is expected and acceptable since Arrow is primarily for testing.
 ///
-/// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
+/// For production use with `Cayenne` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
@@ -488,7 +487,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
         .await
 }
 
-/// Test verifying ideal multi-filter caching behavior with `DuckDB`.
+/// Test verifying ideal multi-filter caching behavior with `Cayenne`.
 ///
 /// This test verifies that multiple filter combinations can be cached simultaneously:
 /// 1. Query with filter A → cache miss → fetch → cache stores A
@@ -496,7 +495,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 3. Query with filter A → cache hit → served from cache (no HTTP fetch)
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
-/// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
+/// Uses `Cayenne` accelerator which supports upsert-based multi-filter caching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -522,7 +521,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             ));
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -701,171 +700,6 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!("✅ Step 3: 'michael' query → cache hit (no HTTP fetch)");
             eprintln!("✅ Step 4: 'jennifer' query → cache hit (no HTTP fetch)");
             eprintln!("\nBoth filter combinations remain cached simultaneously.");
-
-            Ok(())
-        })
-        .await
-}
-
-/// Test multi-filter caching with Cayenne (SQLite+Vortex) accelerator.
-/// Validates that multiple filter combinations (different query params) can be cached
-/// simultaneously using upsert-based caching with primary key constraints.
-///
-/// Uses Cayenne accelerator which supports upsert-based multi-filter caching.
-///
-/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
-/// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(feature = "sqlite")]
-async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some(
-        "integration=info,runtime=info,data_components=info,runtime::accelerated::caching=info",
-    ));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            // Create HTTP dataset with caching mode using Cayenne
-            let origin = start_people_search_origin().await;
-            let mut dataset = Dataset::new(&origin.url, "tvmaze");
-            dataset.params = Some(Params::from_string_map(
-                vec![
-                    (
-                        "allowed_request_paths".to_string(),
-                        "/search/people".to_string(),
-                    ),
-                    ("request_query_filters".to_string(), "enabled".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            ));
-            dataset.acceleration = Some(Acceleration {
-                enabled: true,
-                engine: Some("cayenne".to_string()),
-                mode: Mode::File,
-                refresh_mode: Some(RefreshMode::Caching),
-                refresh_check_interval: Some("30s".to_string()),
-                ..Acceleration::default()
-            });
-
-            let mut app = AppBuilder::new("test_caching_multi_filter_cayenne")
-                .with_dataset(dataset)
-                .build();
-
-            // Disable SQL results caching
-            if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results =
-                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
-            }
-            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
-                sql_cache.enabled = false;
-            }
-
-            configure_test_datafusion();
-            let status = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = Arc::clone(&status).load_components() => {}
-            }
-
-            runtime_ready_check(&status).await;
-
-            // STEP 1: Query for "michael" - cache miss
-            let df1 = status
-                .datafusion()
-                .ctx
-                .table("tvmaze")
-                .await?
-                .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=michael")))?
-                .limit(0, Some(1))?;
-
-            let batches1 = df1.collect().await?;
-            assert!(
-                !batches1.is_empty(),
-                "Step 1: Should have results from HTTP API"
-            );
-            assert_eq!(batches1[0].num_rows(), 1, "Step 1: Should have 1 row");
-
-            // STEP 2: Query for "jennifer" - cache miss (should NOT overwrite "michael")
-            let df2 = status
-                .datafusion()
-                .ctx
-                .table("tvmaze")
-                .await?
-                .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=jennifer")))?
-                .limit(0, Some(1))?;
-
-            let batches2 = df2.collect().await?;
-            assert!(
-                !batches2.is_empty(),
-                "Step 2: Should have results from HTTP API"
-            );
-            assert_eq!(batches2[0].num_rows(), 1, "Step 2: Should have 1 row");
-
-            // STEP 3: Query for "michael" again - should be cache hit
-            let df3 = status
-                .datafusion()
-                .ctx
-                .table("tvmaze")
-                .await?
-                .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=michael")))?
-                .select(vec![col("request_query")])?
-                .limit(0, Some(1))?;
-
-            let batches3 = df3.collect().await?;
-            assert!(
-                !batches3.is_empty(),
-                "Step 3: Should return cached michael data"
-            );
-            assert_eq!(batches3[0].num_rows(), 1, "Step 3: Should have 1 row");
-
-            let batch3 = &batches3[0];
-            let request_query_array3 = batch3
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("request_query should be StringArray");
-            assert_eq!(
-                request_query_array3.value(0),
-                "q=michael",
-                "Should return cached michael data"
-            );
-
-            // STEP 4: Query for "jennifer" again - should be cache hit
-            let df4 = status
-                .datafusion()
-                .ctx
-                .table("tvmaze")
-                .await?
-                .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=jennifer")))?
-                .select(vec![col("request_query")])?
-                .limit(0, Some(1))?;
-
-            let batches4 = df4.collect().await?;
-            assert!(
-                !batches4.is_empty(),
-                "Step 4: Should return cached jennifer data"
-            );
-            assert_eq!(batches4[0].num_rows(), 1, "Step 4: Should have 1 row");
-
-            let batch4 = &batches4[0];
-            let request_query_array4 = batch4
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("request_query should be StringArray");
-            assert_eq!(
-                request_query_array4.value(0),
-                "q=jennifer",
-                "Should return cached jennifer data"
-            );
 
             Ok(())
         })
@@ -1950,7 +1784,6 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
 /// 1. Parent HTTP dataset fetches from source and stores in parent accelerator
 /// 2. Localpod child accelerator automatically receives the same data
 /// 3. Queries to localpod are served from the in-memory child accelerator
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1959,7 +1792,7 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Create parent HTTP dataset with file-mode DuckDB caching
+            // Create parent HTTP dataset with file-mode Cayenne caching
             let origin = start_people_search_origin().await;
             let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_file");
             parent_dataset.params = Some(Params::from_string_map(
@@ -1975,18 +1808,18 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory, // Using memory mode for test simplicity
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
                 ..Acceleration::default()
             });
 
-            // Create localpod dataset pointing to the parent, with in-memory DuckDB caching
+            // Create localpod dataset pointing to the parent, with in-memory Cayenne caching
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_file", "tvmaze");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2097,7 +1930,6 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 ///
 /// This test verifies the `initialize_child_from_parent` functionality that copies existing
 /// parent data to the child accelerator during registration.
-#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_initialization_from_existing_parent_data()
 -> Result<(), anyhow::Error> {
@@ -2110,7 +1942,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             // PHASE 1: Set up parent dataset and populate it with data
             eprintln!("PHASE 1: Setting up parent dataset and populating with data...");
 
-            // Create parent HTTP dataset with DuckDB caching (memory mode for test)
+            // Create parent HTTP dataset with Cayenne caching (memory mode for test)
             let origin = start_people_search_origin().await;
             let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_parent");
             parent_dataset.params = Some(Params::from_string_map(
@@ -2126,7 +1958,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2207,7 +2039,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_parent", "tvmaze_child");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),

@@ -190,7 +190,6 @@ async fn row_count(rt: &Arc<Runtime>, metric: &str) -> Result<usize, anyhow::Err
 /// A sink dataset has no table until its first write creates one. Concurrent first writes
 /// race that: one does the work and the others must wait for it, or they fail with a
 /// missing-table error and lose their data points. The timeout also catches a deadlock here.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyhow::Error> {
     const METRIC: &str = "otel_race_first_write";
@@ -235,7 +234,6 @@ async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyho
 /// Two exports each add a different column at once. The slower one built its batch before
 /// the other changed the table, so the schema check refuses it. It must rebuild against the
 /// current schema and retry so its data points still land.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), anyhow::Error> {
     const METRIC: &str = "otel_race_evolution";
@@ -311,7 +309,6 @@ async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), 
 /// After a restart the dataset has no table until its first write. When that write also adds
 /// a column, the dataset must first be registered from the acceleration checkpoint, or the
 /// export is rejected.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow::Error> {
     const METRIC: &str = "otel_restart_new_dimension";
@@ -385,7 +382,6 @@ async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow:
 /// A writer can name the dataset differently: a Flight `DoPut` turns `foo` into
 /// `spice.public.foo`, and the runtime accepts that as writable. Registration has to find the
 /// dataset by that name too, or the write fails against a table that was never registered.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyhow::Error> {
     const METRIC: &str = "otel_alias_registration";
@@ -446,7 +442,6 @@ async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyho
 /// schema it read, so by the time it evolves, several columns it never saw already exist. If
 /// that counted as removing them, every export would advance one column per retry and the last
 /// ones would run out of retries and lose their data points.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn many_concurrent_exports_adding_distinct_columns_all_land() -> Result<(), anyhow::Error> {
     const METRIC: &str = "otel_race_many_dimensions";

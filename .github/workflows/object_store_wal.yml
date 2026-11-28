@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'crates/object_store_occ/**'
+      # headlog_replay links the model crate.
+      - 'crates/cayenne-metastore-model/**'
       - 'test/object_store_occ/**'
       - '.github/workflows/object_store_wal.yml'
       - 'Cargo.toml'
@@ -19,6 +21,12 @@ concurrency:
   group: object-store-wal-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
+
 jobs:
   plan:
     name: Plan WAL E2E legs
@@ -30,6 +38,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
+    environment: ci
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
     timeout-minutes: 45
@@ -48,11 +57,12 @@ jobs:
       - name: Check the merge group for WAL changes
         id: changes
         if: github.event_name == 'merge_group'
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: |
             code_changes:
               - 'crates/object_store_occ/**'
+              - 'crates/cayenne-metastore-model/**'
               - 'test/object_store_occ/**'
               - '.github/workflows/object_store_wal.yml'
               - 'Cargo.toml'
@@ -78,7 +88,7 @@ jobs:
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
           SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
-          HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+          HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
         with:
           script: |
             // Every leg runs in parallel. The disk legs qualify the local
@@ -111,7 +121,7 @@ jobs:
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             if (process.env.HAS_SPICEIO_SECRET !== 'true') {
-              core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
+              core.warning('SMB_PASSWORD is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
               return legs.filter((leg) => leg.store !== 'spiceio');
             }
             return legs;
@@ -125,11 +135,13 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
+    environment: ci
     timeout-minutes: 45
     services:
       redis:
-        # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
+        # GitHub service containers require Linux. An empty image skips macOS. A service
+        # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -159,14 +171,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # The dev runner image has no C toolchain, and rustc links through cc. The
       # Macs already have one.
-      - uses: ./.github/actions/setup-cc
+      - uses: $/.github/actions/setup-cc
         if: runner.os == 'Linux'
       # The dev runner image has python3 but no pip. The macOS runners carry
       # Homebrew interpreters, and installing one through setup-python needs sudo.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: runner.os == 'Linux'
         with:
           python-version: '3.12'
@@ -184,9 +196,15 @@ jobs:
           "$python" -m venv "$RUNNER_TEMP/wal-oracle"
           "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
           echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
-      - name: Test state protocol and cancellation
+      # Every store-independent test binary; s3_integration runs on the service legs.
+      - name: Test state protocol, cancellation, faults and model replays
         if: matrix.store == 'disk'
-        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+        # The test-name filters select integration modules; the library's own
+        # tests run unfiltered in the first command.
+        run: |
+          set -euo pipefail
+          cargo test --locked --profile dev -p object_store_occ --lib -- --nocapture
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture state_store:: transactional_wal:: local_cancellation:: fault:: headlog:: headlog_replay:: data_file_replay:: prefix_listing:: local_root_overlap::
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
 
@@ -330,7 +348,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: 192.168.3.148
           SPICEIO_SMB_USER: runner
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ai_platform_dev
           SPICEIO_BUCKET: ${{ env.WAL_BUCKET }}
           # spiceio moves to the next port when this one is taken.
@@ -373,7 +391,9 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
           AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
-        run: cargo test --locked --profile dev -p object_store_occ --test s3_integration -- --nocapture
+        # A block scalar: YAML reads a plain value ending in `:` as a mapping key.
+        run: |
+          cargo test --locked --profile dev -p object_store_occ --test integration -- --nocapture s3_integration::
       - name: Run process histories against ${{ matrix.store }}
         timeout-minutes: 30
         env:
@@ -414,7 +434,7 @@ jobs:
       # history, dispatch this workflow on the branch.
       - name: Retain histories and backing stores
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wal-e2e-${{ matrix.os }}-${{ matrix.store }}
           path: wal-e2e-artifacts/

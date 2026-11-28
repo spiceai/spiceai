@@ -301,7 +301,7 @@ mod tests {
     use super::*;
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use datafusion::arrow::array::{
-        Decimal128Array, Float64Array, RecordBatch, StringViewArray, UInt64Array,
+        Array, ArrayRef, Decimal128Array, Float64Array, RecordBatch, StringViewArray, UInt64Array,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::TableReference;
@@ -1644,6 +1644,288 @@ mod tests {
             pretty_sorted(&result)
         );
 
+        Ok(())
+    }
+
+    /// `sum` whose partial state is `Decimal128(38, 0)` — the same shape as
+    /// Spice's checked integer `SUM`. Drives the `FlightSQL` pushdown path
+    /// without depending on `runtime-datafusion`.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct WidePartialInt64Sum {
+        signature: datafusion::logical_expr::Signature,
+    }
+
+    impl WidePartialInt64Sum {
+        fn new() -> Self {
+            Self {
+                signature: datafusion::logical_expr::Signature::uniform(
+                    1,
+                    vec![DataType::Int64],
+                    datafusion::logical_expr::Volatility::Immutable,
+                ),
+            }
+        }
+
+        fn udaf() -> Arc<datafusion::logical_expr::AggregateUDF> {
+            Arc::new(datafusion::logical_expr::AggregateUDF::from(Self::new()))
+        }
+    }
+
+    impl datafusion::logical_expr::AggregateUDFImpl for WidePartialInt64Sum {
+        fn name(&self) -> &'static str {
+            "sum"
+        }
+
+        fn signature(&self) -> &datafusion::logical_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn accumulator(
+            &self,
+            _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+        ) -> Result<Box<dyn datafusion::logical_expr::Accumulator>> {
+            Ok(Box::new(WidePartialInt64SumAcc::default()))
+        }
+
+        fn state_fields(
+            &self,
+            args: datafusion::logical_expr::function::StateFieldsArgs,
+        ) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
+            Ok(vec![
+                Field::new(
+                    datafusion::logical_expr::utils::format_state_name(args.name, "sum"),
+                    DataType::Decimal128(38, 0),
+                    true,
+                )
+                .into(),
+            ])
+        }
+
+        fn groups_accumulator_supported(
+            &self,
+            _args: datafusion::logical_expr::function::AccumulatorArgs,
+        ) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct WidePartialInt64SumAcc {
+        sum: i128,
+        nonempty: bool,
+    }
+
+    impl datafusion::logical_expr::Accumulator for WidePartialInt64SumAcc {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            use datafusion::arrow::array::AsArray;
+            let Some(values) = values.first() else {
+                return Ok(());
+            };
+            let array = values.as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+            for index in 0..array.len() {
+                if !array.is_valid(index) {
+                    continue;
+                }
+                self.sum = self
+                    .sum
+                    .checked_add(i128::from(array.value(index)))
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Execution(
+                            "Overflow in SUM of BIGINT".to_string(),
+                        )
+                    })?;
+                self.nonempty = true;
+            }
+            Ok(())
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion::scalar::ScalarValue> {
+            if !self.nonempty {
+                return Ok(datafusion::scalar::ScalarValue::Int64(None));
+            }
+            i64::try_from(self.sum).map_or_else(
+                |_| {
+                    Err(datafusion::common::DataFusionError::Execution(
+                        "Overflow in SUM of BIGINT".to_string(),
+                    ))
+                },
+                |value| Ok(datafusion::scalar::ScalarValue::Int64(Some(value))),
+            )
+        }
+
+        fn size(&self) -> usize {
+            std::mem::size_of_val(self)
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion::scalar::ScalarValue>> {
+            Ok(vec![datafusion::scalar::ScalarValue::Decimal128(
+                self.nonempty.then_some(self.sum),
+                38,
+                0,
+            )])
+        }
+
+        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+            use datafusion::arrow::array::AsArray;
+            let Some(states) = states.first() else {
+                return Ok(());
+            };
+            let array = states.as_primitive::<datafusion::arrow::datatypes::Decimal128Type>();
+            for index in 0..array.len() {
+                if !array.is_valid(index) {
+                    continue;
+                }
+                self.sum = self.sum.checked_add(array.value(index)).ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "Overflow in SUM of BIGINT".to_string(),
+                    )
+                })?;
+                self.nonempty = true;
+            }
+            Ok(())
+        }
+    }
+
+    fn int64_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+    }
+
+    /// A scheduler-side `SUM` over two executors whose per-executor totals do
+    /// not fit in `Int64` must still return `MAX` when the true total does.
+    /// The pushed SQL has to compute a wide sum; a plain `SUM("v")` would
+    /// evaluate to `Int64` on the first executor (`MAX+MAX`) and error. A
+    /// true overflow (`MAX+MAX` on both sides) must still error.
+    #[tokio::test]
+    async fn test_wide_integer_sum_pushdown_cancels_across_executors_and_errors_when_true_total_overflows()
+    -> Result<()> {
+        let schema = int64_schema();
+        let union_input = make_union(vec![
+            make_flight_exec(&schema, "spice.public.t", &[]),
+            make_flight_exec(&schema, "spice.public.t", &[]),
+        ]);
+
+        let sum_expr = AggregateExprBuilder::new(
+            WidePartialInt64Sum::udaf(),
+            vec![Arc::new(Column::new("v", 0))],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("sum(v)")
+        .build()?;
+
+        let plan = full_aggregate(union_input, &[], vec![Arc::new(sum_expr)])?;
+        let optimized = optimize(plan)?;
+        let displayed = plan_display(&optimized);
+        assert!(
+            displayed.contains(r#"SUM(CAST("v" AS DECIMAL(38,0)))"#),
+            "checked integer SUM must push a wide remote sum, got:\n{displayed}"
+        );
+        assert!(
+            !displayed.contains(r#"sql=SELECT SUM("v")"#),
+            "plain SUM(\"v\") would narrow on each executor, got:\n{displayed}"
+        );
+        assert!(
+            displayed.contains("PartialAggregationFlightSqlExec"),
+            "the two-executor plan must still push the aggregate, got:\n{displayed}"
+        );
+
+        let partial_schema = optimized.children()[0].children()[0].schema();
+        assert_eq!(
+            partial_schema.field(0).data_type(),
+            &DataType::Decimal128(38, 0),
+            "partial state must stay Decimal128(38, 0)"
+        );
+
+        let wide_partial = |value: i128| -> Result<RecordBatch> {
+            RecordBatch::try_new(
+                Arc::clone(&partial_schema),
+                vec![Arc::new(
+                    Decimal128Array::from(vec![value])
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal"),
+                )],
+            )
+            .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+        };
+
+        // Executor 1: MAX+MAX. Executor 2: -MAX. True total is MAX.
+        let mut cancel_data = vec![
+            vec![wide_partial(i128::from(i64::MAX).saturating_mul(2))?],
+            vec![wide_partial(i128::from(-i64::MAX))?],
+        ]
+        .into_iter();
+        let cancel_plan = replace_pushdown_with_memory(Arc::clone(&optimized), &mut cancel_data)?;
+        let cancel = execute_plan(cancel_plan).await?;
+        let cancel_col = cancel
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("final SUM is Int64");
+        assert_eq!(
+            cancel_col.value(0),
+            i64::MAX,
+            "MAX+MAX and -MAX across executors must cancel to MAX"
+        );
+
+        // Both executors return MAX+MAX. True total overflows.
+        let mut overflow_data = vec![
+            vec![wide_partial(i128::from(i64::MAX).saturating_mul(2))?],
+            vec![wide_partial(i128::from(i64::MAX).saturating_mul(2))?],
+        ]
+        .into_iter();
+        let overflow_plan =
+            replace_pushdown_with_memory(Arc::clone(&optimized), &mut overflow_data)?;
+        let overflow = execute_plan(overflow_plan).await;
+        let overflow_err = overflow.expect_err("true total MAX+MAX+MAX+MAX must overflow");
+        assert!(
+            overflow_err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("overflow"),
+            "true overflow must error, got {overflow_err}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vanilla_int64_sum_pushdown_keeps_plain_sql() -> Result<()> {
+        let schema = int64_schema();
+        let flight = make_flight_exec(&schema, "spice.public.t", &[]);
+        let sum_expr = AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("v", 0))])
+            .schema(Arc::clone(&schema))
+            .alias("sum(v)")
+            .build()?;
+        let optimized = optimize(partial_aggregate(flight, &[], vec![Arc::new(sum_expr)])?)?;
+        let displayed = plan_display(&optimized);
+        assert!(
+            displayed.contains(r#"SUM("v")"#),
+            "vanilla Int64 SUM state is Int64, so the remote SQL stays SUM(\"v\"), got:\n{displayed}"
+        );
+        assert!(
+            !displayed.contains("DECIMAL(38,0)"),
+            "vanilla Int64 SUM must not emit a wide cast, got:\n{displayed}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_avg_of_int64_pushdown_uses_wide_sum() -> Result<()> {
+        let schema = int64_schema();
+        let flight = make_flight_exec(&schema, "spice.public.t", &[]);
+        let avg_expr = AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("v", 0))])
+            .schema(Arc::clone(&schema))
+            .alias("avg(v)")
+            .build()?;
+        let optimized = optimize(partial_aggregate(flight, &[], vec![Arc::new(avg_expr)])?)?;
+        let displayed = plan_display(&optimized);
+        assert!(
+            displayed.contains(r#"SUM(CAST("v" AS DECIMAL(38,0)))"#),
+            "AVG(Int64) must not push a narrowing SUM(\"v\"), got:\n{displayed}"
+        );
         Ok(())
     }
 }

@@ -61,7 +61,11 @@ A folder holding more than one data format must be narrowed with a glob or `file
 
 ## Private and gated datasets
 
-Set `hf_token` to a [User Access Token](https://huggingface.co/settings/tokens) of an account that can read the dataset. For a gated dataset, first accept its access conditions on the dataset's page with that account.
+A private or gated dataset needs a [User Access Token](https://huggingface.co/settings/tokens) of an account that can read it. For a gated dataset, first accept its access conditions on the dataset's page with that account. Spice reads the token the way the `hf` CLI does, and uses the first one it finds:
+
+1. `hf_token` in the dataset's `params`, or a secret named `hf_token` in the configured secret stores.
+2. The `HF_TOKEN` environment variable, then `HUGGING_FACE_HUB_TOKEN`.
+3. The token `hf auth login` saves, in the file at `HF_TOKEN_PATH` (by default `$HF_HOME/token`, `~/.cache/huggingface/token`).
 
 ```yaml
 datasets:
@@ -71,15 +75,15 @@ datasets:
       hf_token: ${ secrets:HF_TOKEN }
 ```
 
-When `hf_token` is not set in the dataset, it is loaded from a secret named `hf_token` in the configured secret stores. Authenticated requests also get higher Hub rate limits.
+A token that the dataset's `params` do not set is sent only to the public Hub or to `HF_ENDPOINT`, never to an `hf_endpoint` set in the Spicepod. To read a private dataset through a mirror, set `hf_token` in the dataset's `params`. Authenticated requests also get higher Hub rate limits.
 
 ## Parameters
 
-| Parameter      | Default                  | Description                                                                                                                              |
-| -------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `hf_token`     | none                     | A Hugging Face User Access Token, to read private and gated datasets.                                                                    |
-| `hf_endpoint`  | `https://huggingface.co` | The Hub endpoint, to read through a mirror or proxy of the Hub. It must be `https://`; `http://` is accepted only for a loopback address. |
-| `file_format`  | inferred                 | `parquet`, `csv`, `tsv`, `json`, `jsonl`, `ndjson`, `ldjson` or `orc`.                                                                   |
+| Parameter     | Default                                          | Description                                                                                                                               |
+| ------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `hf_token`    | `HF_TOKEN`, then the token `hf auth login` saves | A Hugging Face User Access Token, to read private and gated datasets.                                                                     |
+| `hf_endpoint` | `HF_ENDPOINT`, then `https://huggingface.co`     | The Hub endpoint, to read through a mirror or proxy of the Hub. It must be `https://`; `http://` is accepted only for a loopback address. |
+| `file_format` | inferred                                         | `parquet`, `csv`, `tsv`, `json`, `jsonl`, `ndjson`, `ldjson` or `orc`.                                                                    |
 
 ## Consistency
 
@@ -89,7 +93,7 @@ The schema is resolved when the dataset is registered, and files at later commit
 
 CSV and TSV files are read by column position. Every CSV or TSV file a dataset selects must therefore have the dataset's columns in the same order. Registration fails if one does not, and so does a scan of a later commit whose files changed their columns. In either case the error names the file and its columns.
 
-The `_location` metadata column, when enabled, holds the commit-pinned location of each row's file. For a public dataset read without `hf_token`, that is `hf://datasets/<owner>/<dataset>@<commit>/<path>`, which DuckDB and `HfFileSystem` can read directly. A dataset read with a token, or through `hf_endpoint`, has its own host instead, `hf://datasets.<key>/...`, so no two datasets with different credentials share a client. The key comes from the endpoint and the dataset's name, never from the token.
+The `_location` metadata column, when enabled, holds the commit-pinned location of each row's file. For a public dataset read without a token, that is `hf://datasets/<owner>/<dataset>@<commit>/<path>`, which DuckDB and `HfFileSystem` can read directly. A dataset read with a token, or through another endpoint than the public Hub, has its own host instead, `hf://datasets.<key>/...`, so no two datasets with different credentials share a client. The key comes from the endpoint and the dataset's name, never from the token.
 
 ## Performance
 

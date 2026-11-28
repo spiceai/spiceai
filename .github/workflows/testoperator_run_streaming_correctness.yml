@@ -53,8 +53,12 @@ on:
         type: string
         default: '42'
 
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
 jobs:
   run-streaming-correctness:
+    environment: ci
     name: Run DynamoDB streaming correctness test
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 180
@@ -66,8 +70,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Load secrets from AWS
-        uses: ./.github/actions/load-aws-secrets
+      - name: Assume the streaming benchmark role
+        id: aws-streaming
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.CI_AWS_STREAMING_BENCH_ROLE_ARN }}
+          role-session-name: gha-streaming-${{ github.run_id }}
+          role-duration-seconds: 10800
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -89,15 +101,24 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: $/.github/actions/rustfs-credentials
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '10800'
+          export-env: 'false'
+
+      - name: Install MinIO
+        uses: $/.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup spiced
-        uses: ./.github/actions/setup-spiced
+        uses: $/.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
@@ -105,12 +126,17 @@ jobs:
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
+      # testoperator generates and checks its data with the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: $/.github/actions/setup-libduckdb
+
       - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
+        uses: $/.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Run DynamoDB streaming correctness test
         run: |
@@ -127,8 +153,9 @@ jobs:
         env:
           # DynamoDB credentials
           DYNAMODB_AWS_REGION: us-east-1
-          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ steps.aws-streaming.outputs.aws-access-key-id }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ steps.aws-streaming.outputs.aws-secret-access-key }}
+          DYNAMODB_AWS_SESSION_TOKEN: ${{ steps.aws-streaming.outputs.aws-session-token }}
           # Metrics
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

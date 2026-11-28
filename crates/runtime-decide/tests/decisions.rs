@@ -18,6 +18,11 @@ limitations under the License.
 //! a model that answers from the text it is given and records every request. Each test
 //! asserts the exact rows and the exact requests the model received.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +48,9 @@ use tokio::sync::RwLock;
 struct Mock {
     decision: bool,
     fail_when_contains: Option<&'static str>,
+    /// The error for a text that `fail_when_contains` matches, from the model name.
+    /// An invalid request when unset.
+    fail_with: Option<fn(String) -> evaluate_api::Error>,
     /// Declines every choice question about a text containing this.
     decline_choices_when_contains: Option<&'static str>,
     requests: Mutex<Vec<EvaluateRequest>>,
@@ -64,6 +72,15 @@ impl Mock {
         Arc::new(Self {
             decision: true,
             fail_when_contains: Some(text),
+            ..Self::default()
+        })
+    }
+
+    fn failing_with(text: &'static str, fail: fn(String) -> evaluate_api::Error) -> Arc<Self> {
+        Arc::new(Self {
+            decision: true,
+            fail_when_contains: Some(text),
+            fail_with: Some(fail),
             ..Self::default()
         })
     }
@@ -107,6 +124,9 @@ impl Evaluate for Mock {
         if let Some(bad) = self.fail_when_contains
             && text.contains(bad)
         {
+            if let Some(fail) = self.fail_with {
+                return Err(fail(request.model));
+            }
             return evaluate_api::InvalidRequestSnafu {
                 model: request.model,
                 message: "the input cannot be answered",
@@ -738,8 +758,52 @@ async fn a_row_the_model_cannot_answer_fails_the_query_by_default() {
 
     assert_eq!(
         run_err(&ctx, "SELECT ai_if(body, 'refund') FROM tickets").await,
-        "Execution error: ai_if: model 'jev' could not answer a row, so the query stopped. Cause: Invalid evaluation request for model 'jev': the input cannot be answered. Retry the query, or pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+        "Execution error: ai_if: model 'jev' could not answer a row, so the query stopped. Cause: Invalid evaluation request for model 'jev': the input cannot be answered. Pass `on_error => 'null'` to return NULL for rows the model cannot answer."
     );
+}
+
+/// Every attempt is billed, so a failure that the same request gets every time is asked
+/// once, and only a failure that a retry can change is asked again.
+#[tokio::test]
+async fn only_a_failure_a_retry_can_change_is_asked_again() {
+    let truncated: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::ReplyTruncated { model };
+    let permission_denied: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::PermissionDenied {
+            model,
+            message: "AccessDeniedException".to_string(),
+        };
+    let not_found: fn(String) -> evaluate_api::Error = |model| evaluate_api::Error::ModelNotFound {
+        model,
+        message: "ResourceNotFoundException".to_string(),
+    };
+    let server_error: fn(String) -> evaluate_api::Error =
+        |model| evaluate_api::Error::ModelCallFailed {
+            model,
+            source: "InternalServerException".into(),
+        };
+    for (name, fail, attempts) in [
+        ("truncated", truncated, 1),
+        ("permission denied", permission_denied, 1),
+        ("not found", not_found, 1),
+        ("server error", server_error, 3),
+    ] {
+        let jev = Mock::failing_with("technical", fail);
+        let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(4, 1));
+
+        run(
+            &ctx,
+            "SELECT id, ai_if(body, 'refund', on_error => 'null') AS refund FROM tickets ORDER BY id",
+        )
+        .await;
+
+        let asked = jev
+            .requests()
+            .iter()
+            .filter(|request| text_of(&request.state).contains("technical"))
+            .count();
+        assert_eq!(asked, attempts, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -814,4 +878,149 @@ async fn the_plan_shows_one_decision_below_the_filter() {
     )
     .await;
     insta::assert_snapshot!("filter_plan", plan);
+}
+
+/// `teams(team)`: three teams, with `billing` listed twice.
+fn with_teams(ctx: SessionContext) -> SessionContext {
+    let teams = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("team", DataType::Utf8, false)])),
+        vec![Arc::new(StringArray::from(vec![
+            "billing",
+            "technical",
+            "account",
+            "billing",
+        ]))],
+    )
+    .expect("teams batch");
+    ctx.register_batch("teams", teams).expect("register teams");
+    ctx
+}
+
+/// The labels each request asked to choose from, sorted.
+fn asked_labels(requests: &[EvaluateRequest]) -> Vec<Vec<String>> {
+    requests
+        .iter()
+        .map(|request| {
+            let mut labels: Vec<String> = request
+                .questions
+                .values()
+                .flat_map(|question| match question {
+                    Question::Choice { criteria, .. } => criteria.keys().cloned().collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            labels.sort();
+            labels
+        })
+        .collect()
+}
+
+/// `labels` can come from a table, through an uncorrelated subquery that returns one
+/// label per row or one list. `DataFusion` computes it once when the query runs.
+#[tokio::test]
+async fn ai_classify_reads_labels_from_a_subquery() {
+    for labels in [
+        "(SELECT DISTINCT team FROM teams)",
+        "(SELECT array_agg(DISTINCT team) FROM teams)",
+    ] {
+        let jev = Mock::decision_model();
+        let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+        let rows = run(
+            &ctx,
+            &format!(
+                "SELECT id, ai_classify(body, {labels}, instructions => 'Route to the owning team') AS team FROM tickets ORDER BY id"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            "+----+-----------+\n| id | team      |\n+----+-----------+\n| 0  | billing   |\n| 1  | technical |\n| 2  | billing   |\n| 3  | account   |\n+----+-----------+",
+            "{labels}"
+        );
+        let requests = jev.requests();
+        assert_eq!(requests.len(), 4, "one request per row: {labels}");
+        let expected = vec![
+            "account".to_string(),
+            "billing".to_string(),
+            "technical".to_string(),
+        ];
+        assert_eq!(asked_labels(&requests), vec![expected; 4], "{labels}");
+    }
+}
+
+/// A deferred constant works where the planner rule moves the call, here a filter.
+#[tokio::test]
+async fn ai_if_reads_its_condition_from_a_subquery_in_a_filter() {
+    let jev = Mock::decision_model();
+    let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+    // `max(team)` is 'technical'.
+    assert_eq!(
+        run(
+            &ctx,
+            "SELECT id FROM tickets WHERE ai_if(body, (SELECT max(team) FROM teams)) ORDER BY id",
+        )
+        .await,
+        "+----+\n| id |\n+----+\n| 1  |\n+----+"
+    );
+    assert_eq!(jev.requests().len(), 4);
+}
+
+/// A subquery's value is checked by the rules a literal is checked by, before any
+/// model is called; and the errors say what is wrong with arguments that are refused.
+#[tokio::test]
+async fn constants_from_subqueries_are_checked() {
+    let jev = Mock::decision_model();
+    let ctx = with_teams(session(vec![("jev", Arc::clone(&jev))], tickets(4, 1)));
+
+    // Without DISTINCT, `billing` is listed twice.
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_classify(body, (SELECT team FROM teams)) FROM tickets"
+        )
+        .await,
+        "Execution error: ai_classify: label 'billing' is listed more than once. List each label once."
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_classify(body, (SELECT team FROM teams WHERE team = 'account')) FROM tickets"
+        )
+        .await,
+        "Execution error: ai_classify: `labels` must list between 2 and 255 labels; it lists 1. Include a fallback such as 'other' when no label may fit."
+    );
+    assert_eq!(jev.requests().len(), 0, "invalid labels call no model");
+
+    assert_eq!(
+        run_err(&ctx, "SELECT ai_classify(body, status) FROM tickets").await,
+        "Error during planning: ai_classify: `labels` must have one value for the whole query: a literal such as ['billing', 'technical'], or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. Usage: ai_classify(input, labels[, instructions => '...'][, model => 'name'][, on_error => 'fail' | 'null'])"
+    );
+    let correlated = run_err(
+        &ctx,
+        "SELECT ai_classify(body, (SELECT array_agg(team) FROM teams WHERE team = tickets.status)) FROM tickets",
+    )
+    .await;
+    assert!(
+        correlated.contains("`labels` must have one value for the whole query"),
+        "{correlated}"
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_if(body, 'refund', (SELECT max(team) FROM teams)) FROM tickets"
+        )
+        .await,
+        "Error during planning: ai_if: argument 3 is not a literal. Optional arguments such as `model` and `on_error` must be literals, because only for a literal can Spice tell which parameter it fills. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])"
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_decide(body, (SELECT max(team) FROM teams)) FROM tickets"
+        )
+        .await,
+        r#"Error during planning: ai_decide: `questions` must be a literal such as '{"urgent": {"type": "noul", "instructions": "Is this urgent?"}}', because it sets the type of the result. Usage: ai_decide(input, questions[, model => 'name'][, on_error => 'fail' | 'null'])"#
+    );
+    assert_eq!(jev.requests().len(), 0);
 }

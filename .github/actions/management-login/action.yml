@@ -74,8 +74,8 @@ runs:
 
         value="$(printf '%s' "$body" | "$GITHUB_ACTION_PATH/token_response.sh" "$http_status" "$TOKEN_URL")"
 
-        # Matches load-aws-secrets: a credential fetched at run time is unknown
-        # to the runner, so register it for redaction explicitly.
+        # A credential fetched at run time is unknown to the runner, so register
+        # it for redaction explicitly.
         echo "::add-mask::$value"
 
         {

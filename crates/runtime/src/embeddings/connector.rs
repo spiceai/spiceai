@@ -17,10 +17,6 @@ use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::DatasetSpec;
-#[cfg(feature = "duckdb")]
-use crate::component::dataset::acceleration::Engine;
-#[cfg(feature = "duckdb")]
-use crate::component::view::View;
 use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::embeddings::execution_plan::{
@@ -31,6 +27,7 @@ use crate::federated::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
+use crate::status::{ComponentStatus, RuntimeStatus};
 use async_trait::async_trait;
 use data_components::cdc::{
     AccelerationContents, ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data,
@@ -48,8 +45,6 @@ use search::index::compound::CompoundSearchIndex;
 use spice_table::{IndexLayer, LayerWalk, find_layer, peel_to};
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use spicepod::semantic::Column;
-#[cfg(feature = "duckdb")]
-use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::sync::Arc;
@@ -62,6 +57,7 @@ pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     secrets: Arc<RwLock<Secrets>>,
+    status: Arc<RuntimeStatus>,
 }
 
 impl std::fmt::Debug for EmbeddingConnector {
@@ -78,12 +74,41 @@ impl EmbeddingConnector {
         inner_connector: Arc<dyn DataConnector>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         secrets: Arc<RwLock<Secrets>>,
+        status: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
             inner_connector,
             embedding_models,
             secrets,
+            status,
         }
+    }
+
+    /// Explains why an embedding model that `dataset` uses is not loaded, when the Spicepod
+    /// configures that model.
+    async fn configured_model_not_loaded(&self, dataset: &DatasetSpec) -> Option<String> {
+        let loaded = self.embedding_models.read().await;
+        dataset
+            .embeddings
+            .iter()
+            .map(|e| &e.model)
+            .chain(
+                dataset
+                    .columns
+                    .iter()
+                    .flat_map(|c| c.embeddings.iter().map(|e| &e.model)),
+            )
+            .filter(|model| !loaded.contains_key(*model))
+            .find(|model| {
+                self.status
+                    .get_embedding_status(model)
+                    .is_some_and(|s| !matches!(s, ComponentStatus::Disabled))
+            })
+            .map(|model| {
+                self.status
+                    .unavailable_embedding_reason(model)
+                    .unwrap_or_else(|| format!("Embedding model '{model}' is not loaded yet."))
+            })
     }
 
     /// Wrap an existing [`TableProvider`] with a [`EmbeddingTable`] provider. If no embeddings
@@ -105,25 +130,21 @@ impl EmbeddingConnector {
             });
         }
 
+        // A retriable error: the model may still be loading or retrying. A model whose load
+        // ended on a configuration error loads again only with the Spicepod change that fixes
+        // it, which reloads this dataset too.
+        if let Some(reason) = self.configured_model_not_loaded(dataset).await {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                source: reason.into(),
+            });
+        }
+
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors
             && vector_engine.enabled
         {
-            #[cfg(feature = "duckdb")]
-            if vector_engine.engine.as_deref() == Some("duckdb")
-                && !dataset.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.engine.to_unpartitioned() == Engine::DuckDB
-                })
-            {
-                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: dataset.source().to_string(),
-                    connector_component: dataset.into(),
-                    source: Box::<dyn std::error::Error + Send + Sync>::from(
-                        "DuckDB vector engine requires DuckDB acceleration. Configure the dataset with `acceleration.engine: duckdb`.",
-                    ),
-                });
-            }
-
             let on_zero_results = warm_index_on_zero_results(dataset.acceleration.as_ref());
 
             let session_context = context.datafusion_session_context();
@@ -201,7 +222,7 @@ impl EmbeddingConnector {
         // this wrapper sits between a (possibly multiplexed) source and the
         // accelerator, so it must build the deferred rows before augmenting them.
         // Offload the synchronous build so a large burst can't stall this worker.
-        let (change_committer, batch, is_dataset_ready, history_unavailable) =
+        let (change_committer, batch, is_dataset_ready, history_unavailable, snapshot_rows) =
             envelope.into_parts_offloaded().await?;
         let data_batch = batch.data_batch();
 
@@ -237,6 +258,7 @@ impl EmbeddingConnector {
             new_change_batch,
             is_dataset_ready,
             history_unavailable,
+            snapshot_rows,
         ))
     }
 }
@@ -298,6 +320,10 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.initialization()
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner_connector.user_token_client_id()
+    }
+
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
     }
@@ -309,36 +335,7 @@ impl DataConnector for EmbeddingConnector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerator_setup(dataset, accelerator)
-            .await?;
-
-        #[cfg(feature = "duckdb")]
-        if let Some(vector_engine) = duckdb_vector_store_for_accelerated_table(dataset) {
-            let embedding_columns = duckdb_embedding_columns(dataset);
-            if embedding_columns.is_empty() {
-                return Ok(());
-            }
-
-            tracing::debug!(
-                dataset = %dataset.name,
-                columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
-                "Wrapping accelerator with DuckDB HNSW vector indexes"
-            );
-
-            let indexed_accelerator =
-                crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
-                    &dataset.name,
-                    embedding_columns,
-                    &vector_engine,
-                    accelerator.accelerator(),
-                    Arc::clone(&self.embedding_models),
-                    Arc::clone(&self.secrets),
-                )
-                .await?;
-            accelerator.set_accelerator(indexed_accelerator);
-            return Ok(());
-        }
-
-        Ok(())
+            .await
     }
 
     async fn on_accelerated_table_registration(
@@ -353,6 +350,10 @@ impl DataConnector for EmbeddingConnector {
 
     fn supports_changes_stream(&self) -> bool {
         self.inner_connector.supports_changes_stream()
+    }
+
+    fn supports_partitioned_changes(&self) -> bool {
+        self.inner_connector.supports_partitioned_changes()
     }
 
     fn supports_durable_write_back_delivery(&self) -> bool {
@@ -526,28 +527,6 @@ impl DataConnector for EmbeddingConnector {
     }
 }
 
-#[cfg(feature = "duckdb")]
-fn duckdb_vector_store_for_accelerated_table(dataset: &DatasetSpec) -> Option<VectorStore> {
-    if let Some(vector_engine) = &dataset.vectors
-        && vector_engine.enabled
-        && vector_engine.engine.as_deref() == Some("duckdb")
-    {
-        return Some(vector_engine.clone());
-    }
-
-    if !dataset.has_embeddings()
-        || !dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
-    {
-        return None;
-    }
-
-    let acceleration = dataset.acceleration.as_ref()?;
-    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
-}
-
 fn vector_index_groups(
     vector_store: &VectorStore,
     dataset: &DatasetSpec,
@@ -623,133 +602,6 @@ fn vector_store_for_embedding(
     }
 
     effective
-}
-
-#[cfg(feature = "duckdb")]
-fn duckdb_embedding_columns(dataset: &DatasetSpec) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
-    let mut embedding_columns = dataset
-        .embeddings
-        .iter()
-        .map(|embedding| {
-            (
-                embedding.column.clone(),
-                ColumnLevelEmbeddingConfig {
-                    model: embedding.model.clone(),
-                    chunking: embedding.chunking.clone(),
-                    row_ids: embedding.primary_keys.clone(),
-                    vector_size: embedding.vector_size,
-                    engine: None,
-                    params: None,
-                    aggregation: embedding.aggregation,
-                    max_elements_per_row: embedding.max_elements_per_row,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-
-    for column in &dataset.columns {
-        // Must be `last()` to mimic what model `EmbeddingTable`'s HashMap ends up with.
-        let Some(embedding) = column.embeddings.last() else {
-            continue;
-        };
-
-        if let Some((_, existing)) = embedding_columns
-            .iter_mut()
-            .find(|(column_name, _)| column_name == &column.name)
-        {
-            *existing = embedding.clone();
-        } else {
-            embedding_columns.push((column.name.clone(), embedding.clone()));
-        }
-    }
-
-    embedding_columns
-}
-
-#[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
-    if let Some(vector_engine) = &view.vectors
-        && vector_engine.enabled
-        && vector_engine.engine.as_deref() == Some("duckdb")
-    {
-        return Some(vector_engine.clone());
-    }
-
-    if !view.has_embeddings()
-        || !view
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
-    {
-        return None;
-    }
-
-    let acceleration = view.acceleration.as_ref()?;
-    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
-}
-
-#[cfg(feature = "duckdb")]
-pub(crate) fn duckdb_embedding_columns_from_view(
-    view: &View,
-) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
-    let mut embedding_columns = Vec::new();
-
-    for column in &view.columns {
-        let Some(embedding) = column.embeddings.last() else {
-            continue;
-        };
-
-        if let Some((_, existing)) = embedding_columns
-            .iter_mut()
-            .find(|(column_name, _): &&mut (String, _)| column_name == &column.name)
-        {
-            *existing = embedding.clone();
-        } else {
-            embedding_columns.push((column.name.clone(), embedding.clone()));
-        }
-    }
-
-    embedding_columns
-}
-
-/// Wraps the accelerator in `builder` with `DuckDB` HNSW vector indexes if the view
-/// has both a `DuckDB` vector engine configured and at least one embedding column.
-/// Returns `true` if the accelerator was wrapped, `false` otherwise.
-#[cfg(feature = "duckdb")]
-pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
-    view: &View,
-    table: &datafusion::common::TableReference,
-    builder: &mut crate::accelerated::Builder,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
-        return Ok(false);
-    };
-
-    let embedding_columns = duckdb_embedding_columns_from_view(view);
-    if embedding_columns.is_empty() {
-        return Ok(false);
-    }
-
-    tracing::debug!(
-        view = %table,
-        columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
-        "Wrapping view accelerator with DuckDB HNSW vector indexes"
-    );
-
-    let accelerator = builder.get_accelerator();
-    let indexed_accelerator =
-        crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
-            table,
-            embedding_columns,
-            &vector_engine,
-            accelerator,
-            view.runtime.embeds(),
-            view.runtime.secrets(),
-        )
-        .await?;
-    builder.set_accelerator(indexed_accelerator);
-
-    Ok(true)
 }
 
 /// Peel an [`IndexLayer`]'s index and enrichment layers down to the raw
@@ -901,6 +753,7 @@ mod tests {
             Arc::clone(source) as Arc<dyn DataConnector>,
             Arc::new(RwLock::new(EmbeddingModelStore::default())),
             Arc::new(RwLock::new(Secrets::default())),
+            RuntimeStatus::new(),
         )
     }
 
@@ -985,5 +838,61 @@ mod tests {
 
         source.assert_handed_only(&table);
         assert_yields_only_the_marker(&mut stream).await;
+    }
+
+    /// A dataset whose embedding model the Spicepod configures but has not loaded fails with an
+    /// error that its load retries, and that names the model's cause, so the dataset loads once
+    /// the model does. A model the Spicepod does not configure fails the dataset for good.
+    #[cfg(feature = "models")]
+    #[tokio::test]
+    async fn a_dataset_retries_while_its_configured_embedding_model_is_not_loaded() {
+        let spicepod_dataset: spicepod::component::dataset::Dataset =
+            serde_json::from_value(serde_json::json!({
+                "from": "test",
+                "name": "test",
+                "columns": [{"name": "content", "embeddings": [{"from": "e"}]}],
+            }))
+            .expect("a valid dataset");
+        let app = app::AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let dataset =
+            crate::component::dataset::builder::DatasetBuilder::try_from(spicepod_dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+                .build()
+                .expect("valid dataset");
+        let context =
+            crate::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
+        let status = RuntimeStatus::new();
+        let connector = EmbeddingConnector::new(
+            Arc::new(StreamingSource::default()) as Arc<dyn DataConnector>,
+            Arc::new(RwLock::new(EmbeddingModelStore::default())),
+            Arc::new(RwLock::new(Secrets::default())),
+            Arc::clone(&status),
+        );
+        let wrap_error = async || {
+            connector
+                .wrap_table(&context, memtable(), &dataset)
+                .await
+                .expect_err("the model is not loaded")
+        };
+
+        assert!(!wrap_error().await.is_retriable());
+
+        status.update_embedding(
+            "e",
+            ComponentStatus::error_with_message("You exceeded your current quota."),
+        );
+        let err = wrap_error().await;
+        assert!(err.is_retriable(), "{err}");
+        assert!(
+            err.to_string().contains("You exceeded your current quota."),
+            "the error must name the model's cause: {err}"
+        );
+
+        status.update_embedding("e", ComponentStatus::Disabled);
+        assert!(!wrap_error().await.is_retriable());
     }
 }

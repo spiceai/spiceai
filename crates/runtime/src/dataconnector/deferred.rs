@@ -98,6 +98,10 @@ impl DataConnector for DeferredConnector {
         false
     }
 
+    fn supports_partitioned_changes(&self) -> bool {
+        false
+    }
+
     // Unlike the stream capabilities above, this is a static property of the
     // source the deferred dataset will eventually load from, not of the
     // placeholder — so it forwards, matching `resolve_refresh_mode`. Answering
@@ -169,6 +173,10 @@ impl DataConnector for DeferredConnector {
 
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
+    }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.inner.user_token_client_id()
     }
 
     fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {

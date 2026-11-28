@@ -14,87 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::{component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpointer};
-use runtime_acceleration::sidecar::OpenOption;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime::component::dataset::Dataset;
 use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
 mod caching_mode;
 mod caching_mode_constraints;
-#[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
-#[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
 mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_timestamptz;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_maintained_aggregates;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_on_conflict_batches;
-#[cfg(feature = "duckdb")]
-mod checkpoint_duckdb;
-#[cfg(feature = "postgres-accel")]
-mod checkpoint_postgres;
-#[cfg(feature = "sqlite")]
-mod checkpoint_sqlite;
-#[cfg(feature = "turso")]
-mod checkpoint_turso;
-#[cfg(feature = "duckdb")]
 mod cron;
-#[cfg(feature = "duckdb")]
-mod duckdb_builtin_pushdown;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
-mod empty_projection_scan;
-#[cfg(feature = "duckdb")]
-mod file_create_duckdb;
-#[cfg(feature = "duckdb")]
-mod file_swap_duckdb;
-#[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
-mod on_conflict;
-#[cfg(feature = "sqlite")]
-mod sqlite_builtin_pushdown;
+mod pk_insert_semantics;
 
-#[cfg(not(target_os = "windows"))]
 mod newest_by_time;
-#[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
-#[cfg(feature = "duckdb")]
 mod on_conflict_options;
 mod on_zero_results_retention;
-#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
-#[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
-#[cfg(feature = "postgres-accel")]
-mod query_push_down;
 mod refresh;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 mod reload_file_accelerated;
-mod retention_arrow;
-#[cfg(not(target_os = "windows"))]
 mod retention_cayenne;
-#[cfg(not(target_os = "windows"))]
 mod settings_change_cayenne;
-#[cfg(feature = "duckdb")]
-mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
-#[cfg(feature = "sqlite")]
-mod user_function_pushdown;
 
 /// Queue a refresh of `table`. Callers poll for the result rather than waiting on the
 /// returned notifier: completion signals with `notify_waiters`, which stores no permit,
@@ -173,7 +128,11 @@ pub(crate) fn has_vortex_file(dir: &std::path::Path) -> bool {
 }
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = format!("{engine}_file");
+    let param_name = if engine == "cayenne" {
+        "cayenne_file_path".to_string()
+    } else {
+        format!("{engine}_file")
+    };
     if mode == &Mode::File {
         return Some(Params::from_string_map(
             vec![(param_name, file.unwrap_or_default())]
@@ -184,9 +143,8 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
     None
 }
 
-/// Materializes the runtime's configured datasets — the [`Dataset`] values that
-/// [`wait_for_checkpoints`] needs, which the runtime does not expose directly —
-/// then loads the runtime's components under `load_timeout` and waits for it to
+/// Materializes the runtime's configured datasets — the [`Dataset`] values, which
+/// the runtime does not expose directly — then loads the runtime's components under `load_timeout` and waits for it to
 /// report ready.
 pub(crate) async fn load_runtime_datasets(
     rt: &Arc<runtime::Runtime>,
@@ -229,41 +187,22 @@ pub(crate) async fn load_runtime_datasets(
     Ok(datasets)
 }
 
-async fn wait_for_checkpoints(
-    datasets: Vec<Dataset>,
-    timeout_secs: u64,
-) -> Result<(), anyhow::Error> {
-    let mut checkpoint_futures = Vec::new();
-
-    for dataset in datasets {
-        let registry = dataset.runtime.accelerator_engine_registry();
-        let check_future = async move {
-            match dataset_checkpointer(
-                &dataset,
-                registry,
-                OpenOption::OpenExisting,
-                SnapshotBehavior::Disabled,
-            )
-            .await
-            {
-                Ok(checkpoint) => {
-                    while !checkpoint.exists().await {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(anyhow::anyhow!("Failed to verify checkpoint: {e}")),
-            }
-        };
-        checkpoint_futures.push(check_future);
-    }
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
-        },
-        result = futures::future::try_join_all(checkpoint_futures) => {
-            result.map(|_| ())
-        }
-    }
+/// Read a persisted Cayenne table through a fresh catalog and provider.
+pub(crate) async fn query_cayenne_file(
+    data_dir: &std::path::Path,
+    table: &str,
+    sql: &str,
+) -> anyhow::Result<Vec<arrow::array::RecordBatch>> {
+    use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+    let catalog = Arc::new(CayenneCatalog::new(format!(
+        "sqlite://{}",
+        data_dir.join("metadata/cayenne.db").display()
+    ))?) as Arc<dyn MetadataCatalog>;
+    catalog.init().await?;
+    let ctx = datafusion::prelude::SessionContext::new();
+    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .open(table)
+        .await?;
+    ctx.register_table(table, Arc::new(provider))?;
+    Ok(ctx.sql(sql).await?.collect().await?)
 }

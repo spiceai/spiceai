@@ -51,7 +51,7 @@ limitations under the License.
 //! # Where each shape is implemented
 //!
 //! Every shape is implemented **per storage engine**, in the sibling
-//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine, so
+//! `runtime-checkpoint-{duckdb,sqlite,postgres}` crates — one crate per engine, so
 //! the stitch binary links only the engines it enables. Each of those crates bundles its
 //! stores behind `runtime_acceleration::sidecar::AcceleratorSidecar`, which the engine's
 //! accelerator returns from `DataAccelerator::sidecar`.
@@ -94,6 +94,16 @@ pub enum CheckpointError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
+
+/// The blob checkpoint table an append refresh keeps the source commit it last loaded
+/// in, one row per dataset. Named here so an accelerator that recreates a table empty
+/// can clear it along with the dataset checkpoint.
+pub const APPEND_CURSOR_TABLE: &str = "spice_sys_append_cursor";
+
+/// The blob checkpoint table the instance writing an acceleration shared with other
+/// instances records its completed initial load in, one row per dataset: the other
+/// instances serve the dataset from the acceleration only once it holds a row.
+pub const INITIAL_LOAD_TABLE: &str = "spice_sys_initial_load";
 
 /// The **blob** checkpoint shape: a per-dataset store of one opaque `String` payload,
 /// satisfied by the accelerator and called by a data-source connector. Object-safe and

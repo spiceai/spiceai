@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{EngineKind, run_bootstrap_then_refresh_cycle};
+use super::{EngineKind, run_bootstrap_then_refresh_cycle, run_restart_over_partial_restore};
 
 // Cayenne snapshot refresh exercises the per-dataset metastore-slice format
 // shipped by `CayenneSnapshotEngine`: the writer's snapshot tar contains
@@ -29,4 +29,15 @@ use super::{EngineKind, run_bootstrap_then_refresh_cycle};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_refresh_cayenne_bootstrap_then_refresh() -> Result<(), anyhow::Error> {
     run_bootstrap_then_refresh_cycle("snapshot_refresh_cayenne", EngineKind::Cayenne).await
+}
+
+/// A restart cut short a restore: part of the newer snapshot is on disk while
+/// the local metastore still holds the older one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_refresh_cayenne_restart_over_partial_restore() -> Result<(), anyhow::Error> {
+    run_restart_over_partial_restore(
+        "snapshot_refresh_cayenne_partial_restore",
+        EngineKind::Cayenne,
+    )
+    .await
 }

@@ -29,6 +29,13 @@ name: Verus Verification
 # reached by an ordinary cache lookup. Each bound is a Verus postcondition
 # discharged for every key, which is what a test can only sample.
 #
+# `crates/range-rescale/src/lib.rs`: Cayenne rescales every clustering-key
+# column onto the curve's coordinate space with a reciprocal multiply instead of
+# a `u128` division. That the estimate plus one remainder correction equals the
+# exact quotient, that no intermediate overflows, and that the result is
+# monotonic in the key are Verus postconditions discharged for every key and
+# range; a wrong coordinate silently mis-clusters files rather than failing.
+#
 # That is also why the verifier runs in the merge queue rather than on the pull
 # request. A proof is a claim about the tree it was checked against; two
 # individually green changes can combine into one the verifier would reject, and
@@ -51,8 +58,8 @@ name: Verus Verification
 # commit, so a context that no pull-request run reports blocks the PR rather
 # than passing it. The job's `if` skips it on a pull request, which reports
 # `Verify Verus proofs` as skipped and satisfies the required check without
-# running the verifier — the same arrangement `Rust Lint`, `Build and Test`, and
-# `Build (release profile)` use in pr.yml.
+# running the verifier — the same arrangement `Rust Lint` and `Build and Test`
+# use in pr.yml.
 #
 # The workflow carries NO `paths` filter for that same reason: a workflow that
 # never triggers reports nothing at all. The change filter inside the job skips
@@ -91,19 +98,24 @@ permissions:
   contents: read
 
 env:
+  # The CI cache's anonymous read URL (.github/ci-cache/README.md). setup-rust and
+  # install-cargo-deny read pinned downloads from it, falling back to the source; empty
+  # where the repository has no CI object store, which turns the cache off.
+  CI_CACHE_URL: ${{ vars.TEST_MINIO_ENDPOINT && format('{0}/ci-cache', vars.TEST_MINIO_ENDPOINT) || '' }}
   # The verifier and its specification library ship together and are versioned
   # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
   # pin in `[workspace.dependencies]`, which every crate that opted into
   # verification inherits (checked below), and VERUS_SHA256 pins the exact
   # bytes of the archive: a release tag names an asset, it does not fix its
   # contents, and this job executes what it downloads.
-  VERUS_RELEASE: release/0.2026.09.27.3cf1832
-  VERUS_ASSET: verus-0.2026.09.27.3cf1832-x86-linux.zip
-  VERUS_SHA256: 43814031e10df043221d83c7fa842e3ebd662cb7b0090fc1eb4d7a8673226978
-  VERUS_VSTD_VERSION: 0.0.0-2026-09-20-0158
+  VERUS_RELEASE: release/0.2026.11.02.8bf68ee
+  VERUS_ASSET: verus-0.2026.11.02.8bf68ee-x86-linux.zip
+  VERUS_SHA256: f3a0119292df8855e4435da8130bee1873b0e6a60c306accf81a08ea687bba3c
+  VERUS_VSTD_VERSION: 0.0.0-2026-11-01-0251
 
 jobs:
   verus-verify:
+    environment: secret-free
     # Crate-agnostic on purpose: this is the single required-check context
     # for every crate that opted into `[package.metadata.verus]`. Adding a
     # crate updates the verify loop and the path filter, not the job name.
@@ -111,16 +123,20 @@ jobs:
     # Never on a pull request — the merge queue is the gate, and the skipped run
     # is what reports this required context there. See the header.
     if: ${{ github.event_name != 'pull_request' }}
-    # GitHub-hosted on purpose: verification must not queue behind the
-    # saturated self-hosted pool.
-    runs-on: ubuntu-24.04
+    runs-on: spiceai-dev-runners
     # Bounded because this is a required `merge_group` check: an unbounded job
     # leaves the queue candidate `AWAITING_CHECKS` for GitHub's six-hour default
     # and stalls every entry behind it (#12717). hash-index alone is ~7 minutes
     # including a cold archive download; cache also compiles its DataFusion
     # graph through the driver, so the bound sits above that combined cost.
-    # sharded-cache adds little: one dependency, and its proofs are arithmetic.
+    # sharded-cache and range-rescale add little: each depends only on vstd
+    # (sharded-cache also on parking_lot), and their proofs are arithmetic.
     timeout-minutes: 40
+    env:
+      # `cargo verus` runs the verifier as the rustc driver, so no compiler
+      # wrapper the host environment carries may sit in front of it.
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -130,11 +146,22 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Installs the toolchain `rust-toolchain.toml` pins, which is the one the
+      # Verus driver is built against and the one `cargo verus` will select.
+      # Leaving it implicit would make the job depend on whatever default the
+      # host was last provisioned with. It runs first because the crate listing
+      # below already needs cargo, and the runner instances on a host share one
+      # `RUSTUP_HOME`, which this action installs into under a lock. It also
+      # carries the Cargo.lock coherence guard, which matters here specifically:
+      # this job runs on `merge_group`, where a textual lockfile merge is what
+      # that guard exists to name before any cargo work.
+      - name: Set up Rust
+        uses: $/.github/actions/setup-rust
+
       # The crates that opted into verification, from the manifests themselves,
       # so the path filter, the pin check and the verify loop below cannot drift
       # from them. `--no-deps` reads the workspace's manifests without resolving
-      # or building anything, and the runner's preinstalled stable is enough for
-      # that: the pinned toolchain is only installed once there is work to do.
+      # or building anything.
       #
       # The opt-in alone would let a crate leave the gate by flipping it to
       # `verify = false` while keeping its proofs. Every crate that depends on
@@ -144,7 +171,7 @@ jobs:
         id: crates
         run: |
           set -euo pipefail
-          metadata=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1)
+          metadata=$(cargo metadata --no-deps --format-version 1)
           crate_dirs() {
             jq -r --arg root "$PWD/" ".packages[] | select($1)
                 | .manifest_path | ltrimstr(\$root) | rtrimstr(\"/Cargo.toml\")" \
@@ -181,13 +208,16 @@ jobs:
             # the `vstd` pin and `[patch.crates-io]`, which can redirect it,
             # the lockfile selects its proc-macro crates, and cargo config can
             # replace the source or change how the driver is invoked. Last,
-            # the gate itself, and the two composite actions this job runs:
-            # one decides whether verification happens at all, the other
-            # installs the toolchain the driver requires.
+            # the gate itself, and the composite actions this job runs: one
+            # decides whether verification happens at all, the others install
+            # the Rust and C toolchains the driver requires (setup-cc runs
+            # configure-apt).
             for path in rust-toolchain.toml Cargo.toml Cargo.lock '.cargo/**' \
                         .github/workflows/verus_verify.yml \
                         '.github/actions/check-code-changes/**' \
-                        '.github/actions/setup-rust/**'; do
+                        '.github/actions/setup-rust/**' \
+                        '.github/actions/setup-cc/**' \
+                        '.github/actions/configure-apt/**'; do
               echo "  - '$path'"
             done
             echo 'EOF'
@@ -201,7 +231,7 @@ jobs:
       # reports the required context green with the verifier never invoked.
       - name: Check for changes this gate covers
         id: changes
-        uses: ./.github/actions/check-code-changes
+        uses: $/.github/actions/check-code-changes
         with:
           filters: ${{ steps.crates.outputs.filters }}
 
@@ -226,16 +256,33 @@ jobs:
             echo 'verify=false' >> "$GITHUB_OUTPUT"
           fi
 
-      # Installs the toolchain `rust-toolchain.toml` pins, which is the one the
-      # Verus driver is built against and the one `cargo verus` will select. The
-      # runner image ships a different stable, so leaving this implicit makes the
-      # job depend on whatever happens to be provisioned. It also carries the
-      # Cargo.lock coherence guard, which matters here specifically: this job runs
-      # on `merge_group`, where a textual lockfile merge is what that guard exists
-      # to name before any cargo work.
-      - name: Set up Rust
+      # `cargo verus` compiles the verified crates' dependency graph (proc
+      # macros included) through the driver, and rustc links through `cc`. The
+      # stock dev-runner image carries no C toolchain, so install it here
+      # rather than rely on the image, as `object_store_wal.yml` does.
+      - name: Set up the C toolchain
         if: steps.gate.outputs.verify == 'true'
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-cc
+
+      # The tools the steps below call, checked up front so a runner image that
+      # lacks one fails here by name instead of as exit 127 mid-step. `gh`
+      # comes from the dev-runner image (ghcr.io/spicehq/arc-runner, built in
+      # spicehq/ai-platform infra/docker/arc-runner).
+      - name: Check runner prerequisites
+        if: steps.gate.outputs.verify == 'true'
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in gh unzip jq sha256sum; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::This runner image is missing: ${missing[*]}." \
+                 "The spiceai-dev-runners image must provide them" \
+                 "(spicehq/ai-platform infra/docker/arc-runner)."
+            exit 1
+          fi
+          gh --version | head -1
 
       # Every verified crate must depend on exactly the `vstd` this verifier
       # ships with. Read from the manifests as cargo resolves them rather than
@@ -267,12 +314,17 @@ jobs:
       # Only the archive is cached. It is re-hashed and re-extracted on every
       # run, so a cache that has been tampered with fails the digest check
       # rather than silently supplying the binary this job then trusts.
+      #
+      # Everything this job writes goes under the runner's per-job temp
+      # directory, never `$HOME` or `/tmp`: the runner instances on a host share
+      # both, so two runs at once would overwrite each other's archive, unpacked
+      # verifier, and the verify log the final check reads.
       - name: Cache Verus archive
         id: cache-verus
         if: steps.gate.outputs.verify == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.verus-dl
+          path: ${{ runner.temp }}/verus-dl
           key: verus-${{ env.VERUS_RELEASE }}-${{ env.VERUS_SHA256 }}
 
       - name: Download Verus
@@ -283,23 +335,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.verus-dl
+          mkdir -p "$RUNNER_TEMP/verus-dl"
           gh release download --repo verus-lang/verus "$VERUS_RELEASE" \
-            -p "$VERUS_ASSET" -O ~/.verus-dl/"$VERUS_ASSET" --clobber
+            -p "$VERUS_ASSET" -O "$RUNNER_TEMP/verus-dl/$VERUS_ASSET" --clobber
 
       - name: Verify the archive digest
         if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
-          echo "$VERUS_SHA256  $HOME/.verus-dl/$VERUS_ASSET" | sha256sum -c -
+          echo "$VERUS_SHA256  $RUNNER_TEMP/verus-dl/$VERUS_ASSET" | sha256sum -c -
 
       - name: Extract Verus
         if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
-          rm -rf ~/.verus && mkdir -p ~/.verus
-          unzip -q ~/.verus-dl/"$VERUS_ASSET" -d ~/.verus
-          verus_bin=$(find ~/.verus -maxdepth 2 -name verus -type f -perm -u+x | head -1)
+          rm -rf "$RUNNER_TEMP/verus" && mkdir -p "$RUNNER_TEMP/verus"
+          unzip -q "$RUNNER_TEMP/verus-dl/$VERUS_ASSET" -d "$RUNNER_TEMP/verus"
+          verus_bin=$(find "$RUNNER_TEMP/verus" -maxdepth 2 -name verus -type f -perm -u+x | head -1)
           if [ -z "$verus_bin" ]; then
             echo "::error::No verus binary found in $VERUS_ASSET"
             exit 1
@@ -353,10 +405,10 @@ jobs:
             crate_name=$(basename "$crate_dir")
             (
               cd "$crate_dir"
-              cargo verus focus 2>&1 | tee "/tmp/verus-${crate_name}.log"
+              cargo verus focus 2>&1 | tee "$RUNNER_TEMP/verus-${crate_name}.log"
             )
             # `cargo verus` exits 0 when a crate opts out of verification and
             # nothing is checked, so assert the proofs actually ran.
             grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' \
-              "/tmp/verus-${crate_name}.log"
+              "$RUNNER_TEMP/verus-${crate_name}.log"
           done

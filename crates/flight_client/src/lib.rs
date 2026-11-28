@@ -30,12 +30,16 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::{
+    CommandGetSqlInfo, CommandStatementSubstraitPlan, ProstMessageExt, SubstraitPlan,
+};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
+use prost::Message;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -47,7 +51,9 @@ use tonic::transport::{Channel, Endpoint};
 
 pub mod arrow_flight_factory;
 pub mod cookie;
+pub mod parameterized_ticket;
 pub mod tls;
+pub mod traced_ticket;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -189,6 +195,15 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("{source}"))]
+    SubstraitUnsupported { source: TonicStatusError },
+
+    /// The server does not accept a Substrait plan with parameter bindings
+    /// ([`parameterized_ticket`]): it predates them. The same query still runs
+    /// as a plan with its values inlined, through [`FlightClient::query_substrait`].
+    #[snafu(display("{source}"))]
+    ParameterizedSubstraitUnsupported { source: TonicStatusError },
+
     #[snafu(display("Failed to publish data to flight endpoint. {source}"))]
     UnableToPublish { source: TonicStatusError },
 
@@ -270,6 +285,17 @@ impl Credentials {
     }
 }
 
+/// A scalar value from a Flight SQL `GetSqlInfo` answer, by the union member
+/// the server wrote it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlInfoValue {
+    String(String),
+    Bool(bool),
+    BigInt(i64),
+    /// `int32_bitmask`, also the member an `int32` value is written as.
+    Int32(i32),
+}
+
 /// Apache Arrow Flight client for interacting with Apache Arrow Flight services.
 ///
 /// This client is cheap to clone. Most fields are wrapped in `Arc`, and the `FlightServiceClient` is
@@ -279,10 +305,219 @@ pub struct FlightClient {
     client: FlightServiceClient<Channel>,
     credentials: Credentials,
     url: Arc<str>,
+    tls_identity_scope: Option<[u8; 32]>,
     metadata: Option<tonic::metadata::MetadataMap>,
 }
 
 impl FlightClient {
+    /// Opaque federation identity covering the endpoint, credentials, and all
+    /// configured metadata, including the resolved mTLS certificate identity.
+    /// Different authorization scopes cannot share a plan.
+    #[must_use]
+    pub fn federation_context(&self) -> String {
+        use sha2::{Digest, Sha256};
+        static SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(rand::random);
+        let mut digest = Sha256::new();
+        digest.update(*SALT);
+        let mut field = |bytes: &[u8]| {
+            digest.update(bytes.len().to_le_bytes());
+            digest.update(bytes);
+        };
+        field(self.url.as_bytes());
+        match self.tls_identity_scope {
+            Some(scope) => {
+                field(b"mtls");
+                field(&scope);
+            }
+            None => field(b"no-client-certificate"),
+        }
+        match &self.credentials {
+            Credentials::Anonymous => field(b"anonymous"),
+            Credentials::UsernamePassword { username, password } => {
+                field(b"basic");
+                field(username.as_bytes());
+                field(password.expose_secret().as_bytes());
+            }
+            Credentials::Bearer { token, prefix } => {
+                field(if *prefix { b"bearer" } else { b"token" });
+                field(token.expose_secret().as_bytes());
+            }
+        }
+        if let Some(metadata) = &self.metadata {
+            let mut fields: Vec<_> = metadata
+                .iter()
+                .map(|entry| match entry {
+                    tonic::metadata::KeyAndValueRef::Ascii(key, value) => {
+                        (key.as_str(), value.as_encoded_bytes())
+                    }
+                    tonic::metadata::KeyAndValueRef::Binary(key, value) => {
+                        (key.as_str(), value.as_encoded_bytes())
+                    }
+                })
+                .collect();
+            // Request metadata overwrites repeated values in iteration order.
+            // Keep that order while canonicalizing independent field names.
+            fields.sort_by_key(|(key, _)| *key);
+            for (key, value) in fields {
+                field(key.as_bytes());
+                field(value);
+            }
+        }
+        format!("spice-substrait:{:x}", digest.finalize())
+    }
+
+    /// Executes a serialized Substrait plan over Flight SQL without converting
+    /// it to SQL. Spice accepts the typed command directly as a `DoGet` ticket,
+    /// so a sidecar that already knows the schema needs no `GetFlightInfo` call.
+    ///
+    /// A `trace_id` travels in the opaque ticket and joins the upstream trace
+    /// without declaring a client override; explicit trace headers retain their
+    /// normal precedence. It must be normalized to 32 hexadecimal characters,
+    /// not all zero.
+    ///
+    /// # Errors
+    /// Returns an error on authentication, unsupported plans, invalid tickets,
+    /// or transport failure. Stream errors remain visible to the caller.
+    pub async fn query_substrait(
+        &self,
+        plan: Bytes,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+    ) -> Result<FlightRecordBatchStream> {
+        let command = CommandStatementSubstraitPlan {
+            plan: Some(SubstraitPlan {
+                plan,
+                version: String::new(),
+            }),
+            transaction_id: None,
+        };
+        let ticket = arrow_flight::Ticket {
+            ticket: command.as_any().encode_to_vec().into(),
+        };
+        self.do_get_substrait(ticket, timeout, trace_id, map_substrait_error)
+            .await
+    }
+
+    /// Executes an encoded Substrait `Plan` whose `parameter_bindings` carry the
+    /// values of its dynamic parameters, as a [`parameterized_ticket`]. The
+    /// upstream decodes each distinct template once and binds the values into
+    /// it, so a sidecar repeating one query shape with different values does
+    /// not pay for a full plan decode per request.
+    ///
+    /// `trace_id` is handled as in [`Self::query_substrait`].
+    ///
+    /// # Errors
+    /// [`Error::ParameterizedSubstraitUnsupported`] when the server does not
+    /// know the ticket, which an upstream that predates it reports as
+    /// `Unimplemented`; the caller can resend the query through
+    /// [`Self::query_substrait`] with its values inlined. Otherwise as
+    /// [`Self::query_substrait`].
+    pub async fn query_substrait_parameterized(
+        &self,
+        plan: Bytes,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+    ) -> Result<FlightRecordBatchStream> {
+        self.do_get_substrait(
+            parameterized_ticket::wrap(plan),
+            timeout,
+            trace_id,
+            map_parameterized_substrait_error,
+        )
+        .await
+    }
+
+    async fn do_get_substrait(
+        &self,
+        ticket: arrow_flight::Ticket,
+        timeout: Option<Duration>,
+        trace_id: Option<&str>,
+        map_error: fn(tonic::Status) -> Error,
+    ) -> Result<FlightRecordBatchStream> {
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+        let token = self.authenticate_basic_token().await?;
+        let ticket = match trace_id {
+            Some(id) => traced_ticket::wrap(&ticket, id),
+            None => ticket,
+        };
+        let mut request = ticket.into_request();
+        self.apply_request_metadata(&mut request, token.as_ref())?;
+        if let Some(deadline) = deadline {
+            request.set_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        let (metadata, stream, _) = self
+            .client
+            .clone()
+            .do_get(request)
+            .await
+            .map_err(map_error)?
+            .into_parts();
+        Ok(
+            FlightRecordBatchStream::new_from_flight_data(checked_flight_data(stream))
+                .with_headers(metadata),
+        )
+    }
+
+    /// The values the server reports through Flight SQL `GetSqlInfo` for the
+    /// `info` codes, by code. A code the server does not report is absent.
+    /// Only scalar values are read (string, boolean, bigint and int32); a list
+    /// or map value is left out.
+    ///
+    /// # Errors
+    /// When the request fails, or its answer is not a `GetSqlInfo` batch.
+    pub async fn get_sql_info(
+        &self,
+        info: &[u32],
+        timeout: Option<Duration>,
+    ) -> Result<std::collections::HashMap<u32, SqlInfoValue>> {
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+        let remaining = || {
+            deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+        };
+        let token = self.authenticate_basic_token().await?;
+        let command = CommandGetSqlInfo {
+            info: info.to_vec(),
+        };
+        let mut request =
+            FlightDescriptor::new_cmd(command.as_any().encode_to_vec()).into_request();
+        self.apply_request_metadata(&mut request, token.as_ref())?;
+        if let Some(timeout) = remaining() {
+            request.set_timeout(timeout);
+        }
+        let flight_info = self
+            .client
+            .clone()
+            .get_flight_info(request)
+            .await
+            .map_err(map_tonic_error_to_message)?
+            .into_inner();
+
+        let mut values = std::collections::HashMap::new();
+        for endpoint in flight_info.endpoint {
+            let Some(ticket) = endpoint.ticket else {
+                continue;
+            };
+            let mut request = ticket.into_request();
+            self.apply_request_metadata(&mut request, token.as_ref())?;
+            if let Some(timeout) = remaining() {
+                request.set_timeout(timeout);
+            }
+            let (_, stream, _) = self
+                .client
+                .clone()
+                .do_get(request)
+                .await
+                .map_err(map_tonic_error_to_message)?
+                .into_parts();
+            let mut batches =
+                FlightRecordBatchStream::new_from_flight_data(checked_flight_data(stream));
+            while let Some(batch) = batches.try_next().await.context(ArrowFlightSnafu)? {
+                read_sql_info(&batch, &mut values)?;
+            }
+        }
+        Ok(values)
+    }
+
     /// Creates a new instance of `FlightClient`.
     ///
     /// # Arguments
@@ -320,9 +555,10 @@ impl FlightClient {
         metadata: Option<tonic::metadata::MetadataMap>,
         tls_options: &tls::ClientTlsOptions,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel_with_options(&url, tls_options)
-            .await
-            .context(UnableToConnectToServerSnafu)?;
+        let (flight_channel, tls_identity_scope) =
+            tls::new_tls_flight_channel_with_scope(&url, tls_options)
+                .await
+                .context(UnableToConnectToServerSnafu)?;
 
         Ok(FlightClient {
             client: FlightServiceClient::new(flight_channel)
@@ -330,6 +566,7 @@ impl FlightClient {
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
             url,
+            tls_identity_scope,
             metadata,
         })
     }
@@ -339,6 +576,17 @@ impl FlightClient {
     pub fn with_metadata(mut self, metadata: tonic::metadata::MetadataMap) -> Self {
         self.metadata = Some(metadata);
         self
+    }
+
+    /// Adds request-scoped trace metadata without replacing connector metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the supplied value is not valid gRPC metadata.
+    pub fn with_trace_header(mut self, key: &'static str, value: &str) -> Result<Self> {
+        self.metadata
+            .get_or_insert_default()
+            .insert(key, value.parse().context(InvalidMetadataSnafu)?);
+        Ok(self)
     }
 
     /// Overrides default maximum message size for encoding and decoding.
@@ -468,12 +716,10 @@ impl FlightClient {
                 .map_err(map_tonic_error_to_message)?
                 .into_parts();
 
-            return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream
-                    .map_ok(conforming_map_entries)
-                    .map_err(|status| FlightError::Tonic(Box::new(status))),
-            )
-            .with_headers(md));
+            return Ok(
+                FlightRecordBatchStream::new_from_flight_data(checked_flight_data(response_stream))
+                    .with_headers(md),
+            );
         }
 
         NoEndpointsFoundSnafu.fail()
@@ -506,11 +752,7 @@ impl FlightClient {
             .map_err(map_tonic_error_to_message)?
             .into_parts();
 
-        Ok(FlightDataDecoder::new(
-            response_stream
-                .map_ok(conforming_map_entries)
-                .map_err(|status| FlightError::Tonic(Box::new(status))),
-        ))
+        Ok(FlightDataDecoder::new(checked_flight_data(response_stream)))
     }
 
     /// Publishes data to a dataset via the `DoPut` Flight method.
@@ -659,6 +901,26 @@ impl FlightClient {
     }
 }
 
+fn map_substrait_error(error: tonic::Status) -> Error {
+    if error.code() == tonic::Code::Unimplemented {
+        Error::SubstraitUnsupported {
+            source: error.into(),
+        }
+    } else {
+        map_tonic_error_to_message(error)
+    }
+}
+
+fn map_parameterized_substrait_error(error: tonic::Status) -> Error {
+    if error.code() == tonic::Code::Unimplemented {
+        Error::ParameterizedSubstraitUnsupported {
+            source: error.into(),
+        }
+    } else {
+        map_tonic_error_to_message(error)
+    }
+}
+
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {
@@ -688,6 +950,69 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// Reads a `GetSqlInfo` batch (`info_name: uint32`, `value: dense_union`) into
+/// `values`, keeping the scalar values.
+fn read_sql_info(
+    batch: &RecordBatch,
+    values: &mut std::collections::HashMap<u32, SqlInfoValue>,
+) -> Result<()> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Int32Type, Int64Type, UInt32Type};
+
+    let malformed = |what: &str| Error::UnableToConvertSchema {
+        source: ArrowError::SchemaError(format!("Malformed GetSqlInfo answer: {what}")),
+    };
+    if batch.num_columns() != 2 {
+        return Err(malformed("expected two columns"));
+    }
+    let names = batch
+        .column(0)
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| malformed("info_name is not uint32"))?;
+    let union = batch
+        .column(1)
+        .as_union_opt()
+        .ok_or_else(|| malformed("value is not a union"))?;
+    for row in 0..batch.num_rows() {
+        let value = union.value(row);
+        if value.is_null(0) {
+            continue;
+        }
+        let value = match value.data_type() {
+            DataType::Utf8 => SqlInfoValue::String(value.as_string::<i32>().value(0).to_string()),
+            DataType::Boolean => SqlInfoValue::Bool(value.as_boolean().value(0)),
+            DataType::Int64 => SqlInfoValue::BigInt(value.as_primitive::<Int64Type>().value(0)),
+            DataType::Int32 => SqlInfoValue::Int32(value.as_primitive::<Int32Type>().value(0)),
+            _ => continue,
+        };
+        values.insert(names.value(row), value);
+    }
+    Ok(())
+}
+
+/// The messages of a `DoGet` or `DoExchange` response, each bounded and conformed before the
+/// caller decodes it.
+fn checked_flight_data(
+    response: tonic::Streaming<FlightData>,
+) -> impl Stream<Item = Result<FlightData, FlightError>> + Send + 'static {
+    response
+        .map_err(|status| FlightError::Tonic(Box::new(status)))
+        .and_then(|message| std::future::ready(within_decompression_bound(message)))
+        .map_ok(conforming_map_entries)
+}
+
+/// Passes `message` through unless it is a compressed batch that declares too large a
+/// decompressed size for its body (see `arrow_tools::ipc::check_declared_decompressed_size`).
+///
+/// # Errors
+///
+/// Returns [`FlightError::DecodeError`] when the declared size is over the bound.
+pub fn within_decompression_bound(message: FlightData) -> Result<FlightData, FlightError> {
+    arrow_tools::ipc::check_declared_decompressed_size(&message.data_header, &message.data_body)
+        .map_err(FlightError::DecodeError)?;
+    Ok(message)
 }
 
 /// Returns `message` with a schema message that declares a `Map` whose `entries` field is

@@ -57,17 +57,22 @@ use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
+use vortex::dtype::FieldName;
+use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::error::VortexResult;
 use vortex::expr::stats;
 use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
+use vortex::file::FileStatistics;
 use vortex::file::MAX_POSTSCRIPT_SIZE;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VORTEX_FILE_EXTENSION;
+use vortex::file::WriteStrategyBuilder;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
+use vortex::layout::LayoutStrategy;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
@@ -78,13 +83,14 @@ use super::cache::CachedVortexMetadata;
 use super::cache::cache_footer;
 use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
-use super::sink::{ShardSpec, VortexSink};
+use super::sink::{FileWriterConfig, ShardSpec, VortexSink};
 use super::source::VortexSource;
 use super::write_observer::VortexWriteObserver;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
 
-const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
+pub(super) const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize =
+    MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;
 
 /// Controls projection-expression pushdown into Vortex scans.
@@ -306,6 +312,7 @@ pub struct VortexFormat {
     write_observer: Option<Arc<dyn VortexWriteObserver>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
     write_shard: Option<WriteShardConfig>,
+    write_strategy: Option<Arc<dyn LayoutStrategy>>,
 }
 
 impl Debug for VortexFormat {
@@ -328,6 +335,10 @@ impl Debug for VortexFormat {
                 &self.write_observer.as_ref().map(|_| "configured"),
             )
             .field("segment_cache", &self.segment_cache)
+            .field(
+                "write_strategy",
+                &self.write_strategy.as_ref().map(|_| "configured"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -513,6 +524,7 @@ impl VortexFormat {
             write_observer: None,
             segment_cache,
             write_shard: None,
+            write_strategy: None,
         }
     }
 
@@ -676,6 +688,17 @@ impl VortexFormat {
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
             write_shard: Some(config),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a format whose writes use `strategy` in place of the writer's default layout
+    /// strategy: how columns are compressed and how data blocks are sized. Scans are
+    /// unaffected.
+    #[must_use]
+    pub fn with_write_strategy(&self, strategy: WriteStrategyBuilder) -> Self {
+        Self {
+            write_strategy: Some(strategy.build()),
             ..self.clone()
         }
     }
@@ -1007,12 +1030,12 @@ impl FileFormat for VortexFormat {
                 )
             };
 
-            let Some(struct_dtype) = dtype.as_struct_fields_opt() else {
+            if dtype.as_struct_fields_opt().is_none() {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to infer statistics for Vortex file {}: file dtype is not a struct",
                     object.location
                 )));
-            };
+            }
 
             let num_rows = usize::try_from(row_count).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -1040,12 +1063,12 @@ impl FileFormat for VortexFormat {
             for field in table_schema.fields() {
                 // If the column does not exist, continue. This can happen if the schema has evolved
                 // but we have not yet updated the Vortex file.
-                let Some(col_idx) = struct_dtype.find(field.name()) else {
+                let Some((stats_set, stats_dtype)) = column_stats(&file_stats, field.name()) else {
                     // The default sets all statistics to `Precision<Absent>`.
                     column_statistics.push(ColumnStatistics::default());
                     continue;
                 };
-                let (stats_set, stats_dtype) = file_stats.get(col_idx);
+                let (stats_set, stats_dtype) = (&stats_set, &stats_dtype);
 
                 // Update the total size in bytes.
                 let column_size =
@@ -1097,15 +1120,22 @@ impl FileFormat for VortexFormat {
                     _ => stats::Precision::Absent,
                 };
 
+                let null_count = null_count.to_df();
+                let min_value = min.to_df();
+                let max_value = max.to_df();
+                let distinct_count = singleton_distinct_count(&min_value, &max_value, &null_count)
+                    .unwrap_or_else(|| {
+                        distinct_count_from_is_constant(stats_set.get_as::<bool>(
+                            Stat::IsConstant,
+                            &DType::Bool(Nullability::NonNullable),
+                        ))
+                    });
                 column_statistics.push(ColumnStatistics {
-                    null_count: null_count.to_df(),
-                    min_value: min.to_df(),
-                    max_value: max.to_df(),
+                    null_count,
+                    min_value,
+                    max_value,
                     sum_value: sum.to_df(),
-                    distinct_count: distinct_count_from_is_constant(stats_set.get_as::<bool>(
-                        Stat::IsConstant,
-                        &DType::Bool(Nullability::NonNullable),
-                    )),
+                    distinct_count,
                     // TODO(connor): Is this correct?
                     byte_size: column_size.to_df(),
                 });
@@ -1206,7 +1236,10 @@ impl FileFormat for VortexFormat {
         let sink = Arc::new(VortexSink::new(
             conf,
             schema,
-            self.session.clone(),
+            FileWriterConfig {
+                session: self.session.clone(),
+                strategy: self.write_strategy.clone(),
+            },
             target_file_size,
             shard_spec,
             self.write_observer.clone(),
@@ -1382,6 +1415,40 @@ fn scalar_stat_to_df(
         .unwrap_or(stats::Precision::Absent)
 }
 
+/// The statistics a file records for its top-level column `name`, with the column's Vortex type,
+/// or `None` if it records none.
+///
+/// The column is looked up by name rather than by position: a file can carry nested statistics,
+/// which are stored in post-order over every field, so a position is not a top-level column.
+#[must_use]
+pub fn column_stats(file_stats: &FileStatistics, name: &str) -> Option<(StatsSet, DType)> {
+    file_stats
+        .get_by_path(&FieldPath::from_name(FieldName::from(name)))
+        .map(|(aggregates, dtype)| (aggregates.to_stats_set(), dtype.clone()))
+}
+
+/// One distinct value when the exact bounds are equal and there is no null.
+///
+/// The bounds reach `DataFusion` only when they account for NaN (see
+/// [`bounds_account_for_nan`]), so equal float bounds are not hiding a NaN. A null would be a
+/// second distinct value, so its count has to be an exact zero. `-0.0` and `0.0` are not equal
+/// here, so a column holding both is not counted as one value.
+#[must_use]
+pub fn singleton_distinct_count(
+    min: &Precision<ScalarValue>,
+    max: &Precision<ScalarValue>,
+    null_count: &Precision<usize>,
+) -> Option<Precision<usize>> {
+    match (min, max, null_count) {
+        (Precision::Exact(min), Precision::Exact(max), Precision::Exact(0))
+            if !min.is_null() && min == max =>
+        {
+            Some(Precision::Exact(1))
+        }
+        _ => None,
+    }
+}
+
 fn distinct_count_from_is_constant(is_constant: stats::Precision<bool>) -> Precision<usize> {
     match is_constant.as_exact() {
         Some(true) => Precision::Exact(1),
@@ -1393,10 +1460,49 @@ fn distinct_count_from_is_constant(is_constant: stats::Precision<bool>) -> Preci
 mod tests {
 
     use super::*;
+
     use crate::common_tests::TestSessionContext;
     use crate::convert::FromDataFusion;
     use datafusion_common::arrow::datatypes::i256;
     use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
+
+    /// Equal exact bounds and no null are one distinct value; anything less certain is not.
+    #[test]
+    fn equal_exact_bounds_without_nulls_are_one_distinct_value() {
+        let int = |v: i64| Precision::Exact(ScalarValue::Int64(Some(v)));
+        let float = |v: f64| Precision::Exact(ScalarValue::Float64(Some(v)));
+        assert_eq!(
+            singleton_distinct_count(&int(5), &int(5), &Precision::Exact(0)),
+            Some(Precision::Exact(1))
+        );
+        assert_eq!(
+            singleton_distinct_count(&int(5), &int(6), &Precision::Exact(0)),
+            None
+        );
+        // A null is a second value, and an unknown null count may hide one.
+        assert_eq!(
+            singleton_distinct_count(&int(5), &int(5), &Precision::Exact(1)),
+            None
+        );
+        assert_eq!(
+            singleton_distinct_count(&int(5), &int(5), &Precision::Absent),
+            None
+        );
+        // Inexact bounds only enclose the values.
+        assert_eq!(
+            singleton_distinct_count(
+                &Precision::Inexact(ScalarValue::Int64(Some(5))),
+                &int(5),
+                &Precision::Exact(0)
+            ),
+            None
+        );
+        // The two signed zeros are distinct values.
+        assert_eq!(
+            singleton_distinct_count(&float(-0.0), &float(0.0), &Precision::Exact(0)),
+            None
+        );
+    }
 
     #[test]
     fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {

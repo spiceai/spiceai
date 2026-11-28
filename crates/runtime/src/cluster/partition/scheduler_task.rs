@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::CLUSTER_PARTITION_ASSIGNMENT_TASK;
 use crate::datafusion::DataFusion;
-use crate::status::{ComponentStatus, RuntimeStatus};
+use runtime_status::{ComponentStatus, RuntimeStatus};
 
 pub use runtime_cluster::scheduler_task_config::{ConfigError, PartitionAssignmentConfig};
 use runtime_cluster::service::ReconcileOutcome;

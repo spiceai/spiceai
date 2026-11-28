@@ -39,10 +39,11 @@ use async_trait::async_trait;
 use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
+use super::xid_registry::EchoKeys;
 use super::{PgOutputDecodeSnafu, Result, XidRegistry};
 use crate::cdc::{
     ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
-    changes_schema,
+    RedactedValue, changes_schema,
 };
 
 /// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
@@ -629,25 +630,24 @@ impl PgChangeRows {
         None
     }
 
-    /// Drop every buffered transaction chunk whose xid the registry recognizes
-    /// as one of this dataset's own write-back deliveries — the echo of a
-    /// commit Spice itself issued. Called by the per-dataset consumer
-    /// ([`super::shared::MemberMailboxReceiver::pop`]), not the shared pump:
-    /// [`XidRegistry::contains`] is a lock-free read of a small mirror, so
-    /// filtering here costs nothing on the shared demux, and only the one
-    /// dataset that actually produced the echo pays for decoding (and
-    /// immediately discarding) it, rather than every table sharing the pump.
+    /// Drop every change in a buffered transaction chunk that is a redundant echo
+    /// of one of this dataset's own write-back deliveries — a commit Spice itself
+    /// issued, carrying rows the accelerator already holds. Called by the
+    /// per-dataset consumer ([`super::shared::MemberMailboxReceiver::pop`]), not
+    /// the shared pump: [`XidRegistry::contains`] is a lock-free read of a small
+    /// mirror, so filtering here costs nothing on the shared demux, and only the
+    /// one dataset that actually produced the echo pays for decoding it.
     ///
-    /// Returns what the pass observed ([`EchoScan`]) — this method only reads the
-    /// registry's lock-free membership mirror, never its own (async) state.
-    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> EchoScan {
-        // Compact both index-aligned vectors in place: keep a write cursor at the
-        // next surviving slot, shift each kept chunk down over the gaps an echo
-        // leaves, then truncate. When nothing echoes — the common case, since most
-        // transactions carry an xid this dataset never wrote — the cursor stays in
-        // lockstep with the scan, no swap runs, and the buffers (and their hints)
-        // are left untouched, so a clean pop pays nothing beyond the membership
-        // reads.
+    /// An echo's change for a key is kept, not dropped, when that key changed
+    /// through the stream after the delivery read it from the accelerator: the
+    /// accelerator no longer holds what the delivery wrote, and the echo is the
+    /// change that carries the source's final row (#16505; see
+    /// [`XidRegistry::begin_read`]). Every change that survives, foreign or kept
+    /// echo, is recorded against its key at `change_lsn`, the envelope's flush
+    /// position.
+    ///
+    /// Returns what the pass observed ([`EchoScan`]).
+    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry, change_lsn: u64) -> EchoScan {
         // Unreachable in production: the pump tracks xids for exactly the members
         // that hold a registry, and only such a member calls this. Keeping every
         // chunk is the safe direction for a state that should not arise — it
@@ -656,29 +656,76 @@ impl PgChangeRows {
             return EchoScan::default();
         };
         let mut scan = EchoScan::default();
-        let mut kept = 0;
-        for read in 0..xids.len() {
-            if let Some(xid) = xids[read] {
-                if registry.contains(xid.get()) {
-                    // Leave the echoed chunk behind the write cursor; the final
-                    // `truncate` discards it. Record its xid for the caller.
-                    scan.dropped.push(xid.get());
-                    continue;
-                }
-                // Surviving with a transaction id this dataset did not issue:
-                // someone else wrote this table. A chunk with no xid is not
-                // counted either way — only a positively identified foreign
-                // transaction is.
+        // Membership first, from the mirror, before taking the per-key state:
+        // the registry never holds both locks at once.
+        let echoes: Vec<Option<u32>> = xids
+            .iter()
+            .map(|xid| {
+                xid.map(NonZeroU32::get)
+                    .filter(|&xid| registry.contains(xid))
+            })
+            .collect();
+        let mut echo_keys = registry.echo_keys();
+        let mut changed = false;
+        for (chunk, (xid, echo)) in self
+            .raw_chunks
+            .iter_mut()
+            .zip(xids.iter().zip(echoes.iter()))
+        {
+            if let Some(echo_xid) = *echo {
+                scan.dropped.push(echo_xid);
+                let before = chunk.len();
+                chunk.retain(|message| {
+                    let keys = change_keys(&self.relation, message);
+                    let needed = match &keys {
+                        ChangeKeys::Keys(keys) => keys
+                            .iter()
+                            .any(|key| echo_keys.echo_needed(echo_xid, Some(key))),
+                        ChangeKeys::All => echo_keys.echo_needed(echo_xid, None),
+                    };
+                    if needed {
+                        // A kept echo change is applied, so it is itself a
+                        // change to its keys that a later delivery's read may
+                        // not have observed.
+                        note_changed(&mut echo_keys, keys, change_lsn);
+                    }
+                    needed
+                });
+                changed |= chunk.len() != before;
+                continue;
+            }
+            // Surviving with a transaction id this dataset did not issue:
+            // someone else wrote this table. A chunk with no xid is not counted
+            // either way — only a positively identified foreign transaction is —
+            // but its changes are applied all the same, so its keys are noted.
+            if xid.is_some() {
                 scan.saw_foreign_txn = true;
+            }
+            for message in chunk.iter() {
+                note_changed(
+                    &mut echo_keys,
+                    change_keys(&self.relation, message),
+                    change_lsn,
+                );
+            }
+        }
+        echo_keys.prune();
+        drop(echo_keys);
+        if !changed {
+            return scan;
+        }
+        // Compact both index-aligned vectors in place, dropping each chunk the
+        // filter emptied.
+        let mut kept = 0;
+        for read in 0..self.raw_chunks.len() {
+            if self.raw_chunks[read].is_empty() {
+                continue;
             }
             if read != kept {
                 self.raw_chunks.swap(read, kept);
                 xids.swap(read, kept);
             }
             kept += 1;
-        }
-        if scan.dropped.is_empty() {
-            return scan;
         }
         self.raw_chunks.truncate(kept);
         xids.truncate(kept);
@@ -688,6 +735,75 @@ impl PgChangeRows {
         self.byte_len = byte_len;
         scan
     }
+}
+
+/// The keys one buffered change message touches, for echo suppression.
+enum ChangeKeys {
+    /// The encoded replica-identity key of each row the message changes: one,
+    /// or two for an `UPDATE` that changes its key.
+    Keys(Vec<Vec<u8>>),
+    /// Every key: a `TRUNCATE`, or a message whose key could not be read.
+    All,
+}
+
+fn note_changed(echo_keys: &mut EchoKeys, keys: ChangeKeys, lsn: u64) {
+    match keys {
+        ChangeKeys::Keys(keys) => {
+            for key in keys {
+                echo_keys.note_changed(key, lsn);
+            }
+        }
+        ChangeKeys::All => echo_keys.note_all_changed(lsn),
+    }
+}
+
+/// Decode the keys `message` changes. Change decoding is structural (it does not
+/// consult the decoder's relation cache), so a fresh decoder serves. A key that
+/// cannot be read, or a message that cannot be decoded, answers
+/// [`ChangeKeys::All`], which keeps an echo's change rather than dropping it.
+fn change_keys(relation: &Relation, message: &bytes::Bytes) -> ChangeKeys {
+    use super::pgoutput::{DecodedMessage, Decoder};
+    let tuples: Vec<TupleData> = match Decoder::new().decode(message.clone()) {
+        Ok(DecodedMessage::Insert { tuple, .. }) => vec![tuple],
+        Ok(DecodedMessage::Update { old, new, .. }) => old.into_iter().chain([new]).collect(),
+        Ok(DecodedMessage::Delete { old, .. }) => vec![old],
+        Ok(_) | Err(_) => return ChangeKeys::All,
+    };
+    let mut keys = Vec::with_capacity(tuples.len());
+    for tuple in &tuples {
+        let Some(key) = encode_key(relation, tuple) else {
+            return ChangeKeys::All;
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    ChangeKeys::Keys(keys)
+}
+
+/// The replica-identity key columns of `tuple`, length-prefixed so distinct keys
+/// never encode alike. `None` when a key column is missing or unchanged-TOAST. A
+/// relation with no key columns encodes every row as the same (empty) key, so any
+/// change to the table counts as a change to every row an echo carries.
+fn encode_key(relation: &Relation, tuple: &TupleData) -> Option<Vec<u8>> {
+    let mut key = Vec::new();
+    for (idx, _) in relation
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.is_key)
+    {
+        let (tag, bytes) = match tuple.columns.get(idx)? {
+            None => (b'n', &[][..]),
+            Some(Value::Text(bytes)) => (b't', bytes.as_ref()),
+            Some(Value::Binary(bytes)) => (b'b', bytes.as_ref()),
+            Some(Value::Unchanged) => return None,
+        };
+        key.push(tag);
+        key.extend_from_slice(&u32::try_from(bytes.len()).ok()?.to_be_bytes());
+        key.extend_from_slice(bytes);
+    }
+    Some(key)
 }
 
 /// Fixed per-value Arrow byte width for a data type, or 0 for variable-width
@@ -1105,37 +1221,37 @@ impl FieldBuilder {
             Self::Bool(b) => b.append_value(matches!(s, "t" | "true" | "TRUE")),
             Self::Int8(b) => {
                 b.append_value(s.parse::<i8>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int8 parse '{s}': {e}"),
+                    message: format!("int8 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int16(b) => {
                 b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int16 parse '{s}': {e}"),
+                    message: format!("int16 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int32(b) => {
                 b.append_value(s.parse::<i32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int32 parse '{s}': {e}"),
+                    message: format!("int32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Int64(b) => {
                 b.append_value(s.parse::<i64>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("int64 parse '{s}': {e}"),
+                    message: format!("int64 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::UInt32(b) => {
                 b.append_value(s.parse::<u32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("uint32 parse '{s}': {e}"),
+                    message: format!("uint32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Float32(b) => {
                 b.append_value(s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("float32 parse '{s}': {e}"),
+                    message: format!("float32 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Float64(b) => {
                 b.append_value(s.parse::<f64>().map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("float64 parse '{s}': {e}"),
+                    message: format!("float64 parse {:?}: {e}", RedactedValue(s.len())),
                 })?);
             }
             Self::Date32(b) => {
@@ -1147,7 +1263,7 @@ impl FieldBuilder {
                 use chrono::Timelike;
                 let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f").map_err(|e| {
                     super::Error::PgOutputDecode {
-                        message: format!("time parse '{s}': {e}"),
+                        message: format!("time parse {:?}: {e}", RedactedValue(s.len())),
                     }
                 })?;
                 let nanos_since_midnight = i64::from(t.num_seconds_from_midnight()) * 1_000_000_000
@@ -1168,17 +1284,17 @@ impl FieldBuilder {
             }
             Self::DictUtf8Int8(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::DictUtf8Int16(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::DictUtf8Int32(b) => {
                 b.append(s).map_err(|e| super::Error::PgOutputDecode {
-                    message: format!("dictionary append '{s}': {e}"),
+                    message: format!("dictionary append {:?}: {e}", RedactedValue(s.len())),
                 })?;
             }
             Self::List {
@@ -1613,7 +1729,10 @@ impl FieldBuilder {
 /// Arrow side only supports single-level lists.
 fn parse_pg_array_literal(s: &str) -> Result<Vec<Option<String>>> {
     let err = |reason: &str| super::Error::PgOutputDecode {
-        message: format!("postgres array literal parse '{s}': {reason}"),
+        message: format!(
+            "postgres array literal parse {:?}: {reason}",
+            RedactedValue(s.len())
+        ),
     };
 
     // Arrays with non-default lower bounds are prefixed: `[0:1]={a,b}`.
@@ -1685,7 +1804,7 @@ fn parse_pg_array_literal(s: &str) -> Result<Vec<Option<String>>> {
 fn parse_pg_date_days_since_epoch(s: &str) -> Result<i32> {
     let parsed = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
         super::Error::PgOutputDecode {
-            message: format!("date parse '{s}': {e}"),
+            message: format!("date parse {:?}: {e}", RedactedValue(s.len())),
         }
     })?;
     let Some(epoch) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1) else {
@@ -1714,7 +1833,7 @@ fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
             });
     }
     PgOutputDecodeSnafu {
-        message: format!("timestamp parse '{s}' failed"),
+        message: format!("timestamp parse {:?} failed", RedactedValue(s.len())),
     }
     .fail()
 }
@@ -2120,7 +2239,7 @@ fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
 
     let combined = format!("{int_part}{frac}");
     let magnitude: i128 = combined.parse().map_err(|e| super::Error::PgOutputDecode {
-        message: format!("numeric '{s}' parse to i128: {e}"),
+        message: format!("numeric {:?} parse to i128: {e}", RedactedValue(s.len())),
     })?;
     let value = sign * magnitude;
 
@@ -2228,7 +2347,10 @@ fn sci_err(s: &str, reason: &str) -> Result<String> {
 
 fn scientific_notation_numeric_error(s: &str, reason: &str) -> super::Error {
     super::Error::PgOutputDecode {
-        message: format!("scientific-notation numeric parse '{s}': {reason}"),
+        message: format!(
+            "scientific-notation numeric parse {:?}: {reason}",
+            RedactedValue(s.len())
+        ),
     }
 }
 
@@ -2264,7 +2386,7 @@ fn parse_pg_timestamp_micros(s: &str) -> Result<i64> {
         return Ok(dt.and_utc().timestamp_micros());
     }
     PgOutputDecodeSnafu {
-        message: format!("timestamp parse '{s}' failed"),
+        message: format!("timestamp parse {:?} failed", RedactedValue(s.len())),
     }
     .fail()
 }
@@ -2275,6 +2397,23 @@ mod tests {
     use crate::postgres_replication::pgoutput::{Column as PgColumn, Value as PgValue};
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    /// A text value that fails to decode is never quoted in the error: row
+    /// values can hold credentials, and pgoutput decode errors are logged.
+    #[test]
+    fn decode_errors_never_show_text_values() {
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let errors = [
+            parse_pg_date_days_since_epoch(FAKE_SECRET).expect_err("not a date"),
+            parse_pg_timestamp_nanos(FAKE_SECRET).expect_err("not a timestamp"),
+            parse_pg_array_literal(&format!("{{{FAKE_SECRET}")).expect_err("not an array"),
+        ];
+        for err in errors {
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                assert!(!rendered.contains(FAKE_SECRET), "value leaked: {rendered}");
+            }
+        }
+    }
 
     #[test]
     fn lsn_committer_supports_deferral() {
@@ -3068,7 +3207,10 @@ mod tests {
             let err = parse_pg_array_literal(bad).expect_err(bad);
             assert_eq!(
                 err.to_string(),
-                format!("pgoutput decode error: postgres array literal parse '{bad}': {reason}"),
+                format!(
+                    "pgoutput decode error: postgres array literal parse <{}-byte value not shown>: {reason}",
+                    bad.len()
+                ),
                 "wrong rejection for {bad}"
             );
         }

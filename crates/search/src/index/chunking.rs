@@ -205,6 +205,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.write_complete_failure_is_fatal()
     }
 
+    fn requires_rebuild(&self) -> bool {
+        self.inner.requires_rebuild()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1279,6 +1283,10 @@ impl Index for ChunkedVectorIndex {
         self.inner.write_complete_failure_is_fatal()
     }
 
+    fn requires_rebuild(&self) -> bool {
+        self.inner.requires_rebuild()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1345,9 +1353,8 @@ impl Chunker for DelimChunker {
 #[cfg(test)]
 #[expect(
     clippy::cast_precision_loss,
-    clippy::float_cmp,
     reason = "test data uses small integer values encoded in f32 to verify ordering; \
-              precision and exact equality are both fine in this synthetic setup"
+              precision loss is fine in this synthetic setup"
 )]
 mod tests {
     use super::*;
@@ -1369,7 +1376,10 @@ mod tests {
 
     #[test]
     fn group_rows_by_chunk_budget_empty() {
-        assert!(group_rows_by_chunk_budget(&[], 100).is_empty());
+        assert_eq!(
+            group_rows_by_chunk_budget(&[], 100),
+            [] as [(usize, usize); 0]
+        );
     }
 
     #[test]
@@ -2257,7 +2267,7 @@ mod tests {
             matches!(err, DataFusionError::NotImplemented(_)),
             "unexpected error: {err}"
         );
-        assert!(inner.deletes().is_empty());
+        assert_eq!(inner.deletes(), [] as [(Vec<String>, Vec<i64>); 0]);
     }
 
     /// Both chunked wrappers must forward the capability — inheriting the trait default would
@@ -3351,7 +3361,7 @@ mod tests {
             .expect("the write lands even though the eviction cannot");
 
         assert_eq!(out.num_rows(), 2);
-        assert!(inner.deletes().is_empty());
+        assert_eq!(inner.deletes(), [] as [(Vec<String>, Vec<i64>); 0]);
     }
 
     #[tokio::test]

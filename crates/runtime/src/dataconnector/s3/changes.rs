@@ -39,6 +39,7 @@ use data_components::cdc::{
     AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter,
     StreamError, build_ready_signal_envelope, shutdown_epoch, wrap_data_as_change_batch,
 };
+use datafusion::execution::memory_pool::MemoryPool;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -128,7 +129,8 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{from}' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}"
+        "Failed to register dataset {dataset_name} (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but '{}' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}",
+        crate::http::v1::redact_source_credentials(from)
     ))]
     FromIsGlob { dataset_name: String, from: String },
 
@@ -307,6 +309,12 @@ impl CommitChange for AppliedKeysCommitter {
         self.applied.lock().commit(self.generation, &self.keys);
         self.inner.commit().await
     }
+
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), CommitError>>> {
+        self.inner.record_position()
+    }
 }
 
 impl Drop for AppliedKeysCommitter {
@@ -320,6 +328,8 @@ impl Drop for AppliedKeysCommitter {
 struct ListingObjectReader {
     connector: S3,
     dataset: DatasetSpec,
+    /// The runtime's query memory pool, which schema inference of each object reads under.
+    memory_pool: Arc<dyn MemoryPool>,
 }
 
 #[async_trait]
@@ -357,7 +367,13 @@ impl ObjectReader for ListingObjectReader {
         })?;
         let table = self
             .connector
-            .create_listing_table(&self.dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &self.dataset,
+                &url,
+                &extension,
+                file_format,
+                &self.memory_pool,
+            )
             .await
             .map_err(|e| StreamError::Connector {
                 connector: "S3",
@@ -627,8 +643,8 @@ impl S3ChangesConfig {
 /// `file_format`, then `file_extension` (`parse_file_extension_param`), then
 /// the `from` path (`detect_file_extension_from_url_or_path`). A prefix
 /// dataset with `file_extension: .parquet` and no `file_format` is therefore
-/// accepted here, matching `get_file_format_and_extension`. ORC (and Vortex
-/// on non-Windows) are listing formats, so they are accepted here too.
+/// accepted here, matching `get_file_format_and_extension`. ORC and Vortex
+/// are listing formats, so they are accepted here too.
 fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
     let file_format = params
         .get("file_format")
@@ -668,21 +684,11 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
 }
 
 /// Formats `get_file_format_and_extension` turns into a listing `FileFormat`.
-/// Vortex is not linked on Windows; keep the allowlist in lockstep.
 fn is_structured_listing_format(name: &str) -> bool {
     matches!(
         name,
-        "parquet" | "csv" | "json" | "tsv" | "jsonl" | "ndjson" | "ldjson" | "orc"
-    ) || {
-        #[cfg(not(windows))]
-        {
-            name == "vortex"
-        }
-        #[cfg(windows)]
-        {
-            false
-        }
-    }
+        "parquet" | "csv" | "json" | "tsv" | "jsonl" | "ndjson" | "ldjson" | "orc" | "vortex"
+    )
 }
 
 fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Duration> {
@@ -887,7 +893,7 @@ fn error_stream(error: impl std::error::Error + Send + Sync + 'static) -> Change
 
 pub async fn s3_changes_stream(
     connector: &S3,
-    _context: &dyn ConnectorContext,
+    context: &dyn ConnectorContext,
     federated_table: Arc<dyn FederatedTableProvider>,
     dataset: &DatasetSpec,
     acceleration: AccelerationContents,
@@ -898,7 +904,9 @@ pub async fn s3_changes_stream(
         Err(error) => return Some(error_stream(error)),
     };
     let listing_files = match connector.get_file_format_and_extension(dataset).await {
-        Ok((_, extension)) => ListingFileFilter { extension },
+        Ok((_, extension)) => ListingFileFilter {
+            extension: extension.to_string(),
+        },
         Err(error) => return Some(error_stream(error)),
     };
     // Only the object store can say whether a `from` without a trailing `/`
@@ -935,6 +943,12 @@ pub async fn s3_changes_stream(
     let object_reader = Arc::new(ListingObjectReader {
         connector: connector.clone(),
         dataset: dataset.clone(),
+        memory_pool: Arc::clone(
+            &context
+                .datafusion_session_context()
+                .runtime_env()
+                .memory_pool,
+        ),
     });
     let object_lister = Arc::new(ListingPrefixScanner {
         connector: connector.clone(),
@@ -1354,6 +1368,7 @@ fn listing_rebuild_envelope(
         batch,
         false,
         true,
+        false,
     ))
 }
 
@@ -1503,7 +1518,6 @@ fn backfill_envelopes(
 
 /// SQS long-poll change stream for one S3 listing dataset, with a periodic
 /// listing backfill so objects missed while the runtime was down still apply.
-#[must_use]
 fn stream_s3_changes(parts: S3ChangesStreamParts) -> ChangesStream {
     Box::pin(try_stream! {
         let S3ChangesStreamParts {
@@ -1764,6 +1778,21 @@ mod tests {
     use tokio::sync::{Mutex, RwLock};
 
     const QUEUE_URL: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events";
+
+    /// The dataset's `from` is named without the credentials its URL carries.
+    #[test]
+    fn from_is_glob_message_leaves_out_url_credentials() {
+        let error = Error::FromIsGlob {
+            dataset_name: "events".to_string(),
+            from: "s3://alice:hunter2@bucket/events/*.parquet".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to register dataset events (s3): `refresh_mode: changes` needs `from` to name an S3 prefix, but 's3://bucket/events/*.parquet' contains a wildcard. Point `from` at the prefix that holds the objects (for example 's3://bucket/events/') and narrow it with `s3_changes_key_prefix`. See: {S3_DOCS}"
+            )
+        );
+    }
 
     #[derive(Debug)]
     struct StaticFederated(Arc<dyn TableProvider>);
@@ -2361,7 +2390,6 @@ mod tests {
             .expect("changes enabled");
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn validate_accepts_vortex_file_format() {
         let params = test_params(vec![
@@ -2371,11 +2399,10 @@ mod tests {
         ])
         .await;
         S3ChangesConfig::try_from_params(&params, &events_dataset())
-            .expect("vortex is a listing FileFormat on non-Windows")
+            .expect("vortex is a listing FileFormat")
             .expect("changes enabled");
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn validate_accepts_vortex_file_extension_without_file_format() {
         let params = test_params(vec![
@@ -2399,10 +2426,9 @@ mod tests {
                 "{name} is a listing FileFormat and must pass changes validation"
             );
         }
-        #[cfg(not(windows))]
         assert!(
             is_structured_listing_format("vortex"),
-            "vortex is a listing FileFormat on non-Windows"
+            "vortex is a listing FileFormat"
         );
         assert!(
             !is_structured_listing_format("txt"),
@@ -3194,7 +3220,7 @@ mod tests {
         assert_eq!(result.keys, vec!["events/new.parquet".to_string()]);
         assert_eq!(result.batches.len(), 1);
         assert_eq!(result.batches[0].num_rows(), 1);
-        assert!(result.unread_keys.is_empty());
+        assert_eq!(result.unread_keys, [] as [String; 0]);
     }
 
     #[tokio::test]

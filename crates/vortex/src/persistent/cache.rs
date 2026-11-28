@@ -10,7 +10,11 @@ use object_store::ObjectMeta;
 use object_store::path::Path;
 use vortex::dtype::StructFields;
 use vortex::file::Footer;
+use vortex::file::SegmentSpec;
 use vortex::file::VortexFile;
+use vortex::layout::layouts::zoned::{LegacyStats, Zoned};
+
+use super::format::DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES;
 
 /// Cached Vortex file metadata for use with `DataFusion`'s [`FileMetadataCache`].
 pub struct CachedVortexMetadata {
@@ -29,6 +33,10 @@ const FOOTER_BASE_BYTES: usize = 4 * 1024;
 /// materialized that column's layout subtree (its zone-map schema and
 /// statistics are built per column).
 const FOOTER_BYTES_PER_COLUMN: usize = 2_560;
+
+/// Heap a file statistic's partial aggregate state retains. Only a footer cached
+/// at write time holds partial state; one parsed from a file holds values alone.
+const FOOTER_BYTES_PER_PARTIAL_STATISTIC: usize = 64;
 
 /// Heap a cached footer retains per segment, once a scan has materialized the
 /// layout node that owns it.
@@ -58,6 +66,24 @@ fn footer_memory_size(footer: &Footer) -> usize {
         .saturating_add(footer.approx_byte_size().unwrap_or_default())
         .saturating_add(columns.saturating_mul(FOOTER_BYTES_PER_COLUMN))
         .saturating_add(segments.saturating_mul(FOOTER_BYTES_PER_SEGMENT))
+        // The footer holds its segment table twice: as parsed, and with the metadata segments
+        // appended, precomputed so a cached footer opens a file without copying the table.
+        .saturating_add(segments.saturating_mul(size_of::<SegmentSpec>()))
+        .saturating_add(
+            partial_statistics(footer).saturating_mul(FOOTER_BYTES_PER_PARTIAL_STATISTIC),
+        )
+}
+
+/// How many of a footer's file statistics carry partial aggregate state.
+fn partial_statistics(footer: &Footer) -> usize {
+    footer.statistics().map_or(0, |statistics| {
+        statistics
+            .aggregates()
+            .iter()
+            .flat_map(vortex::layout::layouts::file_stats::AggregateStats::iter)
+            .filter(|aggregate| aggregate.partial().is_some())
+            .count()
+    })
 }
 
 impl CachedVortexMetadata {
@@ -111,6 +137,61 @@ pub fn synthetic_object_meta(location: Path, size: u64) -> ObjectMeta {
         e_tag: None,
         version: None,
     }
+}
+
+/// Whether caching only the footer, for an open with no segment cache,
+/// preserves the initial read's data I/O.
+///
+/// An open without a cached footer serves the complete segments covered by its
+/// initial tail read from that read. With no segment cache to keep them, a later
+/// open given only the footer would read them again, so keep the uncached open
+/// when the tail supplies row data; zone-map statistics alone do not prevent
+/// caching. Unrecognized segments are treated as data, and metadata that cannot
+/// be inspected leaves the footer uncached.
+/// The Vortex writer places footer metadata after all data segments, so reads
+/// that expand to include that metadata cannot prefetch additional row data.
+pub(super) fn can_cache_footer_after_open(footer: &Footer, file_size: u64) -> bool {
+    let initial_read_size = DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES as u64;
+    if file_size <= initial_read_size {
+        return false;
+    }
+    let initial_offset = file_size - initial_read_size;
+    let mut layouts = vec![Arc::clone(footer.layout())];
+    while let Some(layout) = layouts.pop() {
+        for id in layout.segment_ids() {
+            let Ok(index) = usize::try_from(*id) else {
+                return false;
+            };
+            let Some(segment) = footer.segment_map().get(index) else {
+                return false;
+            };
+            if segment
+                .offset
+                .checked_add(u64::from(segment.length))
+                .is_none_or(|end| end > file_size)
+            {
+                return false;
+            }
+            if segment.length > 0 && segment.offset >= initial_offset {
+                return false;
+            }
+        }
+
+        if layout.is::<Zoned>() || layout.is::<LegacyStats>() {
+            // Only these layouts define slot 1 as zone-map statistics. Other
+            // auxiliary children can hold row data, such as dictionary values.
+            let Ok(Some(data)) = layout.slot(0) else {
+                return false;
+            };
+            layouts.push(data);
+        } else {
+            let Ok(children) = layout.children() else {
+                return false;
+            };
+            layouts.extend(children);
+        }
+    }
+    true
 }
 
 /// Insert a footer into the file-metadata cache, emitting the footer-cache

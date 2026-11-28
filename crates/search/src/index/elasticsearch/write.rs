@@ -803,7 +803,7 @@ pub(super) fn categorical_token(value: &str) -> &str {
 /// `status`, the exception class names from `error.type` / `error.caused_by.type` (each
 /// through [`categorical_token`]), and the item's position within the request — never
 /// `reason`, never `_id`, never the item itself.
-fn describe_bulk_failure(position: usize, op: &Value) -> String {
+pub(super) fn describe_bulk_failure(position: usize, op: &Value) -> String {
     let mut parts = Vec::with_capacity(3);
 
     if let Some(status) = op.get("status").and_then(Value::as_u64) {
@@ -1165,7 +1165,7 @@ mod tests {
                 Some(vec![3.0, 4.0]),
                 Some(write_util::indexable_shape(2)),
             ];
-            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(evicted(&ids, &embeddings), [] as [String; 0]);
             assert_eq!(
                 indexed_ids(&ids, &embeddings),
                 vec!["1".to_string(), "2".to_string(), "1".to_string()],
@@ -1215,7 +1215,7 @@ mod tests {
                 Some(vec![5.0, 6.0]),
             ];
 
-            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(evicted(&ids, &embeddings), [] as [String; 0]);
             assert_eq!(
                 indexed_ids(&ids, &embeddings),
                 vec!["2".to_string(), "1".to_string()],

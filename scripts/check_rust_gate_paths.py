@@ -21,7 +21,7 @@
 # `scripts/check_crate_layers.py` all sat until #12111.
 #
 # The paths that must be gated are DERIVED, not listed: from what the `lint-rust`
-# recipe reads (`CLIPPY_CONF_DIR`, each `$(PYTHON) scripts/…` guard), from the
+# recipe reads (a `CLIPPY_CONF_DIR` it sets, each `$(PYTHON) scripts/…` guard), from the
 # tracked files whose name marks them as lint/test config, from every tracked
 # `.rs` file, and from the files outside the source trees that a Rust source
 # names by relative path. So this catches "a config file the gate reads is in
@@ -348,7 +348,7 @@ def glob_matches(glob: str, path: str) -> bool:
     off the action rather than assumed: `dorny/paths-filter` builds every
     matcher with `MatchOptions = {dot: true}` (`src/filter.ts`, at the SHA
     pinned in `check-code-changes/action.yml`), so a wildcard *does* reach a
-    segment starting with `.` and `**` alone covers `.ci/clippy.toml`. Modelling
+    segment starting with `.` and `**` alone covers `.config/nextest.toml`. Modelling
     it the other way makes this guard stricter than the filter it stands in for,
     which reports a covered path as ungated.
     """

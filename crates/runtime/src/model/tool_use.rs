@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use std::pin::Pin;
@@ -27,13 +27,15 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ResponseFormat,
-    ToolChoiceAllowedMode, ToolChoiceOptions,
+    FinishReason, FunctionCall, FunctionCallStream, FunctionObject, FunctionType,
+    PromptTokensDetails, ResponseFormat, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -41,6 +43,8 @@ use futures::{Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
 
+use runtime_tools::builtin::list_datasets::catalog_prompt_from_tool;
+use runtime_tools::result::{ResultBudget, tool_result_text, with_budget};
 use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
@@ -49,9 +53,45 @@ use super::tool_trace::{
     CallerScope, PendingTurn, StreamedReply, ToolTraceStore, returned_message,
 };
 use crate::model::ModelContextExtension;
+use crate::model::wrapper::defaults::ToolOffer;
 use crate::tools::utils::tool_call_error_response;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
+
+/// The most Spice tool calls Spice runs from one model response.
+///
+/// The provider decides how many tool calls a response makes, and each one Spice runs is a query
+/// or search, so without a bound one request could run any number of them. A model that calls
+/// tools in parallel makes a handful of calls per response; 64 leaves room for that. The first 64
+/// calls, in the order the model made them, run. Each later call is answered with
+/// [`tool_call_not_run_message`] rather than dropped, because the model's next round needs a
+/// result for every call it made.
+pub(crate) const MAX_SPICE_TOOL_CALLS_PER_RESPONSE: usize = 64;
+
+/// What the model is told for a call it made past [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] in a
+/// response that made `requested` Spice tool calls.
+pub(crate) fn tool_call_not_run_message(requested: usize) -> String {
+    format!(
+        "Spice did not run this tool call: the response made {requested} tool calls, and Spice runs at most {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} from one response. Make fewer tool calls at once."
+    )
+}
+
+/// The warning for a response from model `model` that made `requested` Spice tool calls, more
+/// than [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
+fn tool_calls_over_limit_warning(model: &str, requested: usize) -> String {
+    let skipped = requested.saturating_sub(MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+    format!(
+        "Model '{model}' made {requested} tool calls in one response, more than the {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} Spice runs from one response, so Spice ran the first {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} and told the model the other {skipped} did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+    )
+}
+
+/// Warns when a response from model `model` made `requested` Spice tool calls, more than
+/// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
+pub(crate) fn warn_if_over_tool_call_limit(model: &str, requested: usize) {
+    if requested > MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+        tracing::warn!("{}", tool_calls_over_limit_warning(model, requested));
+    }
+}
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
@@ -87,6 +127,21 @@ impl ToolUsingChat {
         }
     }
 
+    /// The budget for one tool result, sized from the model's context window.
+    async fn result_budget(&self) -> ResultBudget {
+        ResultBudget::for_context_window(self.inner_chat.token_limits().await.context_window)
+    }
+
+    /// The tools that this model sends the provider with a request.
+    #[must_use]
+    pub fn tool_offer(&self) -> ToolOffer {
+        if self.tools.is_empty() || self.recursion_limit == Some(0) {
+            ToolOffer::RequestOnly
+        } else {
+            ToolOffer::WithRuntimeTools
+        }
+    }
+
     #[must_use]
     pub fn runtime_tools(&self) -> Vec<ChatCompletionTool> {
         self.tools
@@ -102,56 +157,18 @@ impl ToolUsingChat {
             .collect_vec()
     }
 
-    /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
+    /// `req` with a system message naming the datasets the model can query, so that it can write
+    /// a query without first calling `list_datasets` (see [`catalog_prompt`]).
     async fn prepare_req(
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets") {
-            let list_dataset_messages = self.create_list_dataset_messages(list_datasets).await?;
-            req.messages =
-                insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
+        if let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets")
+            && let Some(catalog) = catalog_prompt_from_tool(list_datasets.as_ref()).await
+        {
+            req.messages = insert_catalog_message(req.messages, catalog)?;
         }
-
         Ok(req)
-    }
-
-    /// Create the messagges expected from a model if it has called the `list_datasets` tool, and recieved a response.
-    /// This is useful to prime the model as if it has already asked to list the available datasets.
-    async fn create_list_dataset_messages(
-        &self,
-        list_datasets: &Arc<dyn SpiceModelTool>,
-    ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t_resp = match list_datasets.call("").await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let tool_name = list_datasets.name();
-                let error = e.to_string();
-                tracing::warn!(
-                    "Tool '{tool_name}' failed while creating initial tool-use messages: {error}"
-                );
-                tool_call_error_response(tool_name.as_ref(), error)
-            }
-        };
-        Ok(vec![
-            ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
-                    ChatCompletionMessageToolCall {
-                        id: "initial_list_datasets".to_string(),
-                        function: FunctionCall {
-                            name: list_datasets.name().to_string(),
-                            arguments: String::new(),
-                        },
-                    },
-                )])
-                .build()?
-                .into(),
-            ChatCompletionRequestToolMessageArgs::default()
-                .content(t_resp.to_string())
-                .tool_call_id("initial_list_datasets".to_string())
-                .build()?
-                .into(),
-        ])
     }
 
     /// Check if a tool call is a spiced runtime tool.
@@ -165,46 +182,52 @@ impl ToolUsingChat {
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
-        match self.as_spiced_tool(tool_call) {
-            Some(t) => match t.call(&tool_call.function.arguments).await {
-                Ok(v) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::log()
-                            .id(Some(tool_call.id.clone()))
-                            .title(format!("'{}' tool completed successfully", tool_call.function.name))
-                            .json_content(v.clone())
-                            .to_jsonl(),
-                    );
-                    v
-                }
-                Err(e) => {
-                    tracing::info!(
-                        target: "task_history",
-                        progress = Progress::error()
-                            .id(Some(tool_call.id.clone()))
-                            .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
-                            .content(e.to_string())
-                            .to_jsonl(),
-                    );
-                    tool_call_error_response(t.name().as_ref(), e)
-                }
-            },
-            None => {
-                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
-                if cfg!(feature = "dev") {
-                    panic!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.function.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.function.name
-                    );
-                    Value::Null
-                }
+        let Some(t) = self.as_spiced_tool(tool_call) else {
+            // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+            if cfg!(feature = "dev") {
+                panic!(
+                    "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                    tool_call.function.name
+                );
+            }
+            tracing::warn!(
+                "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                tool_call.function.name
+            );
+            return Value::Null;
+        };
+        match with_budget(
+            self.result_budget().await,
+            t.call(&tool_call.function.arguments),
+        )
+        .await
+        {
+            Ok(v) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::log()
+                        .id(Some(tool_call.id.clone()))
+                        .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                        .json_content(v.clone())
+                        .to_jsonl(),
+                );
+                v
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "task_history",
+                    progress = Progress::error()
+                        .id(Some(tool_call.id.clone()))
+                        .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                        .content(e.to_string())
+                        .to_jsonl(),
+                );
+                tool_call_error_response(t.name().as_ref(), e)
             }
         }
     }
@@ -216,6 +239,12 @@ impl ToolUsingChat {
     /// `assistant_text` is the text the model wrote beside the tool calls. It is replayed with the
     /// calls: a model that does not see it does not know it already said it, and says it again.
     ///
+    /// `calls_made` is how many Spice tool calls the response made before these, and is advanced
+    /// past them. A streamed response with several choices passes the same count for each, so the
+    /// first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls of the whole response run and each later
+    /// one gets [`tool_call_not_run_message`] as its result. The caller warns once the response's
+    /// total is known.
+    ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
     ///   requested.
@@ -226,6 +255,7 @@ impl ToolUsingChat {
         &self,
         assistant_text: &str,
         requested_tools: Vec<ChatCompletionMessageToolCall>,
+        calls_made: &mut usize,
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
@@ -258,8 +288,16 @@ impl ToolUsingChat {
         }
         let assistant_message: ChatCompletionRequestMessage = assistant_message.build()?.into();
 
-        let mut tool_and_response_content = vec![];
-        for t in spiced_tools.clone() {
+        let first = *calls_made;
+        *calls_made += spiced_tools.len();
+        let mut tool_and_response_content = Vec::with_capacity(spiced_tools.len());
+        let mut ran = 0;
+        for (position, t) in (first..).zip(spiced_tools) {
+            if position >= MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+                let not_run = Value::String(tool_call_not_run_message(*calls_made));
+                tool_and_response_content.push((t, not_run));
+                continue;
+            }
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
@@ -271,6 +309,7 @@ impl ToolUsingChat {
 
             let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
+            ran += 1;
         }
 
         tracing::debug!(
@@ -283,7 +322,7 @@ impl ToolUsingChat {
             .iter()
             .map(|(tool_call, response_content)| {
                 Ok(ChatCompletionRequestToolMessageArgs::default()
-                    .content(response_content.to_string())
+                    .content(tool_result_text(response_content).into_owned())
                     .tool_call_id(tool_call.id.clone())
                     .build()?
                     .into())
@@ -295,7 +334,7 @@ impl ToolUsingChat {
         messages.extend(tool_messages);
 
         let context = RequestContext::current(AsyncMarker::new().await);
-        crate::model::add_tools_used(&context, spiced_tools.len());
+        crate::model::add_tools_used(&context, ran);
 
         Ok(Some(messages))
     }
@@ -312,7 +351,9 @@ impl ToolUsingChat {
             }) {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return Ok(ToolLoopResponse::without_tools(
-                    self.inner_chat.chat_request(req).await?,
+                    self.inner_chat
+                        .chat_request(without_orphan_tool_choice(req))
+                        .await?,
                 ));
             }
 
@@ -353,10 +394,12 @@ impl ToolUsingChat {
                 })
                 .collect();
 
-            match self
-                .process_tool_calls_and_run_spice_tools(&text, tool_calls)
-                .await?
-            {
+            let mut calls_made = 0;
+            let round = self
+                .process_tool_calls_and_run_spice_tools(&text, tool_calls, &mut calls_made)
+                .await?;
+            warn_if_over_tool_call_limit(&req.model, calls_made);
+            match round {
                 // New messages means we have run spice tools locally, ready to recall model.
                 Some(round) => {
                     let mut messages = req.messages;
@@ -419,7 +462,10 @@ impl ToolUsingChat {
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None))
         {
-            return self.inner_chat.chat_stream(req).await;
+            return self
+                .inner_chat
+                .chat_stream(without_orphan_tool_choice(req))
+                .await;
         }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
@@ -480,6 +526,10 @@ impl HiddenMessages {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ToolUsingChat {
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        self.inner_chat.token_limits().await
+    }
+
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
         self.inner_chat.run(prompt).await
     }
@@ -564,7 +614,7 @@ impl Chat for ToolUsingChat {
         self.inner_chat.as_sql()
     }
 
-    /// Override health endpoint to 1. avoid passing tools in request, 2. pre-calling `list_datasets` in [`ToolUsingChat::prepare_req`].
+    /// Override health endpoint to 1. avoid passing tools in request, 2. listing datasets in [`ToolUsingChat::prepare_req`].
     async fn health(&self) -> ChatResult<()> {
         self.inner_chat.health().await
     }
@@ -579,7 +629,7 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
+    new_req.tool_choice = next_round_tool_choice(new_req.tool_choice.take());
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_completion_tokens) = new_req.max_completion_tokens
@@ -600,31 +650,43 @@ fn create_new_recursive_req(
 /// mode. Re-sending it would force a call on every round until
 /// `tool_recursion_limit` runs out, and the turn could never end in an answer.
 ///
-/// An unset choice becomes `auto` too: the model's Spicepod `tool_choice` default is
-/// filled into an unset choice on every round, below this loop.
+/// Any other choice, unset included, stays as it is: the Spicepod's `tool_choice` default is
+/// already in the request, and a round that changes the choice can lose the provider's prompt
+/// cache (Anthropic keys its cache of messages on `tool_choice`).
 fn next_round_tool_choice(
     choice: Option<ChatCompletionToolChoiceOption>,
-) -> ChatCompletionToolChoiceOption {
+) -> Option<ChatCompletionToolChoiceOption> {
     match choice {
-        None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
         Some(
             ChatCompletionToolChoiceOption::Function(_)
             | ChatCompletionToolChoiceOption::Custom(_)
             | ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
         ) => {
             tracing::debug!("Not forcing a tool call again after a round that made one.");
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            ))
         }
         Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
             allowed.allowed_tools.mode = ToolChoiceAllowedMode::Auto;
-            ChatCompletionToolChoiceOption::AllowedTools(allowed)
+            Some(ChatCompletionToolChoiceOption::AllowedTools(allowed))
         }
-        Some(
-            choice @ ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Auto | ToolChoiceOptions::None,
-            ),
-        ) => choice,
+        unforced @ (None
+        | Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+        ))) => unforced,
     }
+}
+
+/// `req` without its `tool_choice` and `parallel_tool_calls` when it offers no tools: a request
+/// with `tool_choice: none` that gets no runtime tools would otherwise carry tool settings and no
+/// tools, which a provider may reject (issue #14821).
+fn without_orphan_tool_choice(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+    if req.tools.as_ref().is_none_or(Vec::is_empty) {
+        req.tool_choice = None;
+        req.parallel_tool_calls = None;
+    }
+    req
 }
 
 /// What goes between the text a model wrote beside a tool call and the first text of the answer
@@ -752,51 +814,45 @@ pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
-// Ensure that `tool_messages` have been added to `messages` after all initial developer/system messages and after initial user messages (i.e. not including user messages after assistant messages).
-fn insert_initial_tools(
-    messages: Vec<ChatCompletionRequestMessage>,
-    tool_name: &str,
-    tool_messages: &[ChatCompletionRequestMessage],
-) -> Vec<ChatCompletionRequestMessage> {
-    // Do not add `tool_messages` if already in `messages`.
-    if messages.iter().any(|m| {
-        let ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            tool_calls: Some(tools),
+/// `messages` with a system message holding `catalog`, after the leading system and developer
+/// messages (the Spicepod `system_prompt` and the client's), and before the conversation. A
+/// conversation that already holds the same message, as text or as one of its text parts, keeps
+/// the one it has.
+fn insert_catalog_message(
+    mut messages: Vec<ChatCompletionRequestMessage>,
+    catalog: String,
+) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
+    let is_catalog = |m: &ChatCompletionRequestMessage| match m {
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Text(text),
             ..
-        }) = m
-        else {
-            return false;
-        };
-        tools.iter().any(|t| match t {
-            ChatCompletionMessageToolCalls::Function(call) => call.function.name == tool_name,
-            ChatCompletionMessageToolCalls::Custom(_) => false,
-        })
-    }) {
-        return messages;
+        }) => *text == catalog,
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Array(parts),
+            ..
+        }) => parts
+            .iter()
+            .any(|ChatCompletionRequestSystemMessageContentPart::Text(part)| part.text == catalog),
+        _ => false,
+    };
+    if messages.iter().any(is_catalog) {
+        return Ok(messages);
     }
-
-    // Find index to insert at
-    let idx = messages
+    let at = messages
         .iter()
-        .enumerate()
-        .find_map(|(i, m)| {
-            if matches!(
+        .position(|m| {
+            !matches!(
                 m,
-                ChatCompletionRequestMessage::Assistant(_)
-                    | ChatCompletionRequestMessage::Tool(_)
-                    | ChatCompletionRequestMessage::Function(_)
-            ) {
-                return Some(i);
-            }
-            None
+                ChatCompletionRequestMessage::System(_)
+                    | ChatCompletionRequestMessage::Developer(_)
+            )
         })
         .unwrap_or(messages.len());
-
-    let Some((a, b)) = messages.split_at_checked(idx) else {
-        return messages;
-    };
-
-    [a, tool_messages, b].concat()
+    let message = ChatCompletionRequestSystemMessageArgs::default()
+        .content(catalog)
+        .build()?;
+    messages.insert(at, message.into());
+    Ok(messages)
 }
 
 struct CustomStream {
@@ -819,7 +875,7 @@ enum ChoiceDisposition {
     /// The model finished a tool call: run the Spice tools it named and stream the
     /// follow-up answer in place of this choice.
     RunTools,
-    /// Nothing in the choice is for the caller: no finish and no content.
+    /// Nothing in the choice is for the caller: no finish, no content and no reasoning.
     Drop,
 }
 
@@ -833,11 +889,16 @@ enum ChoiceDisposition {
 /// the stream ended on `finish_reason: tool_calls` although the tool had run and
 /// the answer was complete, and a chunk carrying both content and `stop` was
 /// forwarded twice.
+///
+/// A chunk carrying only reasoning is forwarded as it arrives, in every round, so a
+/// reasoning model's thinking streams before its answer or its tool calls.
 fn choice_disposition(choice: &ChatChoiceStream) -> ChoiceDisposition {
     match choice.finish_reason {
         Some(FinishReason::ToolCalls) => ChoiceDisposition::RunTools,
         Some(_) => ChoiceDisposition::Forward,
-        None if choice.delta.content.is_some() => ChoiceDisposition::Forward,
+        None if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() => {
+            ChoiceDisposition::Forward
+        }
         None => ChoiceDisposition::Drop,
     }
 }
@@ -892,9 +953,15 @@ fn make_a_stream(
     tokio::spawn(
         request_context
             .scope(async move {
+                // Ordered by (choice index, tool call index), so the calls run, and go back to
+                // the model, in the order that the model made them.
                 let tool_call_states: Arc<
-                    Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
-                > = Arc::new(Mutex::new(HashMap::new()));
+                    Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+                > = Arc::new(Mutex::new(BTreeMap::new()));
+                // The Spice tool calls this response's choices have made, so the cap on them is
+                // one for the whole response. A later round streams from `make_a_stream` of its
+                // own.
+                let mut spice_calls_made = 0;
 
                 let mut chat_output = String::new();
                 // Usage is withheld from every round and sent once, last, as the total across rounds.
@@ -972,21 +1039,29 @@ fn make_a_stream(
                         }
                         match choice_disposition(&chat_choice) {
                             ChoiceDisposition::Forward => {
-                                finished_choices.push(chat_choice);
+                                // Tool calls are withheld until the choice finishes, when it is
+                                // known which are Spice's to run; a finish Spice does not act on
+                                // gives the client the calls whole.
+                                let mut forwarded = chat_choice;
+                                forwarded.delta.tool_calls = if forwarded.finish_reason.is_some() {
+                                    withheld_tool_calls(&tool_call_states, forwarded.index)
+                                } else {
+                                    None
+                                };
+                                finished_choices.push(forwarded);
                                 continue;
                             }
                             ChoiceDisposition::Drop => continue,
                             ChoiceDisposition::RunTools => {}
                         }
 
-                        // A tool call has finished (i.e. we have all chunks), process it.
-                        let tool_calls_to_process = match tool_call_states.lock() {
-                            Ok(states_lock) => states_lock.values().cloned().collect(),
-                            Err(e) => {
-                                tracing::error!("Failed to lock tool_call_states: {}", e);
-                                return;
-                            }
-                        };
+                        // The choice's tool calls have finished (all their chunks are in), so they
+                        // are taken, once, to be run or given to the client.
+                        let finished_calls = take_tool_calls(&tool_call_states, chat_choice.index);
+                        let tool_calls_to_process = finished_calls
+                            .iter()
+                            .map(|(_, call)| call.clone())
+                            .collect();
 
                         // The text the model wrote this round: what was streamed before the
                         // finish, and any text on the finish itself.
@@ -998,13 +1073,17 @@ fn make_a_stream(
                             .process_tool_calls_and_run_spice_tools(
                                 &round_text,
                                 tool_calls_to_process,
+                                &mut spice_calls_made,
                             )
                             .await
                         {
                             Ok(Some(round)) => round,
                             Ok(None) => {
-                                // No spice tools within returned tools, so return as message in stream.
-                                finished_choices.push(chat_choice);
+                                // No Spice tool among the calls: they are the client's, so it
+                                // receives them, whole, with the finish.
+                                let mut finished = chat_choice;
+                                finished.delta.tool_calls = tool_call_chunks(finished_calls);
+                                finished_choices.push(finished);
                                 continue;
                             }
                             Err(e) => {
@@ -1124,6 +1203,7 @@ fn make_a_stream(
                             }
                     }
                 }
+                warn_if_over_tool_call_limit(&req.model, spice_calls_made);
 
                 if wants_usage
                     && let Some(mut chunk) = usage_chunk
@@ -1141,6 +1221,60 @@ fn make_a_stream(
             .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
+}
+
+/// Takes the tool calls of the choice at `choice_index`, accumulated from its chunks, in call
+/// order. Each call is taken once, so a later finish of the same choice cannot give it again.
+fn take_tool_calls(
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Vec<(u32, ChatCompletionMessageToolCall)> {
+    let mut states = match states.lock() {
+        Ok(states) => states,
+        Err(e) => {
+            tracing::error!("Failed to lock tool_call_states: {}", e);
+            return Vec::new();
+        }
+    };
+    let Ok(choice) = i32::try_from(choice_index) else {
+        return Vec::new();
+    };
+    states
+        .extract_if((choice, i32::MIN)..=(choice, i32::MAX), |_, _| true)
+        .filter_map(|((_, index), call)| Some((u32::try_from(index).ok()?, call)))
+        .collect()
+}
+
+/// `calls` as one chunk each; `None` when there are none.
+fn tool_call_chunks(
+    calls: Vec<(u32, ChatCompletionMessageToolCall)>,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .into_iter()
+            .map(|(index, call)| ChatCompletionMessageToolCallChunk {
+                index,
+                id: Some(call.id),
+                r#type: Some(FunctionType::Function),
+                function: Some(FunctionCallStream {
+                    name: Some(call.function.name),
+                    arguments: Some(call.function.arguments),
+                }),
+            })
+            .collect(),
+    )
+}
+
+/// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
+/// each in call order; `None` when it made none, or they were already given.
+fn withheld_tool_calls(
+    states: &Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    tool_call_chunks(take_tool_calls(states, choice_index))
 }
 
 // OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
@@ -1187,12 +1321,12 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::wrapper::defaults::RequestDefaults;
     use async_openai::types::chat::{
         ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
         ChatCompletionMessageToolCall, ChatCompletionNamedToolChoiceCustom,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, CustomName,
-        FunctionCall,
+        ChatCompletionRequestUserMessageArgs, CustomName, FunctionCall,
     };
     use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
     use runtime_request_context::Protocol;
@@ -1203,6 +1337,47 @@ mod tests {
 
     fn stream_choice(json: &str) -> ChatChoiceStream {
         serde_json::from_str(json).expect("valid stream choice")
+    }
+
+    #[test]
+    fn the_tool_call_limit_warning_names_the_model_and_what_did_not_run() {
+        assert_eq!(
+            tool_calls_over_limit_warning("chatm", 20_000),
+            "Model 'chatm' made 20000 tool calls in one response, more than the 64 Spice runs from one response, so Spice ran the first 64 and told the model the other 19936 did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+        );
+    }
+
+    #[test]
+    fn a_choices_withheld_tool_calls_are_given_once_in_call_order() {
+        let call = |id: &str| ChatCompletionMessageToolCall {
+            id: id.to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let states = Mutex::new(BTreeMap::from([
+            ((0, 1), call("b")),
+            ((0, 0), call("a")),
+            ((1, 0), call("other choice")),
+        ]));
+        let ids = |chunks: Option<Vec<ChatCompletionMessageToolCallChunk>>| {
+            chunks.map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|chunk| (chunk.index, chunk.id.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 0)),
+            Some(vec![(0, "a".to_string()), (1, "b".to_string())])
+        );
+        assert_eq!(ids(withheld_tool_calls(&states, 0)), None, "given once");
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 1)),
+            Some(vec![(0, "other choice".to_string())])
+        );
     }
 
     #[test]
@@ -1239,10 +1414,17 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content() {
+    fn a_choice_without_a_finish_is_forwarded_only_when_it_carries_content_or_reasoning() {
         assert_eq!(
             choice_disposition(&stream_choice(
                 r#"{"index":0,"delta":{"content":"The table has "}}"#
+            )),
+            ChoiceDisposition::Forward
+        );
+        // A reasoning model thinks before it answers or calls a tool: its thinking streams.
+        assert_eq!(
+            choice_disposition(&stream_choice(
+                r#"{"index":0,"delta":{"reasoning_content":"I need the orders table"}}"#
             )),
             ChoiceDisposition::Forward
         );
@@ -1273,10 +1455,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(json!([{ "rows": 3 }]))
         }
@@ -1584,14 +1767,6 @@ mod tests {
         assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
     }
 
-    fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(content)
-            .build()
-            .expect("couldn't create system message")
-            .into()
-    }
-
     fn create_user_message(content: &str) -> ChatCompletionRequestMessage {
         ChatCompletionRequestUserMessageArgs::default()
             .content(content)
@@ -1600,168 +1775,81 @@ mod tests {
             .into()
     }
 
-    fn create_assistant_message_with_tool_calls(
-        tool_calls: Vec<ChatCompletionMessageToolCall>,
-    ) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(
-                tool_calls
-                    .into_iter()
-                    .map(ChatCompletionMessageToolCalls::Function)
-                    .collect::<Vec<_>>(),
-            )
+    #[test]
+    fn the_catalog_goes_after_the_system_messages_and_only_once() {
+        let catalog =
+            "Datasets (use these names in sql, search, and table_schema):\n- spice.public.t"
+                .to_string();
+        let system = ChatCompletionRequestSystemMessageArgs::default()
+            .content("You answer questions about sales.")
             .build()
-            .expect("couldn't create assistant message w. tools")
-            .into()
-    }
-
-    fn create_tool_message(tool_call_id: &str, content: &str) -> ChatCompletionRequestMessage {
-        ChatCompletionRequestToolMessageArgs::default()
-            .tool_call_id(tool_call_id)
-            .content(content)
+            .expect("system message")
+            .into();
+        let user = ChatCompletionRequestUserMessageArgs::default()
+            .content("How many orders?")
             .build()
-            .expect("couldn't create tool message")
-            .into()
+            .expect("user message")
+            .into();
+        let messages = insert_catalog_message(vec![system, user], catalog.clone())
+            .expect("inserts the catalog");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| match m {
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: ChatCompletionRequestSystemMessageContent::Text(text),
+                    ..
+                }) if *text == catalog => "catalog",
+                ChatCompletionRequestMessage::System(_) => "system",
+                ChatCompletionRequestMessage::User(_) => "user",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(roles, ["system", "catalog", "user"]);
+
+        let again = insert_catalog_message(messages.clone(), catalog).expect("keeps the catalog");
+        assert_eq!(
+            again.len(),
+            messages.len(),
+            "a second round does not add it twice"
+        );
     }
 
-    fn create_list_datasets_tool_call() -> ChatCompletionMessageToolCall {
-        ChatCompletionMessageToolCall {
-            id: "test_id".to_string(),
-            function: FunctionCall {
-                name: "list_datasets".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }
+    /// A client that sends the dataset list back as a system message of text parts, as the API
+    /// allows, gets it once.
+    #[test]
+    fn a_catalog_sent_back_as_text_parts_is_kept_once() {
+        let catalog =
+            "Datasets (use these names in sql, search, and table_schema):\n- spice.public.t";
+        let messages: Vec<ChatCompletionRequestMessage> = serde_json::from_value(json!([
+            {"role": "system", "content": [{"type": "text", "text": catalog}]},
+            {"role": "user", "content": "How many orders?"},
+        ]))
+        .expect("valid messages");
+        let again = insert_catalog_message(messages.clone(), catalog.to_string())
+            .expect("keeps the catalog");
+        assert_eq!(again, messages);
     }
 
     #[test]
-    fn test_insert_initial_tools_empty_messages() {
-        let messages = vec![];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_with_system_and_user_messages() {
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_with_existing_assistant_message() {
-        let existing_tool_call = ChatCompletionMessageToolCall {
-            id: "existing_id".to_string(),
-            function: FunctionCall {
-                name: "other_tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_skips_if_tool_already_exists() {
-        let existing_list_datasets_call = create_list_datasets_tool_call();
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("Hello"),
-            create_assistant_message_with_tool_calls(vec![existing_list_datasets_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_with_different_tool_name() {
-        let existing_tool_call = ChatCompletionMessageToolCall {
-            id: "other_id".to_string(),
-            function: FunctionCall {
-                name: "other_tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-        };
-
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
-    }
-
-    #[test]
-    fn test_insert_initial_tools_insertion_point_end_of_messages() {
-        let messages = vec![
-            create_system_message("You are a helpful assistant"),
-            create_user_message("What datasets are available?"),
-            create_user_message("And what about tables?"),
-        ];
-        let tool_messages = vec![
-            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
-            create_tool_message("test_id", "dataset1, dataset2"),
-        ];
-
-        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
-
-        insta::assert_json_snapshot!(result, {
-            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
-            "[].Tool.tool_call_id" => "[tool_call_id]"
-        });
+    fn the_catalog_leads_a_conversation_without_system_messages() {
+        let user: ChatCompletionRequestMessage = ChatCompletionRequestUserMessageArgs::default()
+            .content("hi")
+            .build()
+            .expect("user message")
+            .into();
+        let messages = insert_catalog_message(
+            vec![user],
+            "No datasets are available to query.".to_string(),
+        )
+        .expect("inserts the catalog");
+        assert!(matches!(
+            &messages[0],
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(text),
+                ..
+            }) if text == "No datasets are available to query."
+        ));
+        assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
     }
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
@@ -1779,39 +1867,44 @@ mod tests {
     // regression test for #14459
     #[test]
     fn test_next_round_tool_choice() {
-        let auto = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto);
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
         for forced in [
-            None,
-            Some(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Required,
-            )),
-            Some(ChatCompletionToolChoiceOption::Function(
-                "list_datasets".into(),
-            )),
-            Some(ChatCompletionToolChoiceOption::Custom(
-                ChatCompletionNamedToolChoiceCustom {
-                    custom: CustomName {
-                        name: "client_tool".to_string(),
-                    },
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+            ChatCompletionToolChoiceOption::Function("list_datasets".into()),
+            ChatCompletionToolChoiceOption::Custom(ChatCompletionNamedToolChoiceCustom {
+                custom: CustomName {
+                    name: "client_tool".to_string(),
                 },
-            )),
+            }),
         ] {
-            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+            assert_eq!(
+                next_round_tool_choice(Some(forced.clone())),
+                auto,
+                "{forced:?}"
+            );
         }
 
         // `allowed_tools` keeps its tool list, in `auto` mode.
         assert_eq!(
             next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
-            allowed_tools(ToolChoiceAllowedMode::Auto)
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto))
         );
 
-        // Choices that force nothing pass through unchanged.
+        // Choices that force nothing pass through unchanged, so each round sends the provider
+        // the same request prefix.
         for unforced in [
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
-            allowed_tools(ToolChoiceAllowedMode::Auto),
+            None,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            )),
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::None,
+            )),
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto)),
         ] {
-            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+            assert_eq!(next_round_tool_choice(unforced.clone()), unforced);
         }
     }
 
@@ -1848,10 +1941,11 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!([{ "answer": 42 }]))
         }
     }
@@ -1873,12 +1967,15 @@ mod tests {
             None
         }
 
-        async fn call(
-            &self,
-            _arg: &str,
-        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        fn access(&self) -> ::tools::ToolAccess {
+            ::tools::ToolAccess::ReadOnly
+        }
+
+        async fn run(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(json!([format!("dataset_{call}")]))
+            Ok(
+                json!({"datasets": [{"table": format!("dataset_{call}")}], "total": 1, "has_more": false}),
+            )
         }
     }
 
@@ -1887,6 +1984,9 @@ mod tests {
     enum Reply {
         /// Call the Spice `sql` tool, with the call id `call_<request index>`.
         CallSql,
+        /// Call the Spice `sql` tool twice in parallel, with the call ids `call_<request index>`
+        /// and `call_<request index>_b`.
+        CallSqlTwice,
         /// Answer with this text.
         Answer(&'static str),
         /// Fail: a request returns an error, and a stream fails after some text.
@@ -1933,6 +2033,13 @@ mod tests {
         })
     }
 
+    /// The second of two parallel `sql` calls of request `index`.
+    fn second_sql_call(index: usize) -> Value {
+        let mut call = sql_call(index);
+        call["id"] = json!(format!("call_{index}_b"));
+        call
+    }
+
     fn scripted_failure() -> OpenAIError {
         OpenAIError::InvalidArgument("scripted failure".to_string())
     }
@@ -1966,6 +2073,10 @@ mod tests {
                     json!({ "role": "assistant", "tool_calls": [sql_call(index)] }),
                     "tool_calls",
                 ),
+                Reply::CallSqlTwice => (
+                    json!({ "role": "assistant", "tool_calls": [sql_call(index), second_sql_call(index)] }),
+                    "tool_calls",
+                ),
                 Reply::Answer(text) => (json!({ "role": "assistant", "content": text }), "stop"),
                 Reply::Fail => return Err(scripted_failure()),
             };
@@ -1990,6 +2101,26 @@ mod tests {
                         Ok(stream_chunk(
                             index,
                             &json!({ "role": "assistant", "tool_calls": [call] }),
+                            None,
+                        )),
+                        Ok(stream_chunk(index, &json!({}), Some("tool_calls"))),
+                    ]
+                }
+                // Each call streams in chunks of its own index, as `OpenAI` streams parallel calls.
+                Reply::CallSqlTwice => {
+                    let mut first = sql_call(index);
+                    first["index"] = json!(0);
+                    let mut second = second_sql_call(index);
+                    second["index"] = json!(1);
+                    vec![
+                        Ok(stream_chunk(
+                            index,
+                            &json!({ "role": "assistant", "tool_calls": [first] }),
+                            None,
+                        )),
+                        Ok(stream_chunk(
+                            index,
+                            &json!({ "tool_calls": [second] }),
                             None,
                         )),
                         Ok(stream_chunk(index, &json!({}), Some("tool_calls"))),
@@ -2052,7 +2183,10 @@ mod tests {
     /// The steps of the round that called `sql` as request 2, summarized.
     const CALL_2: &str = "assistant calls sql#call_2";
     const RESULT_2: &str = r#"tool call_2: [{"answer":42}]"#;
-    const LIST_DATASETS: &str = "assistant calls list_datasets#initial_list_datasets";
+    /// The system message naming `dataset`, the one dataset the mock `list_datasets` returns.
+    fn catalog(dataset: &str) -> String {
+        format!("system: Datasets (use these names in sql, search, and table_schema):\n- {dataset}")
+    }
 
     fn model(provider: &Arc<ScriptedChat>, tools: Vec<Arc<dyn SpiceModelTool>>) -> ToolUsingChat {
         ToolUsingChat::new(Arc::clone(provider) as Arc<dyn Chat>, tools, None)
@@ -2097,6 +2231,210 @@ mod tests {
             }
         }
         Ok(text)
+    }
+
+    /// A provider whose first response is two choices of [`CHOICE_SQL_CALLS`] `sql` calls each. Choice 0 finishes before choice 1's calls are streamed. Later responses
+    /// answer `done`. It records every request.
+    struct TwoChoiceSql {
+        requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
+    }
+
+    impl TwoChoiceSql {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                requests: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn messages(&self, index: usize) -> Vec<String> {
+            summary(&self.requests.lock()[index].messages)
+        }
+    }
+
+    fn choice_chunk(
+        choice: u32,
+        delta: &Value,
+        finish_reason: Option<&str>,
+    ) -> CreateChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "scripted", "object": "chat.completion.chunk", "created": 0, "model": "scripted",
+            "choices": [{ "index": choice, "delta": delta, "finish_reason": finish_reason }],
+        }))
+        .expect("a valid stream chunk")
+    }
+
+    /// One past the limit, so each choice on its own goes over it.
+    const CHOICE_SQL_CALLS: usize = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+
+    fn choice_sql_calls(choice: u32) -> Vec<Value> {
+        (0..CHOICE_SQL_CALLS)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "id": format!("call_{choice}_{index}"),
+                    "type": "function",
+                    "function": { "name": "sql", "arguments": "{}" },
+                })
+            })
+            .collect()
+    }
+
+    #[async_trait]
+    impl Chat for TwoChoiceSql {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_request(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+            self.requests.lock().push(req);
+            Ok(serde_json::from_value(json!({
+                "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "done" },
+                    "finish_reason": "stop",
+                }],
+            }))
+            .expect("a valid response"))
+        }
+
+        async fn chat_stream(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            let round = {
+                let mut requests = self.requests.lock();
+                requests.push(req);
+                requests.len() - 1
+            };
+            let chunks = if round == 0 {
+                vec![
+                    Ok(choice_chunk(
+                        0,
+                        &json!({ "role": "assistant", "tool_calls": choice_sql_calls(0) }),
+                        None,
+                    )),
+                    Ok(choice_chunk(0, &json!({}), Some("tool_calls"))),
+                    Ok(choice_chunk(
+                        1,
+                        &json!({ "role": "assistant", "tool_calls": choice_sql_calls(1) }),
+                        None,
+                    )),
+                    Ok(choice_chunk(1, &json!({}), Some("tool_calls"))),
+                ]
+            } else {
+                vec![
+                    Ok(choice_chunk(
+                        0,
+                        &json!({ "role": "assistant", "content": "done" }),
+                        None,
+                    )),
+                    Ok(choice_chunk(0, &json!({}), Some("stop"))),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// Two choices of 65 Spice calls in one streamed response run 64 calls in all: the first 64
+    /// of choice 0. The response is warned about once, with its total of 130 calls.
+    #[tokio::test]
+    async fn streamed_choices_share_the_tool_call_limit() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let provider = TwoChoiceSql::new();
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let model = ToolUsingChat::new(
+            Arc::clone(&provider) as Arc<dyn Chat>,
+            vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+            None,
+        );
+
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let text = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            streamed_turn(&model, vec![user("A")])
+                .await
+                .expect("the stream ends")
+        };
+        assert_eq!(text, "donedone");
+        assert_eq!(
+            tool.0.load(Ordering::SeqCst),
+            MAX_SPICE_TOOL_CALLS_PER_RESPONSE
+        );
+        assert_eq!(provider.requests.lock().len(), 3);
+
+        let logged = String::from_utf8(sink.0.lock().expect("capture buffer").clone())
+            .expect("captured log is UTF-8");
+        let warnings: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("tool calls in one response"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one warning per response; got: {logged}");
+        assert!(
+            warnings[0].contains(&tool_calls_over_limit_warning(
+                "scripted",
+                CHOICE_SQL_CALLS * 2
+            )),
+            "the warning names the response's total; got: {logged}"
+        );
+
+        let ran = json!([{"rows": 3}]).to_string();
+        let assistant = |choice: u32| {
+            format!(
+                "assistant calls {}",
+                (0..CHOICE_SQL_CALLS)
+                    .map(|index| format!("sql#call_{choice}_{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let tool_result = |choice: u32, index: usize, content: &str| {
+            format!("tool call_{choice}_{index}: {content}")
+        };
+        // A string result reaches the model as it is, not as an escaped JSON string literal.
+        let not_run = |requested: usize| tool_call_not_run_message(requested);
+
+        let mut choice_0 = vec!["user: A".to_string(), assistant(0)];
+        choice_0.extend((0..MAX_SPICE_TOOL_CALLS_PER_RESPONSE).map(|i| tool_result(0, i, &ran)));
+        choice_0.push(tool_result(
+            0,
+            MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+            &not_run(CHOICE_SQL_CALLS),
+        ));
+        assert_eq!(provider.messages(1), choice_0);
+
+        let mut choice_1 = vec!["user: A".to_string(), assistant(1)];
+        choice_1.extend(
+            (0..CHOICE_SQL_CALLS).map(|i| tool_result(1, i, &not_run(CHOICE_SQL_CALLS * 2))),
+        );
+        assert_eq!(provider.messages(2), choice_1);
     }
 
     /// A request context, authenticated with `api_key` if there is one.
@@ -2317,6 +2655,29 @@ mod tests {
         );
     }
 
+    /// Two `sql` calls in one streamed round run as two calls, and the next round gets both
+    /// calls and both results.
+    #[tokio::test]
+    async fn test_parallel_streamed_tool_calls_run_separately() {
+        let provider = ScriptedChat::new(vec![Reply::CallSqlTwice, Reply::Answer("D")]);
+        let model = sql_model(&provider);
+
+        let answer = streamed_turn(&model, vec![user("A")])
+            .await
+            .expect("turn 1");
+
+        assert_eq!(answer, "D");
+        assert_eq!(
+            provider.messages(1),
+            [
+                "user: A",
+                "assistant calls sql#call_0, sql#call_0_b",
+                RESULT_0,
+                r#"tool call_0_b: [{"answer":42}]"#
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_streamed_spice_tool_steps_reach_the_model_on_the_next_turn() {
         let provider =
@@ -2365,8 +2726,10 @@ mod tests {
         );
     }
 
+    /// The datasets go to the model as one system message per turn, listed afresh each turn: no
+    /// `list_datasets` call is injected, and nothing of an earlier turn's list is replayed (#15578).
     #[tokio::test]
-    async fn test_the_initial_list_datasets_steps_are_never_stored() {
+    async fn the_dataset_list_is_a_system_message_listed_afresh_each_turn() {
         let provider =
             ScriptedChat::new(vec![Reply::CallSql, Reply::Answer("D"), Reply::Answer("F")]);
         let model = model(
@@ -2380,30 +2743,160 @@ mod tests {
         turn(&model, vec![user("A")]).await.expect("turn 1");
         assert_eq!(
             provider.messages(1),
-            [
-                "user: A",
-                LIST_DATASETS,
-                r#"tool initial_list_datasets: ["dataset_1"]"#,
-                CALL_0,
-                RESULT_0
-            ]
+            [catalog("dataset_1").as_str(), "user: A", CALL_0, RESULT_0]
         );
 
-        // Turn 2 gets new `list_datasets` steps, not a stored copy of turn 1's.
         turn(&model, vec![user("A"), assistant("D"), user("E")])
             .await
             .expect("turn 2");
         assert_eq!(
             provider.messages(2),
             [
+                catalog("dataset_2").as_str(),
                 "user: A",
-                LIST_DATASETS,
-                r#"tool initial_list_datasets: ["dataset_2"]"#,
                 CALL_0,
                 RESULT_0,
                 "assistant: D",
                 "user: E"
             ]
         );
+    }
+
+    impl ScriptedChat {
+        /// The `tool_choice` of each request, in order.
+        fn tool_choices(&self) -> Vec<Option<ChatCompletionToolChoiceOption>> {
+            self.requests
+                .lock()
+                .iter()
+                .map(|req| req.tool_choice.clone())
+                .collect()
+        }
+    }
+
+    /// `model` under the Spicepod request defaults `defaults`, as `try_to_chat_model` builds it.
+    fn with_defaults(model: ToolUsingChat, defaults: &[(&str, Value)]) -> RequestDefaults {
+        let tool_offer = model.tool_offer();
+        RequestDefaults::new(
+            Arc::new(model),
+            "scripted",
+            defaults
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+            tool_offer,
+        )
+    }
+
+    /// With no `tool_choice`, each round sends the provider none, so the request prefix stays
+    /// the same from one round to the next and the provider can read it from its prompt cache.
+    #[tokio::test]
+    async fn test_an_unset_tool_choice_stays_unset_on_every_round() {
+        let provider = ScriptedChat::new(vec![
+            Reply::CallSql,
+            Reply::Answer("D"),
+            Reply::CallSql,
+            Reply::Answer("F"),
+        ]);
+        let model = with_defaults(sql_model(&provider), &[("temperature", json!(0.5))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(request(vec![user("E")]))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        assert_eq!(provider.tool_choices(), [None, None, None, None]);
+    }
+
+    /// A Spicepod `tool_choice: required` forces the call of the first round only, and the next
+    /// round can answer (#14459).
+    #[tokio::test]
+    async fn test_a_required_tool_choice_default_forces_only_the_first_round() {
+        let provider = ScriptedChat::new(vec![
+            Reply::CallSql,
+            Reply::Answer("D"),
+            Reply::CallSql,
+            Reply::Answer("F"),
+        ]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("required"))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(request(vec![user("E")]))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        let required = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Required,
+        ));
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
+        assert_eq!(
+            provider.tool_choices(),
+            [required.clone(), auto.clone(), required, auto]
+        );
+    }
+
+    /// A `tool_choice: none` turns the runtime tools off, so the request reaches the provider
+    /// with no tools and no tool choice of its own.
+    #[tokio::test]
+    async fn test_a_none_tool_choice_sends_no_tool_choice_without_tools() {
+        let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("none"))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests[0].tools, None);
+        assert_eq!(requests[0].tool_choice, None);
+    }
+
+    /// `parallel_tool_calls` is a tool setting too, so a `tool_choice: none` that turns the
+    /// runtime tools off also drops the client's `parallel_tool_calls`, streamed or not.
+    #[tokio::test]
+    async fn test_a_none_tool_choice_sends_no_parallel_tool_calls_without_tools() {
+        let provider = ScriptedChat::new(vec![Reply::Answer("D"), Reply::Answer("F")]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("none"))]);
+        let with_parallel_tool_calls = |text| {
+            let mut req = request(vec![user(text)]);
+            req.parallel_tool_calls = Some(false);
+            req
+        };
+
+        model
+            .chat_request(with_parallel_tool_calls("A"))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(with_parallel_tool_calls("E"))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 2);
+        for sent in requests.iter() {
+            assert_eq!(sent.tools, None);
+            assert_eq!(sent.tool_choice, None);
+            assert_eq!(sent.parallel_tool_calls, None);
+        }
     }
 }

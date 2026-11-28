@@ -403,7 +403,7 @@ async fn configure_sqlite_connection(
                 // Equal jitter (shared with the write-conflict retry) so simultaneous
                 // connection-setup retriers don't all wake on the same boundary.
                 let jittered =
-                    turso_shared::apply_equal_jitter(std::time::Duration::from_millis(*delay_ms));
+                    write_retry::apply_equal_jitter(std::time::Duration::from_millis(*delay_ms));
                 tokio::time::sleep(jittered).await;
             }
             Err(error) => return Err(error),

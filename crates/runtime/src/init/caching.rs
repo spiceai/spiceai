@@ -17,11 +17,17 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use cache::{Caching, QueryResultsCacheProvider, SimpleCache, get_hash_builder, lru_cache};
-use spicepod::component::caching::{CacheConfig, Caching as CachingConfig, SQLResultsCacheConfig};
+use spicepod::component::caching::{
+    CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
+};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
-const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
+/// How many logical plans the plans cache keeps.
+pub(crate) const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
+
+/// How long the plans cache keeps a plan.
+pub(crate) const CACHED_PLANS_TTL: Duration = Duration::from_hours(1);
 
 impl Runtime {
     #[must_use]
@@ -45,6 +51,18 @@ impl Runtime {
             .clone()
             .unwrap_or(CacheConfig::default());
 
+        for (cache, hashing_algorithm) in [
+            ("sql_results", sql_results_config.hashing_algorithm),
+            ("search_results", search_results_config.hashing_algorithm),
+            ("embeddings", embeddings_config.hashing_algorithm),
+        ] {
+            if hashing_algorithm == HashingAlgorithm::XXH32 {
+                tracing::warn!(
+                    "`runtime.caching.{cache}.hashing_algorithm: xxh32` is deprecated, use `xxh3` (the default) instead",
+                );
+            }
+        }
+
         if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(
                 &sql_results_config,
@@ -64,7 +82,7 @@ impl Runtime {
             Ok(hash_builder) => {
                 let plans_cache_provider = Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
-                    Duration::from_hours(1),
+                    CACHED_PLANS_TTL,
                     hash_builder,
                 ))
                 .as_tabled_provider();

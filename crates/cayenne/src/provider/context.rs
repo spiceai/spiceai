@@ -20,13 +20,17 @@ use std::sync::Arc;
 
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
-use vortex::VortexSessionDefault;
 use vortex::file::WriteStrategyBuilder;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
-use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
 use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
+
+/// A seq-prefix bake that prunes under 1/this of the deletion index it found
+/// was futile (see `CayenneContext::record_bake_prune`). A bake that reaches the
+/// tombstones prunes most of them; one that cannot prunes none, or a sliver that
+/// slipped under its cutoff.
+const BAKE_FUTILE_PRUNE_DIVISOR: usize = 100;
 
 /// Shared context for Cayenne table operations.
 ///
@@ -82,6 +86,10 @@ pub struct CayenneContext {
     /// dynamic controller. Always recorded (cheap); only acted on when
     /// `dynamic_tuning` is enabled.
     ingest_stats: Arc<IngestStats>,
+    /// Whether the last committed seq-prefix bake was futile: it pruned too
+    /// little of the deletion index to have been worth running (see
+    /// [`Self::record_bake_prune`]).
+    bake_futile: Arc<std::sync::atomic::AtomicBool>,
     /// Per-table query-side observations (p99 latency + QPH), shared with the
     /// process-global query registry so the runtime can push query metrics *down*
     /// into this table's tuner; read on the background tick to derive the
@@ -115,6 +123,15 @@ pub struct CayenneContext {
     /// shared cursor this gate would read the sample the bake just took as stale.
     /// `0` until the first check.
     reclaim_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Rows the deletion index's last reclaim removed per tombstone, which scales
+    /// both deletion-index triggers (see [`super::deletion_yield`]).
+    deletion_index_yield: super::deletion_yield::DeletionIndexYield,
+    /// Key deletion vectors the table's metastore holds, as the last compaction
+    /// trigger counted them; `0` until the first count. Read by the whole-table
+    /// reclaim of a key-delete table (see `deletion_vector_reclaim_decision`).
+    key_deletion_vector_files: std::sync::atomic::AtomicUsize,
+    /// Paces the whole-table reclaims of a table that is not `auto`.
+    whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -314,6 +331,7 @@ impl CayenneContext {
             runtime_env,
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
+            bake_futile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             query_observations,
             goals,
             tuning_bounds,
@@ -322,6 +340,9 @@ impl CayenneContext {
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            deletion_index_yield: super::deletion_yield::DeletionIndexYield::default(),
+            key_deletion_vector_files: std::sync::atomic::AtomicUsize::new(0),
+            whole_table_reclaim_pace: super::pk_deletion_mode::WholeTableReclaimPace::default(),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -379,13 +400,14 @@ impl CayenneContext {
         strategy: WriteStrategyBuilder,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let session = VortexSession::default().set(strategy);
         let mut options = Self::vortex_table_options(&self.config);
         // This format only writes files, so it has no use for a read-path cache.
         // Clearing the size keeps it from building a private one when no
         // process-wide segment cache is installed.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(strategy);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -402,18 +424,16 @@ impl CayenneContext {
         cold_target_file_size_mb: usize,
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
-        let mut session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&self.config.compression_strategy)
-        {
-            session = session.set(full_strategy);
-        }
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
         // Write-only format: it never scans, so drop the read-path cache size and
         // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options);
+        let format =
+            VortexFormat::new_with_options(super::delta_encoding::write_session(), options)
+                .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                    &self.config.compression_strategy,
+                ));
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -666,6 +686,84 @@ impl CayenneContext {
         self.config.bake_deletion_index_trigger
     }
 
+    /// The deletion-index size at which the seq-prefix bake runs:
+    /// [`Self::bake_deletion_index_trigger`], scaled up by how few rows the last
+    /// reclaim found its tombstones hiding (see [`super::deletion_yield`]), and
+    /// raised past a futile bake's residual.
+    ///
+    /// A futile bake (see [`Self::record_bake_prune`]) could not reach the
+    /// tombstones — they are newer than the settled prefix, or a cold file still
+    /// needs them — so the next tick would bake again and prune nothing; on the
+    /// rig, cold tables baked about once a second. The next bake then waits for
+    /// the index to pass `BAKE_TRIGGER_RESIDUAL_HEADROOM` × that residual, the
+    /// backoff `tuning::futile_bake_step` applies through the adaptive
+    /// controller, which only runs with dynamic tuning on. A bake that prunes
+    /// lifts it.
+    ///
+    /// Futility is what the bake pruned, not whether the residual stayed above
+    /// the trigger: on a table taking upserts fast, tombstones arrive during the
+    /// bake, so a bake that prunes half the index can still leave it above the
+    /// trigger. Judged by the residual, CH-benCHmark `stock`'s trigger climbed
+    /// from 50k to 3.75M within 15 minutes and its index to 975k.
+    #[must_use]
+    pub(crate) fn effective_bake_deletion_index_trigger(&self) -> usize {
+        let trigger = self.bake_deletion_index_trigger();
+        let scaled = self.deletion_index_yield.scale_trigger(trigger);
+        match self.ingest_stats.bake_residual() {
+            Some(residual) if self.bake_futile.load(std::sync::atomic::Ordering::Relaxed) => {
+                scaled.max(residual.saturating_mul(tuning::BAKE_TRIGGER_RESIDUAL_HEADROOM))
+            }
+            _ => scaled,
+        }
+    }
+
+    /// Record what a committed seq-prefix bake pruned: `pruned` of the `held`
+    /// tombstones the deletion index held when it pruned (`pruned` is 0 when the
+    /// prune was withheld). The bake was futile when it pruned under
+    /// 1/[`BAKE_FUTILE_PRUNE_DIVISOR`] of them.
+    pub(crate) fn record_bake_prune(&self, held: usize, pruned: usize) {
+        self.bake_futile.store(
+            pruned.saturating_mul(BAKE_FUTILE_PRUNE_DIVISOR) < held,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The deletion-index size at which the whole-table reclaim runs:
+    /// [`Self::configured_deletion_index_trigger`], scaled the same way.
+    #[must_use]
+    pub(crate) fn effective_reclaim_deletion_index_trigger(&self) -> usize {
+        self.deletion_index_yield
+            .scale_trigger(self.configured_deletion_index_trigger())
+    }
+
+    /// Key deletion vectors the metastore held at the last count.
+    #[must_use]
+    pub(crate) fn key_deletion_vector_files(&self) -> usize {
+        self.key_deletion_vector_files
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record how many key deletion vectors the metastore holds.
+    pub(crate) fn set_key_deletion_vector_files(&self, files: usize) {
+        self.key_deletion_vector_files
+            .store(files, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The pace of this table's whole-table reclaims when it is not `auto`.
+    pub(crate) fn whole_table_reclaim_pace(
+        &self,
+    ) -> &super::pk_deletion_mode::WholeTableReclaimPace {
+        &self.whole_table_reclaim_pace
+    }
+
+    /// Record a deletion-index reclaim (a bake or a whole-table rewrite) that
+    /// removed `rows_removed` rows and took `tombstones_reclaimed` tombstones out
+    /// of the index.
+    pub(crate) fn record_deletion_index_yield(&self, rows_removed: u64, tombstones_reclaimed: u64) {
+        self.deletion_index_yield
+            .record(rows_removed, tombstones_reclaimed);
+    }
+
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
     /// apply is at or over capacity, so the background bake — whose merge
     /// (re-encode survivors + publish) competes with the apply for the shared
@@ -900,8 +998,16 @@ impl CayenneContext {
             .record_publish_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
+    /// The residual the last committed seq-prefix bake left, if any (see
+    /// [`Self::record_bake_residual`]).
+    #[cfg(test)]
+    pub(crate) fn ingest_stats_bake_residual(&self) -> Option<usize> {
+        self.ingest_stats.bake_residual()
+    }
+
     /// Record the live deletion-index size a committed seq-prefix bake left
-    /// behind, for the adaptive controller's futile-bake backoff.
+    /// behind, for the futile-bake backoff (see
+    /// [`Self::effective_bake_deletion_index_trigger`]).
     pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
         self.ingest_stats
             .record_bake(deletion_index_len, chrono::Utc::now().timestamp_millis());
@@ -1127,28 +1233,27 @@ impl CayenneContext {
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings. The session's write
-        // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
-        // default, optionally extended with the Zstd string scheme when
-        // `cayenne_compression_strategy=zstd` (this wiring is what makes that
-        // param real — see `delta_encoding::full_strategy_builder_for`).
-        // Maintenance writes and full-level delta writes inherit it; light
-        // delta-encoding levels override it per write via
-        // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let mut vortex_session = VortexSession::default();
-        if let Some(full_strategy) =
-            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
-        {
-            vortex_session = vortex_session.set(full_strategy);
-        }
-
+        // A Vortex session with default encodings, writing with the table's FULL
+        // encoding tier: the BtrBlocks cascade by default, optionally extended
+        // with the Zstd string scheme when `cayenne_compression_strategy=zstd`,
+        // with string and binary data blocks capped (see
+        // `delta_encoding::full_strategy_builder_for`). Maintenance writes and
+        // full-level delta writes inherit it; light delta-encoding levels
+        // override it per write via `write_format_with_strategy` (see
+        // `provider::delta_encoding`).
+        //
         // Cayenne opts into the shared cache: its data files carry a uuid7 write
         // id beneath a uuid7 snapshot directory, so a path is written once and
         // never reused, and retirement invalidates it explicitly.
-        Arc::new(VortexFormat::new_with_process_segment_cache(
-            vortex_session,
-            Self::vortex_table_options(config),
-        ))
+        Arc::new(
+            VortexFormat::new_with_process_segment_cache(
+                super::delta_encoding::write_session(),
+                Self::vortex_table_options(config),
+            )
+            .with_write_strategy(super::delta_encoding::full_strategy_builder_for(
+                &config.compression_strategy,
+            )),
+        )
     }
 
     /// Table options shared by the base format and any per-write format

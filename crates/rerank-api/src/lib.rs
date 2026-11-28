@@ -58,6 +58,17 @@ pub enum Error {
         actual: usize,
     },
 
+    /// A listwise request asks one choice question with an option per document, and
+    /// evaluation models limit how many options a choice may have.
+    #[snafu(display(
+        "Reranker model '{model}' can rank at most {max} documents in one listwise request, but got {count}. Use strategy => 'pointwise', or send fewer candidates (for example, a smaller limit on the search inside rerank())."
+    ))]
+    TooManyDocuments {
+        model: String,
+        count: usize,
+        max: usize,
+    },
+
     #[snafu(display("Reranker health check failed: {source}"))]
     HealthCheckFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -69,10 +80,17 @@ pub enum Error {
     HttpClientCreationFailed { model: String },
 
     #[snafu(display(
-        "Failed to load local reranker model '{model}': {source}. Check the model id/path and that the artifacts (config.json, tokenizer.json, weights) are present. See: https://spiceai.org/docs/components/rerankers"
+        "Failed to load local reranker model '{model}': {source}. Check the model id/path and that the artifacts (config.json, tokenizer.json, weights) are present. See: https://spiceai.org/docs/features/search/rerank"
     ))]
     LocalModelLoadFailed {
         model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Downloading the model from the Hugging Face Hub failed. The source names the reranker,
+    /// the cause and the fix, so it is the whole message.
+    #[snafu(display("{source}"))]
+    FailedToDownloadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 

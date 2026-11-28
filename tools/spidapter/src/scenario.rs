@@ -20,6 +20,7 @@ use spice_cloud_client::types::UpdateChannel;
 pub enum SpiceCompute {
     Scp,
     Local,
+    Ec2,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, serde::Deserialize)]
@@ -71,12 +72,32 @@ pub(crate) struct ScpConfig {
     pub resources: ScpResources,
 }
 
-/// Where Spice runs — plain string `local` or structured `scp: { ... }`.
+/// A temporary scheduler + executor cluster on EC2, nested under `compute: ec2:`.
+/// Each `setup` launches its own instances and `teardown` terminates them.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct Ec2ClusterConfig {
+    pub region: String,
+    /// Subnet that assigns public IPs; the adapter reaches the scheduler over them.
+    pub subnet_id: String,
+    /// Ubuntu 24.04 AMI; the instances install Docker at boot.
+    pub ami_id: String,
+    /// `spiced` container image, e.g. `spiceai/spiceai:2.3.2`.
+    pub image: String,
+    pub scheduler_instance_type: String,
+    pub executor_instance_type: String,
+    pub executor_count: usize,
+    pub disk_size_gb: i32,
+    /// Instances shut down (and terminate) after this long even if teardown never runs.
+    pub max_lifetime_minutes: u32,
+}
+
+/// Where Spice runs — plain string `local` or structured `scp: { ... }` / `ec2: { ... }`.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ComputeConfig {
     Local,
     Scp(Box<ScpConfig>),
+    Ec2(Box<Ec2ClusterConfig>),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -295,5 +316,29 @@ mod tests {
         let result = envsubst("value: ${SPIDAPTER_TEST_VAR_B:-default}").expect("override");
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_B") };
         assert_eq!(result, "value: override");
+    }
+
+    #[test]
+    fn ec2_scenario_parses_with_defaults() {
+        // SAFETY: test-only, single-threaded test runner
+        unsafe {
+            std::env::set_var("SPIDAPTER_EC2_SUBNET_ID", "subnet-0abc");
+            std::env::set_var("SPIDAPTER_EC2_AMI_ID", "ami-0abc");
+            std::env::set_var("SPIDAPTER_EC2_IMAGE", "spiceai/spiceai:2.3.2");
+        }
+        let scenario = load_scenario(
+            "federated-direct-ec2",
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/scenarios")),
+        )
+        .expect("scenario loads");
+        let Some(ComputeConfig::Ec2(ec2)) = scenario.compute else {
+            panic!("expected `compute: ec2:`");
+        };
+        assert_eq!(ec2.subnet_id, "subnet-0abc");
+        assert_eq!(ec2.image, "spiceai/spiceai:2.3.2");
+        assert_eq!(ec2.executor_instance_type, "i3.4xlarge");
+        assert_eq!(ec2.executor_count, 3);
+        assert_eq!(ec2.max_lifetime_minutes, 360);
+        assert!(matches!(scenario.source, SourceConfig::Direct(_)));
     }
 }

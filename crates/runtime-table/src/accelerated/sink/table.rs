@@ -478,7 +478,6 @@ mod tests {
 
     /// A partitioned Cayenne table as the accelerator builds it: the partitioned
     /// table under a poly layer and an index layer, so no sink holds it directly.
-    #[cfg(not(windows))]
     struct LayeredPartitionedCayenne {
         _dir: tempfile::TempDir,
         schema: SchemaRef,
@@ -486,7 +485,6 @@ mod tests {
         layered: Arc<dyn TableProvider>,
     }
 
-    #[cfg(not(windows))]
     impl LayeredPartitionedCayenne {
         async fn new() -> Self {
             use std::collections::HashMap;
@@ -615,7 +613,6 @@ mod tests {
     /// The same for every partition of a partitioned Cayenne table under the
     /// layers the accelerator stacks over it, the partitions a write creates
     /// included.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
         let table = LayeredPartitionedCayenne::new().await;
@@ -651,7 +648,6 @@ mod tests {
 
     /// The same when the partitioned table is the parent of synchronized
     /// datasets, written through `MultiSink`.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn synchronized_refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
         let table = LayeredPartitionedCayenne::new().await;
@@ -706,7 +702,7 @@ mod tests {
         let changes = narrowing_schema_cast_changes(&input, &target, &[]);
         assert_eq!(changes.dropped, ["c".to_string()]);
         assert_eq!(changes.narrowed, ["a: Int64 -> Int32".to_string()]);
-        assert!(changes.engine_normalized.is_empty());
+        assert_eq!(changes.engine_normalized, [] as [String; 0]);
     }
 
     #[test]
@@ -795,7 +791,7 @@ mod tests {
             without_rules.narrowed,
             [r#"created_at: Timestamp(ns, "UTC") -> Timestamp(µs, "UTC")"#.to_string()]
         );
-        assert!(without_rules.engine_normalized.is_empty());
+        assert_eq!(without_rules.engine_normalized, [] as [String; 0]);
     }
 
     /// The rewrite rules must not swallow a real narrowing that happens to sit beside
@@ -882,7 +878,7 @@ mod tests {
             changes.narrowed,
             ["naive: Timestamp(ns) -> Timestamp(µs)".to_string()]
         );
-        assert!(changes.engine_normalized.is_empty());
+        assert_eq!(changes.engine_normalized, [] as [String; 0]);
     }
 
     /// A Cayenne table created before the engine preserved timestamp units still

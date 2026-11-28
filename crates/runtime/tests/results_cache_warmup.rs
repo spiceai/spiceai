@@ -39,7 +39,7 @@ fn lookup_dataset(dir: &std::path::Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", csv.display()), "lookup");
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("arrow".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
@@ -76,7 +76,6 @@ async fn wait_ready(rt: &Arc<Runtime>) {
 }
 
 #[tokio::test]
-#[expect(clippy::expect_used)]
 async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Internal)
