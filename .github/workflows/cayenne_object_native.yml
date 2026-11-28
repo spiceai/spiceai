@@ -73,7 +73,10 @@ jobs:
         id: paths
         if: github.event_name == 'merge_group'
         with:
-          base: ${{ github.event.merge_group.base_sha }}
+          # The target branch, not `base_sha` (the previous queue entry's commit): the
+          # diff must cover every change the merge would land, since the queue merges
+          # the entries below one that passes. See .github/actions/check-code-changes.
+          base: ${{ github.event.merge_group.base_ref }}
           filters: |
             model:
               - 'crates/cayenne-metastore-model/**'

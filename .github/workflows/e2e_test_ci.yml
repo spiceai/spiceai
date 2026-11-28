@@ -1491,9 +1491,23 @@ jobs:
         id: changed
         if: ${{ matrix.changed }}
         env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.before }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          # In a merge group, compare with the target branch's tip rather than
+          # `merge_group.base_sha`, which is the previous queue entry's commit: the
+          # queue merges the entries below one that passes, so a script changed by
+          # an entry below must run here too (see .github/actions/check-code-changes).
+          # The tip is HEAD's ancestor when only the queue advances the branch; a
+          # commit pushed around the queue only adds files that HEAD lacks, which
+          # the `--diff-filter` below drops.
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            BASE_SHA=$(git rev-parse FETCH_HEAD)
+          else
+            BASE_SHA="$BEFORE_SHA"
+          fi
           if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
             echo "No base commit to compare with; no changed scripts to run."
             exit 0
