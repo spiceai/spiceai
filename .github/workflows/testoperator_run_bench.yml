@@ -778,7 +778,16 @@ jobs:
             BRANCH_ID=${{ github.run_id }}
           fi
 
-          BASE_BRANCH="testoperator-snapshot-update/${BRANCH_ID}"
+          # One branch, and one PR, per workload: query set, scale, Spicepod and the
+          # options that change the queries. The PR's evidence names the same
+          # workload, so another workload's snapshots never make it stale, and two
+          # workloads never share an evidence label (.github/scripts/pr_evidence.mjs).
+          WORKLOAD="${WL_QUERY_SET} sf${WL_SCALE_FACTOR} ${WL_SPICEPOD}"
+          if [ -n "${WL_LAYOUT}" ]; then WORKLOAD="${WORKLOAD} layout=${WL_LAYOUT}"; fi
+          if [ -n "${WL_SCENARIO}" ]; then WORKLOAD="${WORKLOAD} queries=${WL_SCENARIO}"; fi
+          if [ -n "${WL_OVERRIDES}" ]; then WORKLOAD="${WORKLOAD} overrides=${WL_OVERRIDES}"; fi
+          WORKLOAD_KEY="$(printf '%s' "${WORKLOAD}" | git hash-object --stdin | cut -c1-12)"
+          BASE_BRANCH="testoperator-snapshot-update/${BRANCH_ID}-${WORKLOAD_KEY}"
           BRANCH_NAME="${BASE_BRANCH}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
@@ -791,9 +800,9 @@ jobs:
             git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
             SNAPSHOT_COMMIT="$(git rev-parse HEAD)"
 
-            # Every run dispatched for one spiced commit pushes to the same
-            # branch, so the push can lose in two ways that say nothing about
-            # the benchmark:
+            # Every run of one workload dispatched for one spiced commit pushes
+            # to the same branch, so the push can lose in two ways that say
+            # nothing about the benchmark:
             # - another run pushed first ("fetch first", or any rejection after
             #   which the branch tip has moved): move this run's snapshot
             #   commit onto the new tip and push again;
@@ -862,7 +871,7 @@ jobs:
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"
               # Before the held runs are released below, so Attestation reads the new evidence.
-              bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "the benchmark snapshot run for ${{ github.event.inputs.query_set }} on ${{ github.event.inputs.spicepod_path }}"
+              bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "testoperator run bench ${WORKLOAD}"
             else
               BODY=$(cat <<EOF
           Automated benchmark snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
@@ -874,7 +883,7 @@ jobs:
           )
               # Target the branch the run was dispatched on. enforce-pull-with-spice, a required
               # check, fails a PR without both a kind/ and an area/ label.
-              BODY="$(printf '%s\n\n%s' "${BODY}" "$(bash .github/scripts/bot_pr_evidence.sh section "the benchmark snapshot run for ${{ github.event.inputs.query_set }} on ${{ github.event.inputs.spicepod_path }}")")"
+              BODY="$(printf '%s\n\n%s' "${BODY}" "$(bash .github/scripts/bot_pr_evidence.sh section "testoperator run bench ${WORKLOAD}")")"
               gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug --label area/tests
               # Auto-merge only into trunk: on an unprotected feature branch
               # --auto merges immediately, before the branch owner can review
@@ -888,6 +897,12 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WL_QUERY_SET: ${{ github.event.inputs.query_set }}
+          WL_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
+          WL_SPICEPOD: ${{ github.event.inputs.spicepod_path }}
+          WL_LAYOUT: ${{ github.event.inputs.layout }}
+          WL_SCENARIO: ${{ github.event.inputs.scenario_query_file }}
+          WL_OVERRIDES: ${{ github.event.inputs.query_overrides }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'

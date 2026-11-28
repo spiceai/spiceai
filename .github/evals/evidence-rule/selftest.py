@@ -340,6 +340,42 @@ round trips: 12/12 passed
 """,
         run_release_checks,
     ), (
+        "counts inflated past what ran",
+        """# Evidence
+
+```
+112/12 unit cases passed
+1437/437 round trips passed (seed 16927)
+```
+
+- S3 integration check: Not run — `SPICE_TEST_S3_BUCKET` is unset.
+""",
+        run_release_checks,
+    ), (
+        "outcomes contradicted",
+        """# Evidence
+
+```
+12/12 unit cases failed
+437/437 round trips failed
+```
+
+- S3 integration check: Not run — `SPICE_TEST_S3_BUCKET` is unset.
+""",
+        run_release_checks,
+    ), (
+        "blocker contradicted",
+        """# Evidence
+
+```
+12/12 unit cases passed
+437/437 round trips passed (seed 16927)
+```
+
+- S3 integration check: Not run — `SPICE_TEST_S3_BUCKET` is set, but the TLS certificate expired.
+""",
+        run_release_checks,
+    ), (
         "misreported after running",
         """# Evidence
 

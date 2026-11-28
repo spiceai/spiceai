@@ -12,12 +12,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  ENFORCED_FROM,
   RUST_AFFECTING,
   checkEvidence,
   describeProblems,
   evidenceEntries,
   evidenceSection,
+  evidenceSections,
   notRunWithoutReason,
 } from './pr_evidence.mjs';
 import { testRunner } from './fake_github.mjs';
@@ -31,25 +31,28 @@ const HEAD = '4d'.repeat(20);
 const BASE = 'f'.repeat(40);
 const ON_BASE = 'e'.repeat(40);
 const ELSEWHERE = '9'.repeat(40);
-const AFTER_CUTOFF = '2026-12-08T00:00:00Z';
+// Run 42 ran at HEAD, run 7 at FIRST, run 9 at the base.
 const RUN = 'https://github.com/o/r/actions/runs/42';
+const RUN_AT = { 42: HEAD, 7: FIRST, 9: BASE };
 
 const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n## Not a heading\n-->';
 
 /** A description with the given Evidence section text between Summary and Docs. */
-const describe = (evidence) =>
-  `## 📝 Summary\n\nFixes the thing.\n\n## 🧪 Evidence\n\n${TEMPLATE_COMMENT}\n\n${evidence}\n\n## 📚 Docs\n\nNone.\n`;
+const describe = (evidence, docs = 'None.') =>
+  `## 📝 Summary\n\nFixes the thing.\n\n## 🧪 Evidence\n\n${TEMPLATE_COMMENT}\n\n${evidence}\n\n## 📚 Docs\n\n${docs}\n`;
 
-const ran = (sha) => `Ran at ${sha.slice(0, 12)}:\n\n\`\`\`\n$ make test\n12 passed\n\`\`\``;
+const ran = (sha, command = 'make test') => `Ran at ${sha.slice(0, 12)}:\n\n\`\`\`\n$ ${command}\n12 passed\n\`\`\``;
 
 const files = (...names) => names.map((filename) => ({ filename }));
 
 /**
  * A stub of the Octokit calls checkEvidence makes. `commits` are listed oldest
  * first as { sha, parents? }; `changes` maps a commit SHA to the files it changes
- * against its first parent; `compares` maps "base...head" to { status, files }.
+ * against its first parent (or null for a response without a file list);
+ * `compares` maps "base...head" to { status, files }; `runs` maps a run id to the
+ * commit it ran at.
  */
-function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = {}, createdAt = '2026-11-01T00:00:00Z', fail }) {
+function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = {}, runs = RUN_AT, fail }) {
   const reads = [];
   const github = {
     paginate: async (method, params) => (await method(params)).data,
@@ -57,7 +60,7 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
       pulls: {
         get: async () => {
           if (fail) throw fail;
-          return { data: { body, created_at: createdAt, head: { sha: commits.at(-1).sha }, base: { sha: BASE } } };
+          return { data: { body, head: { sha: commits.at(-1).sha }, base: { sha: BASE } } };
         },
         listCommits: async () => ({
           data: commits.map(({ sha, parents = [BASE] }) => ({ sha, parents: parents.map((parent) => ({ sha: parent })) })),
@@ -66,6 +69,7 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
       repos: {
         getCommit: async ({ ref, per_page: perPage, page }) => {
           reads.push(`commit ${ref} page ${page}`);
+          if (changes[ref] === null) return { data: {} };
           const all = changes[ref] ?? [];
           return { data: { files: all.slice((page - 1) * perPage, page * perPage) } };
         },
@@ -76,13 +80,23 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
           return { data: found };
         },
       },
+      actions: {
+        getWorkflowRun: async ({ owner, repo, run_id: runId }) => {
+          assert.equal(`${owner}/${repo}`, 'o/r', 'only this repository is asked about runs');
+          reads.push(`run ${runId}`);
+          return { data: { head_sha: runs[runId] } };
+        },
+      },
     },
   };
   return { github, reads };
 }
 
-const check = (state) =>
-  checkEvidence({ github: stubGithub(state).github, owner: 'o', repo: 'r', pullNumber: 7, now: new Date(state.now ?? AFTER_CUTOFF) });
+const check = (state) => checkEvidence({ github: stubGithub(state).github, owner: 'o', repo: 'r', pullNumber: 7 });
+
+const stale = (line, at, rest) =>
+  `"${line}" ran at ${at.slice(0, 12)}, but later commits change shipped code or test inputs: ${rest}. ` +
+  'Re-run the same command at the head and add its output, or remove the entry.';
 
 // --- Finding the section -----------------------------------------------------
 
@@ -111,29 +125,39 @@ test('a heading that is just "Evidence" wins over one that mentions the word', (
   assert.equal(evidenceSection(body), ran(HEAD));
 });
 
+test('every exact Evidence heading counts', () => {
+  assert.equal(evidenceSections(`## Evidence\n\nstub\n\n## 🧪 Evidence\n\nreal\n\n## Docs`).count, 2);
+});
+
 // --- Entries and not-run marks -------------------------------------------------
 
-test('an entry needs its own output: a non-empty fenced block or a link to a run', () => {
+test('entries record fenced output, this repository\'s run links, and commands from pasted output', () => {
   const resolve = (token) => [FIRST, SECOND, HEAD].find((sha) => sha.startsWith(token)) ?? null;
   const entries = evidenceEntries(
-    `Before, at ${FIRST.slice(0, 9)}:\n\n\`\`\`\nFAIL\n\`\`\`\n\n` +
-      `At ${SECOND.slice(0, 9)}: see https://spiceai.org/docs\n\n` +
-      `At ${HEAD.slice(0, 9)}: ${RUN}\n\n\`\`\`\ncommit ${SECOND} printed by git log\n\`\`\`\n\n` +
+    `Before, at ${FIRST.slice(0, 9)}:\n\n\`\`\`\n$ make test\nFAIL\n\`\`\`\n\n` +
+      `At ${SECOND.slice(0, 9)}, re-ran \`make lint\`: https://github.com/other/repo/actions/runs/5 https://github.com/o/r/pull/7/checks\n\n` +
+      `At ${HEAD.slice(0, 9)}: ${RUN}/job/99\n\n\`\`\`\ncommit ${SECOND} printed by git log\n\`\`\`\n\n` +
       `Empty block at ${FIRST.slice(0, 9)}:\n\n\`\`\`\n\n\`\`\``,
-    resolve
+    resolve,
+    'o/r'
   );
   assert.deepEqual(
-    entries.map(({ shas, hasOutput }) => [shas, hasOutput]),
-    [[[FIRST], true], [[SECOND], false], [[HEAD], true], [[FIRST], false]],
-    'a SHA inside output starts no entry, and an empty block is no output'
+    entries.map(({ shas, fenced, runs, commands }) => [shas, fenced, runs, [...commands]]),
+    [
+      [[FIRST], true, [], ['make test']],
+      [[SECOND], false, [], []],
+      [[HEAD], true, ['42'], []],
+      [[FIRST], false, [], []],
+    ],
+    'only this repository\'s runs count, code spans are not commands, a SHA inside output starts no entry, and an empty block is no output'
   );
 });
 
 test('output before the first entry belongs to it', () => {
-  const entries = evidenceEntries(`\`\`\`\n12 passed\n\`\`\`\n\nAll of the above ran at ${HEAD.slice(0, 12)}.`, (token) =>
-    HEAD.startsWith(token) ? HEAD : null
+  const entries = evidenceEntries(`\`\`\`\n$ make test\n12 passed\n\`\`\`\n\nAll of the above ran at ${HEAD.slice(0, 12)}.`, (token) =>
+    HEAD.startsWith(token) ? HEAD : null, 'o/r'
   );
-  assert.deepEqual(entries.map(({ hasOutput }) => hasOutput), [true]);
+  assert.deepEqual(entries.map(({ fenced, commands }) => [fenced, [...commands]]), [[true, ['make test']]]);
 });
 
 test('not-run marks need a real reason; prose and pasted output are not marks', () => {
@@ -158,7 +182,7 @@ test('not-run marks need a real reason; prose and pasted output are not marks', 
 // --- Verdicts ----------------------------------------------------------------
 
 test('complete evidence at the head passes', async () => {
-  assert.deepEqual(await check({ body: describe(ran(HEAD)) }), { problems: [], enforced: true, cited: HEAD });
+  assert.deepEqual(await check({ body: describe(ran(HEAD)) }), { problems: [], cited: HEAD });
 });
 
 test('a description without the section fails with that alone', async () => {
@@ -173,18 +197,52 @@ test('an untouched template fails as empty', async () => {
   assert.deepEqual(result.problems, ['The Evidence section is empty (its template comment does not count).']);
 });
 
-test('a bare SHA with an unrelated link is not evidence', async () => {
-  const result = await check({ body: describe(`Tests pass at ${HEAD.slice(0, 12)}. Docs: https://spiceai.org/docs`) });
+test('a second Evidence section fails, so a stub cannot stand in for the real one', async () => {
+  const body = `## Evidence\n\nGreen at ${HEAD.slice(0, 12)}: ${RUN}\n\n## 🧪 Evidence\n\nIntegration tests: not run\n`;
+  const result = await check({ body });
   assert.deepEqual(result.problems, [
-    `"Tests pass at ${HEAD.slice(0, 12)}. Docs: https://spiceai.org/docs" names ${HEAD.slice(0, 12)} but carries no output: ` +
-      'put the output in a fenced block under it, or link the run.',
+    'A check is marked not run without a reason: "Integration tests: not run". Write `Not run — <reason>`.',
+    'The description has 2 Evidence sections. Keep all the evidence in one.',
+  ]);
+});
+
+test('a check marked not run anywhere in the description needs a reason', async () => {
+  const result = await check({ body: describe(ran(HEAD), 'Docs build: not run') });
+  assert.deepEqual(result.problems, [
+    'A check is marked not run without a reason: "Docs build: not run". Write `Not run — <reason>`.',
+  ]);
+});
+
+test('a bare SHA with an unrelated link is not evidence', async () => {
+  const line = `Tests pass at ${HEAD.slice(0, 12)}. Docs: https://spiceai.org/docs`;
+  const result = await check({ body: describe(line) });
+  assert.deepEqual(result.problems, [
+    `"${line}" names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
+      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
   ]);
   assert.equal(result.cited, null);
 });
 
-test('a link to the run counts as output', async () => {
-  const result = await check({ body: describe(`Green at ${HEAD.slice(0, 12)}: ${RUN}`) });
+test('a run of this repository that ran at the entry\'s commit counts as output', async () => {
+  const { github, reads } = stubGithub({ body: describe(`Green at ${HEAD.slice(0, 12)}: ${RUN}`) });
+  const result = await checkEvidence({ github, owner: 'o', repo: 'r', pullNumber: 7 });
   assert.deepEqual(result.problems, []);
+  assert.deepEqual(reads, ['run 42']);
+});
+
+test('a run at another commit, another repository\'s run, a checks page, a gist, or an upload is not output', async () => {
+  for (const link of [
+    'https://github.com/o/r/actions/runs/9',
+    'https://github.com/other/repo/actions/runs/42',
+    'https://github.com/o/r/pull/7/checks',
+    'https://gist.github.com/someone/abc123',
+    'https://github.com/user-attachments/files/1/log.txt',
+  ]) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await check({ body: describe(`Green at ${HEAD.slice(0, 12)}: ${link}`) });
+    assert.equal(result.problems.length, 1, link);
+    assert.match(result.problems[0], /carries no output/, link);
+  }
 });
 
 test('a check marked not run needs a reason', async () => {
@@ -201,16 +259,15 @@ test('citing only a commit outside the PR fails, naming the head', async () => {
   ]);
 });
 
+const withLaterChange = { commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: files('crates/runtime/src/lib.rs') } };
+const afterHead = (line) => stale(line, FIRST, `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs)`);
+
 test('naming the head without output does not refresh an older run', async () => {
-  const result = await check({
-    body: describe(`${ran(FIRST)}\n\nThe head is ${HEAD.slice(0, 12)}.`),
-    commits: [{ sha: FIRST }, { sha: HEAD }],
-    changes: { [HEAD]: files('crates/runtime/src/lib.rs') },
-  });
+  const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\nThe head is ${HEAD.slice(0, 12)}.`) });
   assert.deepEqual(result.problems, [
-    `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, or link the run.`,
-    `"Ran at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
-      `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`,
+    `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
+      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+    afterHead(`Ran at ${FIRST.slice(0, 12)}:`),
   ]);
   assert.equal(result.cited, FIRST);
 });
@@ -221,10 +278,16 @@ test('a later commit that changes shipped code makes the evidence stale', async 
     commits: [{ sha: FIRST }, { sha: SECOND }, { sha: HEAD }],
     changes: { [SECOND]: files('docs/dev/testing.md'), [HEAD]: files('crates/cayenne/src/lib.rs', 'Cargo.lock') },
   });
-  assert.deepEqual(result.problems, [
-    `"Ran at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
-      `${HEAD.slice(0, 12)} (crates/cayenne/src/lib.rs, Cargo.lock). Re-run the same command at the head and add its output, or remove the entry.`,
-  ]);
+  assert.deepEqual(result.problems, [stale(`Ran at ${FIRST.slice(0, 12)}:`, FIRST, `${HEAD.slice(0, 12)} (crates/cayenne/src/lib.rs, Cargo.lock)`)]);
+});
+
+test('a later change to test inputs makes the evidence stale too', async () => {
+  const result = await check({
+    body: describe(ran(FIRST)),
+    commits: [{ sha: FIRST }, { sha: HEAD }],
+    changes: { [HEAD]: files('test/spicescript/feed-chaos.yaml') },
+  });
+  assert.deepEqual(result.problems, [stale(`Ran at ${FIRST.slice(0, 12)}:`, FIRST, `${HEAD.slice(0, 12)} (test/spicescript/feed-chaos.yaml)`)]);
 });
 
 test('a rename out of shipped code counts as a change to it', async () => {
@@ -234,7 +297,7 @@ test('a rename out of shipped code counts as a change to it', async () => {
     changes: { [HEAD]: [{ filename: 'notes.txt', previous_filename: 'crates/runtime/src/old.rs' }] },
   });
   assert.equal(result.problems.length, 1);
-  assert.match(result.problems[0], /later commits change shipped code: 4d4d4d4d4d4d \(notes\.txt\)/);
+  assert.match(result.problems[0], /later commits change shipped code or test inputs: 4d4d4d4d4d4d \(notes\.txt\)/);
 });
 
 test('every page of a large commit is read', async () => {
@@ -246,10 +309,13 @@ test('every page of a large commit is read', async () => {
   assert.deepEqual(reads, [`commit ${HEAD} page 1`, `commit ${HEAD} page 2`]);
 });
 
-test('a commit past the listed-file limit cannot be shown current', async () => {
+test('a commit past the listed-file limit, or listed without files, cannot be shown current', async () => {
   const many = Array.from({ length: 3000 }, (_, index) => ({ filename: `docs/page-${index}.md` }));
-  const result = await check({ body: describe(ran(FIRST)), commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: many } });
-  assert.match(result.problems[0], /4d4d4d4d4d4d \(more files than GitHub lists, so it cannot be checked\)/);
+  for (const listing of [many, null]) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await check({ body: describe(ran(FIRST)), commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: listing } });
+    assert.match(result.problems[0], /4d4d4d4d4d4d \(more files than GitHub lists, so it cannot be checked\)/);
+  }
 });
 
 test('a clean merge of the base keeps the evidence current', async () => {
@@ -278,7 +344,7 @@ test('a base merge that changes a shipped file against both parents makes the ev
     },
   });
   assert.equal(result.problems.length, 1);
-  assert.match(result.problems[0], /later commits change shipped code: 3c3c3c3c3c3c \(crates\/runtime\/src\/conflict\.rs\)/);
+  assert.match(result.problems[0], /3c3c3c3c3c3c \(crates\/runtime\/src\/conflict\.rs\)/);
 });
 
 test('a merge of a branch other than the base counts everything it brings in', async () => {
@@ -295,7 +361,7 @@ test('a merge of a branch other than the base counts everything it brings in', a
 
 test('a newer run of the same command keeps an older entry current: before and after', async () => {
   const result = await check({
-    body: describe(`Before the fix, at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\n1 failed\n\`\`\`\n\nRe-ran \`make test\` at ${SECOND.slice(0, 12)}: ${RUN}`),
+    body: describe(`Before the fix, at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\n1 failed\n\`\`\`\n\n${ran(SECOND)}`),
     commits: [{ sha: FIRST }, { sha: SECOND }],
     changes: { [SECOND]: files('crates/runtime/src/lib.rs') },
   });
@@ -303,25 +369,29 @@ test('a newer run of the same command keeps an older entry current: before and a
   assert.equal(result.cited, SECOND);
 });
 
-const staleAfterHead = (line) =>
-  `"${line}" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
-  `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`;
-const withLaterChange = { commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: files('crates/runtime/src/lib.rs') } };
+test('a command in a code span on the entry\'s line does not count as re-run', async () => {
+  const line = `Re-ran \`make test\` at ${HEAD.slice(0, 12)}: ${RUN}`;
+  const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\n${line}`) });
+  assert.deepEqual(result.problems, [afterHead(`Ran at ${FIRST.slice(0, 12)}:`)]);
+});
 
 test('an older entry needs a newer run of every command it ran', async () => {
   const result = await check({
     ...withLaterChange,
-    body: describe(`At ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\nok\n$ make lint\nok\n\`\`\`\n\nAt ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ make lint\nok\n\`\`\``),
+    body: describe(`At ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ make test\nok\n$ make lint\nok\n\`\`\`\n\n${ran(HEAD, 'make lint')}`),
   });
-  assert.deepEqual(result.problems, [staleAfterHead(`At ${FIRST.slice(0, 12)}:`)]);
+  assert.deepEqual(result.problems, [afterHead(`At ${FIRST.slice(0, 12)}:`)]);
 });
 
 test('commands compare as written: whitespace inside an argument matters', async () => {
-  const result = await check({
-    ...withLaterChange,
-    body: describe(`At ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ grep "a  b" x\nok\n\`\`\`\n\nAt ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ grep "a b" x\nok\n\`\`\``),
-  });
-  assert.deepEqual(result.problems, [staleAfterHead(`At ${FIRST.slice(0, 12)}:`)]);
+  const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST, 'grep "a  b" x')}\n\n${ran(HEAD, 'grep "a b" x')}`) });
+  assert.deepEqual(result.problems, [afterHead(`Ran at ${FIRST.slice(0, 12)}:`)]);
+});
+
+test('an older entry that names no command cannot be shown re-run', async () => {
+  const line = `Green at ${FIRST.slice(0, 12)}: https://github.com/o/r/actions/runs/7`;
+  const result = await check({ ...withLaterChange, body: describe(`${line}\n\n${ran(HEAD)}`) });
+  assert.deepEqual(result.problems, [afterHead(line)]);
 });
 
 test('an entry naming two commits from the PR is ambiguous', async () => {
@@ -333,36 +403,16 @@ test('an entry naming two commits from the PR is ambiguous', async () => {
   ]);
 });
 
-test('an older entry that names no command cannot be shown re-run', async () => {
-  const line = `Green at ${FIRST.slice(0, 12)}: ${RUN}`;
-  const result = await check({ ...withLaterChange, body: describe(`${line}\n\n${ran(HEAD)}`) });
-  assert.deepEqual(result.problems, [staleAfterHead(line)]);
-});
-
 test('a newer run of a different check does not refresh an older entry', async () => {
   const result = await check({
-    body: describe(
-      `Engine regression at ${FIRST.slice(0, 12)}:\n\n\`\`\`\n$ cargo test -p runtime\n1 passed\n\`\`\`\n\n` +
-        `Formatting at ${HEAD.slice(0, 12)}:\n\n\`\`\`\n$ cargo fmt --check\nok\n\`\`\``
-    ),
-    commits: [{ sha: FIRST }, { sha: HEAD }],
-    changes: { [HEAD]: files('crates/runtime/src/lib.rs') },
+    ...withLaterChange,
+    body: describe(`${ran(FIRST, 'cargo test -p runtime')}\n\n${ran(HEAD, 'cargo fmt --check')}`),
   });
-  assert.deepEqual(result.problems, [
-    `"Engine regression at ${FIRST.slice(0, 12)}:" ran at ${FIRST.slice(0, 12)}, but later commits change shipped code: ` +
-      `${HEAD.slice(0, 12)} (crates/runtime/src/lib.rs). Re-run the same command at the head and add its output, or remove the entry.`,
-  ]);
+  assert.deepEqual(result.problems, [afterHead(`Ran at ${FIRST.slice(0, 12)}:`)]);
   assert.equal(result.cited, HEAD);
 });
 
-test('the check warns until ENFORCED_FROM and then fails every PR, however old', async () => {
-  assert.equal(ENFORCED_FROM, '2026-12-07T00:00:00Z');
-  assert.equal((await check({ body: describe(''), now: '2026-12-06T23:59:59Z' })).enforced, false);
-  // A PR opened long before the cutoff is enforced once the cutoff has passed.
-  assert.equal((await check({ body: describe(''), createdAt: '2026-01-01T00:00:00Z', now: ENFORCED_FROM })).enforced, true);
-});
-
-test('past the listed-commit limit, evidence at the head still passes', async () => {
+test('past the listed-commit limit, only evidence naming just the head passes', async () => {
   const commits = Array.from({ length: 250 }, (_, index) => ({ sha: index.toString(16).padStart(40, '0') }));
   commits[249] = { sha: HEAD };
   assert.deepEqual((await check({ body: describe(ran(HEAD)), commits })).problems, []);
@@ -370,6 +420,14 @@ test('past the listed-commit limit, evidence at the head still passes', async ()
   assert.deepEqual(older.problems, [
     `"Ran at ${commits[10].sha.slice(0, 12)}:" ran at ${commits[10].sha.slice(0, 12)}, but the PR has 250 or more commits, ` +
       `past what GitHub lists, so only evidence at the head (${HEAD.slice(0, 12)}) can be shown current.`,
+  ]);
+  // A commit GitHub left out of the list is kept, not dropped, so it cannot make an older run read as the head's.
+  const omitted = 'c0ffee'.padEnd(40, '0');
+  const line = `Ran at ${omitted.slice(0, 12)} (head ${HEAD.slice(0, 12)}):`;
+  const mixed = await check({ body: describe(`${line}\n\n\`\`\`\n$ make test\nok\n\`\`\``), commits });
+  assert.deepEqual(mixed.problems, [
+    `"${line}" names ${omitted.slice(0, 12)}, which GitHub does not list for this PR (it lists 250 commits at most): ` +
+      `name only the head, ${HEAD.slice(0, 12)}.`,
   ]);
 });
 
@@ -406,21 +464,20 @@ const repoHead = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }
 const actionsEnv = {
   ...process.env,
   GITHUB_SERVER_URL: 'https://github.com',
-  GITHUB_REPOSITORY: 'spiceai/spiceai',
+  GITHUB_REPOSITORY: 'o/r',
   GITHUB_RUN_ID: '123',
 };
+const botEntry = (sha, command) =>
+  `Generated at ${sha.slice(0, 12)} by https://github.com/o/r/actions/runs/123:\n\n\`\`\`\n$ ${command}\ncommitted ${sha.slice(0, 12)}\n\`\`\`\n`;
 
-test('the section bot_pr_evidence.sh writes passes the check', async () => {
-  const section = execFileSync('bash', [HELPER, 'section', 'the snapshot update in this workflow run'], {
+test('the section bot_pr_evidence.sh writes passes the check, on its fenced output', async () => {
+  const section = execFileSync('bash', [HELPER, 'section', 'testoperator run bench tpch sf1 federated/x.yaml'], {
     encoding: 'utf8',
     env: actionsEnv,
   });
-  assert.equal(
-    section,
-    `## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by \`the snapshot update in this workflow run\`: ` +
-      'https://github.com/spiceai/spiceai/actions/runs/123\n'
-  );
-  const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }] });
+  assert.equal(section, `## 🧪 Evidence\n\n${botEntry(repoHead, 'testoperator run bench tpch sf1 federated/x.yaml')}`);
+  // The run ran at the commit it was dispatched on, not the generated one, so the fence is the output.
+  const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }], runs: { 123: BASE } });
   assert.deepEqual(result.problems, []);
 });
 
@@ -429,7 +486,7 @@ test('the section bot_pr_evidence.sh writes passes the check', async () => {
  * a file. `overwrites` edits are undone right after they land, as a concurrent
  * writer working from an older read would. Returns { body, status, stderr }.
  */
-function runUpdate(body, what, { sha = repoHead, overwrites = 0 } = {}) {
+function runUpdate(body, command, { sha = repoHead, overwrites = 0 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
     writeFileSync(join(dir, 'body.md'), body);
@@ -447,7 +504,7 @@ function runUpdate(body, what, { sha = repoHead, overwrites = 0 } = {}) {
     writeFileSync(join(dir, 'git'), `#!/usr/bin/env bash\necho ${sha}\n`);
     chmodSync(join(dir, 'gh'), 0o755);
     chmodSync(join(dir, 'git'), 0o755);
-    const result = spawnSync('bash', [HELPER, 'update', '7', what], {
+    const result = spawnSync('bash', [HELPER, 'update', '7', command], {
       encoding: 'utf8',
       env: { ...actionsEnv, PATH: `${dir}:${process.env.PATH}`, EVIDENCE_RECHECK_DELAY: '0' },
     });
@@ -456,40 +513,15 @@ function runUpdate(body, what, { sha = repoHead, overwrites = 0 } = {}) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
-const updateBody = (body, what, sha) => {
-  const { body: edited, status, stderr } = runUpdate(body, what, { sha });
-  assert.equal(status, 0, stderr);
-  return edited;
-};
 
-test('bot_pr_evidence.sh update puts back an entry a concurrent update dropped', () => {
-  const { body, status, stderr } = runUpdate('Automated update.', 'the benchmark run for tpch on a.yaml', { overwrites: 2 });
-  assert.equal(status, 0, stderr);
-  assert.match(stderr, /missing from 7 after a concurrent update; adding it again\./);
-  assert.match(body, /Generated at [0-9a-f]{12} by `the benchmark run for tpch on a\.yaml`/);
-});
-
-test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
-  const { body, status, stderr } = runUpdate('Automated update.', 'the benchmark run for tpch on a.yaml', { overwrites: 99 });
-  assert.equal(status, 1);
-  assert.match(stderr, /could not be kept in 7's description; add it by hand: Generated at/);
-  assert.equal(body, 'Automated update.');
-});
-
-test('bot_pr_evidence.sh update adds an entry and keeps every earlier entry and section', async () => {
-  const run1 = 'https://github.com/spiceai/spiceai/actions/runs/1';
+test('bot_pr_evidence.sh update replaces the section and keeps every other part of the description', async () => {
+  const command = 'testoperator run schema tpch/sf1/x.yaml';
   const body =
-    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${FIRST.slice(0, 12)} by \`the schema snapshot run\`: ${run1}\n\n` +
-    '```\n## printed by the run, not a heading\n```\n\n# Release notes\n\nKeep me.';
-  const edited = updateBody(body, 'the schema snapshot run', SECOND);
-  assert.equal(
-    edited,
-    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${FIRST.slice(0, 12)} by \`the schema snapshot run\`: ${run1}\n\n` +
-      '```\n## printed by the run, not a heading\n```\n\n' +
-      `Generated at ${SECOND.slice(0, 12)} by \`the schema snapshot run\`: https://github.com/spiceai/spiceai/actions/runs/123\n\n` +
-      '# Release notes\n\nKeep me.\n'
-  );
-  // The older entry ran the same generation, so the newer one keeps it current.
+    `Automated update.\n\n## 🧪 Evidence\n\n${botEntry(FIRST, command)}\n` +
+    '```\n## printed by an earlier run, not a heading\n```\n\n# Release notes\n\nKeep me.';
+  const { body: edited, status, stderr } = runUpdate(body, command, { sha: SECOND });
+  assert.equal(status, 0, stderr);
+  assert.equal(edited, `Automated update.\n\n## 🧪 Evidence\n\n${botEntry(SECOND, command)}\n# Release notes\n\nKeep me.\n`);
   const result = await check({
     body: edited,
     commits: [{ sha: FIRST }, { sha: SECOND }],
@@ -499,11 +531,41 @@ test('bot_pr_evidence.sh update adds an entry and keeps every earlier entry and 
 });
 
 test('bot_pr_evidence.sh update adds the section to a description without one', () => {
-  assert.equal(
-    updateBody('Automated update.', 'the benchmark run'),
-    `Automated update.\n\n## 🧪 Evidence\n\nGenerated at ${repoHead.slice(0, 12)} by \`the benchmark run\`: ` +
-      'https://github.com/spiceai/spiceai/actions/runs/123\n'
-  );
+  const { body, status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml');
+  assert.equal(status, 0, stderr);
+  assert.equal(body, `Automated update.\n\n## 🧪 Evidence\n\n${botEntry(repoHead, 'testoperator run bench tpch sf1 a.yaml')}`);
+});
+
+test('bot_pr_evidence.sh update writes again after a concurrent update replaced its entry', () => {
+  const { body, status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml', { overwrites: 2 });
+  assert.equal(status, 0, stderr);
+  assert.match(stderr, /missing from 7 after a concurrent update; writing it again\./);
+  assert.match(body, /^Generated at [0-9a-f]{12} by https:\/\/github\.com\/o\/r\/actions\/runs\/123:$/m);
+});
+
+test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
+  const { body, status, stderr } = runUpdate('Automated update.', 'testoperator run bench tpch sf1 a.yaml', { overwrites: 99 });
+  assert.equal(status, 1);
+  assert.match(stderr, /could not be kept in 7's description; add it by hand: Generated at/);
+  assert.equal(body, 'Automated update.');
+});
+
+// One PR per workload is what lets the helper replace the section: a branch shared
+// by workloads would mix their evidence, and one workload's commit would make
+// another's entry stale. The snapshot workflows key the branch and name the
+// evidence on the same workload string.
+test('snapshot workflows key each branch, and its evidence, on one workload', () => {
+  const read = (name) => readFileSync(fileURLToPath(new URL(`../workflows/${name}`, import.meta.url)), 'utf8');
+  const bench = read('testoperator_run_bench.yml');
+  assert.match(bench, /^\s*BASE_BRANCH="testoperator-snapshot-update\/\$\{BRANCH_ID\}-\$\{WORKLOAD_KEY\}"$/m);
+  assert.match(bench, /WORKLOAD_KEY="\$\(printf '%s' "\$\{WORKLOAD\}" \| git hash-object --stdin/);
+  assert.equal((bench.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator run bench \$\{WORKLOAD\}"/g) ?? []).length, 2);
+  const cluster = read('testoperator_run_cluster_bench.yml');
+  assert.match(cluster, /^\s*BRANCH_NAME="testoperator-cluster-snapshot-update\/\$\{BRANCH_ID\}-\$\{slug\}-\$\{WORKLOAD_KEY\}"$/m);
+  assert.equal((cluster.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator cluster bench \$\{WORKLOAD\}"/g) ?? []).length, 2);
+  const schema = read('testoperator_run_schema.yml');
+  assert.match(schema, /^\s*BRANCH_NAME="testoperator-snapshot-update\/\$\{SLUG\}"$/m);
+  assert.equal((schema.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator run schema \$\{\{ github\.event\.inputs\.spicepod_path \}\}"/g) ?? []).length, 2);
 });
 
 await runAll();

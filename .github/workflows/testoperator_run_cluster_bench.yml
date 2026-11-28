@@ -649,7 +649,12 @@ jobs:
           # Sanitize the spicepod path for use in the branch name (slashes/
           # brackets aren't great ref characters).
           slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
-          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}"
+          # One branch per workload (query set, scale and Spicepod), named in the PR's
+          # evidence the same way, so another workload's snapshots never make it
+          # stale (.github/scripts/pr_evidence.mjs).
+          WORKLOAD="${CB_QUERY_SET} sf${CB_SCALE_FACTOR} ${CB_SPICEPOD_PATH}"
+          WORKLOAD_KEY="$(printf '%s' "${WORKLOAD}" | git hash-object --stdin | cut -c1-8)"
+          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}-${WORKLOAD_KEY}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
@@ -693,7 +698,7 @@ jobs:
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
             # Before the held runs are released, so Attestation reads the new evidence.
-            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "the cluster benchmark snapshot run for ${CB_QUERY_SET} sf${CB_SCALE_FACTOR} on ${CB_SPICEPOD_PATH}"
+            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "testoperator cluster bench ${WORKLOAD}"
             # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
@@ -783,7 +788,7 @@ jobs:
           } > "${body_file}"
           # Attestation checks the description's Evidence section (.github/scripts/pr_evidence.mjs).
           printf '\n' >> "${body_file}"
-          bash .github/scripts/bot_pr_evidence.sh section "the cluster benchmark snapshot run for ${CB_QUERY_SET} sf${CB_SCALE_FACTOR} on ${CB_SPICEPOD_PATH}" >> "${body_file}"
+          bash .github/scripts/bot_pr_evidence.sh section "testoperator cluster bench ${WORKLOAD}" >> "${body_file}"
 
           # Title carries the same summary that's in the commit message — short
           # but specifies cluster-bench, file counts, spicepod, and query set
