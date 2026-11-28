@@ -20,9 +20,23 @@ limitations under the License.
 //! The table's data is flat: its data files sit directly under the table's
 //! directory (`<write_id>_<n>.vortex`), its deletion vectors under
 //! `deletions/`, a staged write in `_staging/<id>/`, and the lookup index in
-//! `_lookup_index/`, which this sweep never touches.
+//! `_lookup_index/`, whose run files follow their own rule: the sweep retires
+//! a run file no run is registered for only once a data file it covers is
+//! gone, since a run's name is derived from the files it covers and the same
+//! run built again reuses it. That reclaims the run files no index sync
+//! reconsiders (a removed index's, an idle table's).
 //!
-//! A listed object is deleted only when all of these hold:
+//! The sweep deletes nothing itself. It retires what it finds, in one commit
+//! of a `RetireFiles` record through the dataset's log, and the retirement
+//! sweep deletes those objects after the retention, as it does every retired
+//! file. The judgment that an object is unnamed comes from this process's view
+//! of the table; the commit is what licenses acting on it. It goes through the
+//! log's fenced publication, so an instance another has taken writing the
+//! dataset over from, whose view predates the new writer's commits, is refused
+//! and retires nothing, however its clock or lease deadline reads. An object a
+//! commit makes live in the meantime is left out of the record.
+//!
+//! A listed object is retired only when all of these hold:
 //!
 //! - no committed entry of the table names it, live or retired: a flat data
 //!   file by its key (the manifest rows of every snapshot, and the retirement
@@ -49,16 +63,15 @@ limitations under the License.
 //! The sweep runs when the table opens, so the objects a write that crashed or
 //! was fenced left behind are reclaimed even if the table is never written
 //! again, and then at most every [`ORPHAN_SWEEP_INTERVAL`], after a commit or on
-//! the background maintenance tick. It deletes in batched requests
-//! ([`crate::dataset_storage::delete_in_batches`]) and counts what it reclaimed
-//! under `op="orphan_file_sweep"`.
+//! the background maintenance tick. The retirement sweep deletes what it
+//! retired in batched requests and counts it under `op="orphan_file_sweep"`.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 /// How old an unnamed object must be, on the store's clock, before the orphan
-/// sweep deletes it. Far above the longest upload and commit resolution a
+/// sweep retires it. Far above the longest upload and commit resolution a
 /// writer takes; a write still in progress in this process is protected
 /// whatever its age.
 pub(crate) const ORPHAN_AGE_FLOOR: Duration = Duration::from_hours(1);
@@ -71,15 +84,19 @@ pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_mins(15);
 pub struct OrphanSweep {
     /// Why the sweep did not run, when it did not.
     pub skipped: Option<&'static str>,
-    /// Objects deleted, as keys under the table's prefix.
-    pub deleted: Vec<String>,
+    /// Objects retired, by the keys the retirement record names them by: a
+    /// data or staged file relative to the table's directory, a deletion vector
+    /// relative to the data path (`<table>/deletions/<file>`). The retirement
+    /// sweep deletes them after the retention.
+    pub retired: Vec<String>,
+    /// Lookup-index run files no run is registered for that were retired,
+    /// because a data file they cover is gone, by their keys relative to the
+    /// table's directory.
+    pub retired_index_runs: Vec<String>,
     /// Unnamed objects kept because they are younger than the floor.
     pub kept_young: usize,
     /// Unnamed objects kept because a write in this process holds them.
     pub kept_in_flight: usize,
-    /// Objects the sweep tried to delete that may still be stored; the next
-    /// sweep retries them.
-    pub failed: usize,
 }
 
 /// Where a listed object sits, relative to the table's prefix.

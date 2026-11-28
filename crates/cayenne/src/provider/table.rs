@@ -3801,6 +3801,12 @@ pub struct CayenneTableProvider {
     orphan_age_floor_ms: Arc<AtomicU64>,
     /// When the orphan sweep last ran, or the table opened.
     last_orphan_sweep: Arc<ParkingMutex<Instant>>,
+    /// What the orphan sweep read of each unregistered lookup-index run file,
+    /// by its key relative to the table's directory: the object's size and
+    /// modification time when read, and the data files it covers, or `None`
+    /// for one that could not be read as a run. An entry is used only while
+    /// the object is unchanged: a rebuilt run rewrites its file.
+    index_run_covers: Arc<ParkingMutex<HashMap<String, IndexRunCovers>>>,
     /// Held by the orphan sweep while it runs, from when it is scheduled: one
     /// runs at a time, and [`Self::sweep_orphan_files_now`] and
     /// [`Self::drain_in_flight_maintenance`] wait for a scheduled one.
@@ -3863,6 +3869,11 @@ pub struct CayenneTableProvider {
     /// In memory: a restart or a takeover observes every file again, which only
     /// delays its deletion.
     retired_file_timers: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Retired file key → size, for the objects this process's orphan sweep
+    /// retired, so the retirement sweep counts their deletion under the orphan
+    /// sweep's operation. In memory: after a restart they count under the
+    /// retirement sweep's.
+    retired_orphan_sizes: Arc<ParkingMutex<HashMap<String, u64>>>,
     /// Bumped by every retirement into `retired_snapshot_dirs`, so the follow-up
     /// sweep knows to keep going for directories retired while it runs.
     retired_snapshot_generation: Arc<AtomicU64>,
@@ -4339,6 +4350,14 @@ struct CayenneTableProviderOpenOptions {
     existed: bool,
 }
 
+/// What the orphan sweep read of an unregistered lookup-index run file.
+#[derive(Clone, Debug)]
+struct IndexRunCovers {
+    size: u64,
+    modified: chrono::DateTime<chrono::Utc>,
+    files: Option<Vec<String>>,
+}
+
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
 /// ref-counts, each directory's last listing time, and the retired-directory
 /// ledger. A reload opens its replacement provider over the replaced provider's
@@ -4350,6 +4369,11 @@ pub struct SnapshotDirPins {
     last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
     retired_files: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    retired_orphans: Arc<ParkingMutex<HashMap<String, u64>>>,
+    /// The files the table's writes have uploaded and no commit names yet,
+    /// shared with a provider opened over these pins: a replaced provider's
+    /// writes may still be in flight, and the new one's sweeps must see them.
+    uncommitted: Arc<super::uncommitted_files::UncommittedFiles>,
 }
 
 impl SnapshotDirPins {
@@ -4360,6 +4384,8 @@ impl SnapshotDirPins {
             && Arc::ptr_eq(&self.last_listed, &other.last_listed)
             && Arc::ptr_eq(&self.retired, &other.retired)
             && Arc::ptr_eq(&self.retired_files, &other.retired_files)
+            && Arc::ptr_eq(&self.retired_orphans, &other.retired_orphans)
+            && Arc::ptr_eq(&self.uncommitted, &other.uncommitted)
     }
 }
 
@@ -9046,6 +9072,8 @@ impl CayenneTableProvider {
             last_listed: Arc::clone(&self.snapshot_last_listed),
             retired: Arc::clone(&self.retired_snapshot_dirs),
             retired_files: Arc::clone(&self.retired_file_timers),
+            retired_orphans: Arc::clone(&self.retired_orphan_sizes),
+            uncommitted: Arc::clone(&self.uncommitted_files),
         }
     }
 
@@ -10730,22 +10758,39 @@ impl CayenneTableProvider {
             })
             .collect();
         let mut reclaimed = RetiredDirReclaim::default();
+        // Objects the orphan sweep retired count under its own operation.
+        let mut orphans_reclaimed = RetiredDirReclaim::default();
         let mut failed = 0_u64;
         for batch in due.chunks(crate::dataset_storage::DELETE_BATCH) {
-            let objects: Vec<(ObjectStorePath, u64)> = batch
-                .iter()
-                .map(|key| {
-                    (
-                        Self::retired_file_location(&table_root, key),
-                        sizes.get(key).copied().unwrap_or(0),
-                    )
-                })
-                .collect();
-            let (deleted, outcome) = self
-                .delete_sized_counted(&store, objects, "delete a retired file")
-                .await;
-            reclaimed.files = reclaimed.files.saturating_add(deleted.files);
-            reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+            let mut orphans: Vec<(ObjectStorePath, u64)> = Vec::new();
+            let mut retired: Vec<(ObjectStorePath, u64)> = Vec::new();
+            {
+                let orphan_sizes = self.retired_orphan_sizes.lock();
+                for key in batch {
+                    let location = Self::retired_file_location(&table_root, key);
+                    match orphan_sizes.get(key.as_str()) {
+                        Some(size) => orphans.push((location, *size)),
+                        None => retired.push((location, sizes.get(key).copied().unwrap_or(0))),
+                    }
+                }
+            }
+            let mut outcome = Ok(());
+            if !orphans.is_empty() {
+                let (deleted, result) = self
+                    .delete_sized_counted(&store, orphans, "delete a retired file")
+                    .await;
+                orphans_reclaimed.files = orphans_reclaimed.files.saturating_add(deleted.files);
+                orphans_reclaimed.bytes = orphans_reclaimed.bytes.saturating_add(deleted.bytes);
+                outcome = result;
+            }
+            if !retired.is_empty() {
+                let (deleted, result) = self
+                    .delete_sized_counted(&store, retired, "delete a retired file")
+                    .await;
+                reclaimed.files = reclaimed.files.saturating_add(deleted.files);
+                reclaimed.bytes = reclaimed.bytes.saturating_add(deleted.bytes);
+                outcome = outcome.and(result);
+            }
             if let Err(error) = outcome {
                 failed = failed.saturating_add(1);
                 tracing::warn!(
@@ -10761,6 +10806,11 @@ impl CayenneTableProvider {
                     let mut timers = self.retired_file_timers.lock();
                     for key in batch {
                         timers.remove(key);
+                    }
+                    drop(timers);
+                    let mut orphans = self.retired_orphan_sizes.lock();
+                    for key in batch {
+                        orphans.remove(key);
                     }
                 }
                 // A transaction reserves the table: the files are gone, and a
@@ -10780,7 +10830,11 @@ impl CayenneTableProvider {
         maintenance_metrics::track_maintenance(
             table_name,
             MaintenanceOp::RetiredDirSweep,
-            retired_dir_sweep_outcome(reclaimed.files, 0, failed),
+            retired_dir_sweep_outcome(
+                reclaimed.files.saturating_add(orphans_reclaimed.files),
+                0,
+                failed,
+            ),
         );
         if reclaimed.files > 0 {
             maintenance_metrics::track_reclaimed(
@@ -10788,6 +10842,15 @@ impl CayenneTableProvider {
                 MaintenanceOp::RetiredDirSweep,
                 reclaimed.files,
                 reclaimed.bytes,
+                0,
+            );
+        }
+        if orphans_reclaimed.files > 0 {
+            maintenance_metrics::track_reclaimed(
+                table_name,
+                MaintenanceOp::OrphanFileSweep,
+                orphans_reclaimed.files,
+                orphans_reclaimed.bytes,
                 0,
             );
         }
@@ -12404,8 +12467,11 @@ impl CayenneTableProvider {
 
         // The files this table's writers put in its storage and no commit names
         // yet (see `super::uncommitted_files`), shared with its storage for the
-        // deletion vectors written through it.
-        let uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles> = Arc::default();
+        // deletion vectors written through it, and with the provider this one
+        // replaces, whose writes may still be in flight.
+        let uncommitted_files: Arc<super::uncommitted_files::UncommittedFiles> = snapshot_dir_pins
+            .as_ref()
+            .map_or_else(Arc::default, |pins| Arc::clone(&pins.uncommitted));
         // A table whose data path is an object-store URL reads and writes through
         // its own store, under a URL of its own (see `crate::dataset_storage`).
         // A `file://` table given no store (the `cayenne_vnext` flag off) keeps the
@@ -12918,12 +12984,14 @@ impl CayenneTableProvider {
                     .unwrap_or(u64::MAX),
             )),
             last_orphan_sweep: Arc::new(ParkingMutex::new(Instant::now())),
+            index_run_covers: Arc::new(ParkingMutex::new(HashMap::new())),
             orphan_sweep_running: Arc::new(tokio::sync::Mutex::new(())),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             staging_deletes_after_commit: Arc::new(ParkingMutex::new(HashSet::new())),
             append_admission: Arc::new(tokio::sync::RwLock::new(())),
             retired_snapshot_dirs: snapshot_dir_pins.retired,
             retired_file_timers: snapshot_dir_pins.retired_files,
+            retired_orphan_sizes: snapshot_dir_pins.retired_orphans,
             snapshot_last_listed: snapshot_dir_pins.last_listed,
             snapshot_scan_refs: snapshot_dir_pins.scan_refs,
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
@@ -13141,6 +13209,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id.clone(),
                 url.prefix().clone(),
                 url.to_string(),
+                Arc::clone(&self.uncommitted_files),
             )
             .await;
             return;
@@ -13179,6 +13248,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_id.clone(),
                 &url,
                 live,
+                Arc::clone(&self.uncommitted_files),
             )
             .await;
     }
@@ -15469,12 +15539,14 @@ impl CayenneTableProvider {
             uncommitted_files: Arc::clone(&self.uncommitted_files),
             orphan_age_floor_ms: Arc::clone(&self.orphan_age_floor_ms),
             last_orphan_sweep: Arc::clone(&self.last_orphan_sweep),
+            index_run_covers: Arc::clone(&self.index_run_covers),
             orphan_sweep_running: Arc::clone(&self.orphan_sweep_running),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             staging_deletes_after_commit: Arc::clone(&self.staging_deletes_after_commit),
             append_admission: Arc::clone(&self.append_admission),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             retired_file_timers: Arc::clone(&self.retired_file_timers),
+            retired_orphan_sizes: Arc::clone(&self.retired_orphan_sizes),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             snapshot_scan_refs: Arc::clone(&self.snapshot_scan_refs),
             position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
@@ -25557,8 +25629,9 @@ impl CayenneTableProvider {
         let result = self.sweep_orphan_files(floor).await;
         let outcome = match &result {
             Ok(report) if report.skipped.is_some() => None,
-            Ok(report) if report.failed > 0 => Some(MaintenanceOutcome::Failed),
-            Ok(report) if !report.deleted.is_empty() => Some(MaintenanceOutcome::Reclaimed),
+            // Retiring returns no space itself: the retirement sweep deletes the
+            // objects later and counts them under this operation.
+            Ok(report) if !report.retired.is_empty() => Some(MaintenanceOutcome::Applied),
             Ok(_) => Some(MaintenanceOutcome::NoOp),
             Err(_) => Some(MaintenanceOutcome::Failed),
         };
@@ -25573,9 +25646,9 @@ impl CayenneTableProvider {
     }
 
     /// Run the orphan sweep ([`super::orphan_sweep`]) with the age floor
-    /// `floor`: delete what a listing of the table finds that no snapshot names,
-    /// no write of this process holds, and the store dates older than the floor,
-    /// in batched requests.
+    /// `floor`: retire, in one commit, what a listing of the table finds that no
+    /// snapshot names, no write of this process holds, and the store dates older
+    /// than the floor; the retirement sweep deletes it after the retention.
     /// Nothing listed is ever adopted. The caller holds `orphan_sweep_running`.
     ///
     /// # Errors
@@ -25736,60 +25809,178 @@ impl CayenneTableProvider {
                     report.kept_young += 1;
                     continue;
                 }
-                doomed.push((meta.location.clone(), meta.size));
+                // The key the retirement record names it by: a deletion
+                // vector's is relative to the data path, beside the table's
+                // directory; every other object's is relative to the table's.
+                let retired_key = if matches!(placement(key), Placement::Deletion { .. }) {
+                    format!("{table_id}/{key}")
+                } else {
+                    key.to_string()
+                };
+                doomed.push((retired_key, meta.size));
             }
             doomed
         };
-        let sizes: HashMap<ObjectStorePath, u64> = doomed.iter().cloned().collect();
-        let outcome = crate::dataset_storage::delete_in_batches(
-            &store,
-            doomed.into_iter().map(|(location, _)| location).collect(),
-        )
-        .await;
-        report.failed = outcome.failed;
-        if outcome.failed > 0 {
+        report.retired_index_runs = self
+            .retire_unregistered_index_runs(native, &table_id, &table_prefix, &objects)
+            .await?;
+        if doomed.is_empty() {
+            return Ok(report);
+        }
+        // Retire them in one commit instead of deleting them: the retirement
+        // sweep deletes them after the retention, as it does every retired
+        // file. The commit goes through the table's fenced log, so an instance
+        // that another has taken writing over from, and whose view of the
+        // table is therefore stale, retires nothing and deletes nothing.
+        let keys: Vec<String> = doomed.iter().map(|(key, _)| key.clone()).collect();
+        let Some(retired) = native
+            .retire_orphans(&table_id, &keys)
+            .await
+            .map_err(|source| Error::Catalog { source })?
+        else {
+            report.skipped = Some("the table's retired snapshots are not settled");
+            return Ok(report);
+        };
+        if !retired.is_empty() {
+            let sizes: HashMap<&str, u64> = doomed
+                .iter()
+                .map(|(key, size)| (key.as_str(), *size))
+                .collect();
+            let mut orphans = self.retired_orphan_sizes.lock();
+            for key in &retired {
+                orphans.insert(key.clone(), sizes.get(key.as_str()).copied().unwrap_or(0));
+            }
+            drop(orphans);
+            // Their retention starts with the commit that retired them, and the
+            // retirement sweep runs once it has passed, even if the table is
+            // never written again.
+            let now = Instant::now();
+            let mut timers = self.retired_file_timers.lock();
+            for key in &retired {
+                timers.entry(key.clone()).or_insert(now);
+            }
+            drop(timers);
+            self.follow_up_retired_snapshot_dirs(crate::metastore_layout::DATA_FILE_RETENTION);
             tracing::debug!(
                 table = self.table_name(),
-                failed = outcome.failed,
-                error = ?outcome.first_error,
-                "The orphan sweep could not delete some unreferenced objects; the next sweep retries them"
+                retired = retired.len(),
+                "The orphan sweep retired objects no snapshot of the table names; the retirement sweep deletes them after the retention"
             );
         }
-        let reclaimed_bytes = outcome
-            .deleted
-            .iter()
-            .map(|location| sizes.get(location).copied().unwrap_or(0))
-            .fold(0_u64, u64::saturating_add);
-        if !outcome.deleted.is_empty() {
-            maintenance_metrics::track_reclaimed(
-                self.table_name(),
-                MaintenanceOp::OrphanFileSweep,
-                u64::try_from(outcome.deleted.len()).unwrap_or(u64::MAX),
-                reclaimed_bytes,
-                0,
-            );
-        }
-        // An object already gone is reported deleted, and reclaims nothing.
-        report.deleted = outcome
-            .deleted
-            .iter()
-            .chain(&outcome.missing)
-            .map(|location| {
-                crate::object_relative(&table_prefix, location)
-                    .unwrap_or(location.as_ref())
-                    .to_string()
-            })
-            .collect();
-        report.deleted.sort();
-
-        if !report.deleted.is_empty() {
-            tracing::debug!(
-                table = self.table_name(),
-                deleted = report.deleted.len(),
-                "The orphan sweep reclaimed objects no snapshot of the table names"
-            );
-        }
+        report.retired = retired;
         Ok(report)
+    }
+
+    /// Retire the lookup-index run files under the table's directory that no
+    /// run is registered for and that cover a data file that is gone, as the
+    /// lookup index itself does ([`super::lookup_index`]): a run's name is
+    /// derived from the files it covers, so only once one is gone can the name
+    /// never be registered again and its file be deleted. Covers the run files
+    /// no index sync reconsiders: those of a removed index, and of a table no
+    /// longer written. Returns the keys retired.
+    async fn retire_unregistered_index_runs(
+        &self,
+        native: &crate::metastore::object_native::ObjectNativeCatalog,
+        table_id: &str,
+        table_prefix: &ObjectStorePath,
+        objects: &[ObjectMeta],
+    ) -> Result<Vec<String>> {
+        let registered: HashSet<(String, String)> = self
+            .catalog
+            .list_index_runs(table_id)
+            .await?
+            .into_iter()
+            .map(|run| (run.index_key, run.run_name))
+            .collect();
+        let config = self.require_object_store()?;
+        let mut listed: HashSet<String> = HashSet::new();
+        let mut retired = Vec::new();
+        for meta in objects {
+            let Some(relative) = crate::object_relative(table_prefix, &meta.location) else {
+                continue;
+            };
+            let mut parts = relative.split('/');
+            let (Some(dir), Some(key), Some(name), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let is_run = std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "run");
+            if dir != super::constants::LOOKUP_INDEX_DIR_NAME || !is_run {
+                continue;
+            }
+            listed.insert(relative.to_string());
+            if registered.contains(&(key.to_string(), name.to_string())) {
+                continue;
+            }
+            let known = self
+                .index_run_covers
+                .lock()
+                .get(relative)
+                .filter(|known| known.size == meta.size && known.modified == meta.last_modified)
+                .map(|known| known.files.clone());
+            let described = if let Some(described) = known {
+                described
+            } else {
+                // A read that fails now is tried again by the next sweep.
+                let Ok(described) = super::lookup_index::describe_run_file(
+                    config.store.as_ref(),
+                    &meta.location,
+                    name,
+                )
+                .await
+                else {
+                    continue;
+                };
+                self.index_run_covers.lock().insert(
+                    relative.to_string(),
+                    IndexRunCovers {
+                        size: meta.size,
+                        modified: meta.last_modified,
+                        files: described.clone(),
+                    },
+                );
+                described
+            };
+            // A file that cannot be read as a run is left, and not read again.
+            let Some(files) = described else {
+                continue;
+            };
+            let held = self.uncommitted_files.held_keys();
+            if native
+                .retire_index_run(table_id, key, name, &files, relative, &held)
+                .await
+                .map_err(|source| Error::Catalog { source })?
+            {
+                retired.push(relative.to_string());
+            }
+        }
+        self.index_run_covers
+            .lock()
+            .retain(|key, _| listed.contains(key));
+        // Every retired run file's retention runs from now if it is not
+        // running already, and the retirement sweep is scheduled to delete
+        // them: the index's own retirements included, on a table no later
+        // write reconsiders.
+        if let Some(keys) = self.catalog.retired_files(table_id).await? {
+            let pending: Vec<String> = keys
+                .into_iter()
+                .filter(|key| key.starts_with(super::constants::LOOKUP_INDEX_DIR_NAME))
+                .collect();
+            if !pending.is_empty() {
+                let now = Instant::now();
+                let mut timers = self.retired_file_timers.lock();
+                for key in pending {
+                    timers.entry(key).or_insert(now);
+                }
+                drop(timers);
+                self.follow_up_retired_snapshot_dirs(crate::metastore_layout::DATA_FILE_RETENTION);
+            }
+        }
+        retired.sort();
+        Ok(retired)
     }
 
     /// Run the orphan sweep in the background when it is due: after a commit or
@@ -90510,6 +90701,7 @@ mod tests {
     }
 
     mod layered_upsert_state;
+    mod object_native_index_run_reload;
     mod object_native_scan_consistency;
     mod repeated_keys;
     mod scan_deletes_across_compaction;

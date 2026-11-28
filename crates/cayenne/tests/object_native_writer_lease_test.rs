@@ -26,12 +26,13 @@ use cayenne::metadata::{CreateTableOptions, ObjectStoreConfig, VortexConfig};
 use cayenne::metastore::object_native::{
     Access, LeaseSettings, NativeCatalogConfig, ObjectNativeCatalog,
 };
-use cayenne::{CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use object_store_sim::Op;
 use object_store_sim::fault::FaultStore;
 
@@ -556,4 +557,1009 @@ async fn a_writer_whose_lease_requests_recover_writes_again() {
         }
     }
     assert_eq!(a.count_and_sum().await, expected(1..=200));
+}
+
+/// The same takeover, but A's own clock stood still while B wrote for two
+/// hours of store time, as a suspended VM's or a sleeping laptop's monotonic
+/// clock does: on A's clock its lease has not lapsed, so its write gate is
+/// still open. A's orphan sweep, which judges unnamed from A's view of the
+/// table, predates every commit of B; that judgment alone must delete nothing.
+/// The sweep retires through A's fenced log, which refuses it, and A's
+/// retirement sweep deletes only what a commit retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_whose_clock_stood_still_deletes_nothing_its_successor_commits() {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let a_table = Arc::new(
+        a.builder(&a.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: a.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let data_url = a.data_url.clone();
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+
+    let b = Instance::start(&objects, "b", LEASE).await;
+    b.open_table(&data_url).await;
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    b.insert_once_writer(&data_url, 101, 200).await;
+    clock.advance_clock(Duration::from_hours(2));
+    b.insert(201, 300).await.expect("B writes again");
+    assert_eq!(b.count_and_sum().await, expected(1..=300), "B took over");
+
+    // A resumes: on its own clock its lease's deadline is still ahead.
+    let gate = a.catalog.data_write_gate(&table_id);
+    gate.hold_until(Instant::now() + Duration::from_hours(3));
+    assert!(gate.allows(), "A's write gate is open, as its clock says");
+
+    let swept = a_table
+        .sweep_orphan_files_now()
+        .await
+        .expect_err("A's orphan sweep is refused after the takeover");
+    assert!(
+        swept
+            .to_string()
+            .contains("is now written by another instance"),
+        "{swept}"
+    );
+    a_table.reclaim_retired_snapshots_now().await;
+
+    let mut missing = Vec::new();
+    for request in b.requests.log() {
+        if request.op == Op::MultipartComplete
+            && request.path.as_ref().ends_with(".vortex")
+            && objects.head(&request.path).await.is_err()
+        {
+            missing.push(request.path.to_string());
+        }
+    }
+    assert_eq!(
+        missing,
+        Vec::<String>::new(),
+        "B's committed data files are all still stored"
+    );
+    // A third instance, with nothing cached, reads every row B committed.
+    let c = Instance::start(&objects, "c", LEASE).await;
+    c.open_table(&data_url).await;
+    let rows = c
+        .ctx
+        .sql(&format!(
+            "SELECT count(*), coalesce(sum(v), 0) FROM (SELECT id, v FROM {TABLE} WHERE v >= 0)"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("a fresh instance reads every committed file");
+    let value = |column: usize| {
+        rows[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    assert_eq!((value(0), value(1)), expected(1..=300));
+}
+
+/// A writer is taken over in the middle of a sweep, with its deletes still in
+/// flight: A retired orphans while it held the lease, and its retirement sweep
+/// has sent their deletes, which the network holds. A's lease requests then
+/// fail, B takes over and commits for two hours of store time, and only then
+/// do A's held deletes land. They remove only what A's committed record
+/// retired; A's forget record is refused, so A learns it was fenced and a
+/// later orphan sweep of A's retires nothing; and every file A or B committed
+/// is still stored, so a fresh instance reads every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_taken_over_mid_sweep_with_deletes_in_flight_deletes_nothing_its_successor_commits()
+ {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let a_table = Arc::new(
+        a.builder(&a.data_url)
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: a.data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&a_table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let data_url = a.data_url.clone();
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+
+    // Objects no commit names beside A's data file, as a crashed write leaves
+    // them, then two hours of store time and a commit that dates the head.
+    let table_dir = a
+        .requests
+        .log()
+        .into_iter()
+        .find(|request| {
+            request.op == Op::MultipartComplete && request.path.as_ref().ends_with(".vortex")
+        })
+        .and_then(|request| {
+            request
+                .path
+                .as_ref()
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.to_string())
+        })
+        .expect("A's data file");
+    let orphans: Vec<Path> = (0..3)
+        .map(|i| {
+            Path::from(format!(
+                "{table_dir}/{}_{i:05}.vortex",
+                uuid::Uuid::now_v7().simple()
+            ))
+        })
+        .collect();
+    for orphan in &orphans {
+        objects
+            .put(orphan, PutPayload::from_static(b"orphan"))
+            .await
+            .expect("plant an orphan");
+    }
+    clock.advance_clock(Duration::from_hours(2));
+    a.insert(101, 200).await.expect("A writes again");
+    let retired = a_table
+        .sweep_orphan_files_now()
+        .await
+        .expect("A's orphan sweep");
+    assert_eq!(
+        retired.retired.len(),
+        orphans.len(),
+        "A retired the orphans: {retired:?}"
+    );
+
+    // A's retirement sweep sends their deletes; the first is held in flight,
+    // and the rest of its batch waits behind it.
+    let is_orphan = {
+        let orphans = orphans.clone();
+        move |path: &Path| orphans.contains(path)
+    };
+    a.requests
+        .arm(Op::Delete, is_orphan, object_store_sim::fault::Fault::Hold);
+    let sweeping = {
+        let a_table = Arc::clone(&a_table);
+        tokio::spawn(async move { a_table.reclaim_retired_snapshots_now().await })
+    };
+    let held = tokio::time::timeout(Duration::from_secs(15), a.requests.wait_held(None))
+        .await
+        .expect("A's delete is held in flight");
+    assert!(
+        orphans.iter().all(|orphan| clock
+            .log()
+            .iter()
+            .all(|r| r.path != *orphan || r.op != Op::Delete)),
+        "no delete has landed yet"
+    );
+
+    // B takes over and writes for two hours of store time.
+    let b = Instance::start(&objects, "b", LEASE).await;
+    b.open_table(&data_url).await;
+    let is_lease = |path: &Path| path.as_ref().contains("/leases/");
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests.fail_while(op, is_lease);
+    }
+    b.insert_once_writer(&data_url, 201, 300).await;
+    clock.advance_clock(Duration::from_hours(2));
+    b.insert(301, 400).await.expect("B writes again");
+    assert_eq!(b.count_and_sum().await, expected(1..=400), "B took over");
+
+    // A's deletes in flight land now.
+    a.requests
+        .deliver(held)
+        .await
+        .expect("the held delete lands");
+    a.requests.respond(held).expect("A hears it");
+    tokio::time::timeout(Duration::from_secs(15), sweeping)
+        .await
+        .expect("A's retirement sweep finishes")
+        .expect("join");
+
+    // The sweep's `ForgetRetired` record, sent once its deletes returned, is
+    // refused: A learns it was fenced, even with its lease's deadline ahead on
+    // its own clock, and a later orphan sweep of A's retires nothing.
+    let gate = a.catalog.data_write_gate(&table_id);
+    gate.hold_until(Instant::now() + Duration::from_hours(3));
+    assert!(!gate.allows(), "A learned it no longer writes the dataset");
+    let late = a_table.sweep_orphan_files_now().await;
+    assert!(
+        late.as_ref().map_or(true, |sweep| sweep.retired.is_empty()),
+        "A's late orphan sweep retires nothing: {late:?}"
+    );
+    let landed: Vec<String> = clock
+        .log()
+        .into_iter()
+        .filter(|request| request.op == Op::Delete && request.result.is_ok())
+        .map(|request| request.path.to_string())
+        .collect();
+    let mut deleted_orphans: Vec<&Path> = orphans
+        .iter()
+        .filter(|orphan| landed.iter().any(|path| path == orphan.as_ref()))
+        .collect();
+    deleted_orphans.sort();
+    let mut expected_orphans: Vec<&Path> = orphans.iter().collect();
+    expected_orphans.sort();
+    assert_eq!(
+        deleted_orphans, expected_orphans,
+        "A's in-flight deletes landed after the takeover, on the orphans A retired"
+    );
+
+    let mut missing = Vec::new();
+    for request in a.requests.log().into_iter().chain(b.requests.log()) {
+        if request.op == Op::MultipartComplete
+            && request.path.as_ref().ends_with(".vortex")
+            && objects.head(&request.path).await.is_err()
+        {
+            missing.push(request.path.to_string());
+        }
+    }
+    assert_eq!(
+        missing,
+        Vec::<String>::new(),
+        "every data file A and B committed is still stored"
+    );
+    let c = Instance::start(&objects, "c", LEASE).await;
+    c.open_table(&data_url).await;
+    let rows = c
+        .ctx
+        .sql(&format!(
+            "SELECT count(*), coalesce(sum(v), 0) FROM (SELECT id, v FROM {TABLE} WHERE v >= 0)"
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("a fresh instance reads every committed file");
+    let value = |column: usize| {
+        rows[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .value(0)
+    };
+    assert_eq!((value(0), value(1)), expected(1..=400));
+}
+
+/// A lookup-index run file over `files`, one row each, as an index sync
+/// writes one: its name and bytes.
+fn run_file(files: &[&str]) -> (String, Vec<u8>) {
+    let encoder = key_index::KeyEncoder::new(vec![key_index::KeyField::new(DataType::Int64, true)])
+        .expect("an encoder");
+    let mut builder = key_index::tiered::RunBuilder::new(encoder);
+    for (i, file) in files.iter().enumerate() {
+        let keys: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![
+            i64::try_from(i).expect("a small index"),
+        ]));
+        builder.add_batch(file, 0, &[keys]).expect("index a row");
+    }
+    let run = builder.finish().expect("a run");
+    (run.file_name(), run.to_bytes())
+}
+
+/// A reopens the table, and its load of the persisted lookup-index runs is
+/// paused on a run read. B takes over and persists a run of its own. A's clock
+/// stands still, so its lease's deadline is still ahead, and A's load then
+/// removes the run files that the registered set it read before the pause
+/// does not name. It must not delete the run B registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_index_load_deletes_no_run_its_successor_registers() {
+    let clock = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let objects: Arc<dyn ObjectStore> = Arc::clone(&clock) as Arc<dyn ObjectStore>;
+    let indexed = |builder: CayenneTableProviderBuilder| {
+        builder.with_secondary_indexes(vec![vec!["v".to_string()]])
+    };
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let data_url = a.data_url.clone();
+    let a_first = indexed(a.builder(&data_url))
+        .create(CreateTableOptions {
+            table_name: TABLE.to_string(),
+            schema: schema(),
+            primary_key: Vec::new(),
+            on_conflict: None,
+            base_path: data_url.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create the table");
+    a.ctx
+        .register_table(TABLE, Arc::new(a_first))
+        .expect("register");
+    a.insert(1, 100).await.expect("A writes");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+    let runs = |catalog: Arc<dyn MetadataCatalog>, table_id: String| async move {
+        let mut names: Vec<String> = catalog
+            .list_index_runs(&table_id)
+            .await
+            .expect("list runs")
+            .into_iter()
+            .map(|run| format!("{}/{}", run.index_key, run.run_name))
+            .collect();
+        names.sort();
+        names
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while runs(Arc::clone(&a.catalog), table_id.clone())
+        .await
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "A persisted no index run");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let a_runs = runs(Arc::clone(&a.catalog), table_id.clone()).await;
+    eprintln!("A's registered runs: {a_runs:?}");
+
+    // A reopens the table; its load pauses on the first run read.
+    let is_run = |path: &Path| path.as_ref().contains("/_lookup_index/");
+    a.requests.gate_reads(is_run);
+    let reopening = {
+        let builder = indexed(a.builder(&data_url));
+        tokio::spawn(async move { builder.open(TABLE).await.map(|_| ()) })
+    };
+    tokio::time::timeout(Duration::from_secs(15), a.requests.wait_gated(1))
+        .await
+        .expect("A's load reads a run");
+
+    // B takes over and persists a run of its own, as its index sync does:
+    // the run file first, then its registration. (B opens no table here: in
+    // this one test process both instances' index loads would share one lock.)
+    let b = Instance::start(&objects, "b", LEASE).await;
+    for op in [Op::Get, Op::GetConditional, Op::Head, Op::Put] {
+        a.requests
+            .fail_while(op, |path: &Path| path.as_ref().contains("/leases/"));
+    }
+    let (key, a_name) = a_runs[0].split_once('/').expect("key/run");
+    // A run over a data file A's view of the table does not name, as one over
+    // a file B wrote after the takeover is.
+    let (b_name, b_bytes) = run_file(&["01b0000000000000000000000000000b_00000.vortex"]);
+    let b_name = b_name.as_str();
+    let b_path = {
+        let stored: Vec<String> = objects
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list");
+        let a_path = stored
+            .into_iter()
+            .find(|path| path.ends_with(&format!("{key}/{a_name}")))
+            .expect("A's run file");
+        Path::from(a_path.replace(a_name, b_name))
+    };
+    let record = cayenne::metadata::IndexRunRecord {
+        table_id: table_id.clone(),
+        index_key: key.to_string(),
+        run_name: b_name.to_string(),
+        row_count: 1,
+        size_bytes: b_bytes.len() as u64,
+    };
+    objects
+        .put(&b_path, PutPayload::from(b_bytes.clone()))
+        .await
+        .expect("B's run file");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if b.catalog.register_index_run(&record).await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "B never became the writer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let b_runs = runs(Arc::clone(&b.catalog), table_id.clone()).await;
+    eprintln!("B's registered runs: {b_runs:?}");
+
+    // A's clock stood still; its load resumes.
+    a.catalog
+        .data_write_gate(&table_id)
+        .hold_until(Instant::now() + Duration::from_hours(3));
+    a.requests.open_reads();
+    let reopened = tokio::time::timeout(Duration::from_secs(30), reopening)
+        .await
+        .expect("A's reopen finishes")
+        .expect("join");
+    eprintln!("A's reopen: {reopened:?}");
+    // A's load tried to retire B's run, which it judged over a gone file from
+    // its stale view: the commit was refused, and A learned it was fenced.
+    assert!(
+        !a.catalog.data_write_gate(&table_id).allows(),
+        "A's retire commit was refused, so A no longer writes the dataset"
+    );
+
+    let stored: Vec<String> = objects
+        .list(None)
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|path| path.contains("/_lookup_index/"))
+        .collect();
+    eprintln!("stored run files: {stored:?}");
+    let deletes: Vec<String> = a
+        .requests
+        .log()
+        .into_iter()
+        .filter(|request| {
+            request.op == Op::Delete && request.path.as_ref().contains("/_lookup_index/")
+        })
+        .map(|request| format!("{} ok={}", request.path, request.result.is_ok()))
+        .collect();
+    assert!(
+        deletes.iter().all(|delete| delete.ends_with("ok=false")),
+        "A deletes no run file: {deletes:?}"
+    );
+    let missing: Vec<&String> = b_runs
+        .iter()
+        .filter(|run| !stored.iter().any(|path| path.ends_with(run.as_str())))
+        .collect();
+    assert_eq!(
+        missing,
+        Vec::<&String>::new(),
+        "every run B registered keeps its file"
+    );
+}
+
+/// One instance with a lookup index on `v`: its catalog, table and the
+/// location's store.
+async fn indexed_instance() -> (
+    Instance,
+    Arc<dyn ObjectStore>,
+    Arc<CayenneTableProvider>,
+    String,
+) {
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let a = Instance::start(&objects, "a", LEASE).await;
+    let data_url = a.data_url.clone();
+    let table = Arc::new(
+        a.builder(&data_url)
+            .with_secondary_indexes(vec![vec!["v".to_string()]])
+            .create(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: schema(),
+                primary_key: Vec::new(),
+                on_conflict: None,
+                base_path: data_url.clone(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create the table"),
+    );
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let table_id = a.catalog.get_table(TABLE).await.expect("table").table_id;
+    (a, objects, table, table_id)
+}
+
+/// Every run file stored under the location's lookup-index directories.
+async fn stored_run_files(objects: &Arc<dyn ObjectStore>) -> Vec<String> {
+    let mut files: Vec<String> = objects
+        .list(None)
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|path| path.contains("/_lookup_index/"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// The registered runs, as `key/name`.
+async fn registered_runs(a: &Instance, table_id: &str) -> Vec<String> {
+    let mut runs: Vec<String> = a
+        .catalog
+        .list_index_runs(table_id)
+        .await
+        .expect("runs")
+        .into_iter()
+        .map(|run| format!("{}/{}", run.index_key, run.run_name))
+        .collect();
+    runs.sort();
+    runs
+}
+
+/// Waits until `condition` holds of the registered runs and the stored run
+/// files.
+async fn wait_for_runs(
+    a: &Instance,
+    objects: &Arc<dyn ObjectStore>,
+    table_id: &str,
+    what: &str,
+    condition: impl Fn(&[String], &[String]) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let registered = registered_runs(a, table_id).await;
+        let stored = stored_run_files(objects).await;
+        if condition(&registered, &stored) {
+            return (registered, stored);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: registered {registered:?}, stored {stored:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A run file no run is registered for, as a sync that stopped before
+/// registering it leaves, over a data file that is gone: no run over that
+/// file is ever built again, so loading the persisted index retires the
+/// file, and the retirement sweep deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_run_over_a_gone_data_file_is_retired_and_deleted() {
+    let (a, objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let key = registered[0].split_once('/').expect("key/run").0;
+    let (stray_name, stray_bytes) = run_file(&["01b0000000000000000000000000000a_00000.vortex"]);
+    let stray = stored[0].replace(
+        registered[0].split_once('/').expect("key/run").1,
+        &stray_name,
+    );
+    objects
+        .put(&Path::from(stray.as_str()), PutPayload::from(stray_bytes))
+        .await
+        .expect("plant the run file");
+
+    let reopened = Arc::new(
+        a.builder(&a.data_url)
+            .with_secondary_indexes(vec![vec!["v".to_string()]])
+            .open(TABLE)
+            .await
+            .expect("reopen"),
+    );
+    let retired = a
+        .catalog
+        .retired_files(&table_id)
+        .await
+        .expect("retired files")
+        .expect("settled");
+    assert!(
+        retired.contains(&format!("_lookup_index/{key}/{stray_name}")),
+        "the run file is retired: {retired:?}"
+    );
+    assert!(
+        stored_run_files(&objects).await.contains(&stray),
+        "and not deleted before the retention"
+    );
+    reopened.reclaim_retired_snapshots_now().await;
+    let files = stored_run_files(&objects).await;
+    assert_eq!(
+        (files.contains(&stray), files.contains(&stored[0])),
+        (false, true),
+        "the retirement sweep deletes it and keeps the registered run's file: {files:?}"
+    );
+}
+
+/// A run file no run is registered for whose data files are all still live
+/// is kept when the persisted index loads: the same run, built again, has the
+/// same name and registers that file, and deleting it could remove the file
+/// that registration names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_run_over_live_data_files_is_kept() {
+    let (a, objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    // Unregistered with its file left, as a sync that wrote the file and
+    // stopped before registering it leaves it.
+    let (key, name) = registered[0].split_once('/').expect("key/run");
+    a.catalog
+        .remove_index_run(&table_id, key, name)
+        .await
+        .expect("unregister");
+
+    let reopened = Arc::new(
+        a.builder(&a.data_url)
+            .with_secondary_indexes(vec![vec!["v".to_string()]])
+            .open(TABLE)
+            .await
+            .expect("reopen"),
+    );
+    let retired = a
+        .catalog
+        .retired_files(&table_id)
+        .await
+        .expect("retired files")
+        .expect("settled");
+    assert!(
+        !retired.iter().any(|key| key.starts_with("_lookup_index/")),
+        "no run file is retired: {retired:?}"
+    );
+    reopened.reclaim_retired_snapshots_now().await;
+    assert_eq!(
+        stored_run_files(&objects).await,
+        stored,
+        "the run file is kept"
+    );
+}
+
+/// After a compaction the runs over the files it replaced are no longer
+/// wanted, but those files stay readable for the retention: their run files
+/// are unregistered and kept. Once the replaced files are deleted and
+/// forgotten, the next sync retires those run files, and the retirement
+/// sweep deletes them. The new run's file is kept throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_file_is_deleted_only_once_a_data_file_it_covers_is_gone() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    for i in 0..3 {
+        a.insert(i * 100 + 1, (i + 1) * 100)
+            .await
+            .expect("A writes");
+    }
+    let (before, _) = wait_for_runs(&a, &objects, &table_id, "three runs persist", |r, f| {
+        r.len() >= 3 && f.len() == r.len()
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !table.force_full_compaction().await.expect("compaction") {
+        assert!(Instant::now() < deadline, "the compaction never ran");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    table.drain_in_flight_maintenance().await.expect("drain");
+    let old = |name: &String| before.contains(name);
+    // The old runs are unregistered and their files kept.
+    let (after, stored) = wait_for_runs(
+        &a,
+        &objects,
+        &table_id,
+        "the old runs are unregistered",
+        |r, _| !r.is_empty() && !r.iter().any(old),
+    )
+    .await;
+    for run in &before {
+        assert!(
+            stored.iter().any(|path| path.ends_with(run.as_str())),
+            "{run}'s file is kept while its data files are retired: {stored:?}"
+        );
+    }
+    // The replaced data files are deleted and forgotten; a later write's sync
+    // retires the old run files, and the retirement sweep deletes them.
+    table.reclaim_retired_snapshots_now().await;
+    a.insert(301, 400).await.expect("A writes again");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let retired = a
+            .catalog
+            .retired_files(&table_id)
+            .await
+            .expect("retired files")
+            .unwrap_or_default();
+        if before
+            .iter()
+            .all(|run| retired.contains(&format!("_lookup_index/{run}")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the old run files were not retired: {retired:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    table.reclaim_retired_snapshots_now().await;
+    let files = stored_run_files(&objects).await;
+    for run in &before {
+        assert!(
+            !files.iter().any(|path| path.ends_with(run.as_str())),
+            "{run}'s file is deleted once its data files are gone: {files:?}"
+        );
+    }
+    for run in &after {
+        assert!(
+            files.iter().any(|path| path.ends_with(run.as_str())),
+            "the new run {run}'s file is kept: {files:?}"
+        );
+    }
+    assert_eq!(a.count_and_sum().await, expected(1..=400));
+}
+
+/// A compaction records its new snapshot's manifest, and stops holding the
+/// snapshot's files as uncommitted uploads, before the snapshot goes live.
+/// A file named only by that manifest is not gone: the snapshot may still go
+/// live, and a run over it built again. A run over it is neither retired nor
+/// refused registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_over_a_file_of_a_snapshot_not_yet_live_is_not_retired() {
+    let (a, _objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let file = "01b0000000000000000000000000000c_00000.vortex";
+    a.catalog
+        .replace_snapshot_files(
+            &table_id,
+            "01b00000-0000-7000-8000-00000000000c",
+            &[cayenne::metadata::SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: "01b00000-0000-7000-8000-00000000000c".to_string(),
+                file_path: file.to_string(),
+                row_count: 1,
+                file_size_bytes: 1,
+                min_sequence: 1,
+                max_sequence: 1,
+                digest: None,
+            }],
+        )
+        .await
+        .expect("record the manifest of a snapshot not yet live");
+    let native = a
+        .catalog
+        .as_any()
+        .downcast_ref::<ObjectNativeCatalog>()
+        .expect("the object-native catalog");
+    let (name, bytes) = run_file(&[file]);
+    let key = "50c8036caa9bfa1774ae2bf50241a307";
+    let run_key = format!("_lookup_index/{key}/{name}");
+    let none = std::collections::HashSet::new();
+    let retired = native
+        .retire_index_run(&table_id, key, &name, &[file.to_string()], &run_key, &none)
+        .await
+        .expect("retire");
+    let registered = native
+        .register_index_run_covering(
+            &cayenne::metadata::IndexRunRecord {
+                table_id: table_id.clone(),
+                index_key: key.to_string(),
+                run_name: name.clone(),
+                row_count: 1,
+                size_bytes: bytes.len() as u64,
+            },
+            &[file.to_string()],
+            &run_key,
+            &none,
+        )
+        .await
+        .expect("register");
+    assert_eq!(
+        (retired, registered),
+        (false, true),
+        "a run over a file only a not-yet-live snapshot's manifest names is kept and may register"
+    );
+}
+
+/// Removing a table's last index unregisters its runs; while the data files
+/// they cover can still be read, their files are kept, since the same index
+/// added back would build the same runs under the same names. No index sync
+/// runs any more to reconsider them, so the orphan sweep retires each once a
+/// data file it covers is gone, and the retirement sweep deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_indexs_run_files_are_reclaimed_once_their_data_files_are_gone() {
+    let (a, objects, _table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (_, stored) = wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+        !r.is_empty() && f.len() == r.len()
+    })
+    .await;
+
+    // The index is removed: the table opens with none.
+    let plain = Arc::new(a.builder(&a.data_url).open(TABLE).await.expect("reopen"));
+    let _ = a.ctx.deregister_table(TABLE);
+    a.ctx
+        .register_table(
+            TABLE,
+            Arc::clone(&plain) as Arc<dyn datafusion::datasource::TableProvider>,
+        )
+        .expect("register");
+    let (registered, kept) = wait_for_runs(
+        &a,
+        &objects,
+        &table_id,
+        "the runs are unregistered",
+        |r, _| r.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        (registered, kept.clone()),
+        (Vec::<String>::new(), stored.clone()),
+        "unregistered, and their files kept while their data files are live"
+    );
+    let swept = plain.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs,
+        Vec::<String>::new(),
+        "nothing retired while the data files are live"
+    );
+
+    // The data file is rewritten, and the old one deleted and forgotten.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !plain.force_full_compaction().await.expect("compaction") {
+        assert!(Instant::now() < deadline, "the compaction never ran");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    plain.drain_in_flight_maintenance().await.expect("drain");
+    plain.reclaim_retired_snapshots_now().await;
+    let swept = plain.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs.len(),
+        kept.len(),
+        "the orphan sweep retires the kept run files: {swept:?}"
+    );
+    plain.reclaim_retired_snapshots_now().await;
+    assert_eq!(
+        stored_run_files(&objects).await,
+        Vec::<String>::new(),
+        "and the retirement sweep deletes them"
+    );
+    assert_eq!(a.count_and_sum().await, expected(1..=100));
+}
+
+/// A run over a hundred thousand data files, whose file list alone is
+/// larger than four MiB, left unregistered after its data files are gone: the
+/// orphan sweep reads its whole file list, retires it, and the retirement
+/// sweep deletes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistered_run_with_a_long_file_list_is_reclaimed() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let names: Vec<String> = (0..100_000)
+        .map(|i| format!("01b0000000000000000000000000{i:06}_00000.vortex"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (run_name, run_bytes) = run_file(&refs);
+    let list_bytes: usize = names.iter().map(|name| name.len() + 4).sum();
+    assert!(
+        list_bytes > 4 * 1024 * 1024,
+        "the file list alone is {list_bytes} bytes"
+    );
+    let run_path = stored[0].replace(registered[0].split_once('/').expect("key/run").1, &run_name);
+    objects
+        .put(&Path::from(run_path.as_str()), PutPayload::from(run_bytes))
+        .await
+        .expect("plant the run file");
+
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    let key = registered[0].split_once('/').expect("key/run").0;
+    assert_eq!(
+        swept.retired_index_runs,
+        vec![format!("_lookup_index/{key}/{run_name}")],
+        "the orphan sweep reads the whole file list and retires the run"
+    );
+    table.reclaim_retired_snapshots_now().await;
+    assert!(
+        !stored_run_files(&objects).await.contains(&run_path),
+        "the retirement sweep deletes it"
+    );
+}
+
+/// A run file the orphan sweep retires, with no data-file orphan beside it,
+/// still starts its retention and is deleted by the retirement sweep once the
+/// retention passes, as on an idle table no later write reconsiders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_file_only_the_orphan_sweep_retires_is_deleted_after_the_retention() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let (run_name, run_bytes) = run_file(&["01b0000000000000000000000000000e_00000.vortex"]);
+    let run_path = stored[0].replace(registered[0].split_once('/').expect("key/run").1, &run_name);
+    objects
+        .put(&Path::from(run_path.as_str()), PutPayload::from(run_bytes))
+        .await
+        .expect("plant the run file");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        (swept.retired.clone(), swept.retired_index_runs.len()),
+        (Vec::<String>::new(), 1),
+        "only the run file is retired: {swept:?}"
+    );
+    // The retention passes on the timers already running, and the retirement
+    // sweep runs; nothing observes the retired set afresh first.
+    table.elapse_data_file_retention();
+    table.sweep_retired_snapshot_dirs_now().await;
+    assert!(
+        !stored_run_files(&objects).await.contains(&run_path),
+        "the retirement sweep deletes the run file"
+    );
+}
+
+/// A file the orphan sweep could not read as a run, later rewritten under the
+/// same name with a valid run over data files that are gone, is read again
+/// and retired: what the sweep remembers of a file holds only while the file
+/// is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewritten_run_file_is_read_again() {
+    let (a, objects, table, table_id) = indexed_instance().await;
+    a.insert(1, 100).await.expect("A writes");
+    let (registered, stored) =
+        wait_for_runs(&a, &objects, &table_id, "A persists a run", |r, f| {
+            !r.is_empty() && f.len() == r.len()
+        })
+        .await;
+    let (run_name, run_bytes) = run_file(&["01b0000000000000000000000000000f_00000.vortex"]);
+    let run_path = Path::from(
+        stored[0]
+            .replace(registered[0].split_once('/').expect("key/run").1, &run_name)
+            .as_str(),
+    );
+    objects
+        .put(&run_path, PutPayload::from_static(b"not a run file"))
+        .await
+        .expect("plant a damaged run file");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs,
+        Vec::<String>::new(),
+        "a file that cannot be read as a run is left"
+    );
+    objects
+        .put(&run_path, PutPayload::from(run_bytes))
+        .await
+        .expect("rewrite it as a valid run");
+    let swept = table.sweep_orphan_files_now().await.expect("sweep");
+    assert_eq!(
+        swept.retired_index_runs.len(),
+        1,
+        "the rewritten file is read again and retired: {swept:?}"
+    );
 }

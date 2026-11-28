@@ -1593,6 +1593,7 @@ impl LookupIndexState {
         table_id: String,
         location: &datafusion::datasource::listing::ListingTableUrl,
         live: Vec<String>,
+        in_flight: Arc<super::uncommitted_files::UncommittedFiles>,
     ) {
         let coordinator = PersistenceCoordinator::for_location(location.to_string());
         let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
@@ -1612,8 +1613,11 @@ impl LookupIndexState {
         let persisted_runs = Arc::new(PersistedRuns::new(
             self.table_name.clone(),
             store,
-            catalog,
-            table_id,
+            PersistedTable {
+                catalog,
+                table_id,
+                in_flight,
+            },
             root,
             keys,
             (coordinator, owner),
@@ -2646,6 +2650,27 @@ pub(crate) struct PersistedRuns {
     syncing: AtomicBool,
     coordinator: Arc<PersistenceCoordinator>,
     owner: Arc<()>,
+    /// The files this process's writes have uploaded and no commit names yet:
+    /// a run over one is not over a gone file, since its commit may still
+    /// name it.
+    in_flight: Arc<super::uncommitted_files::UncommittedFiles>,
+    /// In the object-native location: the data files each run this process
+    /// registered, loaded or kept covers, by `(key, run name)`. Lock before
+    /// `kept` when holding both.
+    covering: Mutex<HashMap<(String, String), Vec<String>>>,
+    /// In the object-native location: run files kept unregistered because all
+    /// the data files they cover can still be read, so the same run may be
+    /// built again and register the same file. Each sync retires those whose
+    /// files have gone since.
+    kept: Mutex<HashSet<(String, String)>>,
+}
+
+/// The table a [`PersistedRuns`] persists for: its metastore, id, and the
+/// files its writes hold uncommitted.
+struct PersistedTable {
+    catalog: Arc<dyn MetadataCatalog>,
+    table_id: String,
+    in_flight: Arc<super::uncommitted_files::UncommittedFiles>,
 }
 
 /// Field order keeps decoded runs charged until their allocations are freed.
@@ -2677,13 +2702,18 @@ impl PersistedRuns {
     fn new(
         table_name: String,
         store: Arc<dyn ObjectStore>,
-        catalog: Arc<dyn MetadataCatalog>,
-        table_id: String,
+        table: PersistedTable,
         root: object_store::path::Path,
         keys: Vec<String>,
         ownership: (Arc<PersistenceCoordinator>, Arc<()>),
     ) -> Self {
+        let PersistedTable {
+            catalog,
+            table_id,
+            in_flight,
+        } = table;
         Self {
+            in_flight,
             coordinator: ownership.0,
             owner: ownership.1,
             table_name,
@@ -2695,6 +2725,8 @@ impl PersistedRuns {
             loaded: AtomicBool::new(false),
             pending: Mutex::new(None),
             syncing: AtomicBool::new(false),
+            covering: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2708,6 +2740,7 @@ impl PersistedRuns {
         table_id: String,
         root: object_store::path::Path,
         location: String,
+        in_flight: Arc<super::uncommitted_files::UncommittedFiles>,
     ) {
         let coordinator = PersistenceCoordinator::for_location(location);
         let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
@@ -2716,8 +2749,11 @@ impl PersistedRuns {
         let runs = Self::new(
             table_name.clone(),
             store,
-            catalog,
-            table_id,
+            PersistedTable {
+                catalog,
+                table_id,
+                in_flight,
+            },
             root,
             Vec::new(),
             (coordinator, owner),
@@ -2820,7 +2856,10 @@ impl PersistedRuns {
         for (key, view) in views {
             for run in view.run_list() {
                 let name = run_file_name(&run);
-                if existing.remove(&(key.clone(), name.clone())) {
+                let files: Vec<String> = run.files().iter().map(ToString::to_string).collect();
+                let id = (key.clone(), name.clone());
+                if existing.remove(&id) {
+                    self.covering.lock().insert(id, files);
                     continue;
                 }
                 let row_count = run.len() as u64;
@@ -2839,10 +2878,35 @@ impl PersistedRuns {
                     .put(&path, bytes.into())
                     .await
                     .map_err(|e| format!("write {path}: {e}"))?;
-                self.catalog
-                    .register_index_run(&record)
-                    .await
-                    .map_err(|e| format!("register {path}: {e}"))?;
+                // In the object-native location a run is registered only while
+                // every data file it covers can still be read and its file is
+                // not retired: its name then cannot be one a delete in flight
+                // removes. A run refused here keeps its file unregistered.
+                let registered = if let Some(native) = self.native_catalog() {
+                    native
+                        .register_index_run_covering(
+                            &record,
+                            &files,
+                            &Self::retired_key(key, &name),
+                            &self.in_flight.held_keys(),
+                        )
+                        .await
+                        .map_err(|e| format!("register {path}: {e}"))?
+                } else {
+                    self.catalog
+                        .register_index_run(&record)
+                        .await
+                        .map_err(|e| format!("register {path}: {e}"))?;
+                    true
+                };
+                if self.native_catalog().is_some() {
+                    self.covering.lock().insert(id.clone(), files);
+                    if registered {
+                        self.kept.lock().remove(&id);
+                    } else {
+                        self.kept.lock().insert(id);
+                    }
+                }
             }
         }
         // What is left is registered but no longer wanted: runs merged or
@@ -2850,29 +2914,117 @@ impl PersistedRuns {
         for (key, name) in existing {
             self.remove(&key, &name).await?;
         }
-        Ok(())
+        self.retire_kept().await
     }
 
-    /// Unregisters a run, then attempts to delete its file. An orphan left by
-    /// a failed deletion is eligible for cleanup during a successful open.
+    /// Removes a run that is no longer wanted.
+    ///
+    /// In the object-native location its file is deleted only once one of the
+    /// data files it covers is gone: no run over them can be built again, so
+    /// the name cannot be registered again and a delete of it, however late it
+    /// lands, removes nothing a registered run names. The run is unregistered
+    /// and its file retired in one commit, and the retirement sweep deletes it.
+    /// While all its data files can still be read, it is unregistered and its
+    /// file kept: the same run, built again, registers that file. A run whose
+    /// file cannot be described is unregistered and its file left.
+    ///
+    /// Elsewhere it is unregistered, then its file deleted; an orphan left by a
+    /// failed deletion is eligible for cleanup during a successful open.
     async fn remove(&self, key: &str, name: &str) -> Result<(), String> {
         let path = self.path(key, name);
+        let Some(native) = self.native_catalog() else {
+            self.catalog
+                .remove_index_run(&self.table_id, key, name)
+                .await
+                .map_err(|e| format!("unregister {path}: {e}"))?;
+            return match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => {
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unregistered persisted secondary index run was not deleted; a successful open can retry cleanup");
+                    Ok(())
+                }
+            };
+        };
+        let id = (key.to_string(), name.to_string());
+        let known = self.covering.lock().get(&id).cloned();
+        let files = match known {
+            Some(files) => Some(files),
+            None => self.describe(&path, name).await,
+        };
+        if let Some(files) = &files
+            && native
+                .retire_index_run(
+                    &self.table_id,
+                    key,
+                    name,
+                    files,
+                    &Self::retired_key(key, name),
+                    &self.in_flight.held_keys(),
+                )
+                .await
+                .map_err(|e| format!("retire {path}: {e}"))?
+        {
+            self.covering.lock().remove(&id);
+            self.kept.lock().remove(&id);
+            return Ok(());
+        }
         self.catalog
             .remove_index_run(&self.table_id, key, name)
             .await
             .map_err(|e| format!("unregister {path}: {e}"))?;
-        match self.store.delete(&path).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(error) => {
-                tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unregistered persisted secondary index run was not deleted; a successful open can retry cleanup");
-                Ok(())
+        if let Some(files) = files {
+            self.covering.lock().insert(id.clone(), files);
+            self.kept.lock().insert(id);
+        }
+        Ok(())
+    }
+
+    /// Retires the kept run files one of whose data files has gone since.
+    async fn retire_kept(&self) -> Result<(), String> {
+        let Some(native) = self.native_catalog() else {
+            return Ok(());
+        };
+        let kept: Vec<((String, String), Vec<String>)> = {
+            let covering = self.covering.lock();
+            let kept = self.kept.lock();
+            kept.iter()
+                .filter_map(|id| covering.get(id).map(|files| (id.clone(), files.clone())))
+                .collect()
+        };
+        for ((key, name), files) in kept {
+            let retired = native
+                .retire_index_run(
+                    &self.table_id,
+                    &key,
+                    &name,
+                    &files,
+                    &Self::retired_key(&key, &name),
+                    &self.in_flight.held_keys(),
+                )
+                .await
+                .map_err(|e| format!("retire {}: {e}", self.path(&key, &name)))?;
+            if retired {
+                let id = (key, name);
+                self.covering.lock().remove(&id);
+                self.kept.lock().remove(&id);
             }
         }
+        Ok(())
+    }
+
+    /// The data files the run file at `path` covers ([`describe_run_file`]).
+    async fn describe(&self, path: &object_store::path::Path, name: &str) -> Option<Vec<String>> {
+        describe_run_file(self.store.as_ref(), path, name)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Every key's persisted runs. A registered run whose file cannot be read
-    /// is unregistered and deleted, and a file no run is registered for, left
-    /// by a write that stopped before registering it, is deleted. An error
+    /// is removed ([`Self::remove`]), and so is a file no run is registered
+    /// for, left by a write that stopped before registering it
+    /// ([`Self::delete_unregistered`]); in the object-native location either
+    /// keeps its file while every data file it covers can still be read. An error
     /// when the registered runs cannot be listed: nothing is loaded, and
     /// nothing may be synced, since every run would then look unwanted.
     async fn load(
@@ -2926,6 +3078,12 @@ impl PersistedRuns {
                         return Err(PersistedReadError::BudgetRefused);
                     }
                     kept.insert(path);
+                    if self.native_catalog().is_some() {
+                        self.covering.lock().insert(
+                            (record.index_key.clone(), record.run_name.clone()),
+                            run.files().iter().map(ToString::to_string).collect(),
+                        );
+                    }
                     loaded.bytes = loaded.bytes.saturating_add(size_bytes);
                     loaded.runs[slot].push(run);
                 }
@@ -3065,8 +3223,31 @@ impl PersistedRuns {
         })?
     }
 
-    /// Deletes every file under the root that `kept` does not list. Runs only
-    /// before the first sync, so no write is in flight.
+    /// The table's catalog when it is the object-native one, whose instances
+    /// can share the table's files.
+    fn native_catalog(&self) -> Option<&crate::metastore::object_native::ObjectNativeCatalog> {
+        self.catalog
+            .as_any()
+            .downcast_ref::<crate::metastore::object_native::ObjectNativeCatalog>()
+    }
+
+    /// The key the retirement record names run `name` of index `key` by,
+    /// relative to the table's directory.
+    fn retired_key(key: &str, name: &str) -> String {
+        format!("{}/{key}/{name}", super::constants::LOOKUP_INDEX_DIR_NAME)
+    }
+
+    /// Removes every file under the root that `kept` does not list. Runs only
+    /// before the first sync, so no write of this process is in flight.
+    ///
+    /// In the object-native location such a file is a run written and never
+    /// registered (or unregistered since), and is removed as [`Self::remove`]
+    /// removes a run: retired, in a commit, only once one of the data files it
+    /// covers is gone, and otherwise kept for the same run built again. `kept`
+    /// was read from this instance's view of the table, which is stale once
+    /// another instance has taken writing it over: the commit is refused then,
+    /// so nothing is retired on that view. A file that cannot be described is
+    /// left.
     async fn delete_unregistered(&self, kept: &HashSet<object_store::path::Path>) {
         use futures::TryStreamExt;
         let listed: Vec<ObjectMeta> = match self.store.list(Some(&self.root)).try_collect().await {
@@ -3076,6 +3257,45 @@ impl PersistedRuns {
                 return;
             }
         };
+        if let Some(native) = self.native_catalog() {
+            for meta in listed {
+                if kept.contains(&meta.location) {
+                    continue;
+                }
+                let Some((key, name)) = crate::object_relative(&self.root, &meta.location)
+                    .and_then(|relative| relative.split_once('/'))
+                    .filter(|(_, name)| !name.contains('/'))
+                else {
+                    continue;
+                };
+                let Some(files) = self.describe(&meta.location, name).await else {
+                    tracing::debug!(table = %self.table_name, run_file = %meta.location, "Leaving an unregistered file under the persisted secondary index that cannot be read as a run");
+                    continue;
+                };
+                match native
+                    .retire_index_run(
+                        &self.table_id,
+                        key,
+                        name,
+                        &files,
+                        &Self::retired_key(key, name),
+                        &self.in_flight.held_keys(),
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let id = (key.to_string(), name.to_string());
+                        self.covering.lock().insert(id.clone(), files);
+                        self.kept.lock().insert(id);
+                    }
+                    Err(error) => {
+                        tracing::debug!(table = %self.table_name, run_file = %meta.location, %error, "An unregistered persisted secondary index run was not retired; the next open retries");
+                    }
+                }
+            }
+            return;
+        }
         for meta in listed {
             if kept.contains(&meta.location) {
                 continue;
@@ -3120,16 +3340,38 @@ fn distinct_dirs<'a>(mut dirs: impl Iterator<Item = &'a str>) -> bool {
     dirs.all(|dir| unique.insert(dir))
 }
 
-/// A persisted run's name: a digest of the run's files and size, so the same run
-/// always has the same name.
-fn run_file_name(run: &IndexRun) -> String {
-    let mut descriptor = Vec::new();
-    for file in run.files() {
-        descriptor.extend_from_slice(&(file.len() as u64).to_le_bytes());
-        descriptor.extend_from_slice(file.as_bytes());
+/// The data files the run file at `path` covers, read from its first bytes,
+/// when they name it: they are what its name `name` is derived from.
+/// `Ok(None)` when the file is not a run file or its name does not match, and
+/// an error when it cannot be read now. Reads a growing prefix until the file
+/// list ends, never the run's index after it.
+pub(crate) async fn describe_run_file(
+    store: &dyn ObjectStore,
+    path: &object_store::path::Path,
+    name: &str,
+) -> object_store::Result<Option<Vec<String>>> {
+    let size = store.head(path).await?.size;
+    let mut end = DESCRIBE_FIRST_READ.min(size);
+    loop {
+        let bytes = store.get_range(path, 0..end).await?;
+        match IndexRun::describe(&bytes) {
+            Ok(Some(described)) => {
+                return Ok((described.file_name() == name).then_some(described.files));
+            }
+            Ok(None) if end < size => end = end.saturating_mul(4).min(size),
+            _ => return Ok(None),
+        }
     }
-    descriptor.extend_from_slice(&(run.len() as u64).to_le_bytes());
-    format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
+}
+
+/// The first read of a run file's start: the file list of a run over a few
+/// hundred files. A longer list is read in reads four times as long.
+const DESCRIBE_FIRST_READ: u64 = 64 * 1024;
+
+/// A persisted run's name: a digest of the run's files and size, so the same run
+/// always has the same name ([`IndexRun::file_name`]).
+fn run_file_name(run: &IndexRun) -> String {
+    run.file_name()
 }
 
 /// Counts one probe's coverage, and reports the probe on
