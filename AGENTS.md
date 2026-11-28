@@ -24,7 +24,7 @@ Spice sells the simplest data and AI infrastructure to use and operate at massiv
 
 ## Evidence — no claim without a reproduction
 
-Reading the code explains *why*; a run shows *that* it happens. Every bug, concern, regression, or performance claim you make (PR, issue, review, message) carries both: the reasoning, and output from *running* something outside the code you read. An unobserved claim is a hypothesis; label it. **A correctness or data-loss claim or fix requires the adversarial review in *Git & PRs*, by a model other than the one that wrote the change**, and the PR records what it found and what you did about it. Get one too wherever else the reading is load-bearing (concurrency, lifetimes, can't reproduce).
+Reading the code explains *why*; a run shows *that* it happens. Every bug, concern, regression, or performance claim you make (PR, issue, review, message) carries both: the reasoning, and output from *running* something outside the code you read. An unobserved claim is a hypothesis; label it. **No one model's reading is trusted either**: when a claim is load-bearing (correctness or data loss, concurrency, lifetimes, can't reproduce), get an adversarial read from a second model (see *Git & PRs*), and the PR records what it found and what you did about it.
 
 Evidence, matched to the claim:
 
@@ -104,7 +104,8 @@ make test-integration   # needs credentials (.env or `spice login`)
 - Stacked PRs: `docs/dev/stacked_prs.md`. Restack an unpushed child with `git rebase --onto`; restack a pushed one by merging `trunk`, then check for files the merge restored.
 - Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`, or any other way); fix the underlying failure. Investigate before `reset --hard`, `checkout --`, or `clean -f`.
 - Branch from `trunk` (or from the parent when stacking), link the issue, add tests. Style: `docs/dev/style_guide.md`.
-- **Review locally before you push, not through PR round trips.** Before each push that changes code, run `/code-review` (or your harness's equivalent) on the diff, plus an adversarial review by a model other than the one that wrote the change: `codex:adversarial-review`, `grok:adversarial-review`, Antigravity, or Claude when Claude didn't write it. Treat findings as hypotheses (see *Evidence*): reproduce each one, fix or answer it, and batch the fixes into one push. Copilot's PR review is a final check, not the review loop; every round trip costs a CI run and a reviewer's wait.
+- **Don't trust code from any one model.** Before it is pushed, every change, including its tests, a reviewer's suggested fix, and a subagent's output, gets an adversarial review by a model other than the one that wrote it: `codex:adversarial-review`, `grok:adversarial-review`, Antigravity, or Claude when Claude didn't write it.
+- **Review locally, not through PR round trips.** Before each push that changes code, also run `/code-review` (or your harness's equivalent) on the diff. Treat every finding as a hypothesis (see *Evidence*): reproduce it, fix or answer it, and batch the fixes into one push. Copilot's PR review is a final check, not the review loop; every round trip costs a CI run and a reviewer's wait.
 - Only ~2 checks on a PR → look for a conflict (`mergeStateStatus: DIRTY`) and merge `trunk`.
 - No internal tracking labels (`Phase 3`, `PR 6.1`, `step 2b`, or other shorthand from a plan or session) in titles, bodies, or commits. A PR may describe the old behavior.
 - Comments explain how or why, never history ("previously…"). A comment may cite an issue when it adds context (`// regression test for #NNNN`). Use standard, searchable terms in names and comments.
