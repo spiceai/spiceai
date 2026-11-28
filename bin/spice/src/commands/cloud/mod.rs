@@ -6940,12 +6940,19 @@ mod tests {
             format!(
                 "Failed to update configuration at '{path}': it is a symbolic link, and the file it points to ('{target}') still sets SPICE_SPICEAI_TOKEN. Credentials are never written through a link, so they were not removed from it. Delete those lines from that file, or replace '{path}' with a regular file and run this command again. See: https://spiceai.org/docs/cli/reference/login",
                 path = link.display(),
-                target = std::fs::canonicalize(target)
-                    .expect("resolve the link target")
-                    .display()
+                target = target.display()
             )
         };
-        let expected_errors = [still_sets(&regular), still_sets(&fifo)];
+        // The error names the target as `canonicalize` resolves it. When that
+        // fails mid-rename (the EINVAL below), it names the target as the link
+        // stores it, which keeps the unresolved `/var` of a macOS temporary
+        // directory; when reading the link fails too, it names the link itself.
+        let mut expected_errors = vec![still_sets(&link)];
+        for target in [&regular, &fifo] {
+            let resolved = std::fs::canonicalize(target).expect("resolve the link target");
+            expected_errors.push(still_sets(&resolved));
+            expected_errors.push(still_sets(target));
+        }
         // While a link is renamed over, macOS 26 can fail `stat` or `open` of its
         // name with EINVAL. That read reports an error, as any failure to read the
         // target does: it neither blocks nor reports the key as removed.
