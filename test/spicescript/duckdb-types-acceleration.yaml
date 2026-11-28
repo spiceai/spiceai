@@ -1,4 +1,6 @@
 name: duckdb-types-acceleration
+duration: 7s
+tags: [macos-smoke]
 description: >
   A DuckDB table with a column of each Arrow type a `duckdb:` dataset reads
   (boolean, the signed integers, both floats, date, timestamps at millisecond
@@ -11,7 +13,9 @@ description: >
   microseconds up to the last instant of 9999-12-31, such as the common
   `9999-12-31` "no end date" sentinel, load and answer as DuckDB answers them,
   from a table large enough that Cayenne's file mode writes it to a Vortex
-  file instead of holding it inline. (Intervals are in
+  file instead of holding it inline. Sums of decimals at 10, 20 and 38 digits of
+  precision, over enough positive, negative and NULL values to be written to a
+  Vortex file, match DuckDB's sums exactly. (Intervals are in
   known-failing/duckdb/duckdb-types-known.yaml.)
 
 sources:
@@ -36,6 +40,11 @@ spicepod:
         enabled: false
     - from: duckdb:main.far
       name: far
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+    - from: duckdb:main.dec
+      name: dec
       params: ${sources.src.params}
       acceleration:
         enabled: false
@@ -152,6 +161,24 @@ steps:
           WHERE id = 2000;
         UPDATE far SET ts = NULL, ts_ms = NULL, ts_s = NULL, tz = NULL, dt = NULL WHERE id = 7;
 
+  # 3,000 rows of decimals, past Cayenne's inline limit, each written out
+  # digit by digit so no value passes through a float: every third row is
+  # negative and every eleventh NULL. Rows 3001 and 3002 fill every digit of
+  # each precision, one positive and one negative, in different groups, so the
+  # grouped and filtered sums reach 38 digits without overflowing.
+  - source-exec:
+      src: |
+        CREATE TABLE dec AS
+        SELECT g AS id,
+          CAST(printf('%s%d.%02d', sg, (g * 7919) % 100000000, (g * 31) % 100) AS DECIMAL(10, 2)) AS d10,
+          CAST(printf('%s%d.%04d', sg, (g * 104729) % 10000000000000000, (g * 7907) % 10000) AS DECIMAL(20, 4)) AS d20,
+          CAST(printf('%s%d.%010d', sg, (g * 15485863) % 1000000000000000000, (g * 7907) % 10000000000) AS DECIMAL(38, 10)) AS d38
+        FROM (SELECT g, CASE WHEN g % 3 = 0 THEN '-' ELSE '' END AS sg FROM range(1, 3001) r(g));
+        UPDATE dec SET d10 = NULL, d20 = NULL, d38 = NULL WHERE id % 11 = 0;
+        INSERT INTO dec VALUES
+          (3001, 99999999.99, 9999999999999999.9999, 9999989999999999999999999999.9999999999),
+          (3002, -99999999.99, -9999999999999999.9999, -9999989999999999999999999999.9999999999);
+
   - start: {}
 
   # Each column's Arrow type, as DuckDB exports its SQL type to Arrow.
@@ -258,4 +285,21 @@ steps:
       SELECT count(*) AS n, count(ts) AS n_ts, min(ts) AS min_ts, max(ts) AS max_ts,
       max(ts_ms) AS max_ms, max(ts_s) AS max_s, max(tz) AS max_tz, max(dt) AS max_dt FROM far
     protocols: [flight, flightsql, http]
+    expect: { oracle: src }
+
+  # Decimal sums: overall, per group and under a filter, as DuckDB sums them.
+  # Each sum is compared as text, digit for digit, because a numeric comparison
+  # allows a relative difference of 0.1%.
+  - query: >-
+      SELECT CAST(sum(d10) AS VARCHAR) AS s10, CAST(sum(d20) AS VARCHAR) AS s20,
+      CAST(sum(d38) AS VARCHAR) AS s38, count(d38) AS n FROM dec
+    protocols: [flight, flightsql, http]
+    expect: { oracle: src }
+  - query: >-
+      SELECT id % 7 AS k, CAST(sum(d10) AS VARCHAR) AS s10, CAST(sum(d20) AS VARCHAR) AS s20,
+      CAST(sum(d38) AS VARCHAR) AS s38 FROM dec GROUP BY id % 7 ORDER BY k
+    expect: { oracle: src }
+  - query: >-
+      SELECT CAST(sum(d10) AS VARCHAR) AS s10, CAST(sum(d20) AS VARCHAR) AS s20,
+      CAST(sum(d38) AS VARCHAR) AS s38 FROM dec WHERE d38 < 0
     expect: { oracle: src }

@@ -6,7 +6,9 @@ alternatives, and the order of the work. It is not a specification. The
 [technical design](object-native-metastore-technical.md) holds the components,
 code changes, protocol details and the roadmap's exit proofs. The
 [protocol model](../../crates/cayenne-metastore-model/README.md) holds the
-model checks, cited here by run name.
+model checks, cited here by run name; any cited run can be stepped through in the
+[Stateright Explorer](../../crates/cayenne-metastore-model/README.md#exploring-runs-in-the-stateright-explorer)
+with `cayenne-metastore-model serve <run>`.
 [Enhancement #16245](https://github.com/spiceai/spiceai/issues/16245) holds the
 user-facing surface. All of them evolve together as implementation proceeds and unknowns are worked out.
 
@@ -44,9 +46,9 @@ runs unchanged on a local directory.
   state survives losing any instance and its disk, and any instance can
   recover or read it. A local directory is the local and on-prem path: it
   needs no object store or credentials and runs the same code path as a
-  bucket. Its state survives a process crash or kill, not the loss of the
-  disk; whether it survives a power loss is an
-  [open decision](object-native-metastore-technical.md#open-decisions).
+  bucket. It is for development, testing and getting started: its state
+  survives a process crash or kill, with no promise for an OS crash, a power
+  loss or the loss of the disk.
 - **The data moves too.** Today a file-mode dataset keeps its Vortex and
   deletion files on the instance's disk, or in S3 Express where configured.
   Here every file a commit references is in the destination before the
@@ -471,7 +473,9 @@ deleted object or a query within the retention fails.
   never by a listing or a prefix, and one record then forgets it. Its own
   retired entry does not block the delete; a live or prepared entry that names
   the key does. The timer is in memory: a restart restarts it from the retired
-  set, which only delays a delete.
+  set, which only delays a delete. A known limitation of the first version: a
+  writer that restarts more often than T never reaches T, so its retired files
+  are not deleted until it stays up for T. A durable removal time is deferred.
 - *Every instance polls its heads,* so a query on any instance, the writer's or
   another's, reads its files for at least T − S.
 - *Orphans* follow decision 1.12, not T_O.

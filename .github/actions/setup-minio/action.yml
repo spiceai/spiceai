@@ -117,6 +117,13 @@ runs:
           exit 1
         fi
         if [[ -n "$MINIO_SESSION_TOKEN" ]]; then
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          for value in "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" "${MINIO_SESSION_TOKEN}"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "::error::setup-minio: MinIO inputs must not contain a newline"
+              exit 1
+            fi
+          done
           echo "MC_HOST_spice-minio=${MINIO_ENDPOINT%%://*}://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}:${MINIO_SESSION_TOKEN}@${MINIO_ENDPOINT#*://}" >> "$GITHUB_ENV"
         else
           mc alias set spice-minio "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
@@ -138,6 +145,11 @@ runs:
           exit 1
         }
         if ($env:MINIO_SESSION_TOKEN) {
+          # Appended to $GITHUB_ENV as NAME=value: a newline would inject more entries.
+          if (@($env:MINIO_ENDPOINT, $env:MINIO_ACCESS_KEY, $env:MINIO_SECRET_KEY, $env:MINIO_SESSION_TOKEN) -match "[`r`n]") {
+            Write-Output "::error::setup-minio: MinIO inputs must not contain a newline"
+            exit 1
+          }
           $scheme, $hostPort = $env:MINIO_ENDPOINT -split '://', 2
           "MC_HOST_spice-minio=${scheme}://$($env:MINIO_ACCESS_KEY):$($env:MINIO_SECRET_KEY):$($env:MINIO_SESSION_TOKEN)@${hostPort}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         } else {

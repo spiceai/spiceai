@@ -1,4 +1,6 @@
 name: clickhouse-sql-semantics
+duration: 19s
+tags: [long]
 description: >
   ClickHouse federation preserves SQL NULL, Unicode, decimal aggregation and
   correlation semantics, checked against PostgreSQL holding the same rows.

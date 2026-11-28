@@ -324,8 +324,9 @@ fn dataset_infos(
 /// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
 /// accelerated dataset, following its active parent scheduler when synchronized.
 /// Only a dataset with a schedule has a next refresh. For a
-/// `refresh_cron` dataset it is the next cron time after now, or, once a refresh
-/// has been triggered, its recorded due time including jitter until completion.
+/// `refresh_cron` dataset it is the next cron time after now or, once a refresh
+/// has been triggered, its recorded due time including jitter until completion,
+/// whichever is earlier.
 fn dataset_freshness(
     df: &DataFusion,
     ds: &Dataset,
@@ -343,15 +344,18 @@ fn dataset_freshness(
             let acceleration = source_dataset.acceleration.as_ref().filter(|a| a.enabled)?;
             let scheduled = acceleration.refresh_check_interval.is_some()
                 || acceleration.refresh_cron.is_some();
-            df.runtime_status()
+            let recorded = df
+                .runtime_status()
                 .dataset_freshness(&source)
                 .next_refresh
-                .filter(|_| scheduled)
-                .or_else(|| {
-                    let cron = acceleration.refresh_cron.as_deref()?;
-                    scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now())
-                        .ok()
-                })
+                .filter(|_| scheduled);
+            let next_cron = acceleration.refresh_cron.as_deref().and_then(|cron| {
+                scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now()).ok()
+            });
+            match (recorded, next_cron) {
+                (Some(recorded), Some(next_cron)) => Some(recorded.min(next_cron)),
+                (recorded, next_cron) => recorded.or(next_cron),
+            }
         });
     (
         freshness.last_refresh.map(rfc3339),
@@ -417,6 +421,12 @@ pub struct AccelerationRequest {
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset taxi_trips not found"
+            })
+        ))),
+        (status = 409, description = "The dataset is deferred and no query has initialized it yet: none has referenced it, or its initialization failed. Query the dataset to initialize it, or to see the error that prevents it, then refresh", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset eth_recent_blocks is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
             })
         ))),
         (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
@@ -508,6 +518,8 @@ pub(crate) async fn refresh(
     }
 
     let table_ref = TableReference::parse_str(name);
+    // Not held while the refresh is queued: a spicepod reload waits for the write lock.
+    drop(app_lock);
 
     match df.refresh_table(&table_ref, overrides).await {
         Ok(_) => (
@@ -524,6 +536,13 @@ pub(crate) async fn refresh(
             },
         ) => (
             status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
+            }),
+        )
+            .into_response(),
+        Err(err @ crate::datafusion::Error::DatasetNotInitialized { .. }) => (
+            status::StatusCode::CONFLICT,
             Json(MessageResponse {
                 message: format!("{err}"),
             }),
@@ -687,7 +706,7 @@ mod tests {
             })
         });
         DatasetResponseItem {
-            from: "s3://spiceai-public-datasets/trips.parquet".to_string(),
+            from: "s3://spice-datasets-gjezag77s0hu/trips.parquet".to_string(),
             name: name.to_string(),
             replication_enabled: false,
             acceleration_enabled: true,
@@ -717,7 +736,7 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,trips,false,true,,,,,,supported,unsupported\n"
         );
     }
 
@@ -737,8 +756,8 @@ mod tests {
         assert_eq!(
             csv,
             "from,name,replication_enabled,acceleration_enabled,status,error,error_message,last_refresh,next_refresh,properties.search,properties.vector_search\n\
-             s3://spiceai-public-datasets/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
-             s3://spiceai-public-datasets/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,ready_trips,false,true,Ready,,,,,supported,unsupported\n\
+             s3://spice-datasets-gjezag77s0hu/trips.parquet,broken_trips,false,true,Error,dataset.auth,UnableToConnectInvalidUsernameOrPassword,,,supported,unsupported\n"
         );
         let broken = csv
             .lines()

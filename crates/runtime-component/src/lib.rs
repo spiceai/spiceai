@@ -150,6 +150,22 @@ pub fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// `Debug` for a component's params with credentials in URL values redacted, so a
+/// spec printed in an error or log line does not leak a source URL's secrets.
+pub(crate) struct RedactedParams<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(key, value)| (key, redact::redact_source_credentials(value))),
+            )
+            .finish()
+    }
+}
+
 /// Enum representing the initialization type of a component.
 ///
 /// [`ComponentInitialization::OnStartup`] indicates that the component should be
@@ -323,56 +339,4 @@ mod tests {
 }
 pub mod schema_evolution;
 
-/// The role a `spiced` process runs as, selected once at startup with `--role`.
-/// A Spicepod reload cannot change it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum Role {
-    /// The default: serves queries over its own datasets.
-    #[default]
-    Server,
-    /// Serves an application's queries beside it, and sends reads from a
-    /// remote Spice runtime as Substrait plans created locally.
-    Sidecar,
-    /// Plans distributed queries and assigns their tasks to executors.
-    Scheduler,
-    /// Joins a scheduler's cluster and runs the tasks it assigns. Implied by
-    /// `--scheduler-address`.
-    Executor,
-}
-
-impl Role {
-    /// The role's cluster membership: `None` for a server or sidecar, which
-    /// do not join a cluster.
-    #[must_use]
-    pub const fn cluster_role(self) -> Option<ClusterRole> {
-        match self {
-            Self::Server | Self::Sidecar => None,
-            Self::Scheduler => Some(ClusterRole::Scheduler),
-            Self::Executor => Some(ClusterRole::Executor),
-        }
-    }
-
-    /// The role as `--role` spells it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Server => "server",
-            Self::Sidecar => "sidecar",
-            Self::Scheduler => "scheduler",
-            Self::Executor => "executor",
-        }
-    }
-}
-
-impl std::fmt::Display for Role {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The part of a [`Role`] that joins a cluster: a scheduler or an executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClusterRole {
-    Scheduler,
-    Executor,
-}
+pub use runtime_config::{ClusterRole, Role};

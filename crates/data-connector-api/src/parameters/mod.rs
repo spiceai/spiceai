@@ -82,6 +82,11 @@ pub trait ConnectorContext: Send + Sync {
     /// The `--role` the runtime started with. A Spicepod reload cannot change it.
     fn role(&self) -> Role;
 
+    /// The runtime's component-status tracker. A connector that skips data that
+    /// will not be retried keeps the resolved [`runtime_status::RuntimeStatus`]
+    /// after the call — never this context.
+    fn runtime_status(&self) -> Arc<runtime_status::RuntimeStatus>;
+
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry>;
@@ -102,6 +107,23 @@ pub trait ConnectorContext: Send + Sync {
     /// file-accelerated, no checkpoint has been written yet, or the stored
     /// checkpoint cannot be read.
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef>;
+
+    /// The identity of the location through which this dataset's acceleration
+    /// is shared with other instances, when it is (see
+    /// `DataAccelerator::shared_location_id`): a change source's consumer named
+    /// for it is shared by exactly those instances, and only the one writing
+    /// the dataset consumes it. `None` when this instance alone writes the
+    /// acceleration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the location's identity cannot be read; the
+    /// caller fails rather than name a consumer that other instances may not
+    /// share.
+    async fn shared_location_id(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The **blob** checkpoint store over this dataset's accelerator, writing into the
     /// sidecar `table_name`.

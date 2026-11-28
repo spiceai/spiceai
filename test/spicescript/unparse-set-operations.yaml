@@ -1,4 +1,6 @@
 name: unparse-set-operations
+duration: 20s
+tags: [long]
 description: >
   INTERSECT and EXCEPT answer as the source does, NULLs included, wherever the
   query runs. Federated, the whole query is sent to the source, PostgreSQL or

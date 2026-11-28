@@ -1,5 +1,6 @@
-# AWS Glue bills per use, so this runs on the weekly schedule instead of daily.
-schedule: weekly
+# Every query reads the Glue tables' files from S3 over the internet, which AWS
+# bills per GB, so only a dispatch with `--schedule manual` runs this.
+schedule: manual
 tests:
   bench:
     spicepod_path: federated/glue[catalog].yaml

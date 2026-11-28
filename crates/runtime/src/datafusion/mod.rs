@@ -28,7 +28,7 @@ use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
 use crate::accelerated::{
-    AcceleratedTable, Retention,
+    AcceleratedTable, AppendGrouping, Retention,
     refresh::{Refresh, VersionsByTime},
 };
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
@@ -108,7 +108,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::{SendableRecordBatchStream, SessionState};
+use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -147,9 +147,11 @@ use util::{RetryError, retry};
 pub mod query;
 
 pub mod app_context_extension;
+pub(crate) mod append_coalescer;
 pub mod builder;
 pub(crate) mod caching_retention;
 mod change_generations;
+pub mod federated_template;
 use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
@@ -200,6 +202,10 @@ const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
 /// the number of datasets a runtime serves, so real datasets keep their lock between writes
 /// and only a flood of unknown table names triggers a cleanup.
 const MAX_SCHEMA_EVOLVE_LOCKS: usize = 1024;
+
+/// Entry count at which `append_queues` drops the queues nobody is using, as
+/// `schema_evolve_locks` does at [`MAX_SCHEMA_EVOLVE_LOCKS`].
+const MAX_APPEND_QUEUES: usize = 1024;
 
 #[derive(Default)]
 struct StreamingBroadcastBuffer {
@@ -378,6 +384,11 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    #[snafu(display(
+        "Failed to write to dataset {table_name}: the shared write holding these rows stopped before reporting its outcome, so they may or may not be stored. Check the dataset before retrying; a retry can store them twice if the dataset has no primary key."
+    ))]
+    AppendGroupOutcomeUnknown { table_name: String },
+
     #[snafu(display("No executors available to forward write for table {table_name}"))]
     NoExecutorsAvailable { table_name: String },
 
@@ -399,6 +410,14 @@ pub enum Error {
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
+    /// A deferred dataset that no query has initialized: none has referenced it yet, or its
+    /// initialization failed, and a refresh has nothing to refresh before it initializes.
+    /// The message names no cause and promises no retry, because it covers all of these.
+    #[snafu(display(
+        "Dataset {table_name} is not initialized yet: it is initialized by a query that references it, and no query has initialized it. Query the dataset to initialize it, or to see the error that prevents it, then refresh. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#ready-state"
+    ))]
+    DatasetNotInitialized { table_name: String },
+
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
 
@@ -415,6 +434,19 @@ pub enum Error {
 
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
+
+    #[snafu(display(
+        "{}. Spice tries again on the next request that carries a token for it.",
+        source.to_string().trim_end_matches('.')
+    ))]
+    UnableToLoadDeferredCatalog {
+        source: Box<crate::catalogconnector::Error>,
+    },
+
+    #[snafu(display("{source}"))]
+    InvalidDeferredCatalog {
+        source: Box<crate::catalogconnector::Error>,
+    },
 
     #[snafu(display("The catalog {catalog} does not support partition metadata lookups."))]
     CatalogNotPartitionAware { catalog: String },
@@ -478,7 +510,8 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-        "Acceleration mode `append` requires `time_column` parameter for source {from}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        "Acceleration mode `append` requires `time_column` parameter for source {}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column",
+        crate::http::v1::redact_source_credentials(from)
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -504,14 +537,6 @@ pub enum Error {
     UnableToBuildAcceleratedTable {
         dataset_name: String,
         source: AcceleratedTableBuilderError,
-    },
-
-    #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
-    ))]
-    UnsupportedDistributedAccelerationEngine {
-        dataset_name: String,
-        engine: String,
     },
 
     #[snafu(display(
@@ -634,7 +659,6 @@ impl Error {
                 // connector cannot serve.
                 | Self::InvalidCachingRefreshMode { .. }
                 | Self::ConflictingStaleWhileRevalidateConfig { .. }
-                | Self::UnsupportedDistributedAccelerationEngine { .. }
                 | Self::UnsupportedStreamBatchesForBatchRefresh
                 | Self::UnsupportedRefreshCompleteForStream
                 | Self::UnsupportedSnapshotTriggerForCaching
@@ -813,37 +837,11 @@ fn acceleration_rebuilt_message(cause: &str) -> String {
     format!("{cause}, so it is dropped and reloaded from the source.")
 }
 
-/// Validates that the acceleration engine is supported in distributed mode.
-///
-/// Only Arrow, `PartitionedArrow`, and Cayenne engines are supported for distributed acceleration.
-/// Returns an error if a distributed role is active and the engine is unsupported.
-fn validate_distributed_engine(
-    cluster_config: &ResolvedClusterConfig,
-    engine: Engine,
-    dataset_name: &str,
-) -> Result<()> {
-    if cluster_config.effective_role().is_some()
-        && !matches!(
-            engine,
-            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
-        )
-    {
-        return UnsupportedDistributedAccelerationEngineSnafu {
-            dataset_name: dataset_name.to_string(),
-            engine: engine.to_string(),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow).
 pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -1354,6 +1352,12 @@ fn remove_if_same<V>(
     }
 }
 
+/// Whether a component that user tokens for `client_id` load is loaded by a request that
+/// carries tokens for `client_ids`.
+fn loads_with(client_id: Option<&str>, client_ids: &[String]) -> bool {
+    client_id.is_some_and(|client_id| client_ids.iter().any(|id| id == client_id))
+}
+
 struct DeferredTableRegistration {
     dataset: Arc<Dataset>,
     connector: Arc<dyn DataConnector>,
@@ -1473,6 +1477,9 @@ pub struct DataFusion {
     /// resolved a definition the clear retired would outlive it. A write holds the read
     /// guard across its check and insert, so a clear cannot count in between.
     plans_generation: TokioRwLock<u64>,
+    /// Physical plans of fully federated queries, one per query shape, bound to
+    /// each request's literal values (see [`federated_template`]).
+    federated_templates: federated_template::FederatedTemplates,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -1484,6 +1491,12 @@ pub struct DataFusion {
     /// dataset shares one lock (see `schema_evolve_lock`); created on first use and dropped
     /// again once unused, so unknown table names cannot grow the map without bound.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
+    /// Per dataset whose appends may be written together, the appends waiting
+    /// for its turn (see [`append_coalescer`]). Keyed by the table reference
+    /// `get_table_provider` resolves (see `queue_key`), so every name for one
+    /// dataset shares its queue and datasets of one name in different schemas do
+    /// not; created on a dataset's first eligible append.
+    append_queues: ParkingMutex<HashMap<TableReference, Arc<append_coalescer::AppendQueue>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
     /// Snapshot managers by dataset, so shutdown can resign their writer leases.
@@ -1533,6 +1546,11 @@ pub struct DataFusion {
     write_stats_notify: tokio::sync::Notify,
 
     pub(crate) accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    /// Names of datasets whose writer changed (`DataAccelerator::writer_role`),
+    /// for the runtime to reload; see [`Self::take_writer_role_changes`].
+    writer_role_changes: tokio::sync::mpsc::UnboundedSender<TableReference>,
+    writer_role_changes_rx:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>>>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     // Bounds concurrently-executing query plans — ordinary queries + DDL/DML +
@@ -1747,6 +1765,14 @@ impl DataFusion {
         }
 
         None
+    }
+
+    /// The names of datasets whose writer changed, to reload: taken once, by
+    /// the runtime.
+    pub fn take_writer_role_changes(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TableReference>> {
+        self.writer_role_changes_rx.lock().take()
     }
 
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
@@ -2021,6 +2047,7 @@ impl DataFusion {
                 catalog
             };
 
+            self.remove_deferred_catalog(name).await;
             self.ctx.register_catalog(name, catalog_to_register);
             self.set_catalog_access(name, access)?;
         }
@@ -2988,6 +3015,17 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Whether `dataset_name` is a deferred dataset still waiting for the first query that
+    /// references it to initialize it (including one whose attempts have failed).
+    pub async fn awaits_initialization(&self, dataset_name: &TableReference) -> bool {
+        self.has_pending_initializations()
+            && self
+                .pending_initializations
+                .read()
+                .await
+                .contains_key(dataset_name)
+    }
+
     /// Whether `dataset_name` is registered with its loaded provider: registered,
     /// and not a placeholder still awaiting its first-reference initialization
     /// (which stays registered when that initialization fails).
@@ -3160,21 +3198,100 @@ impl DataFusion {
         }
     }
 
-    pub async fn load_deferred_catalog(&self, name: &str, access: &AccessMode) -> Result<()> {
-        let deferred_catalogs = self.deferred_catalogs.read().await;
-        if let Some(catalog) = deferred_catalogs.get(name) {
-            if let Ok(provider) = catalog.get_catalog_provider().await {
-                self.ctx.register_catalog(name, Arc::clone(&provider));
-                self.set_catalog_access(name, access)?;
-            }
-
-            drop(deferred_catalogs);
-
-            let mut deferred_catalogs = self.deferred_catalogs.write().await;
-            deferred_catalogs.remove(name);
+    /// Loads a deferred catalog. It stays deferred until a load succeeds, so a later
+    /// request loads a catalog whose load failed, for example on an expired token. A
+    /// configuration error ends it instead. One load of a catalog runs at a time, and a
+    /// load whose catalog a Spicepod reload replaced or removed registers nothing.
+    pub async fn load_deferred_catalog(&self, name: &str) -> Result<()> {
+        let Some(catalog) = self
+            .deferred_catalogs
+            .read()
+            .await
+            .get(name)
+            .map(Arc::clone)
+        else {
+            return Ok(());
+        };
+        let ended_loads = catalog.ended_loads();
+        let _loading = catalog.lock_load().await;
+        let is_current = |deferred_catalogs: &HashMap<String, Arc<DeferredCatalogProvider>>| {
+            deferred_catalogs
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, &catalog))
+        };
+        // Another request's load ended while this one waited: it loaded the catalog, or it
+        // failed and a later request tries again.
+        if catalog.ended_loads() != ended_loads
+            || !is_current(&*self.deferred_catalogs.read().await)
+        {
+            return Ok(());
         }
 
+        let provider = match catalog.get_catalog_provider().await {
+            Ok(provider) => provider,
+            Err(source) if source.is_configuration_error() => {
+                let err = Error::InvalidDeferredCatalog {
+                    source: Box::new(source),
+                };
+                let mut deferred_catalogs = self.deferred_catalogs.write().await;
+                if !is_current(&deferred_catalogs) {
+                    return Ok(());
+                }
+                deferred_catalogs.remove(name);
+                self.runtime_status.update_catalog(
+                    name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
+                return Err(err);
+            }
+            Err(source) => {
+                return Err(Error::UnableToLoadDeferredCatalog {
+                    source: Box::new(source),
+                });
+            }
+        };
+
+        let mut deferred_catalogs = self.deferred_catalogs.write().await;
+        if is_current(&deferred_catalogs) {
+            self.ctx.register_catalog(name, provider);
+            self.set_catalog_access(name, catalog.access())?;
+            deferred_catalogs.remove(name);
+        }
         Ok(())
+    }
+
+    /// The deferred catalogs that user tokens for one of `client_ids` load.
+    pub async fn deferred_catalogs_for(&self, client_ids: &[String]) -> Vec<String> {
+        self.deferred_catalogs
+            .read()
+            .await
+            .iter()
+            .filter(|(_, catalog)| loads_with(catalog.user_token_client_id(), client_ids))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The deferred datasets that user tokens for one of `client_ids` load.
+    pub async fn deferred_datasets_for(&self, client_ids: &[String]) -> Vec<TableReference> {
+        self.deferred_tables
+            .read()
+            .await
+            .values()
+            .filter(|registration| {
+                loads_with(registration.connector.user_token_client_id(), client_ids)
+            })
+            .map(|registration| registration.dataset.name.clone())
+            .collect()
+    }
+
+    /// Forgets a deferred catalog, so no later request loads it.
+    pub async fn remove_deferred_catalog(&self, name: &str) {
+        self.deferred_catalogs.write().await.remove(name);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn is_deferred_catalog(&self, name: &str) -> bool {
+        self.deferred_catalogs.read().await.contains_key(name)
     }
 
     async fn ensure_sink_dataset(
@@ -3316,7 +3433,7 @@ impl DataFusion {
         // that completes through a provider being replaced by a schema evolution succeeds,
         // but its rows are invisible to the new provider.
         let rebind_lock = self.schema_evolve_lock(table_reference).await;
-        let rebind_guard = rebind_lock.read().await;
+        let rebind_guard = rebind_lock.read_owned().await;
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
@@ -3341,42 +3458,43 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        {
-            let insert_data = Arc::clone(&update_data);
-            let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
-                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                    Arc::clone(&update_schema),
-                    Box::pin(futures::stream::iter((0..insert_data.len()).map(
-                        move |batch_index| {
-                            Ok::<_, DataFusionError>(insert_data[batch_index].clone())
-                        },
-                    ))),
-                ),
-            );
-
-            let insert_plan = table_provider
-                .insert_into(
-                    &self.ctx.state(),
-                    Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
-                    overwrite,
-                )
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToPlanTableInsertSnafu {
-                    table_name: table_reference.to_string(),
-                })?;
-
-            let _ = collect(insert_plan, self.ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToExecuteTableInsertSnafu {
-                    table_name: table_reference.to_string(),
-                })?;
+        // Releases the hold on the provider once the rows are written, so evolution
+        // is free to swap it.
+        let written = self
+            .insert_update(
+                table_reference,
+                &table_provider,
+                &update_schema,
+                &update_data,
+                overwrite,
+                rebind_guard,
+            )
+            .await?;
+        if written == Written::Alone {
+            self.after_write(
+                table_reference,
+                &table_provider,
+                update_type,
+                update_schema,
+                update_data,
+            )
+            .await;
         }
 
-        // The write is done, so evolution is free to swap the provider now.
-        drop(rebind_guard);
+        Ok(())
+    }
 
+    /// The work every committed `write_data` call is followed by: forwarding to
+    /// Drasi, invalidating cached query state, marking the dataset ready, and
+    /// broadcasting the rows to subscribers.
+    async fn after_write(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+        update_type: UpdateType,
+        update_schema: SchemaRef,
+        update_data: Arc<Vec<RecordBatch>>,
+    ) {
         // Queue the committed write for Drasi, when `runtime.drasi` names this
         // table. After the write, so Drasi only sees rows the runtime kept; and
         // a queue rather than an await, so a Drasi outage cannot stall the
@@ -3430,8 +3548,265 @@ impl DataFusion {
                 )
                 .await;
         }
+    }
 
-        Ok(())
+    /// Insert one `write_data` call's rows into `table_provider`, then release
+    /// `rebind_guard`.
+    ///
+    /// An append to a dataset whose appends may be written together (see
+    /// [`append_coalescer`]) that finds another append to it being written, or
+    /// queued, queues behind them, to share one write with the appends queued
+    /// beside it. It returns once that write has returned, with that write's
+    /// outcome: never success before the accelerator has stored its rows. Every
+    /// other insert, and an append that finds none being written or queued, runs
+    /// at once on its own.
+    async fn insert_update(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+        schema: &SchemaRef,
+        data: &Arc<Vec<RecordBatch>>,
+        overwrite: InsertOp,
+        rebind_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<Written> {
+        let queue = if overwrite == InsertOp::Append {
+            self.append_queue(table_reference, table_provider)
+        } else {
+            None
+        };
+        let Some((queue, grouping)) = queue else {
+            let result = self
+                .insert_alone(table_provider, schema, data, overwrite)
+                .await;
+            drop(rebind_guard);
+            return result
+                .map(|()| Written::Alone)
+                .map_err(|failure| insert_error(table_reference, failure));
+        };
+
+        // The turn is taken at once only when it is free and no append is
+        // queued. An append that finds it free with appends queued goes behind
+        // them, and writes them before its own, so it never overtakes an earlier
+        // append of the same key.
+        let mut turn = match queue.try_take_turn() {
+            Some(append_coalescer::FreeTurn::Idle(turn)) => {
+                let result = self
+                    .insert_alone(table_provider, schema, data, overwrite)
+                    .await;
+                drop(turn);
+                drop(rebind_guard);
+                return result
+                    .map(|()| Written::Alone)
+                    .map_err(|failure| insert_error(table_reference, failure));
+            }
+            Some(append_coalescer::FreeTurn::Behind(turn)) => Some(turn),
+            None => None,
+        };
+
+        // An append too large to share a write, or with rows the accelerator
+        // refuses, is still queued, in a group of its own, so that it too keeps
+        // its place behind earlier appends.
+        let keys = append_coalescer::row_keys(&grouping, schema, data);
+        let mut queued = queue.enqueue(
+            table_reference.clone(),
+            Arc::clone(table_provider),
+            Arc::clone(schema),
+            Arc::clone(data),
+            keys,
+            rebind_guard,
+        );
+        loop {
+            let woken = if let Some(turn) = turn.take() {
+                Woken::Turn(turn)
+            } else {
+                tokio::select! {
+                    biased;
+                    outcome = &mut queued.outcome => Woken::Outcome(outcome),
+                    _ = &mut queued.claimed => Woken::Claimed,
+                    turn = queue.take_turn() => Woken::Turn(turn),
+                }
+            };
+            match woken {
+                Woken::Outcome(outcome) => {
+                    return member_result(table_reference, outcome).map(|()| Written::InGroup);
+                }
+                Woken::Claimed => break,
+                Woken::Turn(turn) => {
+                    // Claiming the group and spawning its write happen with no
+                    // `.await` between them, so a cancelled caller cannot leave
+                    // claimed rows unwritten.
+                    match queue.claim(&queued) {
+                        Some(group) => {
+                            self.spawn_group_insert(Arc::clone(&queue), group, turn);
+                        }
+                        // Another append's group holds these rows; its outcome
+                        // follows. Hand the turn to the next group.
+                        None => break,
+                    }
+                }
+            }
+        }
+        let outcome = (&mut queued.outcome).await;
+        member_result(table_reference, outcome).map(|()| Written::InGroup)
+    }
+
+    /// Insert `data` on its own, as one statement.
+    async fn insert_alone(
+        &self,
+        table_provider: &Arc<dyn TableProvider>,
+        schema: &SchemaRef,
+        data: &Arc<Vec<RecordBatch>>,
+        overwrite: InsertOp,
+    ) -> std::result::Result<(), append_coalescer::InsertFailure> {
+        insert_batches(
+            Arc::clone(table_provider),
+            self.ctx.state(),
+            self.ctx.task_ctx(),
+            Arc::clone(schema),
+            data.as_ref().clone(),
+            overwrite,
+        )
+        .await
+    }
+
+    /// Write `group` as one append, on a task of its own that owns `turn` until
+    /// the write returns, then run each member's [`Self::after_write`] and tell
+    /// each member the outcome.
+    ///
+    /// The task does not depend on the appends' callers. Once a group has
+    /// claimed an append's rows they are written whether or not its caller still
+    /// waits, so the work that follows a committed write runs here, for every
+    /// member, rather than in the caller, which may be gone. It runs before any
+    /// member is told the outcome, so a caller still sees it done when
+    /// `write_data` returns, as for a write of its own.
+    ///
+    /// The task holds `queue` until it hands the turn on. Without that, a queue
+    /// whose members have all gone could be dropped from `append_queues` while
+    /// its group still writes, and a new queue for the dataset would find its
+    /// turn free and write ahead of the group.
+    fn spawn_group_insert(
+        &self,
+        queue: Arc<append_coalescer::AppendQueue>,
+        group: append_coalescer::AppendGroup,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let state = self.ctx.state();
+        let task_ctx = self.ctx.task_ctx();
+        let datafusion = self.datafusion_ref.get().cloned();
+        let append_coalescer::AppendGroup {
+            provider,
+            schema,
+            batches,
+            rows,
+            members,
+            rebind_guards,
+            completion,
+        } = group;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = insert_batches(
+                Arc::clone(&provider),
+                state,
+                task_ctx,
+                Arc::clone(&schema),
+                batches,
+                InsertOp::Append,
+            )
+            .await;
+            // The rows are written, so evolution is free to swap the provider.
+            drop(rebind_guards);
+            let appends = members.len();
+            if result.is_ok()
+                && let Some(datafusion) = datafusion.as_ref().and_then(Weak::upgrade)
+            {
+                for member in members {
+                    datafusion
+                        .after_write(
+                            &member.table_reference,
+                            &provider,
+                            UpdateType::Append,
+                            Arc::clone(&schema),
+                            member.data,
+                        )
+                        .await;
+                }
+            }
+            tracing::debug!(
+                appends,
+                rows,
+                written = result.is_ok(),
+                duration_ms = started.elapsed().as_millis(),
+                "Wrote {appends} concurrent appends as one write"
+            );
+            completion.complete(&result);
+            drop(turn);
+            drop(queue);
+        });
+    }
+
+    /// The queue appends to `table_reference` wait in to be written together,
+    /// with how they may be grouped, or `None` when its appends are each written
+    /// alone (see `AcceleratedTable::append_grouping`).
+    fn append_queue(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+    ) -> Option<(Arc<append_coalescer::AppendQueue>, Arc<AppendGrouping>)> {
+        // A group runs its members' `after_write` through this; without it,
+        // appends are written alone.
+        self.datafusion_ref.get()?;
+        let grouping = append_grouping_of(table_provider)?;
+        let mut queues = self.append_queues.lock();
+        if queues.len() >= MAX_APPEND_QUEUES {
+            queues.retain(|_, queue| Arc::strong_count(queue) > 1);
+        }
+        let queue = Arc::clone(queues.entry(queue_key(table_reference)).or_default());
+        Some((queue, grouping))
+    }
+
+    /// Take `table_reference`'s turn to append, so the appends that arrive while
+    /// the guard is held queue to be written together; `None` when its appends
+    /// are each written alone. `#[doc(hidden)]` for integration tests; not a
+    /// stable API.
+    #[doc(hidden)]
+    pub async fn hold_append_turn(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let table_provider = self.get_table_provider(table_reference).await.ok()?;
+        let (queue, _) = self.append_queue(table_reference, &table_provider)?;
+        Some(queue.take_turn().await)
+    }
+
+    /// Hold `table_reference`'s accelerator write lock, which every write to its
+    /// acceleration holds for its whole length, until the guard is dropped;
+    /// `None` when it is not an accelerated dataset. `#[doc(hidden)]` for
+    /// integration tests; not a stable API.
+    #[doc(hidden)]
+    pub async fn hold_accelerator_write_lock(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let table_provider = self.get_table_provider(table_reference).await.ok()?;
+        let lock = accelerated_table_of(&table_provider, AcceleratedTable::accelerator_write_lock)?;
+        Some(lock.lock_owned().await)
+    }
+
+    /// How many appends to `table_reference` wait to be written together, and
+    /// how many groups and appends have been written together so far.
+    /// `#[doc(hidden)]` for integration tests; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn append_queue_counts(&self, table_reference: &TableReference) -> (usize, u64, u64) {
+        let queue = self
+            .append_queues
+            .lock()
+            .get(&queue_key(table_reference))
+            .cloned();
+        queue.map_or((0, 0, 0), |queue| {
+            let (groups, members) = queue.claimed();
+            (queue.queued(), groups, members)
+        })
     }
 
     /// Resolves when a streaming write has completed since the previous call.
@@ -3761,6 +4136,37 @@ impl DataFusion {
         })
     }
 
+    /// An owned bootstrap that still needs [`Self::initialize_accelerator`], for a retry
+    /// whose replacement init revoked the previous owner and then failed.
+    ///
+    /// Unowned [`BootstrapStatus::None`] would also reinitialize, but
+    /// [`Self::generation_lock`] treats an unowned bootstrap as license to revoke
+    /// whoever currently holds the slot — including a newer dataset configuration
+    /// that took ownership after this failure. Registering a dummy owner keeps the
+    /// retry as the slot's occupant until then; if the slot already has a live
+    /// owner, the dummy is revoked so [`AcceleratorBootstrap::borrow`] rejects the
+    /// superseded retry.
+    pub(crate) fn awaiting_accelerator_reinitialization(
+        &self,
+        name: &TableReference,
+    ) -> AcceleratorBootstrap {
+        let owner = Arc::new(BootstrapOwner::default());
+        let mut owners = self.bootstrap_owners.lock();
+        let resolved = resolve_table_reference(name.clone());
+        if owners.get(&resolved).and_then(Weak::upgrade).is_some() {
+            owner.revoke();
+            return AcceleratorBootstrap {
+                owner: Some(owner),
+                unowned: BootstrapStatus::None,
+            };
+        }
+        owners.insert(resolved, Arc::downgrade(&owner));
+        AcceleratorBootstrap {
+            owner: Some(owner),
+            unowned: BootstrapStatus::None,
+        }
+    }
+
     async fn generation_lock(&self, name: &TableReference) -> Result<GenerationPermit> {
         if let Some(owner) = self
             .bootstrap_owners
@@ -4021,16 +4427,17 @@ impl DataFusion {
         let constraint_columns =
             dataset_constraint_columns(dataset, source_constraints, &source_schema);
 
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration_settings.engine,
-            &dataset.name.to_string(),
-        )?;
         if matches!(refresh_mode, RefreshMode::Caching) {
             crate::accelerated::caching::extend_schema_with_cache_namespace(
                 &dataset.name.to_string(),
                 &refresh_schema,
             )
+            .and_then(|schema| {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+            })
             .map_err(|source| Error::UnableToCreateDataAccelerator {
                 source: crate::dataaccelerator::Error::InvalidConfiguration {
                     msg: source.to_string(),
@@ -4145,13 +4552,6 @@ impl DataFusion {
             source_constraints.cloned()
         };
 
-        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration_settings.engine,
-            &dataset.name.to_string(),
-        )?;
-
         // For caching mode, the underlying accelerator storage is augmented
         // with a hidden `__spice_cache_namespace` column so cached rows can be
         // scoped per-principal. The user-facing schema (and therefore query
@@ -4160,18 +4560,37 @@ impl DataFusion {
         // accelerator storage from earlier Spice versions does not have the
         // column and must be deleted (e.g. drop the SQLite/Postgres/Cayenne
         // backing table) before upgrading.
+        //
+        // A Cayenne caching table also stores a hidden `__spice_cache_request`
+        // column naming the request each row was fetched for, so eviction and
+        // refresh keep a paginated response whole. It is nullable and marked
+        // optional: a table created before it opens without it, and the cache
+        // then declines responses that followed pages, as it did before.
+        // Downgrading is not safe the same way: an earlier release ignores the
+        // column, evicts a cached paginated response page by page and can serve
+        // the pages it keeps as the whole response, so the caching acceleration's
+        // data must be deleted before downgrading, as for the namespace column.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
-            Arc::new(
-                crate::accelerated::caching::extend_schema_with_cache_namespace(
-                    &dataset.name.to_string(),
-                    &refresh_schema,
-                )
-                .map_err(|source| Error::UnableToCreateDataAccelerator {
-                    source: crate::dataaccelerator::Error::InvalidConfiguration {
-                        msg: source.to_string(),
-                    },
-                })?,
+            let invalid = |source: DataFusionError| Error::UnableToCreateDataAccelerator {
+                source: crate::dataaccelerator::Error::InvalidConfiguration {
+                    msg: source.to_string(),
+                },
+            };
+            let schema = crate::accelerated::caching::extend_schema_with_cache_namespace(
+                &dataset.name.to_string(),
+                &refresh_schema,
             )
+            .map_err(invalid)?;
+            let schema = if acceleration_settings.engine == Engine::Cayenne {
+                crate::accelerated::caching::extend_schema_with_cache_request(
+                    &dataset.name.to_string(),
+                    &schema,
+                )
+                .map_err(invalid)?
+            } else {
+                schema
+            };
+            Arc::new(schema)
         } else {
             Arc::clone(&refresh_schema)
         };
@@ -4438,10 +4857,17 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        if let Some(grouping) = append_grouping(
+            &acceleration_settings,
+            &source_table_provider,
+            &accelerated_table_provider,
+        ) {
+            accelerated_table_builder.groups_appends_by(grouping);
+        }
         accelerated_table_builder.data_update_publisher(Some(
             crate::dataupdate::DataUpdatePublisher::new(
                 self.data_update_broadcaster.clone(),
-                qualify_dataset_reference(self.normalize_table_reference(dataset.name.clone())),
+                qualify_dataset_reference(dataset.name.clone()),
             ),
         ));
         accelerated_table_builder.cdc_param_overrides(
@@ -4748,7 +5174,43 @@ impl DataFusion {
             accelerated_table_builder.metrics(metrics.clone());
         }
 
-        if refresh_mode == RefreshMode::Changes {
+        // With accelerations shared through one location, another instance may
+        // write this one: then this instance serves its queries, runs no refresh
+        // and consumes no change stream, and the dataset reloads when that
+        // changes (see `watch_writer_role`).
+        let writer_role = match self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+        {
+            Some(engine) => engine.writer_role(dataset).await,
+            None => None,
+        };
+        let replica = writer_role.as_ref().is_some_and(|role| !*role.borrow());
+        if writer_role.is_some() {
+            // The writer records its completed initial load in the location;
+            // a replica is ready from then on.
+            let initial_load = shared_initial_load_record(dataset).await?;
+            accelerated_table_builder.shared(if replica {
+                runtime_table::accelerated::SharedAcceleration::Replica { initial_load }
+            } else {
+                runtime_table::accelerated::SharedAcceleration::Writer { initial_load }
+            });
+        }
+        if replica {
+            // Never polled: the refresh that would consume it does not start.
+            match refresh_mode {
+                RefreshMode::Changes => {
+                    accelerated_table_builder.changes_stream(futures::stream::empty().boxed());
+                }
+                RefreshMode::Append if dataset.time_column.is_none() => {
+                    accelerated_table_builder.append_stream(futures::stream::empty().boxed());
+                }
+                _ => {}
+            }
+        }
+
+        if refresh_mode == RefreshMode::Changes && !replica {
             // Make the dataset's `on_schema_change` policy + constraint columns
             // available to the CDC apply loop before the changes stream starts.
             // Connectors (e.g. Debezium) may have pre-installed a default; this
@@ -4802,7 +5264,7 @@ impl DataFusion {
         // accelerator engine, including Cayenne. When the source does not
         // provide an append_stream, Cayenne falls back to its own validation
         // (supports primary_key); other engines require time_column.
-        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
+        if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() && !replica {
             if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
             } else if acceleration_settings.engine != Engine::Cayenne {
@@ -4899,6 +5361,14 @@ impl DataFusion {
                 dataset_name: dataset.name.to_string(),
             },
         )?;
+        if let Some(role) = writer_role {
+            accelerated_table.attach_task(self.io_runtime.spawn(watch_writer_role(
+                role,
+                !replica,
+                dataset.name.clone(),
+                self.writer_role_changes.clone(),
+            )));
+        }
 
         if let Some((subscription, state)) = snapshot_subscription
             && let Some(requester) = accelerated_table.refresh_requester()
@@ -5021,20 +5491,6 @@ impl DataFusion {
             return Ok(None);
         };
 
-        let needs_dict_normalization = matches!(
-            acceleration_settings.engine.to_unpartitioned(),
-            Engine::Sqlite
-        );
-        let normalized_refresh_schema = if needs_dict_normalization
-            && arrow_tools::schema::has_dictionary_types(refresh_schema)
-        {
-            Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
-                refresh_schema,
-            ))
-        } else {
-            Arc::clone(refresh_schema)
-        };
-
         // For `refresh_sql` datasets the canonical checkpoint schema carries
         // non-materialized source columns that are intentionally absent from the
         // projected refresh schema; compare only the materialized (refresh-schema)
@@ -5049,7 +5505,7 @@ impl DataFusion {
         // the refresh schema), defeating `file_update`'s drop-recreate. Compare the
         // full checkpoint there so real removals are still detected.
         let comparison_schema = if dataset.refresh_sql().is_some() {
-            restrict_schema_to(&existing_schema, &normalized_refresh_schema)
+            restrict_schema_to(&existing_schema, refresh_schema)
         } else {
             Arc::clone(&existing_schema)
         };
@@ -5057,11 +5513,8 @@ impl DataFusion {
         if policy != OnSchemaChange::Block {
             let dataset_name = dataset.name.to_string();
             let ctx = EvolutionContext { constraint_columns };
-            match arrow_tools::schema_evolution::classify(
-                &comparison_schema,
-                &normalized_refresh_schema,
-                &ctx,
-            ) {
+            match arrow_tools::schema_evolution::classify(&comparison_schema, refresh_schema, &ctx)
+            {
                 SchemaEvolution::Identical => {
                     // Name-sets match: register with the checkpoint field order (not
                     // source order) so positional engine paths stay aligned with the
@@ -5251,10 +5704,8 @@ impl DataFusion {
         // not evolve falls back to snapshot + drop + recreate with the new schema (under
         // `block`, this is `file_update`'s today's-behavior-verbatim contract).
         if allow_recreate
-            && let Some(diff) = arrow_tools::schema::schema_difference(
-                &comparison_schema,
-                &normalized_refresh_schema,
-            )
+            && let Some(diff) =
+                arrow_tools::schema::schema_difference(&comparison_schema, refresh_schema)
         {
             let dataset_name = dataset.name.to_string();
             let trigger = if is_file_update {
@@ -6259,6 +6710,13 @@ impl DataFusion {
                 .await;
         }
 
+        if self.awaits_initialization(dataset_name).await {
+            return DatasetNotInitializedSnafu {
+                table_name: dataset_name.to_string(),
+            }
+            .fail();
+        }
+
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
@@ -6403,7 +6861,9 @@ impl DataFusion {
             Arc::clone(&refresh_schema),
         )
         .context(RefreshSqlSnafu)?;
-        if selected_schema != refresh_schema {
+        // Compare the columns only: the acceleration's schema metadata (such as the
+        // accelerator name) is not something the refresh SQL selects.
+        if selected_schema.fields() != refresh_schema.fields() {
             return RefreshSqlSchemaChangeDisallowedSnafu {
                 dataset_name: Arc::from(dataset_name.to_string()),
                 selected_columns: Arc::from(
@@ -6587,6 +7047,10 @@ impl DataFusion {
         }
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
 
+        sql_depth_guard::ensure_data_types_within_depth_limit(&view.sql, &PostgreSqlDialect {})
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format_datafusion_error(&e),
+            })?;
         let statements = DFParser::parse_sql_with_dialect(&view.sql, &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
@@ -6598,11 +7062,16 @@ impl DataFusion {
             }
             .fail();
         }
+        sql_depth_guard::ensure_statement_within_depth_limits(&statements[0]).map_err(|e| {
+            Error::UnableToCreateView {
+                reason: format_datafusion_error(&e),
+            }
+        })?;
 
         let ctx = Arc::clone(&self.ctx);
         let df_ref = Arc::clone(self);
-        let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
+        let dependent_table_names = view::get_view_dependencies(&statements[0], &status);
 
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
@@ -6854,13 +7323,6 @@ impl DataFusion {
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: table.to_string(),
                 })?;
-
-        // Distributed acceleration is only supported with Arrow, PartitionedArrow, or Cayenne engines.
-        validate_distributed_engine(
-            &self.cluster_config,
-            acceleration.engine,
-            &table.to_string(),
-        )?;
 
         let accelerated_table_provider = self
             .create_view_accelerator_table(view, view_plan, schema, acceleration, secrets)
@@ -7137,10 +7599,6 @@ impl DataFusion {
             None
         };
 
-        let generation = session
-            .config()
-            .get_extension::<PlansGeneration>()
-            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -7153,13 +7611,43 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            let current = self.plans_generation.read().await;
-            if generation == Some(*current) {
-                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
-            }
+            self.put_plan_planned_in(cache.as_ref(), session, cache_key, &plan)
+                .await;
         }
 
         Ok(plan)
+    }
+
+    /// Stores `plan`, planned against `session`, in the plans cache under `key`,
+    /// unless the cache has been cleared since `session` was copied: such a plan
+    /// may hold a definition the clear retired (see `plans_generation`).
+    pub(crate) async fn cache_plan_planned_in(
+        &self,
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        if let Some(cache) = self.plans_cache_provider() {
+            self.put_plan_planned_in(cache.as_ref(), session, key, plan)
+                .await;
+        }
+    }
+
+    async fn put_plan_planned_in(
+        &self,
+        cache: &(dyn TabledCacheProvider<LogicalPlan> + Send + Sync),
+        session: &SessionState,
+        key: &RawCacheKey,
+        plan: &LogicalPlan,
+    ) {
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
+        let current = self.plans_generation.read().await;
+        if generation == Some(*current) {
+            cache.put_raw_key(&key.as_u64(), plan.clone()).await;
+        }
     }
 
     /// Route SQL through the planner, which intercepts DDL extensions and
@@ -7225,6 +7713,7 @@ impl DataFusion {
                 .config_mut()
                 .set_extension(Arc::new(PlansGeneration(*generation)));
         }
+        self.federated_templates.clear();
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
         }
@@ -7632,6 +8121,212 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     None
 }
 
+/// Insert `batches` into `provider` as one statement.
+async fn insert_batches(
+    provider: Arc<dyn TableProvider>,
+    state: SessionState,
+    task_ctx: Arc<TaskContext>,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    overwrite: InsertOp,
+) -> std::result::Result<(), append_coalescer::InsertFailure> {
+    use append_coalescer::{InsertFailure, InsertStage};
+    let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
+        ),
+    );
+    let insert_plan = provider
+        .insert_into(
+            &state,
+            Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
+            overwrite,
+        )
+        .await
+        .map_err(|error| InsertFailure::new(InsertStage::Plan, find_datafusion_root(error)))?;
+    collect(insert_plan, task_ctx)
+        .await
+        .map_err(|error| InsertFailure::new(InsertStage::Execute, find_datafusion_root(error)))?;
+    Ok(())
+}
+
+/// The error `write_data` returns for an insert into `table_reference` that failed.
+fn insert_error(
+    table_reference: &TableReference,
+    failure: append_coalescer::InsertFailure,
+) -> Error {
+    let table_name = table_reference.to_string();
+    let stage = failure.stage;
+    let source = failure.into_error();
+    match stage {
+        append_coalescer::InsertStage::Plan => {
+            Error::UnableToPlanTableInsert { table_name, source }
+        }
+        append_coalescer::InsertStage::Execute => {
+            Error::UnableToExecuteTableInsert { table_name, source }
+        }
+    }
+}
+
+/// The key of `table_reference`'s append queue: the catalog, schema and table
+/// `DataFusion::get_table_provider` resolves it to, defaults filled in as there.
+/// One dataset's appends must share a queue whatever name they use, or one
+/// queue's append could be written ahead of an earlier append queued in another.
+fn queue_key(table_reference: &TableReference) -> TableReference {
+    TableReference::full(
+        table_reference
+            .catalog()
+            .unwrap_or(SPICE_DEFAULT_CATALOG)
+            .to_string(),
+        table_reference
+            .schema()
+            .unwrap_or(SPICE_DEFAULT_SCHEMA)
+            .to_string(),
+        table_reference.table().to_string(),
+    )
+}
+
+/// Who runs a `write_data` call's [`DataFusion::after_write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// The call wrote its rows itself and follows the write up itself.
+    Alone,
+    /// A group wrote its rows and followed the write up before telling it.
+    InGroup,
+}
+
+/// What woke an append waiting to be written together with others.
+enum Woken {
+    Outcome(
+        std::result::Result<
+            append_coalescer::MemberOutcome,
+            tokio::sync::oneshot::error::RecvError,
+        >,
+    ),
+    Claimed,
+    Turn(tokio::sync::OwnedMutexGuard<()>),
+}
+
+/// The result a queued append returns to its caller.
+fn member_result(
+    table_reference: &TableReference,
+    outcome: std::result::Result<
+        append_coalescer::MemberOutcome,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+) -> Result<()> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(failure)) => Err(insert_error(table_reference, failure)),
+        Err(_) => AppendGroupOutcomeUnknownSnafu {
+            table_name: table_reference.to_string(),
+        }
+        .fail(),
+    }
+}
+
+/// How `provider`'s accelerated table groups concurrent appends, or `None` when
+/// it writes each alone or is not an accelerated table.
+fn append_grouping_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<AppendGrouping>> {
+    accelerated_table_of(provider, |accelerated| {
+        accelerated.append_grouping().map(Arc::clone)
+    })
+    .flatten()
+}
+
+/// `read` of the accelerated table `provider` wraps, or `None` when it wraps none.
+/// Unwraps what registration stacks around the accelerated table, as
+/// `DataFusion::get_accelerated_table_provider` does.
+fn accelerated_table_of<T>(
+    provider: &Arc<dyn TableProvider>,
+    read: impl FnOnce(&AcceleratedTable) -> T,
+) -> Option<T> {
+    let mut table = Arc::clone(provider);
+    loop {
+        if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
+            let nested_table = adaptor.table_provider.clone()?;
+            table = nested_table;
+            continue;
+        }
+        if let Some(layered) = table.downcast_ref::<spice_table::SpiceTable>() {
+            if let Some(accelerated) = layered.layer_as::<AcceleratedTable>() {
+                return Some(read(accelerated));
+            }
+            let inner = Arc::clone(layered.below());
+            table = inner;
+            continue;
+        }
+        return None;
+    }
+}
+
+/// How concurrent appends to a dataset may be written together, or `None` when
+/// its appends must each be written alone (see [`append_coalescer`]).
+///
+/// Only an unpartitioned, file-backed Cayenne acceleration: it keeps the last
+/// arrival of a key within one append as across appends, and counts the copies an
+/// append repeats itself as superseded, so a group whose members share no key
+/// stores and counts what the members would one after another.
+///
+/// The key is the one the table resolves: the primary key the opened
+/// acceleration reports, which is its stored one even when it kept that through a
+/// settings change it cannot apply in place. Without one, it is the key Cayenne
+/// creates a table with: the acceleration's `primary_key` when it names columns,
+/// otherwise the source's. A key other than the one the table resolves would only
+/// let a key two members share into the superseded count; the rows stored are the
+/// same. A null, though, fails the whole write, so every column any of these keys
+/// names keeps an append with a null in it out of groups.
+fn append_grouping(
+    acceleration: &Acceleration,
+    source: &FederatedTable,
+    accelerator: &Arc<dyn TableProvider>,
+) -> Option<AppendGrouping> {
+    if acceleration.engine != Engine::Cayenne
+        || matches!(acceleration.mode, Mode::Memory)
+        || !acceleration.partition_by.is_empty()
+    {
+        return None;
+    }
+    let stored: Vec<String> = accelerator
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(
+                constraints,
+                &accelerator.schema(),
+            )
+        })
+        .unwrap_or_default();
+    let requested: Vec<String> = acceleration
+        .primary_key
+        .as_ref()
+        .map(|primary_key| primary_key.iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let from_source: Vec<String> = source
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(constraints, &source.schema())
+        })
+        .unwrap_or_default();
+    let key = if !stored.is_empty() {
+        stored.clone()
+    } else if !requested.is_empty() {
+        requested.clone()
+    } else {
+        from_source.clone()
+    };
+    let mut non_null: Vec<String> = Vec::new();
+    for column in stored.into_iter().chain(requested).chain(from_source) {
+        if !non_null.contains(&column) {
+            non_null.push(column);
+        }
+    }
+    Some(AppendGrouping {
+        key: key.into(),
+        non_null: non_null.into(),
+    })
+}
+
 /// Whether a write failed the schema check the runtime runs before inserting anything.
 ///
 /// No rows were written, so the caller can rebuild its batch against the new schema and retry
@@ -7648,6 +8343,64 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
     inner
         .downcast_ref::<Error>()
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
+}
+
+/// Where the instance writing `dataset`'s shared acceleration records its
+/// completed initial load, and the other instances read it.
+async fn shared_initial_load_record(
+    dataset: &Dataset,
+) -> Result<Arc<dyn runtime_checkpoint_api::BlobCheckpointStore>> {
+    crate::dataaccelerator::spice_sys::checkpoint_store(
+        dataset,
+        runtime_checkpoint_api::INITIAL_LOAD_TABLE,
+    )
+    .await
+    .ok_or_else(|| Error::AccelerationRegistration {
+        source: format!(
+            "Dataset '{}' could not open the record of its initial load in the shared state location",
+            dataset.name
+        )
+        .into(),
+    })
+}
+
+/// How often a table that serves the wrong writer role asks again for its
+/// dataset to be reloaded, after a reload that did not replace it.
+const WRITER_ROLE_RELOAD_RETRY: Duration = Duration::from_secs(15);
+
+/// Ask for `dataset` to be reloaded once this instance starts or stops
+/// writing its acceleration: a takeover reopens it from the committed state
+/// and starts its refresh, a handover stops it. `built_as_writer` is the role
+/// the table was built for, so a change between reading the role and starting
+/// this watch reloads it too. The task belongs to the table: while the table
+/// still serves the wrong role, because a reload failed (its source could not
+/// be reached, say), it asks again, and a reload that replaces the table ends
+/// it.
+async fn watch_writer_role(
+    mut role: data_accelerator_api::WriterRole,
+    built_as_writer: bool,
+    dataset: TableReference,
+    reloads: tokio::sync::mpsc::UnboundedSender<TableReference>,
+) {
+    loop {
+        if *role.borrow_and_update() == built_as_writer {
+            if role.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if reloads.send(dataset.clone()).is_err() {
+            return;
+        }
+        tokio::select! {
+            changed = role.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY).await;
+                }
+            }
+            () = tokio::time::sleep(WRITER_ROLE_RELOAD_RETRY) => {}
+        }
+    }
 }
 
 impl Drop for DataFusion {
@@ -7835,8 +8588,6 @@ async fn build_snapshot_creation_config(
     };
 
     let acceleration_engine = match acceleration_settings.engine {
-        #[cfg(feature = "sqlite")]
-        Engine::Sqlite => AccelerationEngine::Sqlite,
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -8070,6 +8821,18 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    /// The dataset's source is named without the credentials its URL carries.
+    #[test]
+    fn append_requires_time_column_message_leaves_out_url_credentials() {
+        let error = Error::AppendRequiresTimeColumn {
+            from: "https://alice:hunter2@api.example.com/rows.csv?api_key=abc123".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Acceleration mode `append` requires `time_column` parameter for source https://api.example.com/rows.csv?api_key=***. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        );
+    }
 
     #[test]
     fn settings_rebuild_messages_name_the_dataset_the_change_and_the_outcome() {
@@ -8482,6 +9245,51 @@ mod tests {
         );
     }
 
+    /// A Cayenne acceleration's schema carries `spice.accelerator` metadata, which a refresh
+    /// SQL's column list does not. Selecting the acceleration's columns must still be
+    /// accepted, and any other column list refused.
+    #[tokio::test]
+    async fn update_refresh_sql_compares_columns_not_schema_metadata() {
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = DataFusion::builder(
+            status::RuntimeStatus::new(),
+            runtime.accelerator_engine_registry(),
+            Handle::current(),
+        )
+        .build();
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("kind", DataType::Utf8, true),
+            ],
+            HashMap::from([("spice.accelerator".to_string(), "cayenne".to_string())]),
+        ));
+        df.ctx
+            .register_table(
+                TableReference::bare("events"),
+                Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table")),
+            )
+            .expect("table should register");
+
+        for sql in [
+            "SELECT id, kind FROM events WHERE id > 1",
+            "SELECT * FROM events",
+        ] {
+            df.update_refresh_sql(TableReference::bare("events"), sql.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("{sql} selects the acceleration's columns: {e}"));
+        }
+        for sql in ["SELECT id FROM events", "SELECT kind, id FROM events"] {
+            let result = df
+                .update_refresh_sql(TableReference::bare("events"), sql.to_string())
+                .await;
+            assert!(
+                matches!(result, Err(Error::RefreshSqlSchemaChangeDisallowed { .. })),
+                "{sql} must be refused: {result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {
         static SQL: &str = "SELECT 1";
@@ -8728,7 +9536,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "sqlite", feature = "snapshots"))]
+    #[cfg(feature = "snapshots")]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -8738,6 +9546,14 @@ mod tests {
         use spicepod::component::snapshot::Snapshots;
         use std::sync::Arc;
         use tempfile::TempDir;
+
+        /// The Cayenne snapshot engine production passes as the override; without it a
+        /// Cayenne archive would be unrestorable and no config is built at all (see
+        /// `cayenne_does_not_publish_without_its_snapshot_engine`).
+        fn test_snapshot_engine() -> Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>
+        {
+            Arc::new(runtime_acceleration::snapshot::engine::DefaultSnapshotEngine)
+        }
 
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
@@ -8810,7 +9626,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 None,
                 None,
                 &dataset.runtime().secrets(),
@@ -8823,7 +9639,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8889,7 +9705,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::RefreshComplete),
                 None,
                 &dataset.runtime().secrets(),
@@ -8902,7 +9718,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8917,7 +9733,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("not-a-valid-batch-count".to_string()),
                 &dataset.runtime().secrets(),
@@ -8930,7 +9746,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8947,7 +9763,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8960,7 +9776,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -8985,7 +9801,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("25".to_string()),
                 &dataset.runtime().secrets(),
@@ -8998,7 +9814,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9023,7 +9839,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9036,7 +9852,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9056,7 +9872,7 @@ mod tests {
             let dataset = create_test_dataset(Some("created_at".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9069,7 +9885,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9089,7 +9905,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 Some("file:///tmp".to_string()),
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 None,
                 &dataset.runtime().secrets(),
@@ -9102,7 +9918,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9122,7 +9938,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("-10".to_string()),
                 &dataset.runtime().secrets(),
@@ -9135,7 +9951,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9151,7 +9967,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("0".to_string()),
                 &dataset.runtime().secrets(),
@@ -9164,7 +9980,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9180,7 +9996,7 @@ mod tests {
             let dataset = create_test_dataset(Some("ts".to_string())).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::TimeInterval),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9193,7 +10009,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9212,7 +10028,7 @@ mod tests {
             let dataset = create_test_dataset(None).await;
             let acceleration = create_acceleration_with_trigger(
                 None,
-                Engine::Sqlite,
+                Engine::Cayenne,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some(String::new()),
                 &dataset.runtime().secrets(),
@@ -9225,7 +10041,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
-                None,
+                Some(test_snapshot_engine()),
             )
             .await;
 
@@ -9237,94 +10053,6 @@ mod tests {
                 ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
-        }
-    }
-
-    mod validate_distributed_engine_tests {
-        use super::super::*;
-        use crate::config::{ClusterConfig, Role};
-
-        fn make_cluster_config(role: Role) -> ResolvedClusterConfig {
-            let config = ClusterConfig {
-                role: Some(role),
-                allow_insecure_connections: true,
-                node_advertise_address: Some("127.0.0.1".to_string()),
-                ..ClusterConfig::default()
-            };
-            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
-        }
-
-        fn make_non_distributed_config() -> ResolvedClusterConfig {
-            ResolvedClusterConfig::try_new(ClusterConfig::default())
-                .expect("valid default cluster config")
-        }
-
-        #[test]
-        fn arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("arrow engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn partitioned_arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
-                .expect("partitioned_arrow engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn cayenne_allowed_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("cayenne engine should be allowed in distributed mode");
-        }
-
-        #[test]
-        fn sqlite_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Executor);
-            let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-            // The fix it names is the engine that stays: Cayenne partitions only in
-            // file mode.
-            assert_eq!(
-                result.expect_err("sqlite is rejected").to_string(),
-                "Failed to create an accelerated table for dataset my_dataset: the 'sqlite' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
-            );
-        }
-
-        #[test]
-        fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(Role::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
-        fn any_engine_allowed_in_non_distributed_mode() {
-            let config = make_non_distributed_config();
-            validate_distributed_engine(&config, Engine::Sqlite, "ds")
-                .expect("duckdb should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Sqlite, "ds")
-                .expect("sqlite should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
-                .expect("postgresql should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Arrow, "ds")
-                .expect("arrow should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Cayenne, "ds")
-                .expect("cayenne should be allowed when not in distributed mode");
         }
     }
 
@@ -9827,10 +10555,12 @@ mod tests {
 }
 
 /// The fully qualified name a dataset registers under, which is the name its
-/// `DoExchange` subscribers are keyed by. A dataset's accelerated table is
-/// built before the dataset registers, so normalizing its name then can still
-/// leave it bare. A bare or partial name registers in the default catalog and
-/// schema, the same defaults `get_table_provider` resolves with.
+/// `DoExchange` subscribers are keyed by. The name is qualified directly, not
+/// resolved against the catalog: a dataset's accelerated table is built before
+/// the dataset registers, so resolving a bare name then can leave it bare or
+/// bind it to a same-named table in another schema. A bare or partial name
+/// registers in the default catalog and schema, the same defaults
+/// `get_table_provider` resolves with.
 fn qualify_dataset_reference(table_reference: TableReference) -> TableReference {
     match table_reference {
         TableReference::Full { .. } => table_reference,

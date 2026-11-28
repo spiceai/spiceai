@@ -1,4 +1,6 @@
 name: served-while-source-down
+duration: 31s
+tags: [long]
 description: >
   An acceleration already on disk is served while its source is down, slow, or
   rejecting the connection: queries answer from it at once, the status says it

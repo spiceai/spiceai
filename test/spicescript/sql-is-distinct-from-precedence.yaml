@@ -1,5 +1,6 @@
 {
   "name": "sql-is-distinct-from-precedence",
+  "duration": "1s",
   "description": "IS [NOT] DISTINCT FROM binds tighter than AND/OR, as in PostgreSQL (expected values from PostgreSQL 17.5). sqlparser 0.62.0 parsed `a IS DISTINCT FROM b OR c` as `a IS DISTINCT FROM (b OR c)`.",
   "spicepod": {
     "version": "v1",

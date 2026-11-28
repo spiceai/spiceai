@@ -1,4 +1,5 @@
 name: cluster-timestamp-boundary
+duration: 82s
 description: >
   Known failing (#15539), on a cluster only (dynamodb-types.yaml passes on one
   spiced). Over DynamoDB items accelerated into Cayenne, `col_timestamp_tz >

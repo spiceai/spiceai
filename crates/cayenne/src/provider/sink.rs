@@ -345,6 +345,12 @@ impl CayenneDataSink {
                 .into_empty_table()
                 .write(normalized, write_guard)
                 .await?;
+            // The append published the load without feeding the maintained
+            // aggregates, which marks them stale; rebuild them from the rows it
+            // wrote before the load returns, so the queries that follow it are
+            // served from maintained state. The write lock is released, so CDC
+            // changes after the load are held as deltas, not lost.
+            self.table.rebuild_stale_maintained_aggregates().await;
             // A load too large for an exact keyset cached a filter of the keys it
             // wrote (`first_load_pk`), which this finds and keeps. Otherwise warm
             // the index the next refresh validates against now, rather than on

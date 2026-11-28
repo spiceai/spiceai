@@ -4,9 +4,9 @@ These scripts need `spiced` built with `snapshots` and `postgres`. From the
 repository root, build the runtime and runner together, then record durations:
 
 ```sh
-cargo build --profile lint -p spiced -p spicescript --no-default-features \
+cargo build --profile lint -p spiced -p testoperator --no-default-features \
   --features spiced/postgres,spiced/snapshots
-target/lint/spicescript test/spicescript/snapshots \
+target/lint/testoperator script test/spicescript/snapshots \
   --spiced target/lint/spiced --record-durations
 ```
 
@@ -40,6 +40,7 @@ invocation restores the original metadata bytes.
 | `snapshots-writer-lease` | A single publisher, standby behavior, graceful handoff (#15256), expiry after SIGKILL, and restore of the new publisher's data. The graceful holder has a two-hour lease; publication within 20 seconds of shutdown must therefore use release rather than expiry. |
 | `snapshots-kill-during-upload` | SIGKILL at different delays after refresh completion, then cold restore without the source. Requires a whole generation, the original key count and sum, a generation that could have been published, and each row's deterministic payload. |
 | `snapshots-object-store` | S3-compatible runtime state and per-dataset snapshot locations, cold restore, and source recovery. |
+| `cayenne-snapshot-position-deletes-moved-dir` | A `DELETE` on a Cayenne table with no primary key writes position deletion vectors; a snapshot taken after it restores on empty local storage with exactly the kept rows, into the writer's directory and into a different `cayenne_file_path` and `cayenne_metadata_dir` (#16735). |
 | `snapshots-policies` | Creation triggers, `always` versus `on_change`, and create-only versus bootstrap-only behavior. |
 | `snapshots-reader` | Explicit `refresh_mode: snapshot` replication and cache behavior while polls find no new snapshot. |
 | `snapshots` | File-store restore and source recovery. |

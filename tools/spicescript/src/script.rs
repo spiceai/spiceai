@@ -25,16 +25,44 @@ limitations under the License.
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use clap::ValueEnum as _;
 use indexmap::IndexMap;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+
+/// A script's tags, which `--only-tag` and `--exclude-tag` select on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tag {
+    /// Too slow for the run before every merge, for what it catches there: the
+    /// merge queue runs `--exclude-tag long`, and the post-merge run on trunk
+    /// runs every script. As with Go's `-short`, a script runs before merge
+    /// unless it opts out.
+    Long,
+    /// Run on the macOS runners too, by E2E Test CI's `spicescript: macOS
+    /// smoke` job (`--only-tag macos-smoke`), as well as on Linux. Those
+    /// runners have no Docker, so every source must be `files`, `mock-http` or
+    /// `duckdb`.
+    MacosSmoke,
+}
+
+/// Source kinds that run on the host rather than in a container.
+const IN_PROCESS_SOURCES: &[&str] = &["files", "mock-http", "duckdb"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Script {
     pub name: String,
     #[serde(default)]
+    pub tags: Vec<Tag>,
+    #[serde(default)]
     pub description: Option<String>,
+    /// Environment variables the script needs, such as a provider's
+    /// credentials. When any is unset or empty the script is not run, and the
+    /// run lists it as not run rather than counting it as passed or failed;
+    /// `--require-all-env` makes that a failure.
+    #[serde(default)]
+    pub requires_env: Vec<String>,
     #[serde(default)]
     pub sources: IndexMap<String, SourceSpec>,
     /// Every combination of these values is a separate run, exposed to the
@@ -61,13 +89,16 @@ pub struct Script {
     #[serde(skip)]
     pub steps: Vec<Step>,
     /// How long the script takes to run, every matrix combination included,
-    /// as recorded in `recordings/durations.json` beside it (see
-    /// [`Script::load`]). `--jobs` starts the longest scripts first.
-    #[serde(skip)]
+    /// recorded by `--record-durations` (see [`Script::load`]). `--partition`
+    /// deals scripts to shards by it and `--jobs` starts the longest first.
+    #[serde(default, with = "opt_duration")]
     pub duration: Option<Duration>,
-    /// The script file's name without `.yaml`: its key in the durations file.
+    /// The script file's name without `.yaml`.
     #[serde(skip)]
     pub file_stem: String,
+    /// The script file.
+    #[serde(skip)]
+    pub path: std::path::PathBuf,
     /// The directory the script is in; `corpus` and `slt` files are relative to it.
     #[serde(skip)]
     pub dir: std::path::PathBuf,
@@ -155,6 +186,13 @@ pub struct SourceSpec {
     /// `${instance.host_from_container}`.
     #[serde(default)]
     pub host_network: bool,
+    /// Give every instance of a run the same namespace (database, schema)
+    /// instead of one each, for instances that act as replicas of one
+    /// acceleration over one source: they then share its replication slot,
+    /// binlog or stream. A step that changes the source runs once per
+    /// instance it reaches, so such steps take `only:`.
+    #[serde(default)]
+    pub shared: bool,
     /// `rustfs` sources: put a toxiproxy in front of the store that delays
     /// every response by this long, so `spiced` (`${sources.<name>.endpoint}`
     /// and `.params`) sees a remote store's round trip. The harness's own
@@ -273,6 +311,11 @@ pub struct Defaults {
     /// node mTLS with a CA and certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
+    /// Why the script runs only as a single node: `--cluster` skips it with
+    /// this reason. For what the runner cannot see in the spicepod up front,
+    /// such as datasets a `spice` step adds while it runs.
+    #[serde(default)]
+    pub single_node: Option<String>,
     /// When the script runs as a cluster, the column each acceleration without
     /// `partition_by` is bucketed on, by dataset name (`*` for any other).
     #[serde(default)]
@@ -343,6 +386,7 @@ impl Default for Defaults {
             spiced_args: Vec::new(),
             executor_args: None,
             cluster: None,
+            single_node: None,
             cluster_partition_by: BTreeMap::new(),
             exclusive: false,
             run_variants: RunVariants::OneAfterAnother,
@@ -402,6 +446,9 @@ pub enum Action {
         /// `false` waits only for `spiced` to answer HTTP, for a start whose
         /// datasets are expected not to become ready.
         wait_ready: bool,
+        /// `false` waits for nothing, for a start that is expected not to
+        /// serve yet; a later `wait-ready` waits for it.
+        wait: bool,
         /// A change to the spicepod, kept for every later start.
         patch: Option<VariantSpec>,
     },
@@ -420,6 +467,9 @@ pub enum Action {
         /// `upgrade`: start again on the binary under test (from the one
         /// `--from` started the instance on).
         upgrade: bool,
+        /// `downgrade`: start again on the binary the instance started on, the
+        /// release `from:` or `--from` names, as a rollback does.
+        downgrade: bool,
     },
     WaitReady {
         timeout: Duration,
@@ -520,20 +570,31 @@ pub enum Action {
         keep: Vec<String>,
     },
     /// Checks the files under the instance's directory, by path relative to it,
-    /// and that no directory matches `lacks_dirs` (paths end in `/`).
+    /// that no directory matches `lacks_dirs` (paths end in `/`), and that every
+    /// file `unchanged_since` names (a `mark-files` id) is still there, unchanged.
     AssertFiles {
         contains: Vec<regex::Regex>,
         lacks: Vec<regex::Regex>,
         lacks_dirs: Vec<regex::Regex>,
+        unchanged_since: Option<String>,
+    },
+    /// Keep the size and a digest of every file under the instance's directory
+    /// whose relative path matches one of `matching` (every file when it is
+    /// empty), for a later `assert-files: { unchanged-since: <id> }`.
+    MarkFiles {
+        id: String,
+        matching: Vec<regex::Regex>,
     },
     StopBackground {
         id: String,
         /// Failures matching one of these do not fail the step.
         allow: Vec<regex::Regex>,
     },
-    /// Runs the `spice` CLI against the instance's runtime.
+    /// Runs the `spice` CLI against the instance's runtime, in the instance's
+    /// directory, with `input` on its standard input.
     SpiceCli {
         args: Vec<String>,
+        input: Option<String>,
         output_contains: Option<String>,
         expect_error: bool,
     },
@@ -847,6 +908,8 @@ pub struct HttpStep {
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
+    /// Nothing answers: the connection is refused (`expect: { refused: true }`).
+    pub refused: bool,
 }
 
 /// Checks the instance's `spiced.log`, across every start.
@@ -979,9 +1042,9 @@ pub enum Timing {
 }
 
 impl Script {
-    /// Loads a script file. Its run time must be recorded in
-    /// `recordings/durations.json` beside it, unless `duration_optional` (a
-    /// run that records durations, which is how a new script gets one).
+    /// Loads a script file. It must record its run time (`duration`), unless
+    /// `duration_optional` (a run that records durations, which is how a new
+    /// script gets one).
     pub fn load(path: &Path, duration_optional: bool) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read script {}", path.display()))?;
@@ -994,34 +1057,37 @@ impl Script {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        script.duration = read_durations(base)?
-            .get(&script.file_stem)
-            .map(|s| Duration::from_secs(*s));
+        script.path = path.to_path_buf();
+        if let Some(duration) = script.duration {
+            check_duration_line(&text, duration)
+                .with_context(|| format!("Invalid script {}", path.display()))?;
+        }
         ensure!(
             duration_optional || script.duration.is_some(),
-            "Script {} has no recorded duration in {}. Run it with --record-durations to record one.",
-            path.display(),
-            base.join(DURATIONS_FILE).display()
+            "Script {} has no recorded `duration`. Run it with --record-durations to record one.",
+            path.display()
         );
         Ok(script)
     }
 
-    /// Records how long the scripts in `dir` took, by file name, in
-    /// `dir/recordings/durations.json`, keeping the entries of the others.
-    pub fn record_durations(dir: &Path, took: &[(String, Duration)]) -> Result<()> {
-        let mut all = read_durations(dir)?;
-        for (stem, duration) in took {
-            all.insert(
-                stem.clone(),
-                duration.as_secs() + u64::from(duration.subsec_nanos() > 0),
-            );
-        }
-        let path = dir.join(DURATIONS_FILE);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&all)? + "\n")
-            .with_context(|| format!("Failed to write {}", path.display()))
+    /// The `requires-env` variables that are unset or empty here.
+    pub fn missing_env(&self) -> Vec<String> {
+        self.requires_env
+            .iter()
+            .filter(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+            .cloned()
+            .collect()
+    }
+
+    /// Records how long the script at `path` took, in whole seconds rounded
+    /// up, in its `duration` line.
+    pub fn record_duration(path: &Path, took: Duration) -> Result<()> {
+        let seconds = took.as_secs() + u64::from(took.subsec_nanos() > 0);
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read script {}", path.display()))?;
+        let text = set_duration(&text, seconds)
+            .with_context(|| format!("Failed to record the duration of {}", path.display()))?;
+        std::fs::write(path, text).with_context(|| format!("Failed to write {}", path.display()))
     }
 
     /// Keeps only the matrix values and variants `selection` names, and
@@ -1113,7 +1179,42 @@ impl Script {
             .remove("steps")
             .context("A script needs `steps`")?;
         expand_shared_variants(&mut root, shared)?;
+        let has_tags = root.as_object().is_some_and(|map| map.contains_key("tags"));
         let mut script: Script = serde_json::from_value(root)?;
+        if has_tags {
+            check_tags_on_one_line(text)?;
+        }
+        for (i, tag) in script.tags.iter().enumerate() {
+            ensure!(
+                !script.tags[..i].contains(tag),
+                "Duplicate tag `{}`; list each tag only once",
+                tag.to_possible_value()
+                    .map_or_else(String::new, |value| value.get_name().to_string())
+            );
+        }
+        ensure!(
+            script.defaults.single_node.is_none()
+                || (script.defaults.cluster.is_none() && script.defaults.executor_args.is_none()),
+            "`defaults.single-node` contradicts `defaults.cluster` and `defaults.executor-args`, \
+             which run the script with executors; keep one"
+        );
+        for name in &script.requires_env {
+            ensure!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "`requires-env` names environment variables, not `{name}`"
+            );
+        }
+        if script.tags.contains(&Tag::MacosSmoke) {
+            for (name, source) in &script.sources {
+                ensure!(
+                    IN_PROCESS_SOURCES.contains(&source.kind.as_str()),
+                    "Source `{name}` is `{}`, which runs in Docker, but the script is tagged \
+                     `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                     `mock-http` or `duckdb` source, or drop the tag",
+                    source.kind
+                );
+            }
+        }
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
         };
@@ -1574,6 +1675,7 @@ const ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "edit-spicepod",
     "flight-put",
@@ -1600,6 +1702,7 @@ const ACTIONS: &[&str] = &[
     "dbgen",
     "source-query",
     "assert-files",
+    "mark-files",
     "wipe-instance-dir",
     "stop-background",
     "spice",
@@ -1634,6 +1737,7 @@ const REACH_NO_SPICED: &[&str] = &[
 /// has none of.
 const UPSTREAM_ONLY: &[&str] = &[
     "upgrade",
+    "downgrade",
     "kill-executor",
     "start-executors",
     "add-executor",
@@ -1648,6 +1752,7 @@ const FAULT_ACTIONS: &[&str] = &[
     "kill-spiced",
     "restart",
     "upgrade",
+    "downgrade",
     "wait-ready",
     "kill-executor",
     "start-executors",
@@ -1738,21 +1843,30 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
     }
     let mut opts = Opts(map);
     let action = match name {
-        "start" => Action::Start {
-            ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
-            wait_ready: wait_ready(&arg)?,
-            patch: patch(&arg)?,
-        },
+        "start" => {
+            let wait = start_waits(&arg)?;
+            ensure!(
+                wait || (arg.get("ready").is_none() && arg.get("ready-timeout").is_none()),
+                "`start` with `wait: false` waits for nothing, so it takes no `ready` or `ready-timeout`; put them on a later `wait-ready`"
+            );
+            Action::Start {
+                ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
+                wait_ready: wait_ready(&arg)?,
+                wait,
+                patch: patch(&arg)?,
+            }
+        }
         "stop" => Action::Stop,
         "kill-spiced" => Action::Kill {
             signal: parse_signal(arg.get("signal"))?.unwrap_or(KillSignal::Kill),
         },
-        "restart" | "upgrade" => Action::Restart {
+        "restart" | "upgrade" | "downgrade" => Action::Restart {
             wait_ready: wait_ready(&arg)?,
             patch: patch(&arg)?,
             kill: parse_signal(arg.get("kill"))?,
             ready_timeout: opts.duration_in(&arg, "ready-timeout")?,
             upgrade: name == "upgrade",
+            downgrade: name == "downgrade",
         },
         "kill-executor" => Action::KillExecutor(
             serde_json::from_value(arg.clone())
@@ -1966,9 +2080,10 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "spice" => {
-            let (args, output_contains, expect_error) = match arg {
+            let (args, input, output_contains, expect_error) = match arg {
                 Value::Array(_) => (
                     serde_json::from_value(arg).context("`spice` arguments must be strings")?,
+                    opts.string("input")?,
                     opts.string("output-contains")?,
                     opts.bool("expect-error")?,
                 ),
@@ -1977,15 +2092,17 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                     let args = inner
                         .parse("args", "`args` must be a list of strings")?
                         .context("`spice` needs `args`")?;
+                    let input = inner.string("input")?;
                     let contains = inner.string("output-contains")?;
                     let expect_error = inner.bool("expect-error")?;
                     inner.finish()?;
-                    (args, contains, expect_error)
+                    (args, input, contains, expect_error)
                 }
                 _ => bail!("`spice` takes a list of arguments, or a mapping with `args`"),
             };
             Action::SpiceCli {
                 args,
+                input,
                 output_contains,
                 expect_error,
             }
@@ -1993,20 +2110,25 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
         "assert-files" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`assert-files` takes a mapping with `contains`, `lacks` or `lacks-dirs`",
+                "`assert-files` takes a mapping with `contains`, `lacks`, `lacks-dirs` or `unchanged-since`",
             )?;
             let contains = inner.patterns("contains")?;
             let lacks = inner.patterns("lacks")?;
             let lacks_dirs = inner.patterns("lacks-dirs")?;
+            let unchanged_since = inner.string("unchanged-since")?;
             inner.finish()?;
             ensure!(
-                !contains.is_empty() || !lacks.is_empty() || !lacks_dirs.is_empty(),
-                "`assert-files` needs `contains`, `lacks` or `lacks-dirs`"
+                !contains.is_empty()
+                    || !lacks.is_empty()
+                    || !lacks_dirs.is_empty()
+                    || unchanged_since.is_some(),
+                "`assert-files` needs `contains`, `lacks`, `lacks-dirs` or `unchanged-since`"
             );
             Action::AssertFiles {
                 contains,
                 lacks,
                 lacks_dirs,
+                unchanged_since,
             }
         }
         "wipe-instance-dir" => {
@@ -2227,10 +2349,16 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
             let mut json = Vec::new();
+            let mut refused = false;
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
                     let mut e = Opts(e);
+                    refused = e.bool("refused")?;
+                    ensure!(
+                        !refused || e.0.is_empty(),
+                        "`refused: true` expects no response, so it takes no other expectation"
+                    );
                     let status = e.parse::<u16>("status", "`status` must be a number")?;
                     let expect_headers = pairs(e.take("headers"), "headers")?;
                     let lacks_headers: Vec<String> = e
@@ -2286,6 +2414,7 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
                 json,
                 timing,
                 key,
+                refused,
             })
         }
         "assert-log" => {
@@ -2526,6 +2655,23 @@ fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
             })
         }
         "mark-metrics" => Action::MarkMetrics(string_arg(&arg, name)?),
+        "mark-files" => {
+            if arg.is_string() {
+                Action::MarkFiles {
+                    id: string_arg(&arg, name)?,
+                    matching: Vec::new(),
+                }
+            } else {
+                let mut inner = Opts::of_mapping(
+                    arg,
+                    "`mark-files` takes an id, or a mapping with `id` and `matching`",
+                )?;
+                let id = inner.string("id")?.context("`mark-files` needs an `id`")?;
+                let matching = inner.patterns("matching")?;
+                inner.finish()?;
+                Action::MarkFiles { id, matching }
+            }
+        }
         "load" => Action::Load(parse_load(arg, base)?),
         "sleep" => Action::Sleep(parse_duration(&arg)?),
         _ => unreachable!("every name in ACTIONS is handled"),
@@ -2702,6 +2848,15 @@ fn wait_ready(arg: &Value) -> Result<bool> {
     }
 }
 
+/// `wait:` on `start`: `false` starts `spiced` and waits for nothing.
+fn start_waits(arg: &Value) -> Result<bool> {
+    match arg.get("wait") {
+        None => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("`wait` must be true or false"),
+    }
+}
+
 /// A `patch:` on `start` or `restart`: the same shape as a variant.
 fn patch(arg: &Value) -> Result<Option<VariantSpec>> {
     arg.get("patch")
@@ -2749,6 +2904,45 @@ fn parse_signal(v: Option<&Value>) -> Result<Option<KillSignal>> {
         Some("STOP-then-KILL") => Ok(Some(KillSignal::StopThenKill)),
         Some(other) => bail!("unknown signal '{other}', expected KILL or STOP-then-KILL"),
     }
+}
+
+/// A script's `tags` must be one line of plain names, `tags: [long]`: CI selects the changed
+/// scripts to run before merge by that line (`grep` for the tag, and
+/// `git diff -I'^tags:'` to ignore a change to it alone), which a block list or
+/// a flow list over several lines would slip past.
+fn check_tags_on_one_line(text: &str) -> Result<()> {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("tags:"))
+        .collect();
+    let one_line = match lines.as_slice() {
+        [line] => {
+            let value = line["tags:".len()..]
+                .split(" #")
+                .next()
+                .unwrap_or_default()
+                .trim();
+            // Plain names only: a quoted or escaped spelling (`"lo\u006eg"`)
+            // decodes to a tag the line does not spell out.
+            value
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .is_some_and(|names| {
+                    names.trim().is_empty()
+                        || names.split(',').all(|name| {
+                            let name = name.trim();
+                            !name.is_empty()
+                                && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                        })
+                })
+        }
+        _ => false,
+    };
+    ensure!(
+        one_line,
+        "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line"
+    );
+    Ok(())
 }
 
 pub fn parse_duration(v: &Value) -> Result<Duration> {
@@ -2896,25 +3090,277 @@ mod opt_duration {
     }
 }
 
-/// Where a directory's scripts record their run times, in whole seconds by
-/// file name.
-pub const DURATIONS_FILE: &str = "recordings/durations.json";
-
-/// The recorded run times of the scripts in `dir`; none if it has no file.
-fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>> {
-    let path = dir.join(DURATIONS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("Invalid {}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
-        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+/// A script's `duration` is one line, `duration: 458s` (`  "duration": "458s",`
+/// in a JSON script), placed after `name`. `--record-durations` and
+/// `test/spicescript/update_durations.py` rewrite that line, and CI does not
+/// count a change to it alone as a changed script.
+fn duration_line(json: bool, seconds: u64) -> String {
+    if json {
+        format!("  \"duration\": \"{seconds}s\",")
+    } else {
+        format!("duration: {seconds}s")
     }
+}
+
+/// The value of `line` if it is a script's `duration` line.
+fn duration_value(json: bool, line: &str) -> Option<&str> {
+    if json {
+        line.strip_prefix("  \"duration\":")
+    } else {
+        line.strip_prefix("duration:")
+    }
+}
+
+/// The whole seconds a `duration` line's value records, as written by [`duration_line`].
+fn whole_seconds(json: bool, value: &str) -> Option<u64> {
+    let value = value.trim();
+    let value = if json {
+        value.strip_prefix('"')?.strip_suffix("\",")?
+    } else {
+        value
+    };
+    value.strip_suffix('s')?.parse().ok()
+}
+
+fn is_json(text: &str) -> bool {
+    text.trim_start().starts_with('{')
+}
+
+fn check_duration_line(text: &str, duration: Duration) -> Result<()> {
+    let json = is_json(text);
+    let lines: Vec<_> = text
+        .lines()
+        .filter_map(|line| duration_value(json, line))
+        .map(|value| whole_seconds(json, value))
+        .collect();
+    ensure!(
+        lines.as_slice() == [Some(duration.as_secs())] && duration.subsec_nanos() == 0,
+        "Write `duration` on one line in whole seconds, as `{}`: --record-durations and CI read and rewrite that line",
+        duration_line(json, 458)
+    );
+    Ok(())
+}
+
+/// `text` with its `duration` line recording `seconds`, added after `name`
+/// when it has none.
+fn set_duration(text: &str, seconds: u64) -> Result<String> {
+    let json = is_json(text);
+    let new = duration_line(json, seconds);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if let Some(i) = lines
+        .iter()
+        .position(|line| duration_value(json, line).is_some())
+    {
+        lines[i] = &new;
+    } else {
+        let name = if json { "  \"name\":" } else { "name:" };
+        let i = lines
+            .iter()
+            .position(|line| line.starts_with(name))
+            .with_context(|| format!("No `{name}` line to put `{new}` after"))?;
+        lines.insert(i + 1, &new);
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty directory holding the scripts `names`, for one test.
+    fn script_dir(test: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spicescript-durations-{test}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the script directory");
+        for name in names {
+            std::fs::write(
+                dir.join(format!("{name}.yaml")),
+                format!("name: {name}\nspicepod: {{}}\nsteps: []"),
+            )
+            .expect("write the script");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_duration_is_recorded_in_the_script_and_loaded_from_it() {
+        let dir = script_dir("round-trip", &["first"]);
+        let path = dir.join("first.yaml");
+        Script::record_duration(&path, Duration::from_millis(1200)).expect("record");
+        // A part of a second rounds up, and the line goes after `name`.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "name: first\nduration: 2s\nspicepod: {}\nsteps: []"
+        );
+        Script::record_duration(&path, Duration::from_secs(7)).expect("record again");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "name: first\nduration: 7s\nspicepod: {}\nsteps: []"
+        );
+        let script = Script::load(&path, false).expect("load");
+        assert_eq!(script.duration, Some(Duration::from_secs(7)));
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_json_script_records_its_duration_after_its_name() {
+        let text = "{\n  \"name\": \"j\",\n  \"spicepod\": {},\n  \"steps\": []\n}\n";
+        let recorded = set_duration(text, 4).expect("record");
+        assert_eq!(
+            recorded,
+            "{\n  \"name\": \"j\",\n  \"duration\": \"4s\",\n  \"spicepod\": {},\n  \"steps\": []\n}\n"
+        );
+        assert_eq!(
+            set_duration(&recorded, 9).expect("rewrite"),
+            recorded.replace("4s", "9s")
+        );
+        let script = Script::parse(&recorded).expect("parse");
+        assert_eq!(script.duration, Some(Duration::from_secs(4)));
+        check_duration_line(&recorded, Duration::from_secs(4)).expect("one line");
+    }
+
+    #[test]
+    fn a_script_without_a_duration_is_refused_unless_recording() {
+        let dir = script_dir("missing", &["first"]);
+        let path = dir.join("first.yaml");
+        let error = Script::load(&path, false).expect_err("first has no duration");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Script {} has no recorded `duration`. Run it with --record-durations to record one.",
+                path.display()
+            )
+        );
+        let script = Script::load(&path, true).expect("load while recording");
+        assert_eq!(script.duration, None);
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn a_duration_must_be_one_line_of_whole_seconds() {
+        let dir = script_dir("invalid", &[]);
+        let path = dir.join("first.yaml");
+        for duration in ["1m", "\"7s\"", "7s # a comment"] {
+            std::fs::write(
+                &path,
+                format!("name: first\nduration: {duration}\nspicepod: {{}}\nsteps: []"),
+            )
+            .expect("write the script");
+            let error = Script::load(&path, false).expect_err(duration);
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "Invalid script {}: Write `duration` on one line in whole seconds, as `duration: 458s`: --record-durations and CI read and rewrite that line",
+                    path.display()
+                ),
+                "{duration}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove the script directory");
+    }
+
+    #[test]
+    fn tags_parse() {
+        let script =
+            Script::parse("name: s\ntags: [long]\nspicepod: {}\nsteps: []").expect("tags parse");
+        assert_eq!(script.tags, vec![Tag::Long]);
+    }
+
+    #[test]
+    fn tags_reject_unknown_tag() {
+        let error = Script::parse("name: s\ntags: [slow]\nspicepod: {}\nsteps: []")
+            .expect_err("unknown tag");
+        assert_eq!(
+            error.to_string(),
+            "unknown variant `slow`, expected `long` or `macos-smoke`"
+        );
+    }
+
+    #[test]
+    fn macos_smoke_refuses_a_source_that_runs_in_docker() {
+        let parse = |kind: &str| {
+            Script::parse(&format!(
+                "name: s\ntags: [macos-smoke]\nsources:\n  src: {{ kind: {kind} }}\nspicepod: {{}}\nsteps: []"
+            ))
+            .map(|s| s.tags)
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("files"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("mock-http"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(parse("duckdb"), Ok(vec![Tag::MacosSmoke]));
+        assert_eq!(
+            parse("postgres"),
+            Err(
+                "Source `src` is `postgres`, which runs in Docker, but the script is tagged \
+                 `macos-smoke` and the macOS runners have no Docker; use a `files`, \
+                 `mock-http` or `duckdb` source, or drop the tag"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn tags_must_be_one_line() {
+        let ok = |text: &str| {
+            Script::parse(text)
+                .map(|s| s.tags)
+                .map_err(|e| e.to_string())
+        };
+        let rejected = Err(
+            "Write `tags` on one line with plain names, as `tags: [long]`: CI selects scripts to run before merge by that line".to_string(),
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(
+            ok("name: s\ntags: [long] # waits on a source's clock\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+        assert_eq!(ok("name: s\ntags: []\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(ok("name: s\nspicepod: {}\nsteps: []"), Ok(vec![]));
+        assert_eq!(
+            ok("name: s\ntags:\n  - long\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\n  long]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("{name: s, tags: [long], spicepod: {}, steps: []}"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [\"lo\\u006eg\"]\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: ['long']\nspicepod: {}\nsteps: []"),
+            rejected
+        );
+        assert_eq!(
+            ok("name: s\ntags: [ long ]\nspicepod: {}\nsteps: []"),
+            Ok(vec![Tag::Long])
+        );
+    }
+
+    #[test]
+    fn tags_reject_duplicate_tag() {
+        let error = Script::parse("name: s\ntags: [long, long]\nspicepod: {}\nsteps: []")
+            .expect_err("duplicate tag");
+        assert_eq!(
+            error.to_string(),
+            "Duplicate tag `long`; list each tag only once"
+        );
+    }
 
     #[test]
     fn sample_objects_takes_its_bounds_and_needs_six_samples() {
@@ -3477,7 +3923,7 @@ steps:
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
-                "a fault runs one of start, stop, kill-spiced, restart, upgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, downgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
             ),
             (
                 "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",

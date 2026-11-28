@@ -18,8 +18,8 @@ limitations under the License.
 //!
 //! The `spice_sys_*` tables — CDC stream positions, the dataset schema checkpoint, the
 //! caching engine's fetch marker — live inside the dataset's own accelerator database.
-//! The per-engine SQL for them lives in the `runtime-checkpoint-{duckdb,sqlite,postgres}`
-//! crates, behind [`AcceleratorSidecar`].
+//! The SQL for them lives in `runtime-checkpoint-sqlite`, which Cayenne's sidecar uses,
+//! behind [`AcceleratorSidecar`].
 //!
 //! What is left here is only the *resolution*: a dataset names an engine, the registry
 //! hands back that engine, and the engine hands back its sidecar. Nothing in this
@@ -37,7 +37,7 @@ use runtime_acceleration::{
 };
 use runtime_checkpoint_api::{BlobCheckpointStore, CheckpointError};
 
-use super::AccelerationSource;
+use super::{AccelerationSource, DataAccelerator};
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 
 /// Resolves `source`'s sidecar through its configured accelerator engine.
@@ -58,14 +58,41 @@ pub async fn sidecar_for(
         })?;
     let engine = acceleration.engine;
 
-    let accelerator = registry
-        .get_accelerator_engine(engine)
-        .await
-        .ok_or_else(|| CheckpointError::Store {
-            source: format!("{engine} accelerator engine not available").into(),
-        })?;
+    let accelerator =
+        accelerator_for(source, &registry)
+            .await
+            .ok_or_else(|| CheckpointError::Store {
+                source: format!("{engine} accelerator engine not available").into(),
+            })?;
 
     accelerator.sidecar(source, open_option).await
+}
+
+/// The engine accelerating `source`, when it is accelerated and the engine is
+/// available.
+async fn accelerator_for(
+    source: &dyn AccelerationSource,
+    registry: &AcceleratorEngineRegistry,
+) -> Option<Arc<dyn DataAccelerator>> {
+    registry
+        .get_accelerator_engine(source.acceleration()?.engine)
+        .await
+}
+
+/// The identity of the location `dataset`'s acceleration is shared through,
+/// when it is (see `DataAccelerator::shared_location_id`).
+///
+/// # Errors
+///
+/// Returns an error when the accelerator cannot read the location's identity.
+pub async fn shared_location_id(
+    dataset: &crate::component::dataset::Dataset,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let registry = dataset.runtime.accelerator_engine_registry();
+    let Some(accelerator) = accelerator_for(dataset, &registry).await else {
+        return Ok(None);
+    };
+    accelerator.shared_location_id(dataset).await
 }
 
 /// The dataset's sidecar, resolved from the runtime handle it carries.

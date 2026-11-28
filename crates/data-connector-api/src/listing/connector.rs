@@ -51,7 +51,9 @@ use datafusion::execution::cache::cache_manager::{
 };
 use datafusion::execution::cache::default_cache::DefaultCache;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -1554,7 +1556,11 @@ pub trait ListingTableConnector: DataConnector {
     {
         let mut format = SpiceJsonFormat::default()
             .with_format(default_format)
-            .with_file_compression_type(file_compression_type);
+            .with_file_compression_type(file_compression_type)
+            .with_source(
+                dataset.name.to_string(),
+                connector_docs_page(&format!("{self}")),
+            );
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -1817,18 +1823,22 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
+    /// The listing table for `dataset`. Its schema is inferred from the source files under
+    /// `memory_pool`, the runtime's query memory pool, since inference can hold a file
+    /// whole (a JSON document is parsed whole).
     async fn create_listing_table(
         &self,
         dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
     {
         let template = self
-            .listing_table_template(dataset, url, extension, file_format)
+            .listing_table_template(dataset, url, extension, file_format, memory_pool)
             .await?;
 
         // This shouldn't error because `listing_table_template` already parsed the same URL.
@@ -1897,6 +1907,7 @@ pub trait ListingTableConnector: DataConnector {
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> DataConnectorResult<ListingTableTemplate>
     where
         Self: Display,
@@ -1913,13 +1924,28 @@ pub trait ListingTableConnector: DataConnector {
 
         let object_store = self.get_object_store(dataset)?;
 
-        let ctx: SessionContext = self.get_session_context();
+        // Inference reads source files, holding a JSON document whole, so it is charged to
+        // the runtime's query memory pool rather than to an unbounded one of its own.
+        let ctx = self.get_session_context();
+        let runtime_env = RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env())
+            .with_memory_pool(Arc::clone(memory_pool))
+            .build_arc()
+            .boxed()
+            .context(crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-RTE".to_string(), // ListingTableConnector-ReadProvider-RuntimeEnv
+            })?;
+        let ctx = SessionContext::new_with_config_rt(ctx.copied_config(), runtime_env);
         let params = self.get_params();
         let displayed_extension = if params.secret_source("file_extension").is_some() {
             params.display_value("file_extension", extension)
         } else {
             extension.to_string()
         };
+
+        // `table_path` can carry connector secrets in its fragment; use this for anything displayed.
+        let sensitive_table_path = SensitiveListingTableUrl::new(table_path.clone(), url.clone());
 
         let (schema_infer_url, schema_infer_meta) =
             if table_path.is_collection() && listing_extension_is_orc(extension) {
@@ -1931,37 +1957,34 @@ pub trait ListingTableConnector: DataConnector {
                     dataset,
                     extension,
                     &displayed_extension,
-                    table_path.clone(),
+                    &sensitive_table_path,
                     &ctx,
                     &object_store,
                 )
                 .await?;
-                (
-                    SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
-                    None,
-                )
+                (sensitive_table_path.clone(), None)
             } else if let Some(url) = dataset.params.get("schema_source_path") {
                 let url = self.get_object_store_url(dataset, Some(url))?;
-                let schema_infer_url = ListingTableUrl::parse(&url).boxed().context(
-                    crate::UnableToGetSchemaInternalSnafu {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
+                let schema_infer_url = SensitiveListingTableUrl::new(
+                    ListingTableUrl::parse(&url).boxed().context(
+                        crate::UnableToGetSchemaInternalSnafu {
+                            dataconnector: format!("{self}"),
+                            connector_component: ConnectorComponent::from(dataset),
+                        },
+                    )?,
+                    url,
+                );
                 let schema_infer_meta = verify_schema_source_path(
                     format!("{self}"),
                     dataset,
                     extension,
                     &displayed_extension,
-                    schema_infer_url.clone(),
+                    &schema_infer_url,
                     &ctx,
                     &object_store,
                 )
                 .await?;
-                (
-                    SensitiveListingTableUrl::new(schema_infer_url, url),
-                    schema_infer_meta,
-                )
+                (schema_infer_url, schema_infer_meta)
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
                 // Report an error if no files matching required extension are found.
@@ -1970,7 +1993,7 @@ pub trait ListingTableConnector: DataConnector {
                     dataset,
                     extension,
                     &displayed_extension,
-                    table_path.clone(),
+                    &sensitive_table_path,
                     &ctx,
                     &object_store,
                 )
@@ -2063,7 +2086,8 @@ pub trait ListingTableConnector: DataConnector {
                         Ok(files) => infer_partitions_with_types_from_files(&table_path, &files),
                         Err(e) => {
                             tracing::debug!(
-                                "Failed to list files for partition inference for {table_path:?}: {e}"
+                                "Failed to list files for partition inference for {}: {e}",
+                                sensitive_table_path.sanitized_url()
                             );
                             Ok(Vec::new())
                         }
@@ -2076,7 +2100,8 @@ pub trait ListingTableConnector: DataConnector {
             match inferred_partitions {
                 Ok(partitions) => {
                     tracing::debug!(
-                        "Inferred partitions for {table_path:?}: {:?}",
+                        "Inferred partitions for {}: {:?}",
+                        sensitive_table_path.sanitized_url(),
                         partitions
                             .iter()
                             .map(|(k, _)| k.as_str())
@@ -2086,7 +2111,10 @@ pub trait ListingTableConnector: DataConnector {
                 }
                 Err(e) => {
                     // This might not be an error, it could be that the table is not partitioned.
-                    tracing::debug!("Failed to infer partitions for {table_path:?}: {e}");
+                    tracing::debug!(
+                        "Failed to infer partitions for {}: {e}",
+                        sensitive_table_path.sanitized_url()
+                    );
                 }
             }
         }
@@ -2206,7 +2234,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        _context: &dyn ConnectorContext,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         ListingTableConnector::validate_dataset(self, dataset)?;
@@ -2222,7 +2250,13 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             }
             Some(file_format) => {
                 // Structured tabular data, use a [`ListingTable`].
-                self.create_listing_table(dataset, &url, &extension, file_format)
+                let memory_pool = Arc::clone(
+                    &context
+                        .datafusion_session_context()
+                        .runtime_env()
+                        .memory_pool,
+                );
+                self.create_listing_table(dataset, &url, &extension, file_format, &memory_pool)
                     .await
             }
         }
@@ -2757,14 +2791,16 @@ async fn get_last_modified(
     dataset: &DatasetSpec,
     extension: &str,
     displayed_extension: &str,
-    table_path: ListingTableUrl,
+    table_path: &SensitiveListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
 ) -> DataConnectorResult<ObjectMeta> {
-    tracing::debug!("Detecting the most recently modified object for the path: {table_path}");
+    let display_path = table_path.sanitized_url();
+    tracing::debug!("Detecting the most recently modified object for the path: {display_path}");
 
     let state = ctx.state();
     let mut file_stream = table_path
+        .expose_sensitive_url()
         .list_all_files(&state, object_store, "")
         .await
         .map_err(|err| DataConnectorError::UnableToConnectInternal {
@@ -2795,7 +2831,7 @@ async fn get_last_modified(
         #[expect(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
-                "Continuing to process {table_path} metadata... {file_count} objects processed so far, representing a total size of: {:.2} GiB",
+                "Continuing to process {display_path} metadata... {file_count} objects processed so far, representing a total size of: {:.2} GiB",
                 total_size as f64 / BYTES_PER_GIB
             );
         }
@@ -2857,12 +2893,13 @@ async fn verify_schema_source_path(
     dataset: &DatasetSpec,
     extension: &str,
     displayed_extension: &str,
-    schema_source_path: ListingTableUrl,
+    schema_source_path: &SensitiveListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
 ) -> DataConnectorResult<Option<ObjectMeta>> {
+    let display_path = schema_source_path.sanitized_url();
     tracing::debug!(
-        "Verifying dataset {table_name} schema source path is valid: {schema_source_path}",
+        "Verifying dataset {table_name} schema source path is valid: {display_path}",
         table_name = dataset.name
     );
 
@@ -2870,6 +2907,7 @@ async fn verify_schema_source_path(
     // Intentionally not passing the `file_extension` parameter to `list_all_files` because we want to
     // short-circuit the listing process if we need to iterate over too many files.
     let mut file_stream = schema_source_path
+        .expose_sensitive_url()
         .list_all_files(&state, object_store, "")
         .await
         .map_err(|err| DataConnectorError::UnableToConnectInternal {
@@ -2899,7 +2937,7 @@ async fn verify_schema_source_path(
             // We've reached the limit of files to scan, but have not found any with the expected extension.
             // We do warning, not an error, as the dataset might have a large number of files.
             tracing::warn!(
-                "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
+                "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{display_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
             );
             return Ok(None);
         }
@@ -2909,7 +2947,7 @@ async fn verify_schema_source_path(
         dataconnector: dataconnector.clone(),
         connector_component: ConnectorComponent::from(dataset),
         message: format!(
-            "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
+            "Failed to find any files matching the extension '{displayed_extension}' at the specified path `{display_path}`. Verify that `schema_source_path` is correct and try again."
         ),
     })
 }
@@ -3185,9 +3223,19 @@ fn sanitize_url(mut url: Url) -> Url {
 
 /// Wrapper struct that contains a potentially sensitive URL with fragments containing secrets,
 /// and a sanitized URL without the fragments that can be used for logging and error messages.
+///
+/// `Display` shows only the sanitized URL. There is deliberately no `Debug`, because the
+/// sensitive URL would print with it.
+#[derive(Clone)]
 struct SensitiveListingTableUrl {
     sensitive_url: ListingTableUrl,
     sanitized_url: Url,
+}
+
+impl Display for SensitiveListingTableUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.sanitized_url, f)
+    }
 }
 
 impl SensitiveListingTableUrl {
@@ -3276,6 +3324,16 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
             );
             ParquetPageIndexOptions::default()
         }
+    }
+}
+
+/// The connector's documentation page under `components/data-connectors/`, which an
+/// error about one of its files links: the connector's name, except where its page is
+/// named for the scheme users write.
+fn connector_docs_page(connector: &str) -> String {
+    match connector {
+        "http_listing" => "https".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -4397,7 +4455,14 @@ mod tests {
             .expect("csv plus file_extension must resolve");
         let file_format = file_format.expect("csv must use the listing-table path");
         let err = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect_err("secret-derived file_extension with no matching files must fail");
         assert_error_hides_canary(&err, "CANARYPGPW7731", REFERENCE);
@@ -4702,7 +4767,14 @@ mod tests {
         };
 
         let template = connector
-            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .listing_table_template(
+                &dataset,
+                &url,
+                &extension,
+                Arc::clone(&file_format),
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("template");
         assert!(
@@ -4716,7 +4788,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4799,7 +4878,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -4883,7 +4969,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -4993,7 +5086,14 @@ mod tests {
         };
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
 
@@ -5086,7 +5186,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -5127,7 +5234,14 @@ mod tests {
             panic!("expected a JSONL file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
 
@@ -5182,7 +5296,14 @@ mod tests {
             "listing must enable flatten_json so user.name is a registered column"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("listing table");
         assert_eq!(
@@ -5501,7 +5622,7 @@ mod tests {
             &dataset,
             ".orc",
             ".orc",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &store,
         )
@@ -5535,7 +5656,14 @@ mod tests {
         );
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -5658,7 +5786,14 @@ mod tests {
         assert_eq!(extension, ".orc");
 
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table must not publish a schema_source_path prefix schema");
 
@@ -5950,6 +6085,14 @@ mod tests {
         }
     }
 
+    /// Wraps a test URL that carries no secrets, so its sanitized form is the same URL.
+    fn sensitive_listing_url(url: &ListingTableUrl) -> SensitiveListingTableUrl {
+        SensitiveListingTableUrl::new(
+            url.clone(),
+            <ListingTableUrl as AsRef<Url>>::as_ref(url).clone(),
+        )
+    }
+
     fn create_meta(location: &str, last_modified_secs: i64, size: u64) -> ObjectMeta {
         ObjectMeta {
             location: Path::from(location),
@@ -5984,7 +6127,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -6204,7 +6347,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         ctx.register_table(name, provider)
@@ -6332,7 +6482,14 @@ mod tests {
             "the production listing path must wrap Parquet so float stats cannot be trusted"
         );
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
         let ctx = SessionContext::new();
@@ -7101,7 +7258,7 @@ mod tests {
             &dataset,
             "*.orc",
             "*.orc",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -7129,7 +7286,7 @@ mod tests {
             &dataset,
             "*.orc",
             "*.orc",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -7174,7 +7331,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -7225,7 +7382,7 @@ mod tests {
             &dataset,
             ".csv.gz",
             ".csv.gz",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -7639,7 +7796,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -7830,7 +7994,14 @@ mod tests {
             panic!("expected a parquet file format");
         };
         let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
             .await
             .expect("create_listing_table production path");
 
@@ -8205,7 +8376,7 @@ mod tests {
             &dataset,
             ".csv",
             ".csv",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -8252,7 +8423,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            table_path,
+            &sensitive_listing_url(&table_path),
             &ctx,
             &test_store,
         )
@@ -8289,7 +8460,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            schema_source_path,
+            &sensitive_listing_url(&schema_source_path),
             &ctx,
             &test_store,
         )
@@ -8317,7 +8488,7 @@ mod tests {
             &dataset,
             ".csv.gz",
             ".csv.gz",
-            schema_source_path,
+            &sensitive_listing_url(&schema_source_path),
             &ctx,
             &test_store,
         )
@@ -8345,7 +8516,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            schema_source_path.clone(),
+            &sensitive_listing_url(&schema_source_path),
             &ctx,
             &test_store,
         )
@@ -8360,6 +8531,109 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Object-store connectors put credentials in the URL fragment. These fake values must
+    /// not appear in any error built from that URL.
+    const FAKE_CREDENTIAL_FRAGMENT: &str =
+        "key=AKIAFAKEKEYID&secret=fake-secret-value&session_token=fake-token";
+    const FAKE_CREDENTIALS: [&str; 3] = ["AKIAFAKEKEYID", "fake-secret-value", "fake-token"];
+
+    fn assert_error_hides_fake_credentials(err: &DataConnectorError) {
+        let chain = error_chain_text(err);
+        let debug = format!("{err:?}");
+        for credential in FAKE_CREDENTIALS {
+            assert!(
+                !chain.contains(credential),
+                "error Display/source must not contain a credential from the URL fragment: {chain}"
+            );
+            assert!(
+                !debug.contains(credential),
+                "error Debug must not contain a credential from the URL fragment: {debug}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_schema_source_path_no_matching_files_hides_url_credentials() {
+        let url = Url::parse(&format!("s3://bucket/schema/#{FAKE_CREDENTIAL_FRAGMENT}"))
+            .expect("to parse url");
+        let schema_source_path = SensitiveListingTableUrl::new(
+            ListingTableUrl::parse(url.clone()).expect("to parse url"),
+            url,
+        );
+        let ctx = SessionContext::new();
+        let dataset = DatasetSpec::new("s3://bucket/schema/", TableReference::bare("test"));
+
+        let meta_files = vec![create_meta("schema/file1.csv", 100, 100)];
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let err = verify_schema_source_path(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            ".parquet",
+            &schema_source_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect_err("no matching files must fail");
+
+        assert_error_hides_fake_credentials(&err);
+        assert!(
+            err.to_string()
+                .contains("at the specified path `s3://bucket/schema/`."),
+            "error must still name the path without its fragment: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_listing_table_schema_source_path_no_matching_files_hides_url_credentials()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let schema_dir = dir.path().join("schema");
+        std::fs::create_dir(&schema_dir).expect("create schema dir");
+        std::fs::write(schema_dir.join("notes.txt"), "hello").expect("write non-matching object");
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset.params.insert(
+            "schema_source_path".to_string(),
+            format!(
+                "file://{}/#{FAKE_CREDENTIAL_FRAGMENT}",
+                schema_dir.display()
+            ),
+        );
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv listing format")
+        else {
+            panic!("expected a CSV file format");
+        };
+
+        let err = connector
+            .create_listing_table(
+                &dataset,
+                &url,
+                &extension,
+                file_format,
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn MemoryPool>),
+            )
+            .await
+            .expect_err("a schema_source_path with no matching files must fail");
+
+        assert_error_hides_fake_credentials(&err);
+        assert!(
+            err.to_string().contains("schema_source_path"),
+            "error must come from the schema_source_path check: {err}"
+        );
     }
 
     #[tokio::test]
@@ -8382,7 +8656,7 @@ mod tests {
             &dataset,
             ".parquet",
             ".parquet",
-            schema_source_path,
+            &sensitive_listing_url(&schema_source_path),
             &ctx,
             &test_store,
         )

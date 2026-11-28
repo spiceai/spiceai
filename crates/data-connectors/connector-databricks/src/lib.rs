@@ -28,7 +28,7 @@ use data_components::Read;
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::sql_warehouse::DatabricksMetrics;
-use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
+use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, delta, sql_warehouse};
 use data_components::unity_catalog::{Endpoint, UnityCatalog as UnityCatalogClient};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
@@ -258,6 +258,8 @@ pub struct Databricks {
     /// warehouses before schema discovery reports them as queryable.
     sql_warehouse_type_provider: Option<Arc<dyn SqlWarehouseTypeProvider>>,
     initialization: ComponentInitialization,
+    /// The client ID whose user tokens load this connector (U2M auth).
+    user_token_client_id: Option<String>,
     metrics: Option<Arc<DatabricksMetrics>>,
     /// Unity Catalog client for table type detection and permission checking.
     /// Present when the connector was created with enough information to call UC APIs.
@@ -339,6 +341,10 @@ impl Databricks {
             AuthCredentials::U2M(_) => ComponentInitialization::OnTrigger,
             _ => ComponentInitialization::default(),
         };
+        let user_token_client_id = match &auth_credentials {
+            AuthCredentials::U2M(client_id) => Some(client_id.to_string()),
+            _ => None,
+        };
 
         match mode {
             "sql_warehouse" => {
@@ -405,6 +411,7 @@ impl Databricks {
                     read_provider: Arc::clone(&read_provider) as Arc<dyn Read>,
                     sql_warehouse_type_provider: Some(read_provider),
                     initialization,
+                    user_token_client_id,
                     metrics,
                     uc_client,
                     delta_provider: None,
@@ -480,6 +487,7 @@ impl Databricks {
                     read_provider: Arc::clone(&delta_provider) as Arc<dyn Read>,
                     sql_warehouse_type_provider: None,
                     initialization,
+                    user_token_client_id,
                     metrics: None,
                     uc_client,
                     delta_provider: Some(delta_provider),
@@ -673,6 +681,7 @@ impl Databricks {
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
             initialization: ComponentInitialization::default(),
+            user_token_client_id: None,
             metrics: None,
             uc_client: None,
             delta_provider: None,
@@ -1143,6 +1152,10 @@ impl DataConnector for Databricks {
         self.initialization
     }
 
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.user_token_client_id.as_deref()
+    }
+
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.metrics.as_ref().map(|m| {
             Arc::new(DatabricksMetricsProvider {
@@ -1299,6 +1312,11 @@ fn databricks_invalid_configuration_message(
                 }
                 _ => {}
             }
+        }
+        if let Some(error @ delta::Error::UnsupportedStorageLocation { .. }) =
+            err.downcast_ref::<delta::Error>()
+        {
+            return Some(error.to_string());
         }
         current = err.source();
     }
@@ -1542,6 +1560,43 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Mutex,
     };
+
+    /// A user-to-machine connector initializes on a request and reports the client ID that
+    /// request's user token is matched on.
+    #[tokio::test]
+    async fn a_u2m_connector_reports_its_client_id() {
+        let parameters = Parameters::try_new(
+            "connector databricks",
+            [
+                ("mode", "delta_lake"),
+                ("databricks_endpoint", "http://127.0.0.1:1"),
+                ("databricks_auth_mode", "u2m"),
+                ("databricks_client_id", "u2m-client"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), secrecy::SecretString::from(value)))
+            .collect(),
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("U2M parameters should be accepted for databricks");
+
+        let databricks = Databricks::new(
+            "u2m",
+            parameters,
+            tokio::runtime::Handle::current(),
+            Arc::new(TokenProviderRegistry::new()),
+            None,
+            None,
+        )
+        .await
+        .expect("a U2M connector builds");
+
+        assert_eq!(databricks.user_token_client_id(), Some("u2m-client"));
+        assert!(databricks.initialization().is_on_trigger());
+    }
 
     /// Temporary (STS) credentials only authenticate when the session token travels with
     /// the key and secret, so `databricks_aws_session_token` has to survive into the storage
@@ -1941,6 +1996,7 @@ mod tests {
             }),
             sql_warehouse_type_provider,
             initialization: ComponentInitialization::default(),
+            user_token_client_id: None,
             metrics: None,
             uc_client: Some(Arc::new(
                 UnityCatalogClient::new(Endpoint(endpoint), None, None)
@@ -1985,6 +2041,25 @@ mod tests {
                     message.contains("Lakehouse Federation foreign table"),
                     "expected the typed Databricks error message: {message}"
                 );
+            }
+            other => panic!("unexpected error classification: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_classify_table_provider_error_does_not_retry_an_unsupported_storage_location() {
+        let dataset = make_dataset("databricks:cat.sch.local", "local").await;
+        let refusal = delta::Error::UnsupportedStorageLocation {
+            table_reference: TableReference::parse_str("cat.sch.local"),
+            reason: "its storage location uses the 'file' scheme".to_string(),
+        };
+        let expected = refusal.to_string();
+
+        let err = classify_table_provider_error(&dataset, Box::new(refusal));
+
+        match err {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert_eq!(message, expected);
             }
             other => panic!("unexpected error classification: {other}"),
         }

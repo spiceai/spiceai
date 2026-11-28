@@ -7,13 +7,16 @@ inputs:
   expected-rows-count:
     description: 'Expected number of rows in the dataset'
     required: false
+# The runtime is reached at the ports `allocate-spice-ports` exported for this job
+# (SPICE_HTTP_ENDPOINT, SPICE_FLIGHT_ENDPOINT), or at spiced's defaults when the job
+# allocated none.
 runs:
   using: 'composite'
   steps:
     - name: Ensure datasets loaded
       shell: bash
       run: |
-        response=$(curl http://localhost:8090/v1/datasets)
+        response=$(curl "${SPICE_HTTP_ENDPOINT:-http://localhost:8090}/v1/datasets")
         echo $response | jq
         length=$(echo $response | jq 'if type=="array" then length else empty end')
         if [[ $length -lt 1 ]]; then
@@ -23,15 +26,17 @@ runs:
 
     - name: Verify table ${{ inputs.name }} exists
       shell: bash
+      env:
+        INPUT_NAME: ${{ inputs.name }}
       run: |
         response=$(curl -X POST \
           -H "Content-Type: text/plain" \
           -d "show tables;" \
-          http://localhost:8090/v1/sql
+          "${SPICE_HTTP_ENDPOINT:-http://localhost:8090}/v1/sql"
         )
         echo $response | jq
 
-        full_name="${{ inputs.name }}"
+        full_name="${INPUT_NAME}"
 
         # Split the full_name into schema and table_name if it contains a dot
         if [[ $full_name == *"."* ]]; then
@@ -58,10 +63,18 @@ runs:
 
     - name: Verify SQL REPL result count for table ${{ inputs.name }}
       shell: bash
+      env:
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_EXPECTED_ROWS_COUNT: ${{ inputs.expected-rows-count }}
       run: |
-        query="select * from ${{ inputs.name }} limit 10;"
+        query="select * from ${INPUT_NAME} limit 10;"
         echo "Executing query: $query"
-        sql_output=$(spice sql <<EOF
+        # `spice sql` queries over Flight; SPICE_FLIGHT_ENDPOINT is a bare host:port.
+        endpoint_args=(sql)
+        if [[ -n "${SPICE_HTTP_ENDPOINT:-}" && -n "${SPICE_FLIGHT_ENDPOINT:-}" ]]; then
+          endpoint_args=(--http-endpoint "${SPICE_HTTP_ENDPOINT}" sql --endpoint "grpc://${SPICE_FLIGHT_ENDPOINT}")
+        fi
+        sql_output=$(spice "${endpoint_args[@]}" <<EOF
         $query
         .error
         EOF
@@ -74,11 +87,11 @@ runs:
           exit 1
         fi
 
-        if [[ -n "${{ inputs.expected-rows-count }}" ]]; then
-          expected_rows="${{ inputs.expected-rows-count }} rows"
-          expected_rows_displayed="${{ inputs.expected-rows-count }}/${{ inputs.expected-rows-count }} rows displayed"
+        if [[ -n "${INPUT_EXPECTED_ROWS_COUNT}" ]]; then
+          expected_rows="${INPUT_EXPECTED_ROWS_COUNT} rows"
+          expected_rows_displayed="${INPUT_EXPECTED_ROWS_COUNT}/${INPUT_EXPECTED_ROWS_COUNT} rows displayed"
           if [[ $sql_output != *"$expected_rows"* ]] && [[ $sql_output != *"$expected_rows_displayed"* ]]; then
-            echo "Unexpected row count: ${{ inputs.expected-rows-count }}"
+            echo "Unexpected row count: ${INPUT_EXPECTED_ROWS_COUNT}"
             exit 1
           fi
         fi

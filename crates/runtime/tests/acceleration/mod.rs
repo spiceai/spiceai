@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::{component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpointer};
-use runtime_acceleration::sidecar::OpenOption;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime::component::dataset::Dataset;
 use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
@@ -31,28 +29,11 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 mod cayenne_memory;
 mod cayenne_on_conflict_batches;
-#[cfg(feature = "postgres-accel")]
-mod checkpoint_postgres;
-#[cfg(feature = "sqlite")]
-mod checkpoint_sqlite;
 mod cron;
-#[cfg(feature = "sqlite")]
-mod decimal_division;
-#[cfg(feature = "sqlite")]
-mod empty_projection_scan;
-#[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "sqlite"))]
-mod on_conflict;
 mod pk_insert_semantics;
-#[cfg(feature = "sqlite")]
-mod sqlite_builtin_pushdown;
-#[cfg(feature = "sqlite")]
-mod sqlite_interval_arithmetic;
-#[cfg(feature = "sqlite")]
-mod sqlite_query_errors;
 
 mod newest_by_time;
 mod on_conflict_cayenne;
@@ -61,19 +42,14 @@ mod on_zero_results_retention;
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
 mod partition_by_cayenne;
-#[cfg(feature = "postgres-accel")]
-mod query_push_down;
 mod refresh;
 mod reload_file_accelerated;
-mod retention_arrow;
 mod retention_cayenne;
 mod settings_change_cayenne;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
-#[cfg(feature = "sqlite")]
-mod user_function_pushdown;
 
 /// Queue a refresh of `table`. Callers poll for the result rather than waiting on the
 /// returned notifier: completion signals with `notify_waiters`, which stores no permit,
@@ -167,33 +143,8 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
     None
 }
 
-/// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
-/// or unaccelerated when `engine` is `None`.
-#[cfg(feature = "sqlite")]
-pub(crate) fn csv_dataset(
-    from: &str,
-    name: &str,
-    engine: Option<&str>,
-) -> spicepod::component::dataset::Dataset {
-    let mut dataset = spicepod::component::dataset::Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(
-        vec![("file_format".to_string(), "csv".to_string())]
-            .into_iter()
-            .collect(),
-    ));
-    dataset.acceleration = engine.map(|engine| spicepod::acceleration::Acceleration {
-        enabled: true,
-        engine: Some(engine.to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
-        ..spicepod::acceleration::Acceleration::default()
-    });
-    dataset
-}
-
-/// Materializes the runtime's configured datasets — the [`Dataset`] values that
-/// [`wait_for_checkpoints`] needs, which the runtime does not expose directly —
-/// then loads the runtime's components under `load_timeout` and waits for it to
+/// Materializes the runtime's configured datasets — the [`Dataset`] values, which
+/// the runtime does not expose directly — then loads the runtime's components under `load_timeout` and waits for it to
 /// report ready.
 pub(crate) async fn load_runtime_datasets(
     rt: &Arc<runtime::Runtime>,
@@ -234,45 +185,6 @@ pub(crate) async fn load_runtime_datasets(
     crate::utils::runtime_ready_check(rt).await;
 
     Ok(datasets)
-}
-
-async fn wait_for_checkpoints(
-    datasets: Vec<Dataset>,
-    timeout_secs: u64,
-) -> Result<(), anyhow::Error> {
-    let mut checkpoint_futures = Vec::new();
-
-    for dataset in datasets {
-        let registry = dataset.runtime.accelerator_engine_registry();
-        let check_future = async move {
-            match dataset_checkpointer(
-                &dataset,
-                registry,
-                OpenOption::OpenExisting,
-                SnapshotBehavior::Disabled,
-            )
-            .await
-            {
-                Ok(checkpoint) => {
-                    while !checkpoint.exists().await {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(anyhow::anyhow!("Failed to verify checkpoint: {e}")),
-            }
-        };
-        checkpoint_futures.push(check_future);
-    }
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
-        },
-        result = futures::future::try_join_all(checkpoint_futures) => {
-            result.map(|_| ())
-        }
-    }
 }
 
 /// Read a persisted Cayenne table through a fresh catalog and provider.

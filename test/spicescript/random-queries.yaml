@@ -1,4 +1,6 @@
 name: random-queries
+duration: 604s
+tags: [long]
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,
   ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that

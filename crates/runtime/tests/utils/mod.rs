@@ -23,10 +23,6 @@ limitations under the License.
 // `accelerator_crates_register_their_engines` guards the mechanism; this is where the
 // binaries that share these helpers get it.
 use accelerator_cayenne as _;
-#[cfg(feature = "postgres-accel")]
-use accelerator_postgres as _;
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
 
 use std::{
     fmt::Display,
@@ -53,6 +49,8 @@ use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
+
+pub(crate) mod sql_clients;
 
 /// The one `MeterProvider` for the test process, installed before any instrument
 /// exists: instruments bind to the provider installed when they are first used, so

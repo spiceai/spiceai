@@ -109,6 +109,10 @@ impl ConnectorContext for RuntimeConnectorContext {
         self.runtime.role()
     }
 
+    fn runtime_status(&self) -> Arc<crate::status::RuntimeStatus> {
+        self.runtime.status()
+    }
+
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
         self.runtime.http_rate_control_registry()
     }
@@ -123,6 +127,13 @@ impl ConnectorContext for RuntimeConnectorContext {
 
     async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef> {
         super::sink::accelerated_checkpoint_schema(&self.bind(dataset)).await
+    }
+
+    async fn shared_location_id(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        spice_sys::shared_location_id(&self.bind(dataset)).await
     }
 
     async fn blob_checkpoint_store(

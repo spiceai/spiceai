@@ -57,21 +57,40 @@ use url::Url;
 pub struct Databricks {
     params: Parameters,
     initialization: ComponentInitialization,
+    /// The client ID whose user tokens load this catalog (U2M auth).
+    user_token_client_id: Option<String>,
 }
 
 impl Databricks {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
-        let component_initialization = match build_auth_credentials(&params.parameters) {
-            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::default(),
+        let user_token_client_id = match build_auth_credentials(&params.parameters) {
+            Ok(AuthCredentials::U2M(client_id)) if serves_user_tokens(&params.parameters) => {
+                Some(client_id.to_string())
+            }
+            _ => None,
+        };
+        let component_initialization = if user_token_client_id.is_some() {
+            ComponentInitialization::OnTrigger
+        } else {
+            ComponentInitialization::default()
         };
 
         Arc::new(Self {
             params: params.parameters,
             initialization: component_initialization,
+            user_token_client_id,
         })
     }
+}
+
+/// Whether the catalog's mode reads the token of each request. A Spark Connect session keeps the
+/// token it was built with, so it cannot serve user-to-machine (U2M) tokens.
+fn serves_user_tokens(params: &Parameters) -> bool {
+    matches!(
+        params.get("mode").expose().ok(),
+        Some("delta_lake" | "sql_warehouse")
+    )
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
@@ -281,6 +300,14 @@ impl CatalogConnector for Databricks {
                 connector_component: ConnectorComponent::from(catalog),
             }
         })?;
+        if matches!(auth_credentials, AuthCredentials::U2M(_)) && !serves_user_tokens(&self.params)
+        {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message: "User-to-machine (U2M) authentication requires 'mode' to be 'delta_lake' or 'sql_warehouse'. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#params".into(),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
 
         let token_provider: Arc<dyn TokenProvider> = match auth_credentials {
             AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
@@ -513,6 +540,10 @@ impl CatalogConnector for Databricks {
     fn initialization(&self) -> ComponentInitialization {
         self.initialization
     }
+
+    fn user_token_client_id(&self) -> Option<&str> {
+        self.user_token_client_id.as_deref()
+    }
 }
 
 #[expect(clippy::unnecessary_wraps)]
@@ -530,8 +561,8 @@ fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReferen
         tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
         return None;
     }
-    let storage_location = uc_table.storage_location.as_deref()?;
-    // Don't append a trailing slash here — `DeltaTable::from` calls
+    let storage_location = uc_table.object_storage_location()?;
+    // Don't append a trailing slash here — `DeltaTable::open` calls
     // `ensure_folder_location` which already adds one when needed.
     // Unconditionally appending caused double-slash paths (e.g.
     // "file:///path/to/table//") when the catalog API returned

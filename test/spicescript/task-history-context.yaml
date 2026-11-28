@@ -1,4 +1,6 @@
 name: task-history-context
+duration: 21s
+tags: [long]
 description: >
   runtime.task_history.captured_context shapes every task that records a
   prompt, a search query or tool arguments, including the ai() SQL function and

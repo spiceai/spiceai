@@ -1,4 +1,5 @@
 name: parquet-struct-map-key
+duration: 3s
 description: >
   A key lookup into a map that sits inside a struct column of a Parquet file
   (`som['mm']['k']`, which DataFusion folds into one

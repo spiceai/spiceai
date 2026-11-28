@@ -1,0 +1,66 @@
+name: cluster-point-lookups
+duration: 56s
+description: >
+  On a cluster of one executor, point lookups answer as PostgreSQL does:
+  an equality on a primary key or, on a table without one, on any column;
+  a constant projection under `LIMIT 1`; the limit below the projection; an
+  absent key; a contradiction. A lookup is planned on a lean path that skips
+  most optimizer rules, and on a cluster the scheduler rewrites its scan
+  into the union of the executor's partitions, a union of one input that
+  only a skipped rule removes; that lookup must be planned in full (#16856).
+
+sources:
+  src: { kind: postgres }
+
+# `k` has a primary key, `u` none; the Cayenne variant declares `k`'s key on
+# its acceleration.
+variants:
+  federated: federated
+  cayenne:
+    datasets:
+      k: { acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: id } }
+      u: { acceleration: { enabled: true, engine: cayenne, mode: file } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-point-lookups
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - { from: 'postgres:public.k', name: k, params: '${sources.src.params}' }
+    - { from: 'postgres:public.u', name: u, params: '${sources.src.params}' }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE k (id int PRIMARY KEY, region int NOT NULL, name text COLLATE "C");
+        INSERT INTO k SELECT i, i % 4, 'n' || i FROM generate_series(1, 64) i;
+        UPDATE k SET name = NULL WHERE id = 7;
+        CREATE TABLE u (id int NOT NULL, region int NOT NULL, name text COLLATE "C");
+        INSERT INTO u SELECT i, i % 4, 'n' || i FROM generate_series(1, 64) i;
+        INSERT INTO u VALUES (5, 9, 'n5');
+  - start: {}
+  # Keyed lookups.
+  - query: SELECT * FROM k WHERE id = 5
+  - query: SELECT id, name FROM k WHERE 5 = id
+  - query: SELECT name FROM k WHERE id = 7
+  - query: SELECT 1 AS present FROM k WHERE id = 5 LIMIT 1
+  - query: SELECT * FROM k WHERE id = 5 LIMIT 1
+  - query: SELECT 1 AS present FROM (SELECT * FROM k WHERE id = 5 LIMIT 1) q
+  - query: SELECT * FROM k WHERE id = 1000
+    expect-empty: true
+  - query: SELECT * FROM k WHERE id = 5 AND id = 6
+    expect-empty: true
+  # Unkeyed lookups: an equality on any column, matching one row or several.
+  - query: SELECT * FROM u WHERE id = 6
+  - query: SELECT region, name FROM u WHERE id = 5
+  - query: SELECT 1 AS present FROM u WHERE name = 'n5' LIMIT 1
+  - query: SELECT id FROM u WHERE region = 1
+  - query: SELECT 1 AS present FROM u WHERE name = 'absent' LIMIT 1
+    expect-empty: true

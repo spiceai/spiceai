@@ -2,6 +2,7 @@
 # unchanged stops replication for the whole table until a restart rebuilds it.
 # Move this script to test/spicescript/ once it passes.
 name: postgres-cdc-unchanged-toast
+duration: 131s
 description: >
   Under Postgres's default (primary-key) replica identity, an UPDATE that leaves
   an out-of-line value unchanged replicates, and replication keeps flowing for

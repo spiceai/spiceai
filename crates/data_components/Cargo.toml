@@ -32,6 +32,7 @@ bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
+cpu-budget.workspace = true
 connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
@@ -53,6 +54,7 @@ duration-parse = { path = "../duration-parse" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 moka.workspace = true
+opentelemetry.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http-body-limit = { path = "../http-body-limit" }
@@ -90,12 +92,14 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-status = { path = "../runtime-status" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 runtime-request-context = { path = "../runtime-request-context", features = [
   "datafusion",
 ] }
-rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -121,6 +125,7 @@ tonic = { workspace = true }
 tracing.workspace = true
 twox-hash.workspace = true
 url.workspace = true
+redact = { path = "../redact" }
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 zip = "9.1"
@@ -171,11 +176,6 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
-sqlite = [
-    "dep:rusqlite",
-    "datafusion-table-providers/sqlite",
-    "datafusion-table-providers/sqlite-federation",
-]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
@@ -189,11 +189,12 @@ iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock = "0.6"
-zstd = "0.13.5"
+zstd = "0.13.6"
 
 [[bench]]
 harness = false
@@ -221,6 +222,11 @@ required-features = ["bench", "kafka"]
 
 [[bench]]
 harness = false
+name = "debezium_decode"
+required-features = ["debezium"]
+
+[[bench]]
+harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
 
@@ -236,3 +242,9 @@ workspace = true
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+# Installs a counting `#[global_allocator]` to check that decoding an Avro body
+# allocates in proportion to the body, not to the item counts it declares.
+[[test]]
+name = "avro_decode_allocation"
+path = "tests/avro_decode_allocation.rs"

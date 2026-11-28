@@ -677,12 +677,16 @@ async fn handle_nsql_query(
             );
         }
 
-        let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                headers,
-                "Error preparing data for NQL model".to_string(),
-            );
+        let mut req = match sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) {
+            Ok(req) => req,
+            Err(e) => {
+                record_nsql_error(&span, &format!("Error preparing data for NSQL model: {e}"));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    "Error preparing data for NQL model".to_string(),
+                );
+            }
         };
 
         req.messages.push(nsql_context.message.clone());
@@ -711,6 +715,7 @@ async fn handle_nsql_query(
             res = chat_fut => match res {
                 Ok(r) => r,
                 Err(e) => {
+                    record_nsql_error(&span, &format!("Error running NSQL model: {e}"));
                     tracing::error!("Error running NQL model: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
                 }
@@ -776,6 +781,10 @@ async fn handle_nsql_query(
                             }
                             Err(e) => {
                                 if num_retries >= DEFAULT_NSQL_RETRIES {
+                                    record_nsql_error(
+                                        &span,
+                                        &format!("Error collecting query results: {e}"),
+                                    );
                                     tracing::error!("Error collecting query results: {e}");
                                     return (StatusCode::BAD_REQUEST, headers, e.to_string());
                                 }
@@ -793,6 +802,7 @@ async fn handle_nsql_query(
                         // If query failed, retry with the updated context
 
                         if num_retries >= DEFAULT_NSQL_RETRIES {
+                            record_nsql_error(&span, &format!("Error executing query: {e}"));
                             tracing::error!("Error executing query: {e}");
                             return (StatusCode::BAD_REQUEST, headers, e.to_string());
                         }
@@ -807,6 +817,7 @@ async fn handle_nsql_query(
                 }
             }
             Ok(None) => {
+                record_nsql_error(&span, "No query produced from NSQL model");
                 tracing::trace!("No query produced from NSQL model");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -815,11 +826,18 @@ async fn handle_nsql_query(
                 );
             }
             Err(e) => {
+                record_nsql_error(&span, &format!("Error running NSQL model: {e}"));
                 tracing::error!("Error running NSQL model: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
             }
         }
     }
+}
+
+/// Records a failure on the `nsql` task span so it reaches `runtime.task_history.error_message`.
+/// The exporter reads ERROR events attached to the span, and the handler runs outside it.
+fn record_nsql_error(span: &Span, message: &str) {
+    tracing::error!(target: "task_history", parent: span, "{message}");
 }
 
 async fn resolve_nsql_model_name(
@@ -942,6 +960,7 @@ mod tests {
             depends_on: vec![],
             metrics: None,
             as_tool: false,
+            build: None,
         }
     }
 
@@ -1911,6 +1930,205 @@ mod tests {
         assert_eq!(
             error,
             "No model specified and multiple compatible LLM models are configured (first_model, second_model). Include the 'model' field in the request."
+        );
+    }
+
+    /// The ERROR events recorded on a span, as `(span name, event target, message)`.
+    #[derive(Clone, Default)]
+    struct SpanErrorCapture(std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanErrorCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::ERROR {
+                return;
+            }
+            let Some(span) = ctx.event_span(event) else {
+                return;
+            };
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            if let Ok(mut errors) = self.0.lock() {
+                errors.push((
+                    span.name().to_string(),
+                    event.metadata().target().to_string(),
+                    visitor.0,
+                ));
+            }
+        }
+    }
+
+    impl SpanErrorCapture {
+        /// Installs the capture for the current thread. `#[tokio::test]` runs the handler on this
+        /// thread, so the events it emits reach the capture.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        /// The messages the `nsql` span recorded under the `task_history` target.
+        fn nsql_task_history_errors(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .filter(|(span, target, _)| span == "nsql" && target == "task_history")
+                .map(|(_, _, message)| message.clone())
+                .collect()
+        }
+    }
+
+    /// A model endpoint that rejects every chat completion, as an over-context prompt is.
+    async fn serve_failing_chat_completions() -> String {
+        let router = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {
+                        "message": "the prompt is 13858 tokens, and the model's context holds 8192",
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": null
+                    }})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test model endpoint");
+        let address = listener
+            .local_addr()
+            .expect("the test model endpoint has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the test model endpoint serves");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// A model that fails the request puts its error on the `nsql` `task_history` span.
+    #[tokio::test]
+    async fn model_error_is_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let endpoint = serve_failing_chat_completions().await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            None,
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error running NSQL model: "),
+            "{errors:?}"
+        );
+        assert!(errors[0].contains("context holds 8192"), "{errors:?}");
+    }
+
+    /// Generated SQL that keeps failing past the retry limit puts its error on the `nsql` span.
+    #[tokio::test]
+    async fn exhausted_query_retries_are_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let (endpoint, _sent) =
+            serve_scripted_chat_completions(&["SELECT no_such_column FROM no_such_table"; 12])
+                .await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            None,
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error executing query: "),
+            "{errors:?}"
+        );
+    }
+
+    /// A model endpoint whose reply is not the JSON the NSQL prompt asks for.
+    async fn serve_malformed_chat_completions() -> String {
+        let router = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "this is not json"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test model endpoint");
+        let address = listener
+            .local_addr()
+            .expect("the test model endpoint has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the test model endpoint serves");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// A reply the NSQL parser rejects puts its error on the `nsql` `task_history` span.
+    #[tokio::test]
+    async fn malformed_model_response_is_recorded_on_the_nsql_span() {
+        let capture = SpanErrorCapture::default();
+        let _guard = capture.install();
+        let endpoint = serve_malformed_chat_completions().await;
+
+        let (status, _) = post_nsql_to_openai_model(
+            &endpoint,
+            &[],
+            None,
+            json!({ "query": "how many rows", "model": "nsql_model" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let errors = capture.nsql_task_history_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error running NSQL model: "),
+            "{errors:?}"
         );
     }
 }

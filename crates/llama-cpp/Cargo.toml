@@ -12,7 +12,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
-llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "15068ee560c2ac97b0212b14f163664907cf16cd" } # branch: spiceai-v1.0.0 (spiceai/llama.cpp#39, #40, #41, #42 and #44 merged)
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "726960fcf6f690d1379e089534a65dfe4c82087c" } # branch: spiceai-b12600 (spiceai/llama.cpp#48, the CVE-2026-137057 grammar fix on tag b12600-spiceai.1)
 snafu.workspace = true
 tracing.workspace = true
 

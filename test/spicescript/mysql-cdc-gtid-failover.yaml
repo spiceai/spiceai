@@ -1,4 +1,6 @@
 name: mysql-cdc-gtid-failover
+duration: 207s
+tags: [long]
 description: >
   A MySQL changes-mode acceleration follows its source through a failover. The
   dataset is accelerated from a GTID primary, spiced stops (cleanly or killed),

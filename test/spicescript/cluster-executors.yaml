@@ -1,4 +1,6 @@
 name: cluster-executors
+duration: 92s
+tags: [long]
 description: >
   A scheduler with two executors answers queries over PostgreSQL, federated
   and accelerated into Cayenne, as PostgreSQL does; while one executor is

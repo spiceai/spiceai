@@ -1,4 +1,6 @@
 name: mongodb-schema
+duration: 70s
+tags: [long]
 description: >
   MongoDB collections whose schema is not known at startup, federated and
   through change streams into Cayenne: a collection that does not exist yet

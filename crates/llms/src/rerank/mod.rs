@@ -29,7 +29,7 @@ limitations under the License.
 //!   pointwise and parses JSON scores from the response.
 //! - **Evaluation-backed**: any evaluation model (e.g. `TypeSafe` Jev) can be
 //!   used via [`EvaluateRerank`], which asks a `noul` relevance question per
-//!   document.
+//!   document (pointwise), or one `choice` of the best document (listwise).
 //!
 //! The `rerank()` UDTF looks up a model name in the reranker store, then the
 //! chat store ([`LlmRerank`]), then the evaluation store ([`EvaluateRerank`])

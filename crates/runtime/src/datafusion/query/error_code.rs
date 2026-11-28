@@ -64,6 +64,13 @@ impl From<&DataFusionError> for ErrorCode {
             DataFusionError::Plan(..) | DataFusionError::SchemaError(..) => {
                 ErrorCode::QueryPlanningError
             }
+            // Refused while planning which requests to send: a planning error, as it was
+            // when it was reported as one.
+            DataFusionError::External(e)
+                if data_components::refusal::is_request_bound_refusal(e.as_ref()) =>
+            {
+                ErrorCode::QueryPlanningError
+            }
             DataFusionError::ObjectStore(..)
             | DataFusionError::External(..)
             | DataFusionError::Execution(..) => ErrorCode::QueryExecutionError,
@@ -236,6 +243,28 @@ mod tests {
         assert_eq!(
             ErrorCode::from(&DataFusionError::Internal("bug".to_string())),
             ErrorCode::InternalError
+        );
+    }
+
+    /// A query over an HTTP dataset's request bound is refused while planning which
+    /// requests to send, so it keeps the planning code it had as a `Plan` error, by
+    /// its type and however it is wrapped. Other external errors keep theirs.
+    #[test]
+    fn a_request_bound_refusal_is_a_planning_error() {
+        let bound = DataFusionError::Context(
+            "scan".to_string(),
+            Box::new(DataFusionError::External(Box::new(
+                data_components::http::provider::Error::TooManyRequests {
+                    message: "a reworded request-bound refusal".to_string(),
+                },
+            ))),
+        );
+        assert_eq!(ErrorCode::from(&bound), ErrorCode::QueryPlanningError);
+        assert_eq!(
+            ErrorCode::from(&DataFusionError::External(Box::new(std::io::Error::other(
+                "set `max_request_partitions`"
+            )))),
+            ErrorCode::QueryExecutionError
         );
     }
 }

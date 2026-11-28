@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod metrics_collector;
 pub mod outbound_broadcaster;
 pub mod partition_load_tracker;
+pub mod peer;
 pub mod pki;
 pub mod scheduler_task_config;
 pub mod service;

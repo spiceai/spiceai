@@ -30,7 +30,7 @@ use crate::{compare, template};
 
 use super::{
     DEFAULT_READY_TIMEOUT, Instance, POLL, STOP_TIMEOUT, SourceState, Sources, apply_patch,
-    assert_files, assert_log, assert_status, check_error_text, explain, http_step, max_wait,
+    assert_files, assert_log, assert_status, check_error_text, explain, http_step, mark_files,
     namespace, random_queries, refresh, run_query, run_slt, source_query, spice_cli,
     start_background, start_executors, stop_background, tlp, wait_metric,
 };
@@ -40,8 +40,19 @@ pub(super) fn describe(action: &Action) -> String {
         Action::Start { .. } => "start".into(),
         Action::Stop => "stop".into(),
         Action::Kill { signal } => format!("kill-spiced ({signal:?})"),
-        Action::Restart { kill, upgrade, .. } => {
-            let name = if *upgrade { "upgrade" } else { "restart" };
+        Action::Restart {
+            kill,
+            upgrade,
+            downgrade,
+            ..
+        } => {
+            let name = if *upgrade {
+                "upgrade"
+            } else if *downgrade {
+                "downgrade"
+            } else {
+                "restart"
+            };
             match kill {
                 Some(signal) => format!("{name} (kill {signal:?})"),
                 None => name.into(),
@@ -106,6 +117,7 @@ pub(super) fn describe(action: &Action) -> String {
         ),
         Action::SpiceCli { args, .. } => format!("spice {}", one_line(&args.join(" "), 80)),
         Action::MarkMetrics(m) => format!("mark-metrics {m}"),
+        Action::MarkFiles { id, .. } => format!("mark-files {id}"),
         Action::AssertObjects {
             source,
             prefix,
@@ -232,6 +244,7 @@ pub(super) fn one_line(s: &str, max: usize) -> String {
 }
 
 pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> Result<String> {
+    let started = Instant::now();
     match action {
         Action::StartSource(name) | Action::UnpauseSource(name) => {
             sources.set(name, SourceState::Running).await
@@ -244,7 +257,7 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
         }
         _ => unreachable!("only source steps reach here"),
     }
-    .map(|()| String::new())
+    .map(|()| format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
 }
 
 /// Runs a step on the `spiced` it reaches. Without a sidecar, that is the
@@ -267,7 +280,7 @@ pub(super) async fn run_instance_step(
         return super::load::run_load(script, instance, load, tier, sources).await;
     }
     match tier {
-        Tier::Upstream => run_step(script, instance, step, sources).await,
+        Tier::Upstream => run_step(script, instance, step, sources, tier).await,
         Tier::Sidecar if step.action.is_lifecycle() => {
             let started = Instant::now();
             sidecar_lifecycle(script, instance, step).await?;
@@ -275,7 +288,7 @@ pub(super) async fn run_instance_step(
         }
         Tier::Sidecar => {
             swap_sidecar(instance);
-            let outcome = run_step(script, instance, step, sources).await;
+            let outcome = run_step(script, instance, step, sources, tier).await;
             swap_sidecar(instance);
             outcome
         }
@@ -291,14 +304,15 @@ fn swap_sidecar(instance: &mut Instance) {
     }
 }
 
-/// The readiness wait a start allows when it names none.
+/// The readiness wait a start allows when it names none. `--max-wait` does not
+/// cap it: getting `spiced` ready is setup, not a check a known-failing script
+/// is expected to fail, and a readiness wait that is normally a second can run
+/// past a 30 s cap on a loaded host.
 fn ready_default(script: &Script) -> Duration {
-    max_wait(
-        script
-            .defaults
-            .ready_timeout
-            .unwrap_or(DEFAULT_READY_TIMEOUT),
-    )
+    script
+        .defaults
+        .ready_timeout
+        .unwrap_or(DEFAULT_READY_TIMEOUT)
 }
 
 /// Starts the sidecar unless it is running, once its upstream is up, and
@@ -336,7 +350,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
             wait_ready,
             ..
         } => {
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::Stop => spiced.stop(STOP_TIMEOUT).await.context("the sidecar")?,
@@ -355,7 +369,7 @@ async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step
                 None => spiced.stop(STOP_TIMEOUT).await,
             }
             .context("the sidecar")?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::WaitReady { timeout } => {
@@ -373,6 +387,7 @@ async fn run_step(
     instance: &mut Instance,
     step: &Step,
     sources: &Sources,
+    tier: Tier,
 ) -> Result<String> {
     let ready_default = ready_default(script);
     let started = Instant::now();
@@ -380,11 +395,19 @@ async fn run_step(
         Action::Start {
             ready_timeout,
             wait_ready,
+            wait,
             patch,
         } => {
+            ensure!(
+                *wait || (instance.executors.is_empty() && instance.sidecar.is_none()),
+                "`start` with `wait: false` starts one `spiced`, and this instance also runs executors or a sidecar"
+            );
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            if !*wait {
+                return Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()));
+            }
+            let timeout = ready_timeout.unwrap_or(ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
@@ -421,6 +444,7 @@ async fn run_step(
             wait_ready,
             patch,
             upgrade,
+            downgrade,
         } => {
             match kill {
                 Some(signal) => {
@@ -431,16 +455,23 @@ async fn run_step(
                 }
                 None => instance.spiced.stop(STOP_TIMEOUT).await?,
             }
-            if *upgrade {
-                instance.spiced.binary.clone_from(&instance.target_binary);
+            let binary = if *upgrade {
+                Some(instance.target_binary.clone())
+            } else if *downgrade {
+                Some(instance.first_binary.clone())
+            } else {
+                None
+            };
+            if let Some(binary) = binary {
+                instance.spiced.binary.clone_from(&binary);
                 for executor in &mut instance.executors {
                     executor.stop(STOP_TIMEOUT).await?;
-                    executor.binary.clone_from(&instance.target_binary);
+                    executor.binary.clone_from(&binary);
                 }
             }
             apply_patch(instance, patch.as_ref())?;
             instance.spiced.start(&instance.spicepod_yaml)?;
-            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            let timeout = ready_timeout.unwrap_or(ready_default);
             // A scheduler with accelerations is ready only once an executor
             // has joined and loaded them, so the executor starts first.
             instance.spiced.wait_http(timeout).await?;
@@ -785,6 +816,19 @@ async fn run_step(
             let text = instance.spiced.metrics().await?;
             instance.metric_marks.insert(id.clone(), text);
         }
+        Action::MarkFiles { id, matching } => {
+            let mut marks = mark_files(&instance.spiced.dir)?;
+            if !matching.is_empty() {
+                marks.retain(|file, _| matching.iter().any(|pattern| pattern.is_match(file)));
+            }
+            ensure!(
+                !marks.is_empty(),
+                "`mark-files: {id}` found no file to record"
+            );
+            let shown = format!(" {} files", marks.len());
+            instance.file_marks.insert(id.clone(), marks);
+            return Ok(shown);
+        }
         Action::WaitMetric(w) => {
             let shown = wait_metric(instance, w, sources).await?;
             return Ok(format!(
@@ -808,11 +852,19 @@ async fn run_step(
         }
         Action::SpiceCli {
             args,
+            input,
             output_contains,
             expect_error,
         } => {
-            let shown =
-                spice_cli(instance, args, output_contains.as_deref(), *expect_error).await?;
+            let shown = spice_cli(
+                instance,
+                tier,
+                args,
+                input.as_deref(),
+                output_contains.as_deref(),
+                *expect_error,
+            )
+            .await?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()
@@ -876,8 +928,17 @@ async fn run_step(
             contains,
             lacks,
             lacks_dirs,
+            unchanged_since,
         } => {
-            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs)?;
+            let unchanged = unchanged_since
+                .as_ref()
+                .map(|id| {
+                    instance.file_marks.get(id).with_context(|| {
+                        format!("`unchanged-since: {id}` names no earlier `mark-files: {id}`")
+                    })
+                })
+                .transpose()?;
+            let shown = assert_files(&instance.spiced.dir, contains, lacks, lacks_dirs, unchanged)?;
             return Ok(format!(
                 " ({:.1}s) {shown}",
                 started.elapsed().as_secs_f64()

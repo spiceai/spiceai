@@ -1,4 +1,6 @@
 name: tool-authorization
+duration: 24s
+tags: [long]
 description: >
   Who may call a tool is decided the same way on every path that runs one. A
   read-write tool (`store_memory`, or any tool of an MCP server) needs a

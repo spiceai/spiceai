@@ -393,6 +393,7 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
         .try_init();
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -404,11 +405,12 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
             configure_test_datafusion();
 
             let app = AppBuilder::new("partition_without_executor")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(SchedulerConfig {
@@ -607,6 +609,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -616,11 +619,12 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
         .scope(async {
             configure_test_datafusion();
             let app = AppBuilder::new("test_predicate_pushdown_accel")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(make_named_scheduler_config(
@@ -992,6 +996,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -1001,11 +1006,12 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
         .scope(async {
             configure_test_datafusion();
             let app = AppBuilder::new("test_refresh_forwarding")
-                .with_dataset(make_memory_accelerated_dataset(
+                .with_dataset(make_accelerated_dataset(
                     format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(make_named_scheduler_config(
@@ -1080,6 +1086,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
     }
 
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let cayenne_tempdir = tempfile::tempdir().expect("cayenne tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
         .await
@@ -1095,6 +1102,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                     format!("file:{}", csv_path.display()),
                     "test_data",
                     "city",
+                    cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(
@@ -1264,6 +1272,26 @@ fn make_accelerated_dataset(
     partition_column: &str,
     base_dir: &std::path::Path,
 ) -> Dataset {
+    make_cayenne_partitioned_dataset(
+        source_path,
+        name,
+        PartitionedBy {
+            name: "expr0".to_string(),
+            expression: format!("bucket({num_buckets}, {partition_column})"),
+        },
+        base_dir,
+    )
+}
+
+/// A Cayenne file-mode acceleration under `base_dir`, partitioned by `partition_by`.
+/// Cayenne refuses `partition_by` in memory mode, so every partitioned Cayenne test
+/// here uses file mode.
+fn make_cayenne_partitioned_dataset(
+    source_path: impl Into<String>,
+    name: &str,
+    partition_by: PartitionedBy,
+    base_dir: &std::path::Path,
+) -> Dataset {
     let mut dataset = Dataset::new(source_path, name);
 
     dataset.acceleration = Some(Acceleration {
@@ -1271,10 +1299,7 @@ fn make_accelerated_dataset(
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Full),
-        partition_by: vec![PartitionedBy {
-            name: "expr0".to_string(),
-            expression: format!("bucket({num_buckets}, {partition_column})"),
-        }],
+        partition_by: vec![partition_by],
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 (
@@ -1298,6 +1323,10 @@ fn make_accelerated_dataset(
 /// Unlike [`make_accelerated_dataset`], this uses `Mode::Memory` so no shared file path
 /// is required between executors — each executor materialises its assigned partitions
 /// independently in process memory.
+///
+/// The tests with two executors use this rather than Cayenne: two Cayenne executors in
+/// one process serve rows from each other's partitions, which separate `spiced`
+/// processes do not (see `test/spicescript/cluster-checked-sum.yaml`).
 fn make_memory_accelerated_dataset(
     source_path: impl Into<String>,
     name: &str,
@@ -1321,29 +1350,24 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
-/// Create a dataset with in-memory Arrow acceleration, partitioned by a raw column value (not
-/// `bucket()`).
-/// Each unique value of `partition_column` becomes its own partition.
+/// Create a dataset with Cayenne file-mode acceleration, partitioned by a raw column value
+/// (not `bucket()`): each unique value of `partition_column` becomes its own partition.
+/// `base_dir` is used as in [`make_accelerated_dataset`].
 fn make_column_partitioned_dataset(
     source_path: impl Into<String>,
     name: &str,
     partition_column: &str,
+    base_dir: &std::path::Path,
 ) -> Dataset {
-    let mut dataset = Dataset::new(source_path, name);
-
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("arrow".to_string()),
-        mode: Mode::Memory,
-        refresh_mode: Some(RefreshMode::Full),
-        partition_by: vec![PartitionedBy {
+    make_cayenne_partitioned_dataset(
+        source_path,
+        name,
+        PartitionedBy {
             name: partition_column.to_string(),
             expression: partition_column.to_string(),
-        }],
-        ..Acceleration::default()
-    });
-
-    dataset
+        },
+        base_dir,
+    )
 }
 
 /// Return a `SchedulerConfig` pointing at an S3 path scoped to `test_name`.
@@ -1381,7 +1405,7 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
     ));
     SchedulerConfig {
         state_location: Some(format!(
-            "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
+            "s3://spiceai-ci-integration-tests/cluster-state/{test_name}/{run_id}/"
         )),
         params: Some(spicepod::param::Params::from_string_map(params)),
         partition_assignment_interval: "1s".to_string(),

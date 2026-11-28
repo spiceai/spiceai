@@ -1,0 +1,83 @@
+name: mssql
+duration: 14s
+description: >
+  A Microsoft SQL Server table with the common types, and a row of NULLs,
+  answers through the `mssql` connector with the values inserted: federated,
+  and accelerated into Cayenne by its time column. The columns SQL Server
+  alone has (XML, GEOGRAPHY, MONEY, DATETIMEOFFSET, binary) are read without
+  error.
+
+sources:
+  mssql:
+    kind: docker
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports: [1433]
+    env: { ACCEPT_EULA: 'Y', MSSQL_SA_PASSWORD: '1StrongPwd!!' }
+    ready: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b -Q 'SELECT 1'
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mssql
+  datasets:
+    - from: mssql:test_mssql_table
+      name: t
+      time_column: col_datetime
+      params:
+        mssql_host: ${sources.mssql.host}
+        mssql_port: '${sources.mssql.port.1433}'
+        mssql_database: ${sources.mssql.namespace}
+        mssql_username: sa
+        mssql_password: '1StrongPwd!!'
+        mssql_encrypt: 'false'
+        mssql_trust_server_certificate: 'true'
+
+steps:
+  # A database per instance, in the one server the instances share.
+  - source-exec:
+      mssql: >-
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b
+        -Q 'CREATE DATABASE [${sources.mssql.namespace}]'
+  - source-exec:
+      mssql: |
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '1StrongPwd!!' -C -b -d '${sources.mssql.namespace}' -Q "
+        CREATE TABLE test_mssql_table (
+            col_int INT, col_bigint BIGINT, col_smallint SMALLINT, col_tinyint TINYINT,
+            col_float FLOAT, col_real REAL, col_decimal DECIMAL(10, 2),
+            col_char CHAR(10), col_varchar VARCHAR(50), col_text TEXT,
+            col_nchar NCHAR(10), col_nvarchar NVARCHAR(50), col_ntext NTEXT,
+            col_uniqueidentifier UNIQUEIDENTIFIER, col_binary BINARY(10), col_varbinary VARBINARY(50),
+            col_xml XML, col_money MONEY, col_smallmoney SMALLMONEY,
+            col_date DATE, col_time TIME, col_datetime DATETIME, col_smalldatetime SMALLDATETIME,
+            col_datetime2 DATETIME2, col_datetimeoffset DATETIMEOFFSET, col_bit BIT, col_geography GEOGRAPHY);
+        INSERT INTO test_mssql_table VALUES (
+            123, 9223372036854775807, 32767, 255, 123.456, 123.456, 12345.67,
+            'char_val', 'varchar_val', 'text_val', N'nchar_val', N'nvarchar_val', N'ntext_val',
+            '6F9619FF-8B86-D011-B42D-00C04FC964FF', 0x1234567890, 0xabcdef,
+            '<root><value>test</value></root>', 12345.67, 1234.56,
+            '2024-01-01', '12:34:56', '2024-01-01 12:34:56', '2024-01-01 12:00:00',
+            '2024-01-01 12:34:56.1234567', '2024-01-01 12:34:56.1234567 +02:00', 1,
+            geography::STGeomFromText('POINT(47.6062 -22.3321)', 4326));
+        INSERT INTO test_mssql_table (col_datetime) VALUES ('2024-01-02 00:00:00');"
+  - start: {}
+
+  # Every column decodes, the NULL row included.
+  - query: SELECT * FROM t
+    expect: {}
+  - query: SELECT count(*) AS n, count(col_int) AS non_null FROM t
+    expect: { rows: [['2', '1']] }
+  - query: >
+      SELECT col_int, col_bigint, col_smallint, col_tinyint, col_decimal,
+             col_varchar, col_text, col_nvarchar, col_ntext, col_date, col_bit
+      FROM t WHERE col_int IS NOT NULL
+    expect:
+      rows:
+        - ['123', '9223372036854775807', '32767', '255', '12345.67',
+           varchar_val, text_val, nvarchar_val, ntext_val, '2024-01-01', 'true']
+  - query: SELECT col_int, col_varchar, col_date, col_bit FROM t WHERE col_int IS NULL
+    expect: { rows: [[null, null, null, null]] }
+  - assert-log: { clean: true }

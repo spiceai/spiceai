@@ -35,24 +35,55 @@ jobs:
     # infra/docker/arc-runner).
     runs-on: spiceai-dev-runners
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The workflows and actions under check. Steps only read these files;
+      # none runs one.
+      - name: Check out the workflows and actions to verify
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          path: checked
+          sparse-checkout: .github
+      # The scripts that run. This runner is reused across jobs, so a pull
+      # request from a fork runs the base branch's copies, never its own. The
+      # merge_group run tests a fork's changes to these scripts before it merges.
+      - name: Check out the check scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: checker
+          sparse-checkout: scripts
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.base.sha || '' }}
+      # A symlink would make the checks read, and print, a file elsewhere on
+      # this runner.
+      - name: Refuse symlinks in the files under check
+        run: |
+          set -euo pipefail
+          links="$(find checked -path checked/.git -prune -o -type l -print)"
+          if [ -n "$links" ]; then
+            printf '::error::Symlinks are not allowed in the files this workflow checks:\n%s\n' "$links"
+            exit 1
+          fi
       - name: Install gh-actions-lock into this job's temp directory
         # A runner can be reused, and `gh extension install` leaves an installed
         # extension as it is. Installing under RUNNER_TEMP, which the runner
         # empties for each job, makes this job run the pinned release, not a copy
         # an earlier job left behind.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "XDG_DATA_HOME=${RUNNER_TEMP}/gh-data" >> "$GITHUB_ENV"
           echo "GH_CONFIG_DIR=${RUNNER_TEMP}/gh-config" >> "$GITHUB_ENV"
           XDG_DATA_HOME="${RUNNER_TEMP}/gh-data" GH_CONFIG_DIR="${RUNNER_TEMP}/gh-config" \
             gh extension install github/gh-actions-lock --pin v0.4.1
-      - run: gh actions-lock --verify
+      # The job token goes only to the pinned `gh` steps, never to a step that
+      # runs a script from a checkout.
+      - name: Verify the lockfile
+        working-directory: checked
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh actions-lock --verify
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -62,6 +93,8 @@ jobs:
       # The tests run first: a check that stopped finding `uses:` keys would
       # pass every workflow.
       - name: Test the full-length SHA pin check
+        working-directory: checker
         run: python scripts/test_pin_actions_to_sha.py -v
       - name: Check every uses is pinned to a full-length commit SHA
-        run: python scripts/pin_actions_to_sha.py --check
+        working-directory: checker
+        run: python scripts/pin_actions_to_sha.py --check "$GITHUB_WORKSPACE/checked"

@@ -1,4 +1,6 @@
 name: http-caching
+duration: 31s
+tags: [long]
 description: >
   A Cayenne `refresh_mode: caching` acceleration over an HTTP API caches each
   request's response by its filters: a repeated query is answered without a

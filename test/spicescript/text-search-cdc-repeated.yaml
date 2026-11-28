@@ -2,6 +2,8 @@
 # text_search asked once before a document arrives through change capture
 # finds it when asked again with the identical text (#15392).
 name: text-search-cdc-repeated
+duration: 12s
+tags: [long]
 description: >
   A text_search over a change-captured Cayenne dataset, asked again with the
   identical text after a document arrives, finds it.

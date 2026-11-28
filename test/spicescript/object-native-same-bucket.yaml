@@ -1,4 +1,6 @@
 name: object-native-same-bucket
+duration: 47s
+tags: [long]
 description: >
   An S3 source whose files share a bucket with the state location: one dataset
   accelerated with Cayenne, whose data files are in the state location, and one

@@ -33,10 +33,7 @@ use crate::common;
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, STAGING_DIR_NAME,
-    TimeRetentionFilterBuilder,
-};
+use cayenne::{CayenneTableProvider, MetadataCatalog, TimeRetentionFilterBuilder};
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -63,9 +60,11 @@ test_with_backends!(test_needed_key_dv_retained_after_retention_impl);
 test_with_backends!(test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl);
 test_with_backends!(test_orphaned_dv_cleanup_below_threshold_retained_impl);
 test_with_backends!(test_loader_self_heals_orphaned_missing_dv_impl);
-test_with_backends!(test_loader_errors_on_missing_needed_dv_impl);
+test_on_data_store!(test_loader_errors_on_missing_needed_dv_impl);
 
-// List-files cache maintenance tests
+// List-files cache maintenance tests. They stay on SQLite: a table in the
+// object-native location scans the files its commits name and never lists them,
+// so it has no list-files cache entry to maintain.
 test_with_backends!(test_cache_delta_applied_after_append_impl);
 test_with_backends!(test_file_based_retention_targeted_cache_invalidation_impl);
 
@@ -95,9 +94,8 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
     insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
-    let dir = table_id_dir(&fixture, &table, table_name);
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         3,
         "Expected 3 Vortex files after 3 inserts"
     );
@@ -107,7 +105,7 @@ async fn test_file_based_retention_deletes_expired_files_impl(fixture: TestFixtu
     assert_eq!(deleted, 1, "Should delete 1 row (the expired file)");
 
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         2,
         "Expected 2 Vortex files after deletion"
     );
@@ -144,14 +142,17 @@ async fn test_file_based_retention_no_eligible_files_impl(fixture: TestFixture) 
     insert_row(&table, 1, now_us).await?;
     insert_row(&table, 2, now_us - 5_000_000).await?;
 
-    let dir = table_id_dir(&fixture, &table, table_name);
-    assert_eq!(count_vortex_files(&dir), 2, "Expected 2 Vortex files");
+    assert_eq!(
+        count_vortex_files(&fixture, &table).await,
+        2,
+        "Expected 2 Vortex files"
+    );
 
     let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
     assert_eq!(deleted, 0, "No files should be deleted");
 
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         2,
         "All Vortex files should still exist"
     );
@@ -188,14 +189,17 @@ async fn test_file_based_retention_deletes_all_files_impl(fixture: TestFixture) 
     insert_row(&table, 1, now_us - 10_000_000).await?; // 10s ago — expired
     insert_row(&table, 2, now_us - 20_000_000).await?; // 20s ago — expired
 
-    let dir = table_id_dir(&fixture, &table, table_name);
-    assert_eq!(count_vortex_files(&dir), 2, "Expected 2 Vortex files");
+    assert_eq!(
+        count_vortex_files(&fixture, &table).await,
+        2,
+        "Expected 2 Vortex files"
+    );
 
     let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
     assert_eq!(deleted, 2, "Should delete 2 rows (both files)");
 
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         0,
         "All Vortex files should be deleted"
     );
@@ -238,9 +242,8 @@ async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixt
     // File 2: fully expired.
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago
 
-    let dir = table_id_dir(&fixture, &table, table_name);
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         2,
         "Expected 2 Vortex files after 2 inserts"
     );
@@ -251,7 +254,7 @@ async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixt
 
     // File 1 must still exist — it has max(event_time) = now, above the cutoff.
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         1,
         "Mixed file must be preserved; only the fully-expired file is deleted"
     );
@@ -450,9 +453,8 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
     assert_eq!(cache.len(), 2, "Expected 2 cache entries before delete");
 
     // Verify 3 vortex files on disk (including the expired one)
-    let dir = table_id_dir(&fixture, &table, table_name);
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         3,
         "Expected 3 Vortex files before file-based delete"
     );
@@ -463,7 +465,7 @@ async fn test_file_based_retention_targeted_cache_invalidation_impl(
 
     // Verify the expired file was physically removed
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         2,
         "Expected 2 Vortex files after deletion"
     );
@@ -561,9 +563,8 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
     insert_row(&table, 2, now_us - 2_000_000).await?; // 2s ago — within retention (3s margin)
     insert_row(&table, 3, now_us - 10_000_000).await?; // 10s ago — expired
 
-    let dir = table_id_dir(&fixture, &table, table_name);
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         3,
         "Expected 3 Vortex files after 3 inserts"
     );
@@ -572,7 +573,7 @@ async fn test_pk_file_based_retention_main_table_only_impl(fixture: TestFixture)
     assert_eq!(deleted, 1, "Should delete 1 row (the expired file)");
 
     assert_eq!(
-        count_vortex_files(&dir),
+        count_vortex_files(&fixture, &table).await,
         2,
         "Expected 2 Vortex files after deletion"
     );
@@ -612,9 +613,6 @@ async fn create_retention_table(
     retention_seconds: u64,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join(table_name);
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = retention_schema();
 
     // Single-row inserts must materialize as physical Vortex files because
@@ -631,7 +629,7 @@ async fn create_retention_table(
         schema: Arc::clone(&schema),
         primary_key: vec![], // No PK → position-based → file-based deletes preferred
         on_conflict: None,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
@@ -642,9 +640,11 @@ async fn create_retention_table(
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, runtime_env, table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     ))
 }
@@ -660,9 +660,6 @@ async fn create_pk_retention_table(
     with_upsert: bool,
     runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
-    let table_dir = fixture.data_path.join(table_name);
-    std::fs::create_dir_all(&table_dir)?;
-
     let schema = retention_schema();
 
     let on_conflict = if with_upsert {
@@ -688,7 +685,7 @@ async fn create_pk_retention_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict,
-        base_path: table_dir.to_string_lossy().to_string(),
+        base_path: fixture.data_store.base_path(table_name),
         partition_column: None,
         vortex_config,
     };
@@ -699,9 +696,11 @@ async fn create_pk_retention_table(
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog_arc, runtime_env)
-            .with_time_retention_filter_builder(retention_builder)
-            .create(table_options)
+        fixture
+            .data_store
+            .create_with(catalog_arc, runtime_env, table_options, |builder| {
+                builder.with_time_retention_filter_builder(retention_builder)
+            })
             .await?,
     ))
 }
@@ -717,8 +716,9 @@ async fn reopen_table(
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     Ok(Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .open(table_name)
+        fixture
+            .data_store
+            .open(catalog, runtime_env, table_name)
             .await?,
     ))
 }
@@ -840,42 +840,29 @@ async fn assert_table_contents(
     Ok(())
 }
 
-/// Count `.vortex` data files under the table's snapshot directory.
-///
-/// Directory structure: `[data_path]/[table_id]/[snapshot_id]/`
-fn count_vortex_files(table_dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(table_dir) else {
-        return 0;
-    };
-    let mut count = 0;
-    for entry in entries.filter_map(std::result::Result::ok) {
-        let path = entry.path();
-        if path.is_dir()
-            && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME)
-            && let Ok(snapshot_entries) = std::fs::read_dir(&path)
-        {
-            for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
-                if file_entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "vortex")
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
-}
-
-/// Resolve the on-disk directory containing snapshot data for a table.
-fn table_id_dir(
+/// The files the data store holds under `table`'s data path, once the files a
+/// table in the object-native location keeps for the data-file retention are
+/// deleted ([`common::reclaim_delayed_deletes`]).
+async fn stored_files(
     fixture: &TestFixture,
     table: &CayenneTableProvider,
-    table_name: &str,
-) -> std::path::PathBuf {
-    let meta = table.metadata();
-    fixture.data_path.join(table_name).join(&meta.table_id)
+) -> Vec<common::StoredFile> {
+    common::reclaim_delayed_deletes(fixture, table).await;
+    fixture
+        .data_store
+        .list_files(&table.metadata().path)
+        .await
+        .expect("list the table's data path")
+}
+
+/// Count the table's `.vortex` data files in the store, outside staging.
+async fn count_vortex_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+    let table_dir = format!("{}/", table.metadata().table_id);
+    stored_files(fixture, table)
+        .await
+        .iter()
+        .filter(|file| file.is_data_file() && file.relative.starts_with(&table_dir))
+        .count()
 }
 
 /// Creates a dummy non-empty cache value. The cache rejects empty vecs internally.
@@ -910,47 +897,31 @@ async fn count_key_based_delete_files(
         .count()
 }
 
-/// Physically delete every `.arrow` deletion-vector file under `root` (simulating
-/// the file-first sweep having unlinked the file but crashed before removing the
-/// catalog row). Returns the number deleted.
-fn delete_arrow_files(root: &std::path::Path) -> usize {
-    fn walk(dir: &std::path::Path, count: &mut usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, count);
-            } else if path.extension().is_some_and(|ext| ext == "arrow") {
-                std::fs::remove_file(&path).expect("remove .arrow file");
-                *count += 1;
-            }
+/// Physically delete every deletion vector the store holds for the table
+/// (simulating the file-first sweep having unlinked the file but crashed before
+/// removing the catalog row). Returns the number deleted.
+async fn delete_arrow_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+    let mut count = 0;
+    for file in stored_files(fixture, table).await {
+        if file.is_deletion_vector() {
+            fixture
+                .data_store
+                .delete(&file.path)
+                .await
+                .expect("remove deletion vector");
+            count += 1;
         }
     }
-    let mut count = 0;
-    walk(root, &mut count);
     count
 }
 
-/// Count `.arrow` deletion-vector files physically present anywhere under `root`.
-fn count_arrow_files(root: &std::path::Path) -> usize {
-    fn walk(dir: &std::path::Path, count: &mut usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, count);
-            } else if path.extension().is_some_and(|ext| ext == "arrow") {
-                *count += 1;
-            }
-        }
-    }
-    let mut count = 0;
-    walk(root, &mut count);
-    count
+/// Count the deletion vectors the store holds for the table.
+async fn count_arrow_files(fixture: &TestFixture, table: &CayenneTableProvider) -> usize {
+    stored_files(fixture, table)
+        .await
+        .iter()
+        .filter(|file| file.is_deletion_vector())
+        .count()
 }
 
 /// Test: a key-based deletion vector orphaned by retention is cleaned up.
@@ -983,8 +954,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
     let table_id = table.metadata().table_id.clone();
     // Deletion-vector `.arrow` files are written under the base table path
     // (`<base>/<snapshot_id>/deletions/`), a sibling of the `table_id` data
-    // directory, so walk the whole base path to find them.
-    let base_dir = fixture.data_path.join(table_name);
+    // directory, which is why `stored_files` lists the whole data path.
 
     let now_us = chrono::Utc::now().timestamp_micros();
 
@@ -1002,7 +972,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
         "Upsert should have written one key-based deletion vector"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         1,
         "The DV .arrow file should exist on disk before retention"
     );
@@ -1026,7 +996,7 @@ async fn test_orphaned_key_dv_cleaned_after_retention_impl(fixture: TestFixture)
         "Orphaned key-based deletion vector should be removed from the catalog"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         0,
         "Orphaned DV .arrow file should be removed from disk"
     );
@@ -1128,7 +1098,6 @@ async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
     )
     .await?;
     let table_id = table.metadata().table_id.clone();
-    let base_dir = fixture.data_path.join(table_name);
 
     let now_us = chrono::Utc::now().timestamp_micros();
 
@@ -1160,7 +1129,7 @@ async fn test_all_snapshots_emptied_cleans_all_orphaned_dvs_impl(
         "All orphaned key-based deletion vectors should be removed from the catalog"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         0,
         "All orphaned DV .arrow files should be removed from disk"
     );
@@ -1185,7 +1154,6 @@ async fn test_orphaned_dv_cleanup_below_threshold_retained_impl(
     )
     .await?;
     let table_id = table.metadata().table_id.clone();
-    let base_dir = fixture.data_path.join(table_name);
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us - 100_000_000).await?;
@@ -1207,7 +1175,7 @@ async fn test_orphaned_dv_cleanup_below_threshold_retained_impl(
         "1 orphan-eligible DV is below the threshold of 2 → sweep must not run"
     );
     assert_eq!(
-        count_arrow_files(&base_dir),
+        count_arrow_files(&fixture, &table).await,
         1,
         "Below-threshold orphan DV .arrow file must remain on disk"
     );
@@ -1232,7 +1200,6 @@ async fn test_loader_self_heals_orphaned_missing_dv_impl(fixture: TestFixture) -
     )
     .await?;
     let table_id = table.metadata().table_id.clone();
-    let base_dir = fixture.data_path.join(table_name);
 
     let now_us = chrono::Utc::now().timestamp_micros();
     insert_row(&table, 1, now_us - 100_000_000).await?;
@@ -1244,11 +1211,11 @@ async fn test_loader_self_heals_orphaned_missing_dv_impl(fixture: TestFixture) -
     let deleted = execute_delete(&table, retention_delete_filter(retention_seconds)).await?;
     assert_eq!(deleted, 1);
     assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
-    assert_eq!(count_arrow_files(&base_dir), 1);
+    assert_eq!(count_arrow_files(&fixture, &table).await, 1);
 
     // Simulate the file-first sweep: unlink the file but leave the catalog row.
     assert_eq!(
-        delete_arrow_files(&base_dir),
+        delete_arrow_files(&fixture, &table).await,
         1,
         "should remove the orphaned DV .arrow file"
     );
@@ -1282,7 +1249,6 @@ async fn test_loader_errors_on_missing_needed_dv_impl(fixture: TestFixture) -> T
     )
     .await?;
     let table_id = table.metadata().table_id.clone();
-    let base_dir = fixture.data_path.join(table_name);
 
     // insert id=1 then upsert id=1 (both fresh, no retention): the DV shadows the
     // surviving original copy, so its delete sequence is above the floor → NEEDED.
@@ -1292,18 +1258,19 @@ async fn test_loader_errors_on_missing_needed_dv_impl(fixture: TestFixture) -> T
     insert_row(&table, 1, now_us).await?;
     common::poll_inlined_data_count_zero(&fixture.catalog, &table_id).await?;
     assert_eq!(count_key_based_delete_files(&fixture, &table).await, 1);
-    assert_eq!(count_arrow_files(&base_dir), 1);
+    assert_eq!(count_arrow_files(&fixture, &table).await, 1);
 
     // Delete the needed DV's file (genuine data loss), leaving the catalog row.
-    assert_eq!(delete_arrow_files(&base_dir), 1);
+    assert_eq!(delete_arrow_files(&fixture, &table).await, 1);
     drop(table);
 
     // Reopen must fail: a missing file still within the floor is not a self-healable
     // orphan.
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let result = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .open(table_name)
+    let result = fixture
+        .data_store
+        .open(catalog, ctx.runtime_env(), table_name)
         .await;
     assert!(
         result.is_err(),

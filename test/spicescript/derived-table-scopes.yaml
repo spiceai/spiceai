@@ -1,4 +1,6 @@
 name: derived-table-scopes
+duration: 32s
+tags: [long]
 description: >
   Joins of aliased derived tables, whose subqueries repeat an expression over an
   aliased LEFT JOIN, answer the way PostgreSQL does. Federated PostgreSQL, MySQL

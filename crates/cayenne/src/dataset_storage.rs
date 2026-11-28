@@ -251,10 +251,11 @@ impl DatasetStorage {
         table_path: &str,
         dataset_id: &str,
         store: Arc<dyn ObjectStore>,
+        writes: crate::catalog::DataWriteGate,
     ) -> Result<Self, String> {
         let recorded = url::Url::parse(table_path)
             .map_err(|error| format!("data path '{table_path}' is not a URL: {error}"))?;
-        let prefix = Path::from_url_path(recorded.path())
+        let prefix = object_key_of_url(&recorded)
             .map_err(|error| format!("data path '{table_path}' has no object path: {error}"))?;
         let in_location = crate::metastore_layout::is_object_native_data_path(table_path);
         // A dataset in the object-native location is served by its location's
@@ -270,11 +271,11 @@ impl DatasetStorage {
             recorded.scheme(),
             recorded.host_str().unwrap_or_default()
         );
-        let data_root = if prefix.as_ref().is_empty() {
-            format!("{DATASET_STORE_SCHEME}://{dataset_id}")
-        } else {
-            format!("{DATASET_STORE_SCHEME}://{dataset_id}/{prefix}")
-        };
+        let data_root = url_of_object_key(&url, &prefix)
+            .ok_or_else(|| format!("dataset id '{dataset_id}' cannot name a store"))?
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
         let dataset: Arc<str> = Arc::from(dataset);
         let table_path: Arc<str> = Arc::from(table_path.trim_end_matches('/'));
         let scoped: Arc<dyn ObjectStore> = Arc::new(DatasetScopedStore {
@@ -283,6 +284,7 @@ impl DatasetStorage {
             authority: recorded_authority.clone(),
             dataset: Arc::clone(&dataset),
             table_path: Arc::clone(&table_path),
+            writes,
         });
         Ok(Self {
             store: scoped,
@@ -415,13 +417,37 @@ impl DatasetStorage {
         if authority != self.recorded_authority && authority != own {
             return Err(outside(&self.recorded_authority, location));
         }
-        Path::from_url_path(url.path())
+        object_key_of_url(&url)
             .map(Some)
             .map_err(|error| ObjectStoreError::Generic {
                 store: STORE_NAME,
                 source: Box::new(error),
             })
     }
+}
+
+/// The object key a data-path URL (`s3://bucket/…`, `file:///…`,
+/// `cayenne://<id>/…`) names: its path, percent-decoded once. Every data-path URL
+/// encodes each key part once, so a key with a space or a `%` round-trips.
+///
+/// # Errors
+///
+/// Returns an error if the decoded path is not a valid object key.
+pub fn object_key_of_url(url: &url::Url) -> Result<Path, object_store::path::Error> {
+    Path::from_url_path(url.path())
+}
+
+/// The URL of object key `key` under `root`'s scheme and authority, with each key
+/// part percent-encoded once, so [`object_key_of_url`] gives `key` back: a space,
+/// a `%` and a literal `%20` in a key each survive the round trip. `None` when
+/// `root` cannot have a path.
+#[must_use]
+pub fn url_of_object_key(root: &url::Url, key: &Path) -> Option<url::Url> {
+    let mut url = root.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut().ok()?.clear().extend(key.parts());
+    Some(url)
 }
 
 /// `location` relative to the dataset's `prefix`, as a user finds it under the
@@ -489,6 +515,47 @@ pub(crate) async fn delete_in_batches(
     outcome
 }
 
+/// A multipart upload of a dataset's store that sends no further part, and
+/// does not complete, once the instance stops writing the dataset: the upload
+/// then never becomes visible, and its parts are an unfinished upload the
+/// writer's orphan handling reclaims. A part already sent is not recalled.
+#[derive(Debug)]
+struct GatedUpload {
+    inner: Box<dyn MultipartUpload>,
+    writes: crate::catalog::DataWriteGate,
+    dataset: Arc<str>,
+}
+
+#[async_trait]
+impl MultipartUpload for GatedUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        if !self.writes.allows() {
+            let refused = replica_write(&self.dataset);
+            return Box::pin(async move { Err(refused) });
+        }
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
+        if !self.writes.allows() {
+            return Err(replica_write(&self.dataset));
+        }
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<(), ObjectStoreError> {
+        self.inner.abort().await
+    }
+}
+
+/// The refusal of a data write on an instance that does not write `dataset`.
+fn replica_write(dataset: &str) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: STORE_NAME,
+        source: crate::metastore::object_native::not_writer_message(dataset).into(),
+    }
+}
+
 fn outside(authority: &str, location: &str) -> ObjectStoreError {
     let shown = if location.contains("://") {
         location.to_string()
@@ -515,9 +582,22 @@ struct DatasetScopedStore {
     /// committed file the store cannot serve.
     dataset: Arc<str>,
     table_path: Arc<str>,
+    /// Closed while another instance writes the dataset: then this store sends
+    /// no write or delete, so this instance leaves no object behind. A request
+    /// already sent when it closes is not recalled.
+    writes: crate::catalog::DataWriteGate,
 }
 
 impl DatasetScopedStore {
+    /// `Err` when another instance writes the dataset.
+    fn check_writes(&self) -> Result<(), ObjectStoreError> {
+        if self.writes.allows() {
+            Ok(())
+        } else {
+            Err(replica_write(&self.dataset))
+        }
+    }
+
     /// A failed read of `location` as the dataset sees it: a committed file that is
     /// not in the store keeps its `NotFound` kind, so callers that probe for a file
     /// still recognize it, and carries [`DataFileError::Missing`] as its source; a
@@ -616,6 +696,7 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
         self.check(location)?;
+        self.check_writes()?;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -625,7 +706,13 @@ impl ObjectStore for DatasetScopedStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
         self.check(location)?;
-        self.inner.put_multipart_opts(location, opts).await
+        self.check_writes()?;
+        let upload = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(GatedUpload {
+            inner: upload,
+            writes: self.writes.clone(),
+            dataset: Arc::clone(&self.dataset),
+        }))
     }
 
     async fn get_opts(
@@ -695,8 +782,11 @@ impl ObjectStore for DatasetScopedStore {
         let prefix = self.prefix.clone();
         let authority = self.authority.clone();
         let inner = Arc::clone(&self.inner);
+        let writes = self.writes.clone();
+        let dataset = Arc::clone(&self.dataset);
         // Paths outside the dataset fail in place; each batch of the rest goes to
-        // the inner store's own batched delete.
+        // the inner store's own batched delete, unless another instance writes
+        // the dataset by the time the batch is sent.
         locations
             .ready_chunks(DELETE_BATCH)
             .flat_map(move |batch| {
@@ -713,6 +803,12 @@ impl ObjectStore for DatasetScopedStore {
                 }
                 let deleted = if inside.is_empty() {
                     stream::empty().boxed()
+                } else if !writes.allows() {
+                    let refusals: Vec<Result<Path, ObjectStoreError>> = inside
+                        .iter()
+                        .map(|_| Err(replica_write(&dataset)))
+                        .collect();
+                    stream::iter(refusals).boxed()
                 } else {
                     inner.delete_stream(stream::iter(inside.into_iter().map(Ok)).boxed())
                 };
@@ -758,6 +854,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -769,6 +866,7 @@ impl ObjectStore for DatasetScopedStore {
     ) -> Result<(), ObjectStoreError> {
         self.check(from)?;
         self.check(to)?;
+        self.check_writes()?;
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -785,6 +883,7 @@ mod tests {
             table_path,
             "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
             Arc::clone(store),
+            crate::catalog::DataWriteGate::open(),
         )
         .expect("storage")
     }
@@ -890,6 +989,58 @@ mod tests {
         assert!(!storage.is_local());
     }
 
+    /// A data path whose keys need escaping in a URL (a space, a literal `%20`,
+    /// a `%`) gets a run-time root that encodes each key part once, so a data URL
+    /// built on it names the dataset's own keys and its store accepts them.
+    #[tokio::test]
+    async fn the_data_root_names_the_keys_of_the_data_path() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (table_path, key, data_root) in [
+            (
+                "s3://bucket/state%20dir/orders",
+                "state dir/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/state%20dir/orders",
+            ),
+            (
+                "s3://bucket/state%2520dir/orders",
+                "state%20dir/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/state%2520dir/orders",
+            ),
+            (
+                "s3://bucket/100%25/orders",
+                "100%/orders",
+                "cayenne://0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000/100%25/orders",
+            ),
+        ] {
+            let storage = storage(table_path, &inner);
+            assert_eq!(storage.data_root(), data_root, "{table_path}");
+            let file = storage
+                .resolve(&format!("{}/t/1.vortex", storage.data_root()))
+                .expect("a file of the dataset")
+                .expect("a URL");
+            assert_eq!(file.as_ref(), format!("{key}/t/1.vortex"), "{table_path}");
+            storage
+                .store()
+                .put(&file, PutPayload::from_static(b"a"))
+                .await
+                .expect("put under the dataset");
+        }
+        let mut keys: Vec<String> = inner
+            .list(None)
+            .map(|meta| meta.expect("list").location.as_ref().to_string())
+            .collect()
+            .await;
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "100%/orders/t/1.vortex",
+                "state dir/orders/t/1.vortex",
+                "state%20dir/orders/t/1.vortex",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_path_sharing_only_a_string_prefix_is_outside() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -907,6 +1058,61 @@ mod tests {
         assert!(
             matches!(listed.as_slice(), [Err(_)]),
             "listing the whole store is refused: {listed:?}"
+        );
+    }
+
+    /// An upload that started while this instance wrote the dataset sends no
+    /// further part and never completes once another instance writes it, so
+    /// the object never becomes visible.
+    #[tokio::test]
+    async fn an_upload_stops_when_the_instance_stops_writing() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gate = crate::catalog::DataWriteGate::open();
+        let storage = DatasetStorage::new(
+            "orders",
+            "s3://bucket/p/a",
+            "0193aaaa-bbbb-7ccc-8ddd-eeeeffff0000",
+            Arc::clone(&inner),
+            gate.for_table(),
+        )
+        .expect("storage");
+        let path = Path::from("p/a/file.vortex");
+        let mut upload = storage
+            .store()
+            .put_multipart(&path)
+            .await
+            .expect("an upload starts while this instance writes");
+        upload
+            .put_part(PutPayload::from_static(b"first"))
+            .await
+            .expect("a part goes while this instance writes");
+
+        gate.set(false);
+        let part = upload
+            .put_part(PutPayload::from_static(b"second"))
+            .await
+            .expect_err("no part goes once another instance writes");
+        assert!(
+            part.to_string()
+                .contains("accepts no change from this table"),
+            "{part}"
+        );
+        let complete = upload
+            .complete()
+            .await
+            .expect_err("the upload does not complete");
+        assert!(
+            complete
+                .to_string()
+                .contains("accepts no change from this table"),
+            "{complete}"
+        );
+        assert!(
+            matches!(
+                inner.head(&path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the object never becomes visible"
         );
     }
 

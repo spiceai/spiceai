@@ -1,4 +1,6 @@
 name: append-kill
+duration: 74s
+tags: [long]
 description: >
   Append refresh into Cayenne on a short interval, which holds new rows in
   memory by default before they reach files: rows appended just before
@@ -26,7 +28,7 @@ variants:
     datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
   # Object-native data (#16131): data files in the state location, which an
   # instance that loses its directory serves again without the source.
-  object-native-local: object-native-local
+  object-native: object-native
   # `object-native-s3` (variants.yaml), with appends staged in files and
   # compacted every 2 s once 4 files are waiting. Inline storage is off: by
   # default a small append is held in the metastore until 64 of them (or 10,000
@@ -111,18 +113,18 @@ steps:
     eventually: 30s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events
 
-  # Object-native data (#16131): the dataset's folder is in the state location,
-  # and nothing is at a local `s3:` path. Appended rows sit in the memory tier
-  # and its seals, which are in the dataset's log there, until a checkpoint
-  # writes data files; the wipe below shows they are served from the location.
-  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/data/' }
-    only: object-native-local
+  # Object-native data (#16131): the dataset's log is in the state location,
+  # and nothing is at a local `s3:` path. With inline storage on (all but
+  # object-native-s3), appends this small are held in the log rather than in
+  # data files; the wipe below shows they are served from the location.
+  - assert-files: { contains: '^state/cayenne/v1/datasets/events-[^/]+/head$' }
+    only: object-native
   - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
     only: object-native-s3
   - assert-objects: { source: slow-lake, prefix: state/cayenne/v1/datasets/events-, contains: /head, min: 1 }
     only: object-native-s3-latency
   - assert-files: { lacks: '(^|/)s3:' }
-    only: &object-native-data [object-native-local, object-native-s3, object-native-s3-latency]
+    only: &object-native-data [object-native, object-native-s3, object-native-s3-latency]
 
   # Killed, and its directory lost: the rows come back from the location
   # alone, since the source is down and cannot supply them again.

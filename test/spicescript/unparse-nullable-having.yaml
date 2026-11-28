@@ -1,4 +1,6 @@
 name: unparse-nullable-having
+duration: 21s
+tags: [long]
 description: >
   A HAVING predicate on a nullable computed grouping key returns the same
   count as PostgreSQL over the source rows: federated to PostgreSQL, MySQL and

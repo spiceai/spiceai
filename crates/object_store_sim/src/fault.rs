@@ -19,7 +19,16 @@
 //!
 //! A read has no side effect, so a lost response is indistinguishable from a
 //! failed request; listings report the error as their first item.
-use std::{collections::BTreeMap, fmt, sync::Arc};
+//!
+//! Two more controls serve protocol replays: a read gate that holds plain GETs
+//! of chosen paths, so a reader can read a head and fetch what it lists later,
+//! and a store clock that runs ahead of or behind the process's, stamping each
+//! object's `LastModified` when it is written, as a real store does.
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
@@ -34,6 +43,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use super::Op;
 
 type Predicate = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+/// Matches a request by its path and, for a put, its bytes.
+type RulePredicate = Arc<dyn Fn(&Path, Option<&PutPayload>) -> bool + Send + Sync>;
 /// Async work executed immediately before a held request reaches storage.
 pub type BeforeHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 type SharedUpload = Arc<AsyncMutex<Box<dyn MultipartUpload>>>;
@@ -48,7 +59,7 @@ pub enum Fault {
 
 struct Rule {
     op: Op,
-    predicate: Predicate,
+    predicate: RulePredicate,
     fault: Fault,
     repeat: bool,
 }
@@ -88,6 +99,27 @@ struct State {
     next: u64,
     log: Vec<Applied>,
     blocked: Vec<(Path, PutPayload, PutOptions)>,
+    /// Plain GETs of matching paths wait here until the gate opens.
+    read_gate: Option<Predicate>,
+    /// Whether conditional GETs (`If-None-Match` polls) wait at the gate too.
+    gate_polls: bool,
+    /// GETs waiting at the gate now.
+    gated: usize,
+    /// How far the store's clock runs ahead of the inner store's, in
+    /// milliseconds; negative when it runs behind. Each write takes the offset
+    /// current when it lands.
+    clock_offset_ms: i64,
+    /// The clock offset each object was last written at, which every GET, HEAD
+    /// and LIST adds to its `LastModified`, so an object's time stays fixed
+    /// until it is written again, as in a real store.
+    written_offset_ms: HashMap<Path, i64>,
+}
+
+impl State {
+    /// The clock offset `path` was last written at.
+    fn offset_of(&self, path: &Path) -> chrono::TimeDelta {
+        chrono::TimeDelta::milliseconds(self.written_offset_ms.get(path).copied().unwrap_or(0))
+    }
 }
 
 /// State shared by the store and the multipart uploads it hands out.
@@ -96,15 +128,21 @@ struct Shared {
     state: Mutex<State>,
     applied: AsyncMutex<()>,
     captured: Notify,
+    reads_opened: Notify,
 }
 
 impl Shared {
     fn fault(&self, op: Op, path: &Path) -> Option<Fault> {
+        self.fault_for(op, path, None)
+    }
+
+    /// The fault of the first rule matching `op` on `path`, with `payload` for a put.
+    fn fault_for(&self, op: Op, path: &Path, payload: Option<&PutPayload>) -> Option<Fault> {
         let mut state = self.state.lock();
         let index = state
             .rules
             .iter()
-            .position(|r| r.op == op && (r.predicate)(path))?;
+            .position(|r| r.op == op && (r.predicate)(path, payload))?;
         let fault = state.rules[index].fault;
         if !state.rules[index].repeat {
             state.rules.remove(index);
@@ -217,7 +255,26 @@ impl FaultStore {
     ) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
+            fault,
+            repeat: false,
+        });
+    }
+
+    /// Arm one put (`Create`, `Cas` or `Put`) whose path and bytes match
+    /// `predicate`, so a test can pick a write by what it writes. Rules are
+    /// consumed in insertion order.
+    pub fn arm_put(
+        &self,
+        op: Op,
+        predicate: impl Fn(&Path, &PutPayload) -> bool + Send + Sync + 'static,
+        fault: Fault,
+    ) {
+        self.shared.state.lock().rules.push(Rule {
+            op,
+            predicate: Arc::new(move |path, payload| {
+                payload.is_some_and(|payload| predicate(path, payload))
+            }),
             fault,
             repeat: false,
         });
@@ -227,7 +284,7 @@ impl FaultStore {
     pub fn fail_while(&self, op: Op, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
         self.shared.state.lock().rules.push(Rule {
             op,
-            predicate: Arc::new(predicate),
+            predicate: Arc::new(move |path, _| predicate(path)),
             fault: Fault::Fail,
             repeat: true,
         });
@@ -292,8 +349,91 @@ impl FaultStore {
         let op = put_op(&options.mode);
         let mode = format!("{:?}", options.mode);
         let result = self.inner.put_opts(path, payload.clone(), options).await;
+        if result.is_ok() {
+            let mut state = self.shared.state.lock();
+            let offset = state.clock_offset_ms;
+            state.written_offset_ms.insert(path.clone(), offset);
+        }
         self.shared.record(path, op, &mode, Some(payload), &result);
         result
+    }
+
+    /// Hold plain GETs of matching paths before I/O until [`Self::open_reads`],
+    /// so a reader can read a head and fetch what it lists later.
+    pub fn gate_reads(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        self.shared.state.lock().read_gate = Some(Arc::new(predicate));
+    }
+
+    /// Hold conditional GETs (`If-None-Match` polls) of matching paths before
+    /// I/O until [`Self::open_reads`], as [`Self::gate_reads`] holds plain ones,
+    /// so a poll can be caught in flight.
+    pub fn gate_polls(&self, predicate: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        let mut state = self.shared.state.lock();
+        state.read_gate = Some(Arc::new(predicate));
+        state.gate_polls = true;
+    }
+
+    /// Release every GET held at the gate, and stop holding new ones.
+    pub fn open_reads(&self) {
+        {
+            let mut state = self.shared.state.lock();
+            state.read_gate = None;
+            state.gate_polls = false;
+        }
+        self.shared.reads_opened.notify_waiters();
+    }
+
+    /// Wait until at least `count` GETs are held at the gate.
+    pub async fn wait_gated(&self, count: usize) {
+        loop {
+            let notified = self.shared.captured.notified();
+            if self.shared.state.lock().gated >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Run the store's clock ahead by `by`: an object written from now on
+    /// carries a `LastModified` that much later than the inner store gives
+    /// it. An object already written keeps its time until it is written again.
+    pub fn advance_clock(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.shared.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_add(by);
+    }
+
+    /// Run the store's clock behind by `by`: an object written from now on
+    /// carries a `LastModified` that much earlier than the inner store gives
+    /// it, as a store whose clock lags the process's does.
+    pub fn set_clock_back(&self, by: std::time::Duration) {
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        let mut state = self.shared.state.lock();
+        state.clock_offset_ms = state.clock_offset_ms.saturating_sub(by);
+    }
+
+    /// Wait at the read gate while it holds `path`.
+    async fn wait_at_gate(&self, path: &Path) {
+        let mut counted = false;
+        loop {
+            let notified = self.shared.reads_opened.notified();
+            {
+                let mut state = self.shared.state.lock();
+                let held = state.read_gate.as_ref().is_some_and(|gate| gate(path));
+                if !held {
+                    if counted {
+                        state.gated -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    state.gated += 1;
+                    counted = true;
+                }
+            }
+            self.shared.captured.notify_waiters();
+            notified.await;
+        }
     }
 
     /// Apply the exact original request, even if already delivered: the same
@@ -382,7 +522,15 @@ impl FaultStore {
             let answer = list(inner.as_ref()).try_collect::<Vec<_>>().await;
             shared.record(&prefix, Op::List, &mode, None, &answer);
             match answer {
-                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
+                Ok(mut objects) => {
+                    {
+                        let state = shared.state.lock();
+                        for meta in &mut objects {
+                            meta.last_modified += state.offset_of(&meta.location);
+                        }
+                    }
+                    futures::stream::iter(objects.into_iter().map(Ok)).boxed()
+                }
                 Err(error) => futures::stream::iter([Err(error)]).boxed(),
             }
         })
@@ -419,7 +567,10 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.shared.fault(put_op(&options.mode), path) {
+        match self
+            .shared
+            .fault_for(put_op(&options.mode), path, Some(&payload))
+        {
             Some(Fault::Fail) => {
                 self.shared
                     .state
@@ -451,12 +602,20 @@ impl ObjectStore for FaultStore {
         } else {
             Op::Get
         };
+        let gated =
+            op == Op::Get || (op == Op::GetConditional && self.shared.state.lock().gate_polls);
+        if gated {
+            self.wait_at_gate(path).await;
+        }
         if self.shared.fault(op, path).is_some() {
             return Err(injected("get failed before I/O"));
         }
         let _guard = self.shared.applied.lock().await;
         let mode = format!("{options:?}");
-        let result = self.inner.get_opts(path, options).await;
+        let mut result = self.inner.get_opts(path, options).await;
+        if let Ok(answer) = &mut result {
+            answer.meta.last_modified += self.shared.state.lock().offset_of(path);
+        }
         self.shared.record(path, op, &mode, None, &result);
         result
     }
@@ -542,7 +701,13 @@ impl ObjectStore for FaultStore {
             return Err(refused(Op::List));
         }
         let _guard = self.shared.applied.lock().await;
-        let answer = self.inner.list_with_delimiter(prefix).await;
+        let mut answer = self.inner.list_with_delimiter(prefix).await;
+        if let Ok(listed) = &mut answer {
+            let state = self.shared.state.lock();
+            for meta in &mut listed.objects {
+                meta.last_modified += state.offset_of(&meta.location);
+            }
+        }
         self.shared
             .record(&at, Op::List, "delimiter", None, &answer);
         answer

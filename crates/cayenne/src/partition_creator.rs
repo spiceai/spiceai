@@ -216,6 +216,7 @@ impl CayennePartitionCreator {
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
         .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_schema_indexes(&self.schema)
         .with_dataset_name(&self.table_name)
         .with_partitioned_table_conflict_detection(self.vortex_config.pk_conflict_detection);
         if let Some(ref rb) = self.time_retention_filter_builder {

@@ -14,22 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! String literals that survive `sqlparser`'s quote escaping.
+//! String literals written as quote-free pieces.
 //!
-//! `sqlparser` renders `Value::SingleQuotedString` by doubling each `'`, but it
-//! leaves a quote alone when the character before it is a backslash (it assumes
-//! `\'` is already escaped) and when the next character is another quote (it
-//! assumes `''` is already escaped). Neither assumption holds for a *value*: the
-//! string `a\'b` renders as `'a\'b'`, which `DuckDB` and `SQLite` read as the
-//! string `a\` followed by stray SQL (a parser error), and the string `a''b`
-//! renders as `'a''b'`, which reads back as `a'b` — a filter on the wrong value.
-//!
-//! Neither engine treats backslash as an escape in a standard string literal, so
-//! the only quoting needed is doubling. When a value contains one of the two
-//! shapes the renderer mishandles, it is rendered as a concatenation of
-//! quote-free pieces and lone-quote literals instead, e.g.
-//! `('a\' || '''' || 'b')`. A lone `'` renders as `''''` because it has nothing
-//! before or after it to trip either skip.
+//! A value that holds `\'` or `''` is written as a concatenation of quote-free
+//! pieces and lone-quote literals, e.g. `('a\' || '''' || 'b')`. `DuckDB` and
+//! `SQLite` read a backslash literally in a standard string literal, so the
+//! concatenation reads back as the value.
 
 use datafusion::sql::sqlparser::ast::{self, BinaryOperator, Value};
 

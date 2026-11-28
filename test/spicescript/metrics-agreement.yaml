@@ -1,4 +1,6 @@
 name: metrics-agreement
+duration: 26s
+tags: [long]
 description: >
   What the runtime reports agrees with what ran: after a known workload (7
   queries on an accelerated table and 4 on a federated one over Flight, 2

@@ -17,7 +17,6 @@ limitations under the License.
 use arrow_schema::SchemaRef;
 
 use crate::{access::AccessMode, find_first_delimiter};
-use acceleration::Engine;
 use datafusion::common::TableReference;
 use datafusion::sql::sqlparser::{
     dialect::{Dialect, GenericDialect},
@@ -362,10 +361,10 @@ pub struct DatasetSpec {
 impl std::fmt::Debug for DatasetSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatasetSpec")
-            .field("from", &self.from)
+            .field("from", &redact::redact_source_credentials(&self.from))
             .field("name", &self.name)
             .field("access", &self.access)
-            .field("params", &self.params)
+            .field("params", &crate::RedactedParams(&self.params))
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
             .field("schema", &self.schema)
@@ -663,10 +662,6 @@ impl DatasetSpec {
     #[must_use]
     pub fn is_file_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            if acceleration.engine == Engine::PostgreSQL {
-                return true;
-            }
-
             return acceleration.enabled
                 && matches!(
                     acceleration.mode,
