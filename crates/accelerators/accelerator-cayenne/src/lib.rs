@@ -3811,6 +3811,45 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 #[async_trait]
 impl DataAccelerator for CayenneAccelerator {
+    async fn writer_role(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Option<data_accelerator_api::WriterRole> {
+        // Only an acceleration in the object-native location is shared with
+        // other instances; any other is written by this instance alone.
+        self.native_catalog
+            .get()
+            .and_then(|catalog| catalog.writer_watch(&source.name().to_string()))
+    }
+
+    async fn shared_location_id(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        // Only a file-mode acceleration placed in the object-native metastore is
+        // shared through the state location.
+        if !source.is_file_accelerated() {
+            return Ok(None);
+        }
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        if self.metastore_type_for(source, &metadata_dir).await?
+            != metastore::Metastore::ObjectNative
+        {
+            return Ok(None);
+        }
+        let opened = self
+            .get_or_create_catalog(&metadata_dir, metastore::Metastore::ObjectNative, source)
+            .await?;
+        let Some(native) = opened.native() else {
+            return Err(format!(
+                "Cayenne object-native catalog for dataset '{}' did not open",
+                source.name()
+            )
+            .into());
+        };
+        Ok(Some(native.location_id().await?))
+    }
+
     async fn change_sink(
         &self,
         context: runtime_acceleration::change_sink::ChangeSinkContext,

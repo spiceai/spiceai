@@ -15,14 +15,20 @@ limitations under the License.
 */
 
 use app::AppBuilder;
+use arrow::array::{AsArray, RecordBatch};
+use arrow::datatypes::Int64Type;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime::status::ComponentStatus;
 use snafu::ResultExt;
+use spicepod::component::dataset::Dataset;
 use spicepod::component::model::Model;
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, TaskHistory};
 use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
+use spicepod::param::Params;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::models::get_tpcds_dataset;
 use crate::utils::{
@@ -210,6 +216,95 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
             insta::assert_snapshot!(pretty);
 
             Ok(())
+        })
+        .await
+}
+
+/// The SQL that [`test_sql_worker_runs_while_a_dataset_failed_to_load`] schedules.
+const RUNS_WHILE_A_DATASET_FAILED_SQL: &str = "SELECT 1141 AS worker_ran";
+
+/// A SQL worker runs on its schedule while a dataset failed to load: a component that
+/// failed may never load, so it must not hold the worker back.
+#[tokio::test]
+async fn test_sql_worker_runs_while_a_dataset_failed_to_load() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let present_csv = dir.path().join("loaded.csv");
+            std::fs::write(&present_csv, "id\n1\n")?;
+            let csv_dataset = |path: &std::path::Path, name: &str| {
+                let mut dataset = Dataset::new(format!("file:{}", path.display()), name);
+                dataset.params = Some(Params::from_string_map(HashMap::from([(
+                    "file_format".to_string(),
+                    "csv".to_string(),
+                )])));
+                dataset
+            };
+            let app = AppBuilder::new("test_sql_worker_runs_while_a_dataset_failed_to_load")
+                .with_dataset(csv_dataset(&present_csv, "loaded"))
+                .with_dataset(csv_dataset(&dir.path().join("missing.csv"), "failed"))
+                .with_worker(create_sql_worker(
+                    "every_second",
+                    RUNS_WHILE_A_DATASET_FAILED_SQL,
+                    "* * * * * *",
+                ))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let (_tracing, trace_provider) =
+                init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
+            let loader = tokio::spawn({
+                let rt = Arc::clone(&rt);
+                async move { rt.load_components().await }
+            });
+
+            let status = rt.status();
+            let settled = tokio::time::timeout(Duration::from_secs(30), async {
+                while !(matches!(
+                    status.get_component_status("dataset:failed"),
+                    Some(ComponentStatus::Error(_))
+                ) && matches!(
+                    status.worker_status("every_second"),
+                    Some(ComponentStatus::Ready)
+                )) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "dataset 'failed' must fail to load and the worker must load; dataset {:?}, worker {:?}",
+                status.get_component_status("dataset:failed"),
+                status.worker_status("every_second")
+            );
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = trace_provider.force_flush();
+            let data = rt
+                .datafusion()
+                .query_builder(&format!(
+                    "SELECT COUNT(*) AS runs FROM runtime.task_history WHERE task = 'sql_query' AND input = '{RUNS_WHILE_A_DATASET_FAILED_SQL}'"
+                ))
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await?;
+            let runs: i64 = data
+                .iter()
+                .map(|batch| batch.column(0).as_primitive::<Int64Type>().value(0))
+                .sum();
+            assert!(
+                runs > 0,
+                "the worker must run while dataset 'failed' is in Error"
+            );
+
+            loader.abort();
+            Ok::<(), anyhow::Error>(())
         })
         .await
 }

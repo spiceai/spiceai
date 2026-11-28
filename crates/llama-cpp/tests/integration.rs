@@ -18,3 +18,4 @@ limitations under the License.
 //! `make nextest`.
 
 mod gguf_corruption;
+mod grammar;

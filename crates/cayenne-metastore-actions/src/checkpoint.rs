@@ -27,9 +27,9 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
     let mut snapshots = std::collections::BTreeMap::<&str, Vec<p::FileEntry>>::new();
     for ((snapshot, _), file) in &s.files {
         snapshots
-            .entry(snapshot.as_str())
+            .entry(snapshot.as_ref())
             .or_default()
-            .push(file.clone());
+            .push((**file).clone());
     }
     for (snapshot, files) in snapshots {
         actions.push(Action::new(Kind::AddFiles(p::AddFiles {
@@ -42,7 +42,7 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
     for stat in s.file_stats.values() {
         actions.push(Action::new(Kind::SetFileStats(p::SetFileStats {
             table_id: t(),
-            stat: Some(stat.clone()),
+            stat: Some((**stat).clone()),
         })));
     }
     for (snapshot, seq) in &s.groups {
@@ -98,7 +98,7 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
             table_id: t(),
             id: id.clone(),
             partition_key: row.partition_key.clone(),
-            payload: row.raw_payload.clone(),
+            payload: row.raw_payload.to_vec(),
             count: row.count,
             seq: row.seq,
         })));
@@ -108,14 +108,14 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
             created_at: row.created_at.clone(),
             table_id: t(),
             id: id.clone(),
-            payload: row.raw_payload.clone(),
+            payload: row.raw_payload.to_vec(),
             count: row.count,
             seq: row.seq,
             published: row.published,
             idempotent: false,
         })));
     }
-    let keys = |m: &std::collections::BTreeMap<Vec<u8>, i64>| {
+    let keys = |m: &crate::state::SharedMap<Vec<u8>, i64>| {
         m.iter()
             .map(|(pk, seq)| p::PkSeq {
                 pk: pk.clone(),
@@ -179,6 +179,7 @@ mod tests {
     use super::*;
     use crate::state::{Inlined, InlinedDel, Partition, TableStats};
     use crate::{DatasetState, ObjRef};
+    use std::sync::Arc;
 
     #[test]
     fn checkpoint_roundtrip() {
@@ -192,30 +193,30 @@ mod tests {
         for snapshot in ["live", "old"] {
             s.files.insert(
                 (snapshot.into(), "file".into()),
-                p::FileEntry {
+                Arc::new(p::FileEntry {
                     path: "file".into(),
                     rows: 2,
                     ..Default::default()
-                },
+                }),
             );
             s.file_stats.insert(
                 (snapshot.into(), "file".into()),
-                p::FileStat {
+                Arc::new(p::FileStat {
                     snapshot_id: snapshot.into(),
                     path: "file".into(),
                     blob: Some(ObjRef::of(b"stats")),
                     ..Default::default()
-                },
+                }),
             );
             s.groups.insert(snapshot.into(), 7);
         }
         s.files.insert(
             ("live".into(), "second".into()),
-            p::FileEntry {
+            Arc::new(p::FileEntry {
                 path: "second".into(),
                 rows: 0,
                 ..Default::default()
-            },
+            }),
         );
         s.delete_files.insert(
             "dv".into(),
@@ -249,7 +250,7 @@ mod tests {
                 created_at: String::new(),
                 partition_key: Some("p".into()),
                 payload: ObjRef::of(b"data"),
-                raw_payload: b"data".to_vec(),
+                raw_payload: b"data".as_slice().into(),
                 count: 1,
                 seq: 10,
             },
@@ -259,7 +260,7 @@ mod tests {
             InlinedDel {
                 created_at: String::new(),
                 payload: ObjRef::of(b"del"),
-                raw_payload: b"del".to_vec(),
+                raw_payload: b"del".as_slice().into(),
                 count: 1,
                 seq: 11,
                 published: true,

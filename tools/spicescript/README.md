@@ -1,7 +1,7 @@
 # spicescript
 
-`spicescript` runs scenario scripts against a prebuilt `spiced`. A script is a
-YAML file that:
+`testoperator script` runs scenario scripts against a prebuilt `spiced`; this crate
+is the library behind it. A script is a YAML file that:
 1. starts the sources the scenario needs (PostgreSQL, MySQL, ClickHouse, an
    object store, any Docker image, a mock HTTP server);
 2. starts `spiced` on a spicepod;
@@ -39,28 +39,28 @@ The scripts live in `test/spicescript/`; see its README for their layout.
 ## Running
 
 ```bash
-cargo build -p spicescript
+cargo build -p testoperator
 # Every script in a directory, against the installed spiced (~/.spice/bin/spiced):
-target/debug/spicescript test/spicescript
+target/debug/testoperator script test/spicescript
 # The whole suite, eight spiced processes at a time:
-target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spicescript
+target/debug/testoperator script --jobs 8 --spiced trunk=target/release/spiced test/spicescript
 # One script, against two builds; they must agree:
-target/debug/spicescript --jobs 4 \
+target/debug/testoperator script --jobs 4 \
   --spiced release=$HOME/.spice/bin/spiced --spiced dev=target/release/spiced \
   test/spicescript/postgres-cdc-parity.yaml
 # Upgrade scripts start on the release their `from:` names, downloaded once, and move
 # to the build under test at each `upgrade` step; --from replaces that release:
-target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
-target/debug/spicescript --from $HOME/.spice/bin/spiced \
+target/debug/testoperator script --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
+target/debug/testoperator script --from $HOME/.spice/bin/spiced \
   --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
-target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
+target/debug/testoperator script --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
-target/debug/spicescript --max-wait 20s test/spicescript/known-failing/clickhouse
+target/debug/testoperator script --max-wait 20s test/spicescript/known-failing/clickhouse
 # One matrix combination and one variant of a script:
-target/debug/spicescript --matrix src=clickhouse --variant cayenne test/spicescript/full-refresh-chaos.yaml
+target/debug/testoperator script --matrix src=clickhouse --variant cayenne test/spicescript/full-refresh-chaos.yaml
 # Parse only:
-target/debug/spicescript --check test/spicescript
+target/debug/testoperator script --check test/spicescript
 ```
 
 Docker must be running. The `aws` CLI is needed for object-store sources, and
@@ -219,6 +219,12 @@ as changing the script.
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms`, `times`, `repeat` (the body is `body` that many times over, with any `{i}` in it replaced by each copy's index, so the copies differ as real records do) and `encoding: gzip` or `encoding: zstd` (the body is sent compressed, gzip at its best level or zstd at level 3, with `Content-Encoding`, for a response small on the wire that decodes to many times its size); `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
+**A source shared by every instance.** `shared: true` on a source gives every
+instance of a run the same namespace (database) instead of one each, for
+instances that act as replicas of one acceleration over one source and so
+share its replication slot, binlog or stream. A step that changes the source
+runs once per instance it reaches, so give such steps `only:`.
+
 **DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
 DuckDB library installed on the host, so each `duckdb` or `ducklake` source
 writes its data and checks answers with the `duckdb` CLI of one release and
@@ -374,7 +380,7 @@ Flight SQL with HTTP using the generated SQL reference corpus and seeded
 random queries over local Parquet files. One seed also exercises plain Flight:
 
 ```bash
-target/debug/spicescript --spiced target/release/spiced test/spicescript/query-protocols.yaml
+target/debug/testoperator script --spiced target/release/spiced test/spicescript/query-protocols.yaml
 ```
 
 The [SQL surface generator](../../test/spicescript/corpus/sql_surface.py) maintains

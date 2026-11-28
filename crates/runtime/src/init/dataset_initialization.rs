@@ -1026,6 +1026,20 @@ mod tests {
             }
             self.inner.init(source).await
         }
+
+        async fn writer_role(
+            &self,
+            source: &dyn AccelerationSource,
+        ) -> Option<data_accelerator_api::WriterRole> {
+            self.inner.writer_role(source).await
+        }
+
+        async fn shared_location_id(
+            &self,
+            source: &dyn AccelerationSource,
+        ) -> std::result::Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.shared_location_id(source).await
+        }
     }
 
     /// Serves `other_schema`, and fails accelerator setup until `fail_setup` is used up

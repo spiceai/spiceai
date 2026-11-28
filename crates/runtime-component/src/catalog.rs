@@ -169,15 +169,18 @@ impl std::fmt::Debug for CatalogSpec {
         f.debug_struct("CatalogSpec")
             .field("provider", &self.provider)
             .field("catalog_id", &self.catalog_id)
-            .field("from", &self.from)
+            .field("from", &redact::redact_source_credentials(&self.from))
             .field("name", &self.name)
             .field("access", &self.access)
             .field("orig_include", &self.orig_include)
             .field("include", &self.include)
             .field("orig_exclude", &self.orig_exclude)
             .field("exclude", &self.exclude)
-            .field("params", &self.params)
-            .field("dataset_params", &self.dataset_params)
+            .field("params", &crate::RedactedParams(&self.params))
+            .field(
+                "dataset_params",
+                &crate::RedactedParams(&self.dataset_params),
+            )
             .field("acceleration", &self.acceleration)
             .finish_non_exhaustive()
     }

@@ -48,6 +48,8 @@ mod messages_tests;
 mod model_capability_tests;
 mod mtls;
 pub(crate) mod optional_json;
+#[cfg(test)]
+mod refresh_sql_depth_tests;
 mod response_outcome;
 mod routes;
 mod server_timing;
