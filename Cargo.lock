@@ -18337,6 +18337,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_spawn",
  "rand 0.10.4",
+ "redact",
  "reqwest 0.13.4",
  "secrecy",
  "serde",

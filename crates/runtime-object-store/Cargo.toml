@@ -28,6 +28,7 @@ nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
 object_store_spawn = { path = "../object_store_spawn" }
 rand.workspace = true
+redact = { path = "../redact" }
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
