@@ -728,11 +728,15 @@ impl CayenneAccelerator {
         }
 
         let sqlite_factory = SqliteTableProviderFactory::new();
+        // As long as the metastore waits: a restore writes here while the restores of
+        // other datasets in the same database hold its write lock.
         let pool = sqlite_factory
             .get_or_init_instance(
                 Arc::from(metadata_db_path.as_str()),
                 datafusion_table_providers::sql::db_connection_pool::Mode::File,
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(
+                    cayenne::sqlite_metastore_config().busy_timeout_ms,
+                ),
             )
             .await
             .map_err(|source| CheckpointError::Store {
@@ -744,11 +748,16 @@ impl CayenneAccelerator {
             source.name().to_string(),
         )))
     }
-    /// Clears the dataset checkpoint and append cursor `source` has in the
-    /// `metastore_type` metastore, whose catalog does not hold its table: the table is
-    /// about to be created there empty, and either one, left from a table that metastore
-    /// held before (a dataset moved to the other metastore and back, a drop that did not
-    /// reach the sidecar), would mark the empty table loaded and skip its initial load.
+    /// Clears the dataset checkpoint, append cursor and source positions `source` has
+    /// in the `metastore_type` metastore, whose catalog does not hold its table: the
+    /// table is about to be created there empty. A checkpoint or cursor left from a
+    /// table that metastore held before (a `mode: file_create` drop, a dataset moved to
+    /// the other metastore and back) would mark the empty table loaded and skip its
+    /// initial load, and a source position would resume a connector that reads it after
+    /// this point past every row the table lost. Kafka and Debezium read theirs when
+    /// they are built, before the table opens. Without such a load record the positions
+    /// stay: they are this start's own, as a connector records its consumer group
+    /// before the table opens.
     pub(super) async fn clear_load_state_of_new_table(
         &self,
         source: &dyn AccelerationSource,
@@ -804,6 +813,11 @@ impl CayenneAccelerator {
                 .context(AccelerationCreationFailedSnafu)?;
         }
         if had_checkpoint || had_cursor {
+            sidecar
+                .clear_source_positions()
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
             tracing::info!(
                 target: "spiced::acceleration::cayenne",
                 "Dataset '{table_name}' (cayenne) has no table in its metastore, so it is created empty and loaded from its source; the load record left from an earlier table of the same name is cleared."

@@ -47,12 +47,14 @@ use runtime_acceleration::{
     Engine,
     acceleration::{Acceleration, Mode},
     dataset_checkpoint::{self, DatasetCheckpointer},
+    sidecar::OpenOption,
     snapshot::{
         AccelerationEngine, ForceCreate, SnapshotBehavior, SnapshotManager, SnapshotPoll,
         SnapshotPollOutcome,
     },
     testing::TestAccelerationSource,
 };
+use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};
 use runtime_secrets::Secrets;
 use spice_table::{LayerWalk, find_concrete};
 use spicepod::{
@@ -187,6 +189,19 @@ fn expected_rows(ids: std::ops::Range<i64>) -> Vec<(i64, i64)> {
     ids.map(|id| (id, id * 10)).collect()
 }
 
+fn kafka_checkpoint() -> KafkaCheckpoint {
+    KafkaCheckpoint {
+        consumer_group_id: "group-1".to_string(),
+        topic: "t".to_string(),
+        schema_json: "{}".to_string(),
+        offsets: vec![KafkaOffset {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: OLD_ROWS,
+        }],
+    }
+}
+
 /// The schema-less checkpoint a restore bootstraps from the snapshot metadata.
 struct NoCheckpoint;
 
@@ -305,6 +320,15 @@ async fn a_restart_over_a_partial_restore_serves_the_full_newer_snapshot() {
         .await
         .expect("open the writer");
     overwrite(&writer, 0..OLD_ROWS).await;
+    writer_accelerator
+        .sidecar(&writer_source, OpenOption::CreateIfNotExists)
+        .await
+        .expect("the writer's sidecar")
+        .kafka_checkpoint_store()
+        .expect("kafka store")
+        .upsert(&kafka_checkpoint())
+        .await
+        .expect("kafka checkpoint");
     let writer_manager = manager(&writer_accelerator, &writer_source, &location, &secrets).await;
     publish(&writer_manager, OLD_ROWS).await;
     let (reader_accelerator, _reader_registry) = process().await;
@@ -314,6 +338,20 @@ async fn a_restart_over_a_partial_restore_serves_the_full_newer_snapshot() {
         .await
         .expect("restore N")
         .expect("N is published");
+    assert_eq!(
+        reader_accelerator
+            .sidecar(&reader_source, OpenOption::OpenExisting)
+            .await
+            .expect("the reader's sidecar")
+            .kafka_checkpoint_store()
+            .expect("kafka store")
+            .get()
+            .await
+            .expect("kafka get")
+            .map(|checkpoint| checkpoint.offsets),
+        Some(kafka_checkpoint().offsets),
+        "the restore brings the source positions with the rows"
+    );
 
     // The writer publishes N+1. A reader killed while extracting it leaves part
     // of N+1's data files behind; its metastore still holds N.
@@ -402,4 +440,78 @@ async fn a_restart_over_a_partial_restore_serves_the_full_newer_snapshot() {
         quiesced_before_reload,
         "the restore quiesces the instance it extracts over"
     );
+}
+
+/// A slice file an earlier restore left in the metadata directory (one killed
+/// during its import, or one an older build refused) has the path the next
+/// snapshot's slice extracts to. The next restore replaces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slice_left_by_an_earlier_restore_does_not_block_the_next() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let location = root.path().join("snapshots");
+    std::fs::create_dir_all(&location).expect("snapshot location");
+    let secrets = Arc::new(RwLock::new(Secrets::new()));
+    let writer_source = source(&root.path().join("writer"));
+    let reader_source = source(&root.path().join("reader"));
+
+    let (writer_accelerator, writer_registry) = process().await;
+    let writer = open(&writer_registry, &writer_source)
+        .await
+        .expect("open the writer");
+    overwrite(&writer, 0..OLD_ROWS).await;
+    let writer_manager = manager(&writer_accelerator, &writer_source, &location, &secrets).await;
+    publish(&writer_manager, OLD_ROWS).await;
+    let (reader_accelerator, _reader_registry) = process().await;
+    let old = manager(&reader_accelerator, &reader_source, &location, &secrets)
+        .await
+        .download_latest_snapshot()
+        .await
+        .expect("restore N")
+        .expect("N is published");
+
+    overwrite(&writer, 0..NEW_ROWS).await;
+    publish(&writer_manager, NEW_ROWS).await;
+    let leftover = root
+        .path()
+        .join("reader")
+        .join("metadata")
+        .join("t.slice.json");
+    std::fs::write(&leftover, br#"{"left":"by an earlier restore"}"#).expect("leftover slice");
+
+    let (accelerator, registry) = process().await;
+    let initial = open(&registry, &reader_source)
+        .await
+        .expect("open the reader");
+    let poll = manager(&accelerator, &reader_source, &location, &secrets)
+        .await
+        .download_if_newer(Some(old.snapshot_id), None, None)
+        .await
+        .expect("poll");
+    let SnapshotPoll {
+        outcome: SnapshotPollOutcome::Downloaded(restored),
+        ..
+    } = poll
+    else {
+        panic!("N+1 must be downloaded over the leftover slice: {poll:?}");
+    };
+    assert_eq!(restored.snapshot_id, old.snapshot_id + 1);
+    assert!(
+        !leftover.exists(),
+        "the restore consumes the slice it extracts"
+    );
+
+    let factory: ReloadProviderFactory = {
+        let registry = Arc::clone(&registry);
+        let source = reader_source.clone();
+        Arc::new(move || {
+            let registry = Arc::clone(&registry);
+            let source = source.clone();
+            Box::pin(async move { open(&registry, &source).await })
+        })
+    };
+    let reloaded = accelerator
+        .reload_from_snapshot(&reader_source, Arc::clone(&initial), factory)
+        .await
+        .expect("reload from snapshot");
+    assert_eq!(rows(reloaded).await, expected_rows(0..NEW_ROWS));
 }

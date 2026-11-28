@@ -3557,12 +3557,16 @@ impl SnapshotManager {
             });
         }
 
-        extract_archive_file_with_options(&temp_archive_path, extract_target, extract_options)
-            .await
-            .map_err(|source| SnapshotDownloadError::ArchiveExtract {
+        if let Err(source) =
+            extract_archive_file_with_options(&temp_archive_path, extract_target, extract_options)
+                .await
+        {
+            let _ = fs::remove_file(&temp_archive_path).await;
+            return Err(SnapshotDownloadError::ArchiveExtract {
                 path: temp_archive_path.clone(),
                 source: std::io::Error::other(source.to_string()),
-            })?;
+            });
+        }
 
         if let Err(source) = self
             .snapshot_engine

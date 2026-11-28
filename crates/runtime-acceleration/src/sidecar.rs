@@ -42,13 +42,14 @@ limitations under the License.
 //! needs one fails loudly at registration instead of silently running stateless and
 //! re-bootstrapping on every restart.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
 
@@ -62,6 +63,36 @@ use crate::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior}
 pub enum OpenOption {
     CreateIfNotExists,
     OpenExisting,
+}
+
+/// A dataset's source positions in its sidecar — what each connector resumes from —
+/// by sidecar table: every table but the dataset checkpoint.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourcePositions {
+    pub tables: BTreeMap<String, PositionRows>,
+}
+
+/// One sidecar table's rows for a dataset, by column name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PositionRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PositionValue>>,
+}
+
+/// One value of a [`PositionRows`] row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v")]
+pub enum PositionValue {
+    #[serde(rename = "n")]
+    Null,
+    #[serde(rename = "i")]
+    Integer(i64),
+    #[serde(rename = "r")]
+    Real(f64),
+    #[serde(rename = "s")]
+    Text(String),
+    #[serde(rename = "x")]
+    Blob(Vec<u8>),
 }
 
 /// One dataset's sidecar tables inside one accelerator engine.
@@ -137,6 +168,36 @@ pub trait AcceleratorSidecar: Send + Sync {
         &self,
         snapshot_behavior: SnapshotBehavior,
     ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError>;
+
+    /// Deletes the dataset's source positions and keeps its dataset checkpoint. For a
+    /// table created empty: a connector that resumed from a kept position would skip
+    /// every row the table no longer has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the sidecar cannot be read or written.
+    async fn clear_source_positions(&self) -> Result<(), CheckpointError>;
+
+    /// The dataset's source positions, for a snapshot to carry with the rows it
+    /// captures, or `None` when this engine's snapshots do not carry them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the sidecar cannot be read.
+    async fn export_source_positions(&self) -> Result<Option<SourcePositions>, CheckpointError>;
+
+    /// Replaces the dataset's source positions with those a restored snapshot carried
+    /// with its rows. An engine can skip a carried position that its source may no
+    /// longer keep. `None`, a snapshot that carried none, clears them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the sidecar cannot be written, or a
+    /// position does not fit this sidecar's tables.
+    async fn import_source_positions(
+        &self,
+        positions: Option<&SourcePositions>,
+    ) -> Result<(), CheckpointError>;
 }
 
 /// Reports that `engine` does not host the `store` sidecar.

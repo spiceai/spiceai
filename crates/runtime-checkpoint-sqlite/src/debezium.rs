@@ -36,8 +36,8 @@ use rusqlite::OptionalExtension;
 
 use crate::{downcast_failed, store_error};
 
-const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
-const DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_debezium_kafka_offsets";
+pub(crate) const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
+pub(crate) const DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_debezium_kafka_offsets";
 
 /// Debezium checkpoint store backed by a `SQLite` accelerator.
 pub struct SqliteDebeziumCheckpointStore {
@@ -215,7 +215,7 @@ impl DebeziumCheckpointStore for SqliteDebeziumCheckpointStore {
     }
 }
 
-fn ensure_debezium_kafka_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn ensure_debezium_kafka_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let create_metadata = format!(
         "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
             dataset_name TEXT PRIMARY KEY,

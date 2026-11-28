@@ -22,9 +22,11 @@ limitations under the License.
     reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
 )]
 
+mod file_create_positions;
 mod lookup_index_catch_up;
 mod partitioned_keyed_writes;
 mod partitioned_lookup_index;
+mod sidecar_lock_wait;
 mod snapshot_restore_over_leftovers;
 mod source_ack_cancellation;
 mod stored_data_files;

@@ -2645,7 +2645,12 @@ async fn attach_member(
         &watermark,
         setup.slot_restart_lsn,
         setup.slot.consistent_lsn.max(seated_floor),
-        !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
+        super::absence_implies_gap(
+            params.ephemeral_accelerator,
+            tracks_positions,
+            load_runs_without_rebuild,
+            params.acceleration,
+        ),
         contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();

@@ -32,6 +32,7 @@ chrono.workspace = true
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 rusqlite.workspace = true
 serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 arrow_tools = { path = "../arrow_tools" }

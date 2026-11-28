@@ -486,7 +486,7 @@ async fn init_kafka_consumer(
         InvalidConfigurationNoSourceSnafu {
             dataconnector: "kafka",
             message: format!(
-                "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
+                "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file, and the dataset's snapshots when snapshots are enabled, or rename the dataset to proceed.",
                 metadata.topic
             ),
             connector_component: ConnectorComponent::from(dataset),
@@ -499,7 +499,7 @@ async fn init_kafka_consumer(
             InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: format!(
-                    "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file or rename the dataset to proceed.",
+                    "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file, and the dataset's snapshots when snapshots are enabled, or rename the dataset to proceed.",
                     metadata.consumer_group_id
                 ),
                 connector_component: ConnectorComponent::from(dataset),

@@ -316,7 +316,8 @@ pub fn set_sqlite_metastore_config(config: SqliteMetastoreConfig) {
     }
 }
 
-fn sqlite_metastore_config() -> SqliteMetastoreConfig {
+/// The process-wide `SQLite` metastore pragma config.
+pub fn sqlite_metastore_config() -> SqliteMetastoreConfig {
     SQLITE_METASTORE_CONFIG
         .read()
         .map(|cfg| *cfg)

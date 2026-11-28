@@ -60,6 +60,7 @@ use cayenne::MetadataCatalog;
 use cayenne::metastore::EXPECTED_TABLES;
 use cayenne::metastore::snapshot::{DatasetMetastoreSlice, SliceValue};
 use datafusion::datasource::TableProvider;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, SourcePositions};
 use runtime_acceleration::snapshot::engine::{
     DirectoryArchiveExtra, DirectoryArchiveFile, DirectorySnapshotPlan, SnapshotEngine,
     SnapshotEngineError,
@@ -79,6 +80,44 @@ use tokio::fs;
 /// `<metadata_dir>/<dataset_name>.slice.json`.
 fn slice_archive_path(dataset_name: &str) -> String {
     format!("metadata/{dataset_name}.slice.json")
+}
+
+/// Where a restore's slice for `dataset_name` lands: `<dir>/<dataset_name>.slice.json`
+/// for each directory the archive's `metadata/` prefix maps to, or for every directory
+/// when no prefix is `metadata/`.
+fn slice_file_candidates(dirs: &[(PathBuf, String)], dataset_name: &str) -> Vec<PathBuf> {
+    let slice_filename = format!("{dataset_name}.slice.json");
+    let metadata: Vec<PathBuf> = dirs
+        .iter()
+        .filter(|(_, prefix)| prefix.starts_with("metadata"))
+        .map(|(target_dir, _)| target_dir.join(&slice_filename))
+        .collect();
+    if metadata.is_empty() {
+        dirs.iter()
+            .map(|(target_dir, _)| target_dir.join(&slice_filename))
+            .collect()
+    } else {
+        metadata
+    }
+}
+
+/// The `*.slice.json` files directly in `dir`: slices left by restores of any
+/// dataset that share the directory. A snapshot never archives them; its own slice
+/// is exported from the metastore.
+async fn slice_files_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = PathBuf::from(entry.file_name());
+        if name.to_string_lossy().ends_with(".slice.json") {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 /// File names (relative to `metadata_dir`) that must be excluded from the
@@ -109,6 +148,28 @@ pub enum CayenneSnapshotError {
         source: serde_json::Error,
     },
 
+    #[snafu(display("Failed to read the source positions of dataset '{dataset}': {source}"))]
+    ExportPositions {
+        dataset: String,
+        source: runtime_checkpoint_api::CheckpointError,
+    },
+
+    #[snafu(display(
+        "Failed to restore the source positions of dataset '{dataset}' from its snapshot: {source}"
+    ))]
+    ImportPositions {
+        dataset: String,
+        source: runtime_checkpoint_api::CheckpointError,
+    },
+
+    #[snafu(display(
+        "The snapshot of dataset '{dataset}' carries source positions this build cannot read: {source}"
+    ))]
+    ParsePositions {
+        dataset: String,
+        source: serde_json::Error,
+    },
+
     #[snafu(display(
         "Cayenne snapshot at {path:?} is missing the per-dataset metastore slice. \
          The snapshot was likely produced by an older Spice that shipped the \
@@ -128,6 +189,16 @@ pub enum CayenneSnapshotError {
         path.display()
     ))]
     ListDataDir {
+        dataset: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to list the metadata directory {} of dataset '{dataset}' for its snapshot: {source}",
+        path.display()
+    ))]
+    ListMetadataDir {
         dataset: String,
         path: PathBuf,
         source: std::io::Error,
@@ -497,6 +568,9 @@ pub struct CayenneSnapshotEngine {
     data_dir_anchor: PathBuf,
     /// The providers a restore quiesces before extracting.
     serving: Arc<ServingProviders>,
+    /// Where the dataset's source positions are kept; a snapshot carries them with
+    /// its rows.
+    sidecar: Option<Arc<dyn AcceleratorSidecar>>,
 }
 
 impl CayenneSnapshotEngine {
@@ -510,7 +584,16 @@ impl CayenneSnapshotEngine {
             dataset_name: dataset_name.into(),
             data_dir_anchor,
             serving: Arc::default(),
+            sidecar: None,
         }
+    }
+
+    /// Carry the dataset's source positions in `sidecar` with each snapshot, and
+    /// replace them with a restored snapshot's.
+    #[must_use]
+    pub fn with_sidecar(mut self, sidecar: Arc<dyn AcceleratorSidecar>) -> Self {
+        self.sidecar = Some(sidecar);
+        self
     }
 
     /// Quiesce the provider `serving` records for this dataset before a restore.
@@ -585,12 +668,31 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             )));
         }
 
-        // 1. Export the per-dataset metastore slice.
-        let slice = self
+        // 1. Export the source positions, then the per-dataset metastore slice.
+        //    Positions read before the rows are never ahead of them, so a restore
+        //    may replay a change but never skips one.
+        let positions = match &self.sidecar {
+            Some(sidecar) => sidecar
+                .export_source_positions()
+                .await
+                .context(ExportPositionsSnafu {
+                    dataset: self.dataset_name.clone(),
+                })
+                .map_err(|e| Self::engine_err(&e))?,
+            None => None,
+        };
+        let mut slice = self
             .catalog
             .export_dataset_slice(&self.dataset_name, &self.data_dir_anchor)
             .await
             .context(ExportSnafu {
+                dataset: self.dataset_name.clone(),
+            })
+            .map_err(|e| Self::engine_err(&e))?;
+        slice.source_positions = positions
+            .map(|positions| serde_json::to_value(&positions))
+            .transpose()
+            .context(SerializeSnafu {
                 dataset: self.dataset_name.clone(),
             })
             .map_err(|e| Self::engine_err(&e))?;
@@ -606,6 +708,19 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         // 3. Build a plan: skip the cayenne.db* files and every data entry
         //    the slice does not reference, add the slice as an extra.
         let mut skip: HashSet<PathBuf> = METASTORE_FILES.iter().map(PathBuf::from).collect();
+        for (dir, prefix) in dirs {
+            if prefix.starts_with("metadata") {
+                skip.extend(
+                    slice_files_in(dir)
+                        .await
+                        .context(ListMetadataDirSnafu {
+                            dataset: self.dataset_name.clone(),
+                            path: dir.clone(),
+                        })
+                        .map_err(|e| Self::engine_err(&e))?,
+                );
+            }
+        }
         skip.extend(
             unreferenced_data_entries(&self.data_dir_anchor, &slice)
                 .await
@@ -640,7 +755,7 @@ impl SnapshotEngine for CayenneSnapshotEngine {
     /// serving queries until the reload swaps it out.
     async fn prepare_directory_restore(
         &self,
-        _dirs: &[(PathBuf, String)],
+        dirs: &[(PathBuf, String)],
         dataset_name: &str,
     ) -> Result<(), SnapshotEngineError> {
         if dataset_name != self.dataset_name {
@@ -651,6 +766,21 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         }
         if let Some(provider) = self.serving.get(dataset_name) {
             crate::change_sink::quiesce_table_maintenance(&provider).await;
+        }
+        // A slice left by a restore that did not finish has the path this archive's
+        // slice extracts to, and extraction refuses to replace a file whose checksum
+        // differs.
+        for path in slice_file_candidates(dirs, dataset_name) {
+            match fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(SnapshotEngineError::from_display(format!(
+                        "CayenneSnapshotEngine: failed to remove the slice {} left by an earlier restore: {err}",
+                        path.display(),
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -671,21 +801,7 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         // landed at `<metadata_dir>/<dataset_name>.slice.json` (its
         // archive path uses the same `metadata/` prefix that
         // `AccelerationLayout::cayenne` configures).
-        let slice_filename = format!("{dataset_name}.slice.json");
-        let metadata_candidates: Vec<PathBuf> = dirs
-            .iter()
-            .filter(|(_, prefix)| prefix.starts_with("metadata"))
-            .map(|(target_dir, _)| target_dir.join(&slice_filename))
-            .collect();
-        // Fallback: search every dir, in case the layout prefix list
-        // changes shape in the future.
-        let candidate_paths: Vec<PathBuf> = if metadata_candidates.is_empty() {
-            dirs.iter()
-                .map(|(target_dir, _)| target_dir.join(&slice_filename))
-                .collect()
-        } else {
-            metadata_candidates
-        };
+        let candidate_paths = slice_file_candidates(dirs, dataset_name);
 
         let mut slice_path: Option<PathBuf> = None;
         for cand in &candidate_paths {
@@ -711,14 +827,24 @@ impl SnapshotEngine for CayenneSnapshotEngine {
                 path: candidate_paths
                     .first()
                     .cloned()
-                    .unwrap_or_else(|| PathBuf::from(&slice_filename)),
+                    .unwrap_or_else(|| PathBuf::from(format!("{dataset_name}.slice.json"))),
             })
         })?;
 
-        let bytes = fs::read(&slice_path)
+        let imported = self.import_slice_file(&slice_path).await;
+        // Its information is in the local metastore now, or the import failed; a
+        // file left here would fail the next restore's extraction either way.
+        let _ = fs::remove_file(&slice_path).await;
+        imported
+    }
+}
+
+impl CayenneSnapshotEngine {
+    async fn import_slice_file(&self, slice_path: &Path) -> Result<(), SnapshotEngineError> {
+        let bytes = fs::read(slice_path)
             .await
             .context(ReadSliceSnafu {
-                path: slice_path.clone(),
+                path: slice_path.to_path_buf(),
             })
             .map_err(|e| Self::engine_err(&e))?;
         let slice = DatasetMetastoreSlice::from_json_bytes(&bytes).map_err(|e| {
@@ -728,6 +854,19 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             })
         })?;
 
+        let positions = slice
+            .source_positions
+            .clone()
+            .map(serde_json::from_value::<SourcePositions>)
+            .transpose()
+            .context(ParsePositionsSnafu {
+                dataset: self.dataset_name.clone(),
+            })
+            .map_err(|e| Self::engine_err(&e))?;
+
+        // Rows before positions: positions without their rows would resume the
+        // connector past every row the snapshot held. A failed slice import leaves
+        // the local positions as they were.
         self.catalog
             .import_dataset_slice(&slice, &self.data_dir_anchor)
             .await
@@ -735,12 +874,15 @@ impl SnapshotEngine for CayenneSnapshotEngine {
                 dataset: self.dataset_name.clone(),
             })
             .map_err(|e| Self::engine_err(&e))?;
-
-        // Best-effort: remove the slice file so it doesn't sit in the data
-        // directory after import. Its information now lives in the local
-        // metastore.
-        let _ = fs::remove_file(&slice_path).await;
-
+        if let Some(sidecar) = &self.sidecar {
+            sidecar
+                .import_source_positions(positions.as_ref())
+                .await
+                .context(ImportPositionsSnafu {
+                    dataset: self.dataset_name.clone(),
+                })
+                .map_err(|e| Self::engine_err(&e))?;
+        }
         Ok(())
     }
 }
@@ -908,6 +1050,7 @@ mod tests {
         );
         DatasetMetastoreSlice {
             format_version: SLICE_FORMAT_VERSION,
+            source_positions: None,
             engine: SLICE_ENGINE.to_string(),
             dataset_name: "trips".to_string(),
             exported_at_ms: 0,
@@ -1757,6 +1900,291 @@ mod tests {
             vec![("alpha".to_string(), 5), ("beta".to_string(), 20)],
             "every partition reads back its current rows"
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_leaves_out_slices_restores_left_in_the_metadata_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        let data_dir = tmp.path().join("data").join("trips");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: "trips".to_string(),
+                schema: schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create_table");
+        std::fs::write(metadata_dir.join("trips.slice.json"), b"{}").expect("own leftover");
+        std::fs::write(metadata_dir.join("riders.slice.json"), b"{}").expect("other leftover");
+
+        let plan = CayenneSnapshotEngine::new(
+            catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            data_dir.clone(),
+        )
+        .prepare_directory_snapshot(
+            &[
+                (metadata_dir.clone(), "metadata/".to_string()),
+                (data_dir.clone(), "data/".to_string()),
+            ],
+            "trips",
+        )
+        .await
+        .expect("prepare_directory_snapshot");
+
+        for leftover in ["trips.slice.json", "riders.slice.json"] {
+            assert!(
+                plan.skip_relative_paths.contains(&PathBuf::from(leftover)),
+                "{leftover} must not be archived: {:?}",
+                plan.skip_relative_paths
+            );
+        }
+        assert_eq!(plan.extra_entries.len(), 1);
+        assert_eq!(
+            plan.extra_entries[0].archive_path,
+            "metadata/trips.slice.json"
+        );
+    }
+
+    async fn sqlite_sidecar(metadata_dir: &Path, dataset: &str) -> Arc<dyn AcceleratorSidecar> {
+        use datafusion_table_providers::sql::db_connection_pool::{
+            JoinPushDown, Mode, sqlitepool::SqliteConnectionPool,
+        };
+        let pool = SqliteConnectionPool::new(
+            &metadata_dir.join("cayenne.db").to_string_lossy(),
+            Mode::File,
+            JoinPushDown::Disallow,
+            Vec::new(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("sidecar pool");
+        Arc::new(runtime_checkpoint_sqlite::SqliteSidecar::new(
+            Arc::new(pool),
+            dataset.to_string(),
+        ))
+    }
+
+    /// A node restored from a snapshot resumes its connector where the snapshot's
+    /// rows end, not from the start of the source.
+    #[tokio::test]
+    async fn a_snapshot_carries_the_source_positions_of_its_rows() {
+        use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};
+        let offsets = vec![KafkaOffset {
+            topic: "events".to_string(),
+            partition: 0,
+            offset: 999,
+        }];
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (meta, data) = (
+            tmp.path().join("w/metadata"),
+            tmp.path().join("w/data/trips"),
+        );
+        std::fs::create_dir_all(&meta).expect("mkdir metadata");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        let catalog = fresh_catalog(&meta).await;
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: "trips".to_string(),
+                schema: schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create_table");
+        let writer_sidecar = sqlite_sidecar(&meta, "trips").await;
+        writer_sidecar
+            .kafka_checkpoint_store()
+            .expect("kafka store")
+            .upsert(&KafkaCheckpoint {
+                consumer_group_id: "group-1".to_string(),
+                topic: "events".to_string(),
+                schema_json: "{}".to_string(),
+                offsets: offsets.clone(),
+            })
+            .await
+            .expect("kafka checkpoint");
+        let plan =
+            CayenneSnapshotEngine::new(catalog as Arc<dyn MetadataCatalog>, "trips", data.clone())
+                .with_sidecar(writer_sidecar)
+                .prepare_directory_snapshot(
+                    &[
+                        (meta.clone(), "metadata/".to_string()),
+                        (data.clone(), "data/".to_string()),
+                    ],
+                    "trips",
+                )
+                .await
+                .expect("prepare_directory_snapshot");
+
+        let (reader_meta, reader_data) = (
+            tmp.path().join("r/metadata"),
+            tmp.path().join("r/data/trips"),
+        );
+        std::fs::create_dir_all(&reader_meta).expect("mkdir metadata");
+        std::fs::create_dir_all(&reader_data).expect("mkdir data");
+        let reader_catalog = fresh_catalog(&reader_meta).await;
+        let reader_sidecar = sqlite_sidecar(&reader_meta, "trips").await;
+        std::fs::write(
+            reader_meta.join("trips.slice.json"),
+            &plan.extra_entries[0].bytes,
+        )
+        .expect("extract the slice");
+        CayenneSnapshotEngine::new(
+            reader_catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            reader_data.clone(),
+        )
+        .with_sidecar(Arc::clone(&reader_sidecar))
+        .finalize_directory_snapshot(
+            &[
+                (reader_meta.clone(), "metadata/".to_string()),
+                (reader_data.clone(), "data/".to_string()),
+            ],
+            "trips",
+        )
+        .await
+        .expect("restore");
+
+        let restored = reader_sidecar
+            .kafka_checkpoint_store()
+            .expect("kafka store")
+            .get()
+            .await
+            .expect("kafka get")
+            .expect("the restore brings the Kafka checkpoint with the rows");
+        assert_eq!(restored.offsets, offsets);
+    }
+
+    #[tokio::test]
+    async fn a_slice_that_fails_to_import_restores_no_source_positions() {
+        use runtime_checkpoint_api::kafka::{KafkaCheckpoint, KafkaOffset};
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (meta, data) = (
+            tmp.path().join("w/metadata"),
+            tmp.path().join("w/data/trips"),
+        );
+        std::fs::create_dir_all(&meta).expect("mkdir metadata");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        let catalog = fresh_catalog(&meta).await;
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: "trips".to_string(),
+                schema: schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create_table");
+        let writer_sidecar = sqlite_sidecar(&meta, "trips").await;
+        writer_sidecar
+            .kafka_checkpoint_store()
+            .expect("kafka store")
+            .upsert(&KafkaCheckpoint {
+                consumer_group_id: "group-1".to_string(),
+                topic: "events".to_string(),
+                schema_json: "{}".to_string(),
+                offsets: vec![KafkaOffset {
+                    topic: "events".to_string(),
+                    partition: 0,
+                    offset: 999,
+                }],
+            })
+            .await
+            .expect("kafka checkpoint");
+        let plan =
+            CayenneSnapshotEngine::new(catalog as Arc<dyn MetadataCatalog>, "trips", data.clone())
+                .with_sidecar(writer_sidecar)
+                .prepare_directory_snapshot(
+                    &[
+                        (meta.clone(), "metadata/".to_string()),
+                        (data.clone(), "data/".to_string()),
+                    ],
+                    "trips",
+                )
+                .await
+                .expect("prepare_directory_snapshot");
+        // A slice whose rows the metastore refuses, with its positions intact.
+        let mut slice: serde_json::Value =
+            serde_json::from_slice(&plan.extra_entries[0].bytes).expect("slice JSON");
+        assert!(slice["source_positions"].is_object(), "{slice}");
+        slice["tables"]["cayenne_table"] = serde_json::json!([]);
+
+        let (reader_meta, reader_data) = (
+            tmp.path().join("r/metadata"),
+            tmp.path().join("r/data/trips"),
+        );
+        std::fs::create_dir_all(&reader_meta).expect("mkdir metadata");
+        std::fs::create_dir_all(&reader_data).expect("mkdir data");
+        let reader_catalog = fresh_catalog(&reader_meta).await;
+        let reader_sidecar = sqlite_sidecar(&reader_meta, "trips").await;
+        std::fs::write(
+            reader_meta.join("trips.slice.json"),
+            serde_json::to_vec(&slice).expect("slice bytes"),
+        )
+        .expect("extract the slice");
+        CayenneSnapshotEngine::new(
+            reader_catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            reader_data.clone(),
+        )
+        .with_sidecar(Arc::clone(&reader_sidecar))
+        .finalize_directory_snapshot(
+            &[
+                (reader_meta.clone(), "metadata/".to_string()),
+                (reader_data.clone(), "data/".to_string()),
+            ],
+            "trips",
+        )
+        .await
+        .expect_err("the metastore refuses the slice");
+
+        assert!(
+            reader_sidecar
+                .kafka_checkpoint_store()
+                .expect("kafka store")
+                .get()
+                .await
+                .expect("kafka get")
+                .is_none(),
+            "positions without their rows would resume past every row the snapshot held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_import_removes_its_slice() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let metadata_dir = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        let catalog = fresh_catalog(&metadata_dir).await;
+        let slice = metadata_dir.join("trips.slice.json");
+        std::fs::write(&slice, b"not a slice").expect("write slice");
+
+        CayenneSnapshotEngine::new(
+            catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            tmp.path().to_path_buf(),
+        )
+        .finalize_directory_snapshot(&[(metadata_dir.clone(), "metadata/".to_string())], "trips")
+        .await
+        .expect_err("a slice that does not parse fails the import");
+        assert!(!slice.exists(), "the slice must not block the next restore");
     }
 
     #[tokio::test]
