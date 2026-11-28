@@ -39,16 +39,13 @@ use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "SMB";
 /// Default connection pool size.
 const DEFAULT_POOL_SIZE: usize = 4;
-/// Hard cap on the in-memory buffer used by `get_opts` / `head` helpers.
-/// Prevents a pathological server from triggering OOM on a gigantic file.
-const MAX_BUFFERED_READ: u64 = 2 * 1024 * 1024 * 1024;
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
@@ -564,7 +561,7 @@ impl ObjectStore for SMBObjectStore {
         }
 
         let (start, end, _to_read) = resolve_range(options.range.as_ref(), meta.size);
-        guard_read_size(end.saturating_sub(start))?;
+        guard_buffered_read(STORE_NAME, end.saturating_sub(start))?;
 
         let data = session
             .get_object_range(path, start, end)
@@ -665,19 +662,6 @@ impl ObjectStore for SMBObjectStore {
                 .map_err(|e| map_put_error(e, to.to_string())),
         }
     }
-}
-
-fn guard_read_size(size: u64) -> object_store::Result<()> {
-    if size > MAX_BUFFERED_READ {
-        return Err(object_store::Error::Generic {
-            store: STORE_NAME,
-            source: format!(
-                "SMB read of {size} bytes exceeds {MAX_BUFFERED_READ}-byte cap; reduce range or stream"
-            )
-            .into(),
-        });
-    }
-    Ok(())
 }
 
 /// A multipart upload implementation backed by the internal SMB WAL writer.
@@ -949,9 +933,10 @@ mod tests {
 
     #[test]
     fn test_guard_read_size() {
-        guard_read_size(1024).expect("small reads are allowed");
-        guard_read_size(MAX_BUFFERED_READ).expect("exactly at cap is allowed");
-        let err = guard_read_size(MAX_BUFFERED_READ + 1)
+        use super::super::common::MAX_BUFFERED_READ;
+        guard_buffered_read(STORE_NAME, 1024).expect("small reads are allowed");
+        guard_buffered_read(STORE_NAME, MAX_BUFFERED_READ).expect("exactly at cap is allowed");
+        let err = guard_buffered_read(STORE_NAME, MAX_BUFFERED_READ + 1)
             .expect_err("one byte over the cap must be refused");
         let object_store::Error::Generic { store, source } = &err else {
             panic!("expected a generic SMB store error, got {err:?}");

@@ -37,8 +37,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
-    process_directory_entries_shallow, resolve_range, should_skip_entry,
+    DirEntry, build_byte_range, build_object_meta, generic_error, guard_buffered_read,
+    process_directory_entries, process_directory_entries_shallow, resolve_range,
+    should_skip_entry,
 };
 
 const STORE_NAME: &str = "FTP";
@@ -587,6 +588,7 @@ impl ObjectStore for FTPObjectStore {
         }
 
         let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
+        guard_buffered_read(STORE_NAME, data_to_read)?;
 
         #[expect(clippy::cast_possible_truncation)]
         let data = read_ftp_data(

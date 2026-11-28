@@ -193,6 +193,32 @@ pub fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64
     }
 }
 
+/// Largest read a file-based store buffers into memory in one `get_opts` call.
+///
+/// The object length comes from the server's metadata reply, so without a
+/// ceiling a server reporting a huge size makes the store allocate that much.
+pub const MAX_BUFFERED_READ: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Refuse a buffered read longer than [`MAX_BUFFERED_READ`].
+///
+/// Call this on the length resolved from the server-reported size, before
+/// opening the file or allocating any buffer for it.
+///
+/// # Errors
+///
+/// Returns a generic error for `store` when `len` exceeds the cap.
+pub fn guard_buffered_read(store: &'static str, len: u64) -> object_store::Result<()> {
+    if len > MAX_BUFFERED_READ {
+        return Err(generic_error(
+            store,
+            format!(
+                "{store} read of {len} bytes exceeds {MAX_BUFFERED_READ}-byte cap; reduce range or stream"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Build a byte `Range` from resolved start and end offsets.
 #[inline]
 #[must_use]
@@ -278,6 +304,23 @@ mod tests {
         let range = GetRange::Suffix(2000);
         let (start, end, to_read) = resolve_range(Some(&range), 1000);
         assert_eq!((start, end, to_read), (0, 1000, 1000));
+    }
+
+    #[test]
+    fn test_guard_buffered_read() {
+        guard_buffered_read("NFS", 0).expect("an empty read is allowed");
+        guard_buffered_read("NFS", MAX_BUFFERED_READ).expect("exactly at cap is allowed");
+        let err = guard_buffered_read("NFS", MAX_BUFFERED_READ + 1)
+            .expect_err("one byte over the cap must be refused");
+        assert_eq!(
+            err.to_string(),
+            "Generic NFS error: NFS read of 2147483649 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
+        let err = guard_buffered_read("SFTP", u64::MAX).expect_err("u64::MAX must be refused");
+        assert_eq!(
+            err.to_string(),
+            "Generic SFTP error: SFTP read of 18446744073709551615 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
     }
 
     #[test]
