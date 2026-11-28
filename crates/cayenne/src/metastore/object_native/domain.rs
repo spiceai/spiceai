@@ -179,15 +179,29 @@ impl Domain {
                 if matches!(inner.head, Head::Writer(_)) {
                     self.data_writes.set(false);
                 }
-                match inner.become_writer().await {
+                let became_writer = match inner.become_writer().await {
                     Ok(()) if took_over => {
                         tracing::info!("{}", super::took_over_message(dataset, &inner.location()));
+                        true
                     }
-                    Ok(()) => {}
-                    Err(error) => tracing::warn!(
-                        "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
-                        subject(dataset)
-                    ),
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            "{} holds its writer lease but could not take the dataset over, so it keeps serving queries as a replica and retries. Cause: {error}",
+                            subject(dataset)
+                        );
+                        false
+                    }
+                };
+                // Publish the writer state before tables may send writes based on it.
+                drop(inner);
+                if became_writer {
+                    self.data_writes.set(true);
+                }
+                #[cfg(test)]
+                if became_writer && let Some(hook) = self.inner.after_writer_gate_open.lock().take()
+                {
+                    hook(&self.inner);
                 }
             }
             LeaseRole::Standby { holder } => {
@@ -351,12 +365,42 @@ impl Domain {
             .collect()
     }
 
-    pub(super) async fn read(&self) -> CatalogResult<StateLease<'_>> {
+    /// The state for a read: as of the last change that returned, without
+    /// waiting for one in progress ([`StateSlot::published`]). While nothing is
+    /// published it waits for the state, and fails as the stopped log does.
+    pub(super) async fn read(&self) -> CatalogResult<Arc<DatasetStateReader>> {
+        if let Some(published) = self.inner.published() {
+            return Ok(published);
+        }
+        // A returned lease of a log that serves reads holds the state it published.
         let inner = self.inner.take().await;
         match inner.stop {
-            None | Some(Stop::Replica) => Ok(inner),
+            None | Some(Stop::Replica) => Ok(Arc::clone(&inner.reader)),
             Some(stop) => Err(inner.stopped(stop)),
         }
+    }
+
+    /// The state for a read that must include the writer's latest commit. A
+    /// writer's published state does, so the read does not wait; a replica
+    /// takes the state and follows the writer's commits first.
+    async fn read_followed(&self) -> CatalogResult<Arc<DatasetStateReader>> {
+        if let Some(published) = self.inner.published_by_writer() {
+            return Ok(published);
+        }
+        Ok(Arc::clone(&self.take_followed().await?.reader))
+    }
+
+    /// The state, after following the writer's commits on a replica. Fails as
+    /// the stopped log does.
+    async fn take_followed(&self) -> CatalogResult<StateLease<'_>> {
+        let mut inner = self.inner.take().await;
+        if let Some(stop) = inner.stop
+            && stop != Stop::Replica
+        {
+            return Err(inner.stopped(stop));
+        }
+        inner.follow().await?;
+        Ok(inner)
     }
 
     /// Create an empty log at a new prefix.
@@ -436,6 +480,14 @@ impl Domain {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(inner)),
+                published: arc_swap::ArcSwapOption::empty(),
+                replica: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                before_load: Mutex::new(None),
+                #[cfg(test)]
+                between_role_and_state: Mutex::new(None),
+                #[cfg(test)]
+                after_writer_gate_open: Mutex::new(None),
             }),
         })
     }
@@ -612,13 +664,41 @@ impl Inner {
         // catalog's own checks should have caught, and leaves the state partly
         // changed, so the log stops until the process restarts.
         self.revision += 1;
-        if let Err(error) = self.reader.state.apply_in_place(&record) {
+        if let Err(error) = self.apply_record(&record, false) {
             self.stop = Some(Stop::Refused);
             let message = refused_change_message(&self.dataset, &error.to_string());
             tracing::error!("{message}");
             return Err(CatalogError::InvalidOperationNoSource { message });
         }
         self.buffer(record).await
+    }
+
+    /// Apply `record` to the state, copying it first while it is published for
+    /// reads. With `restore`, a refused record leaves the state as it was;
+    /// without, it leaves it partly changed.
+    pub(super) fn apply_record(
+        &mut self,
+        record: &Record,
+        restore: bool,
+    ) -> cayenne_metastore_actions::state::Result<()> {
+        let state = &mut Arc::make_mut(&mut self.reader).state;
+        if restore {
+            state.apply(record)
+        } else {
+            state.apply_in_place(record)
+        }
+    }
+
+    /// Replace the state with `state`, read back from the log.
+    fn replace_state(&mut self, state: DatasetState) {
+        self.reader = Arc::new(
+            DatasetStateReader::from_state(
+                state,
+                Arc::clone(&self.reader.store),
+                self.reader.prefix.clone(),
+            )
+            .with_anchor(self.reader.anchor.clone()),
+        );
     }
 
     /// Set the commit time on the actions that keep one.
@@ -694,10 +774,8 @@ impl Domain {
     /// Returns an error when the catalog must be reopened, or a replica cannot
     /// read the writer's commits.
     pub async fn sidecar_value(&self, key: &str) -> CatalogResult<Option<Vec<u8>>> {
-        let mut inner = self.read().await?;
-        inner.follow().await?;
-        Ok(inner
-            .reader
+        let reader = self.read_followed().await?;
+        Ok(reader
             .state
             .positions
             .get(&(key.to_string(), String::new()))
@@ -708,10 +786,9 @@ impl Domain {
     /// # Errors
     /// Returns an error when the catalog must be reopened.
     pub async fn sidecar_counters(&self, key: &str) -> CatalogResult<Vec<(String, i64)>> {
-        let inner = self.read().await?;
+        let reader = self.read().await?;
         let start = (key.to_string(), "\0".to_string());
-        inner
-            .reader
+        reader
             .state
             .positions
             .range(start..)
@@ -803,8 +880,7 @@ impl Domain {
         key: &str,
         make: impl FnOnce() -> Vec<u8>,
     ) -> CatalogResult<Option<Vec<u8>>> {
-        let mut inner = self.read().await?;
-        inner.follow().await?;
+        let mut inner = self.take_followed().await?;
         let position = (key.to_string(), String::new());
         if let Some(value) = inner.reader.state.positions.get(&position) {
             return Ok(Some(value.clone()));
@@ -1298,8 +1374,6 @@ impl Inner {
         writer.revision = self.revision + 1;
         *self = writer;
         self.resolve_decided_transactions().await?;
-        // Data writes are allowed only once the head is this instance's.
-        self.data_writes.set(true);
         Ok(())
     }
     /// The error a caller gets from a log stopped for `stop`.
@@ -1360,7 +1434,9 @@ impl Inner {
                     prefix.clone(),
                     config.retain_below_floor,
                 ))),
-                reader: DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                reader: Arc::new(
+                    DatasetStateReader::from_state(state, store, prefix).with_anchor(anchor),
+                ),
                 head,
                 revision: 0,
                 reread: false,
@@ -1421,10 +1497,14 @@ impl Inner {
                     return Ok(self.revision);
                 }
                 self.revision += 1;
-                if let Err(error) = Self::apply_followed(&mut self.reader.state, entries) {
+                // Applied to a copy, so the state published for reads holds
+                // either none of the batch or all of it.
+                let mut state = self.reader.state.clone();
+                if let Err(error) = Self::apply_followed(&mut state, entries) {
                     self.reread = true;
                     return Err(error);
                 }
+                Arc::make_mut(&mut self.reader).state = state;
             }
             Poll::Reopen => {
                 // The writer checkpointed past this replica's cursor and the
@@ -1445,7 +1525,7 @@ impl Inner {
                 .await
                 .map_err(invalid)?;
         let replayed = replay_state(opened)?;
-        self.reader.state = replayed.state;
+        self.replace_state(replayed.state);
         self.revision += 1;
         self.floor_state = replayed.floor_state;
         self.since_floor = replayed.since_floor;
@@ -1474,5 +1554,120 @@ impl Inner {
 fn replica_error(dataset: &str) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: replica_change_message(dataset),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::LeaseSettings;
+    use super::{Access, Arc, DatasetStateReader, Domain, NativeCatalogConfig};
+    use object_store::{ObjectStore, memory::InMemory, path::Path};
+    use parking_lot::Mutex;
+
+    const KEY: &str = "cdc-checkpoint";
+    const REPLICA_VALUE: &[u8] = b"replica-state";
+    const LATEST_VALUE: &[u8] = b"log-latest";
+
+    fn leased_config(identity: &'static str) -> NativeCatalogConfig {
+        NativeCatalogConfig {
+            access: Access::Leased(LeaseSettings {
+                duration: std::time::Duration::from_secs(60),
+                identity: Some(identity),
+            }),
+            ..NativeCatalogConfig::default()
+        }
+    }
+
+    fn value(reader: &DatasetStateReader) -> Option<Vec<u8>> {
+        reader
+            .state
+            .positions
+            .get(&(KEY.to_string(), String::new()))
+            .cloned()
+    }
+
+    async fn replica_ready_to_take_over() -> Domain {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = Path::from("catalog");
+        let writer = Domain::create_with_config(
+            Arc::clone(&store),
+            prefix.clone(),
+            leased_config("writer"),
+            true,
+            None,
+            "orders",
+        )
+        .await
+        .expect("create writer");
+        writer
+            .set_sidecar_value(KEY, Some(REPLICA_VALUE.to_vec()))
+            .await
+            .expect("record the state the replica opens");
+
+        let replica = Domain::open_with_config(
+            store,
+            prefix,
+            leased_config("replica"),
+            true,
+            None,
+            "orders",
+        )
+        .await
+        .expect("open replica");
+        assert_eq!(
+            value(&replica.read().await.expect("publish replica state")),
+            Some(REPLICA_VALUE.to_vec())
+        );
+
+        writer
+            .set_sidecar_value(KEY, Some(LATEST_VALUE.to_vec()))
+            .await
+            .expect("advance the writer state");
+        writer.release_lease().await;
+        replica
+    }
+
+    #[tokio::test]
+    async fn writer_publication_never_exposes_replica_state_as_writer_state() {
+        let replica = replica_ready_to_take_over().await;
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_hook = Arc::clone(&observed);
+        *replica.inner.between_role_and_state.lock() = Some(Box::new(move |slot| {
+            *observed_in_hook.lock() = Some(slot.published_by_writer().as_deref().and_then(value));
+        }));
+
+        assert!(replica.keep_lease().await);
+        assert_eq!(
+            observed.lock().clone(),
+            Some(None),
+            "the role transition exposed the replica's published state as writer state"
+        );
+        assert_eq!(
+            replica.sidecar_value(KEY).await.expect("read writer state"),
+            Some(LATEST_VALUE.to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_opens_data_writes_after_publishing_writer_state() {
+        let replica = replica_ready_to_take_over().await;
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_hook = Arc::clone(&observed);
+        let gate = replica.data_writes.clone();
+        *replica.inner.after_writer_gate_open.lock() = Some(Box::new(move |slot| {
+            *observed_in_hook.lock() =
+                Some((gate.allows(), slot.published().as_deref().and_then(value)));
+        }));
+
+        assert!(replica.keep_lease().await);
+        assert_eq!(
+            observed.lock().clone(),
+            Some((true, Some(LATEST_VALUE.to_vec()))),
+            "the data-write gate opened before the writer state was published"
+        );
+        assert_eq!(
+            value(&replica.read().await.expect("read published writer state")),
+            Some(LATEST_VALUE.to_vec())
+        );
     }
 }

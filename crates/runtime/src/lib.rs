@@ -29,7 +29,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
 use datafusion_proto::bytes::Serializeable;
-use init::scheduler::ScheduleRegistry;
+use init::scheduler::{DatasetScheduleWaiters, ScheduleRegistry};
 use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -789,6 +789,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    dataset_schedule_waiters: Arc<DatasetScheduleWaiters>,
 
     /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
     distributed: Option<DistributedNode>,
@@ -2274,6 +2275,15 @@ impl Runtime {
         // Must be loaded before datasets
         self.load_embeddings().await;
         self.load_rerankers().await;
+
+        // A dataset whose writer changes (another instance took its shared
+        // acceleration over, or this one did) reloads.
+        if let Some(changes) = self.df.take_writer_role_changes() {
+            tokio::spawn(Self::reload_on_writer_changes(
+                Arc::downgrade(&self),
+                changes,
+            ));
+        }
 
         // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({

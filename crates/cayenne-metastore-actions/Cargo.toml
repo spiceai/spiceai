@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 blake3.workspace = true
+imbl = "7.0.2"
 prost.workspace = true
 snafu.workspace = true
 

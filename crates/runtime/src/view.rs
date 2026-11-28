@@ -37,12 +37,41 @@ use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_resul
 use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-pub(crate) use runtime_datafusion::dependent_tables::get_dependent_table_names;
+pub(crate) use runtime_datafusion::dependent_tables::{
+    get_dependent_table_names, table_function_arguments,
+};
+
+/// The tables a view reads: the tables its SQL names, and the arguments of its
+/// table-function calls that name a dataset or view, like the `docs` of
+/// `text_search(docs, 'fox')`. Every dataset and view has a status from the start
+/// of loading, before its table is registered.
+pub(crate) fn get_view_dependencies(
+    statement: &parser::Statement,
+    status: &RuntimeStatus,
+) -> Vec<TableReference> {
+    let mut tables = get_dependent_table_names(statement);
+    let declared: HashSet<_> = status
+        .get_dataset_statuses()
+        .into_keys()
+        .chain(status.get_view_statuses().into_keys())
+        .map(crate::datafusion::resolve_table_reference)
+        .collect();
+    for argument in table_function_arguments(statement) {
+        if declared.contains(&crate::datafusion::resolve_table_reference(
+            argument.clone(),
+        )) && !tables.contains(&argument)
+        {
+            tables.push(argument);
+        }
+    }
+    tables
+}
 
 pub(crate) async fn prepare_view(
     ctx: &SessionContext,

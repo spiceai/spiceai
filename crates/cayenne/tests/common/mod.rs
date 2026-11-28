@@ -1250,3 +1250,17 @@ pub fn one_file(table_id: &str, snapshot: &str) -> [cayenne::metadata::SnapshotF
         digest: None,
     }]
 }
+
+/// The `percentile` (0 to 100) of `samples`, nearest rank.
+pub fn percentile(samples: &[std::time::Duration], percentile: f64) -> std::time::Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a rank within a test's sample count"
+    )]
+    let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}

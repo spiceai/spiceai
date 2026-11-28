@@ -52,6 +52,13 @@ pub(super) struct OpenedCatalog {
     native: Option<Arc<ObjectNativeCatalog>>,
 }
 
+impl OpenedCatalog {
+    /// The object-native catalog, when the dataset is in the state location.
+    pub(super) fn native(&self) -> Option<&Arc<ObjectNativeCatalog>> {
+        self.native.as_ref()
+    }
+}
+
 const OBJECT_NATIVE_DIR: &str = "object_native";
 
 pub(super) use cayenne::CAYENNE_VNEXT_PARAM;
@@ -550,14 +557,23 @@ impl CayenneAccelerator {
                     Arc::clone(&store),
                     runtime_state_location::StateFeature::CayenneData,
                 );
-                let native =
-                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                // Instances on one location share its accelerations: a writer
+                // lease on each dataset decides which instance writes it, and
+                // the others serve it as replicas until it lapses.
+                let config = cayenne::metastore::object_native::NativeCatalogConfig {
+                    access: cayenne::metastore::object_native::Access::Leased(
+                        cayenne::metastore::object_native::LeaseSettings::default(),
+                    ),
+                    ..cayenne::metastore::object_native::NativeCatalogConfig::default()
+                };
+                let native = cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at_with_config(
                         runtime_state_location::metrics::metered(
                             store,
                             runtime_state_location::StateFeature::CayenneMetastore,
                         ),
                         prefix.join("v1").join("catalog"),
                         &format!("{}/cayenne/v1", location.location.trim_end_matches('/')),
+                        config,
                     )
                     .await
                     .boxed()

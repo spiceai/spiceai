@@ -450,7 +450,7 @@ dependencies = [
  "strum_macros 0.27.2",
  "thiserror 2.0.18",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -504,6 +504,12 @@ checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
 
 [[package]]
 name = "arcref"
@@ -700,7 +706,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex 0.14.0",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -3418,9 +3424,9 @@ dependencies = [
 
 [[package]]
 name = "camino"
-version = "1.2.2"
+version = "1.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e629a66d692cb9ff1a1c664e41771b3dcaf961985a9774c0eb0bd1b51cf60a48"
+checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
 dependencies = [
  "serde_core",
 ]
@@ -3718,6 +3724,7 @@ name = "cayenne-metastore-actions"
 version = "2.5.0-unstable"
 dependencies = [
  "blake3",
+ "imbl",
  "prost 0.14.3",
  "snafu",
 ]
@@ -4261,8 +4268,8 @@ dependencies = [
  "flate2",
  "liblzma",
  "memchr",
- "zstd 0.13.5",
- "zstd-safe 7.4.1",
+ "zstd 0.13.6",
+ "zstd-safe 7.4.2",
 ]
 
 [[package]]
@@ -6248,6 +6255,7 @@ dependencies = [
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-status",
  "serde_json",
  "snafu",
  "tempfile",
@@ -6329,6 +6337,7 @@ dependencies = [
  "bytes",
  "chrono",
  "connector-postgres-common",
+ "cpu-budget",
  "criterion 0.7.0",
  "dashmap",
  "dataformat-json",
@@ -6384,9 +6393,11 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime-checkpoint-api",
+ "runtime-metrics",
  "runtime-object-store",
  "runtime-rate-control",
  "runtime-request-context",
+ "runtime-status",
  "runtime-udfs-api",
  "rusqlite",
  "rustc-hash 2.1.2",
@@ -6416,7 +6427,7 @@ dependencies = [
  "uuid 1.23.2",
  "wiremock",
  "zip",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -6462,7 +6473,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6508,13 +6519,13 @@ dependencies = [
  "tokio",
  "url",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
 name = "datafusion-catalog"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6538,7 +6549,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6563,7 +6574,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6589,7 +6600,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "futures",
  "log",
@@ -6600,7 +6611,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-compression",
@@ -6632,13 +6643,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6662,7 +6673,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6685,7 +6696,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6708,7 +6719,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6759,12 +6770,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 
 [[package]]
 name = "datafusion-execution"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6789,7 +6800,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6814,7 +6825,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6868,7 +6879,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6899,7 +6910,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6919,7 +6930,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6943,7 +6954,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -6967,7 +6978,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6982,7 +6993,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6998,7 +7009,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -7007,7 +7018,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -7017,7 +7028,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "chrono",
@@ -7066,7 +7077,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -7089,7 +7100,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -7103,7 +7114,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "chrono",
@@ -7120,7 +7131,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -7141,7 +7152,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -7178,7 +7189,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-catalog",
@@ -7205,7 +7216,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -7217,7 +7228,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-models"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "datafusion-common",
  "datafusion-proto-common",
@@ -7229,7 +7240,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -7244,7 +7255,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -7258,7 +7269,7 @@ dependencies = [
 [[package]]
 name = "datafusion-spark"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -7285,7 +7296,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -7304,7 +7315,7 @@ dependencies = [
 [[package]]
 name = "datafusion-substrait"
 version = "55.3.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=f406ecb57de54718f23338cde6496e5876e80eae#f406ecb57de54718f23338cde6496e5876e80eae"
+source = "git+https://github.com/spiceai/datafusion.git?rev=de1c731731d882d1f597a819d50dad440a3cbd29#de1c731731d882d1f597a819d50dad440a3cbd29"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -10143,7 +10154,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-util",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -10493,7 +10504,7 @@ dependencies = [
  "url",
  "uuid 1.23.2",
  "zeroize",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -10733,7 +10744,7 @@ checksum = "d0acd33ff0285af998aaf9b57342af478078f53492322fafc47450e09397e0e9"
 dependencies = [
  "bitmaps",
  "rand_core 0.6.4",
- "rand_xoshiro",
+ "rand_xoshiro 0.6.0",
  "sized-chunks",
  "typenum",
  "version_check",
@@ -10813,6 +10824,27 @@ checksum = "25f6af35c6a517aea5c72314abe90134980d2ae6a763809b50c208b3e429d71f"
 dependencies = [
  "nom 7.1.3",
 ]
+
+[[package]]
+name = "imbl"
+version = "7.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46bad832b9b463ed9398b8506488cc2e3b897a9d44f13af115f382aac71f4fec"
+dependencies = [
+ "archery",
+ "equivalent",
+ "imbl-sized-chunks",
+ "rand_core 0.9.5",
+ "rand_xoshiro 0.7.0",
+ "version_check",
+ "wide",
+]
+
+[[package]]
+name = "imbl-sized-chunks"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0813be332553f857953298749fa19549e8b61b80589757c29b4e2a804fa9c6"
 
 [[package]]
 name = "imgref"
@@ -11815,7 +11847,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-src"
 version = "1.0.12600"
-source = "git+https://github.com/spiceai/llama.cpp?rev=71e6732c2181497d90e46ca84dff61251477f7d8#71e6732c2181497d90e46ca84dff61251477f7d8"
+source = "git+https://github.com/spiceai/llama.cpp?rev=726960fcf6f690d1379e089534a65dfe4c82087c#726960fcf6f690d1379e089534a65dfe4c82087c"
 
 [[package]]
 name = "llguidance"
@@ -13161,7 +13193,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid 1.23.2",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -14676,7 +14708,7 @@ dependencies = [
  "snafu",
  "snap",
  "tokio",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -14916,7 +14948,7 @@ dependencies = [
  "snap",
  "tokio",
  "twox-hash",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -15097,7 +15129,7 @@ dependencies = [
  "better_io",
  "dtype_dispatch",
  "half",
- "rand_xoshiro",
+ "rand_xoshiro 0.6.0",
 ]
 
 [[package]]
@@ -16573,6 +16605,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -18084,6 +18125,7 @@ dependencies = [
  "key-index",
  "logos",
  "opentelemetry 0.32.0",
+ "redact",
  "runtime-acceleration",
  "runtime-config",
  "serde",
@@ -20728,7 +20770,7 @@ dependencies = [
  "tokio",
  "tonic",
  "yaml",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -21652,7 +21694,7 @@ dependencies = [
  "tantivy-bitpacker",
  "tantivy-common",
  "tantivy-fst",
- "zstd 0.13.5",
+ "zstd 0.13.6",
 ]
 
 [[package]]
@@ -21869,7 +21911,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
- "util",
  "uuid 1.23.2",
  "yaml",
 ]
@@ -21934,6 +21975,7 @@ dependencies = [
  "serde_json",
  "spiceai",
  "spicepod",
+ "spicescript",
  "system-adapter-protocol",
  "test-framework",
  "tokio",
@@ -22017,7 +22059,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -26185,11 +26227,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+checksum = "b04655dc7bf4abd8ebe23dac6bef20fceea52a29ad19e37a4101b3951d7e8b45"
 dependencies = [
- "zstd-safe 7.4.1",
+ "zstd-safe 7.4.2",
 ]
 
 [[package]]
@@ -26203,9 +26245,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-safe"
-version = "7.4.1"
+version = "7.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+checksum = "df2575690b2a3eccad509fe7898cdde32a5afca06a06449ff4dcfb318c7b7281"
 dependencies = [
  "zstd-sys",
 ]
@@ -26221,9 +26263,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.2+zstd.1.5.7"
+version = "2.2.0+zstd.1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
 dependencies = [
  "cc",
  "pkg-config",

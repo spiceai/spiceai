@@ -17,9 +17,11 @@ limitations under the License.
 //! Credential redaction for URLs, for component sources that hold one, and for
 //! messages that embed them.
 //!
-//! A URL can carry a credential in two places: its userinfo
-//! (`https://user:password@host/...`) and the values of secret-looking query keys
-//! (`?token=...`, `?api_key=...`, `?sig=...`). Whatever reports such a URL to a reader wider
+//! A URL can carry a credential in three places: its userinfo
+//! (`https://user:password@host/...`), the values of secret-looking query keys
+//! (`?token=...`, `?api_key=...`, `?sig=...`), and the values of secret-looking
+//! `key=value` pairs in its fragment (`#key=...&secret=...`), where object-store
+//! connectors put their parameters. Whatever reports such a URL to a reader wider
 //! than whoever configured it — an API response, a plan, a log line, an error — reports it
 //! through this crate, so there is one definition of what a credential in a URL is.
 //! The redacted URL keeps everything else as written.
@@ -55,6 +57,7 @@ const SECRET_QUERY_KEY_ENDINGS: &[&str] = &[
     "credential",
     "credentials",
     "authorization",
+    "sasstring",
 ];
 
 const REDACTED: &str = "***";
@@ -194,24 +197,38 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
         Some((path, query)) => {
             out.push_str(path);
             out.push('?');
-            for (i, pair) in query.split('&').enumerate() {
-                if i > 0 {
-                    out.push('&');
-                }
-                match pair.split_once('=') {
-                    Some((key, _)) if is_secret_query_key(key) => {
-                        out.push_str(key);
-                        out.push('=');
-                        out.push_str(REDACTED);
-                    }
-                    _ => out.push_str(pair),
-                }
-            }
+            push_redacted_pairs(&mut out, query);
         }
         None => out.push_str(before_fragment),
     }
-    out.push_str(fragment);
+    // Object-store connectors carry their parameters, credentials included, as
+    // `key=value` pairs in the fragment (`s3://bucket/path#region=...&secret=...`).
+    match fragment.strip_prefix('#') {
+        Some(pairs) if pairs.contains('=') => {
+            out.push('#');
+            push_redacted_pairs(&mut out, pairs);
+        }
+        _ => out.push_str(fragment),
+    }
     Some((out, authority_end + url_len))
+}
+
+/// Appends `&`-separated `key=value` pairs to `out`, with the values of
+/// secret-looking keys replaced.
+fn push_redacted_pairs(out: &mut String, pairs: &str) {
+    for (i, pair) in pairs.split('&').enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((key, _)) if is_secret_query_key(key) => {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(REDACTED);
+            }
+            _ => out.push_str(pair),
+        }
+    }
 }
 
 /// In free text a quote ends a URL, but a secret query value can contain one
@@ -248,8 +265,8 @@ fn extend_over_quoted_secret(rest: &str, mut url_len: usize) -> usize {
 }
 
 /// `url` without credentials: its `user[:password]@` removed and the values of
-/// secret-looking query keys (`token`, `api_key`, `sig`, `X-Amz-Signature`, ...)
-/// replaced with `***`, everything else as written.
+/// secret-looking query and fragment keys (`token`, `api_key`, `sig`,
+/// `X-Amz-Signature`, `secret`, ...) replaced with `***`, everything else as written.
 ///
 /// Only a URL at the start of `url` is redacted; text that does not start with a
 /// URL that has an authority is returned unchanged.
@@ -390,6 +407,37 @@ mod tests {
         ] {
             assert_eq!(redact_url_credentials(url), url);
         }
+    }
+
+    #[test]
+    fn redact_url_credentials_redacts_secret_fragment_params() {
+        for (url, expected) in [
+            (
+                "s3://bucket/data/#region=us-east-1&key=AKIAFAKE&secret=fake%2Fsecret&session_token=fake-token",
+                "s3://bucket/data/#region=us-east-1&key=***&secret=***&session_token=***",
+            ),
+            (
+                "abfss://container@acct.dfs.core.windows.net/p/#account=acct&access_key=K&sas_string=sv%3D1%26sig%3DS&client_secret=C",
+                "abfss://container@acct.dfs.core.windows.net/p/#account=acct&access_key=***&sas_string=***&client_secret=***",
+            ),
+            (
+                "gs://bucket/p/#service_account_key=K&client_timeout=30s",
+                "gs://bucket/p/#service_account_key=***&client_timeout=30s",
+            ),
+        ] {
+            assert_eq!(redact_url_credentials(url), expected, "url: {url}");
+        }
+        assert_eq!(
+            redact_message_credentials(
+                "Failed to list files at the specified path `s3://bucket/x/#key=AKIAFAKE&secret=S`. Verify the path."
+            ),
+            "Failed to list files at the specified path `s3://bucket/x/#key=***&secret=***`. Verify the path."
+        );
+        // A fragment that is not `key=value` pairs is not a connector's parameters.
+        assert_eq!(
+            redact_url_credentials("https://example.com/docs#section-2"),
+            "https://example.com/docs#section-2"
+        );
     }
 
     #[test]

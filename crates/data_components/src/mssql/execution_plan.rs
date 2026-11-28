@@ -20,7 +20,6 @@ use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::TableReference,
-    common::utils::quote_identifier,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::Expr,
@@ -36,7 +35,11 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::ResultExt;
 
-use super::{connection_manager::SqlServerConnectionPool, dialect::MsSqlDialect};
+use super::{
+    connection_manager::SqlServerConnectionPool,
+    dialect::{MsSqlDialect, quote_identifier, quote_table_reference},
+    is_text_type,
+};
 
 pub type Result<T, E = super::Error> = std::result::Result<T, E>;
 
@@ -154,7 +157,7 @@ impl SqlServerExecPlan {
 
         let mut sql = format!(
             "SELECT {top_expr}{columns} FROM {table_reference}",
-            table_reference = self.table_reference.to_quoted_string()
+            table_reference = quote_table_reference(&self.table_reference)
         );
         if !where_expr.is_empty() {
             sql.push(' ');
@@ -255,6 +258,15 @@ impl ExecutionPlan for SqlServerExecPlan {
             let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
                 return Ok(SortOrderPushdownResult::Unsupported);
             };
+            // SQL Server orders text by the column's collation and binary after zero padding,
+            // not by code point or byte; a column of unknown type is not pushed either.
+            if self
+                .projected_schema
+                .field_with_name(col.name())
+                .map_or(true, |field| is_text_type(field.data_type()))
+            {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
 
             // If the field is not nullable, null ordering is irrelevant — always Exact.
             let is_nullable = self

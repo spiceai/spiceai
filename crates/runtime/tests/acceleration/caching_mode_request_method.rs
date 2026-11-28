@@ -119,7 +119,7 @@ fn http_dataset(base_url: &str, name: &str, accelerated: bool) -> Dataset {
         params.insert("caching_ttl".to_string(), "1h".to_string());
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
             mode: Mode::Memory,
             refresh_mode: Some(RefreshMode::Caching),
             params: Some(Params::from_string_map(params)),
