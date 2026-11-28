@@ -1,0 +1,54 @@
+---
+name: Agent Eval Selftest
+# The evals in .github/evals test the rules in AGENTS.md. Each eval directory
+# ships a selftest.py that scores a rule-following arm against a rule-ignoring
+# one and fails if they converge: an eval that passes whatever the agent did
+# measures nothing. This runs those selftests when an eval changes. They need
+# no agent and no network.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/evals/**'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when an eval also changes.
+      - '.github/workflows/agent_evals_selftest.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/evals/**'
+      - '.github/workflows/agent_evals_selftest.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+# Every job declares its own token permissions; nothing is granted by default.
+permissions: {}
+
+jobs:
+  selftest:
+    environment: secret-free
+    name: Evals discriminate
+    runs-on: spiceai-dev-runners
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Reads the checkout and runs the frozen Python fixtures; nothing else.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Evidence-rule evals
+        run: python3 .github/evals/evidence-rule/selftest.py

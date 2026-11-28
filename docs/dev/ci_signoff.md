@@ -148,6 +148,72 @@ against the merge is exactly what finds that out. Fix what it reported and run
 `make signoff` again — the new status replaces the failed one. A `pending`
 status is not a verdict and does not block inheritance.
 
+### Fill in the Evidence section
+
+Every PR that needs a sign-off also needs evidence in its description, in the
+`🧪 Evidence` section of [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md)
+(the rule is *Evidence* in [`AGENTS.md`](../../AGENTS.md)). So does a PR the
+no-Rust fast-track covers that changes the check itself: `pr_evidence.mjs`,
+`bot_pr_evidence.sh`, their tests, the workflows that run those tests, `pr.yml`,
+the PR template, `AGENTS.md`, or `.github/evals/`. **Attestation** checks it with `.github/scripts/pr_evidence.mjs`
+from a checkout of the default branch's tip, which it resolves first and
+verifies exactly before importing, so a PR into an older release branch is
+judged by the current rule:
+
+- The description has one Evidence section (a heading that is just
+  "Evidence"; heading-shaped lines inside pasted output don't count), and it
+  says more than the template comment.
+- Each entry names one commit from this PR, on a line outside its output, and
+  carries that output: a fenced block under it with output beyond its `$ `
+  lines, or a link to a run of this repository's workflows that ran at that
+  commit and executed (it concluded success or failure, with a job that ran
+  steps; checked through the API). Other links, uploads, gists and checks pages are not output: paste an
+  excerpt in a fenced block.
+- Every check marked not run, anywhere in the description, gives a real reason
+  (`Not run — <reason>`, not the placeholder and not "TODO").
+- Every entry is current: no later commit changes a file the sign-off covers
+  (the same list as [the no-Rust fast-track](#branches-with-no-rust-changes-are-fast-tracked),
+  checked by old and new path) or anything under `test/`, unless newer entries
+  re-run every command it ran. An entry's commands are the `$ ` lines in its
+  pasted output that are followed by output of their own, compared as written. That is the before-and-after pattern: the
+  failing run at an older commit, the same command passing at the head. A newer
+  run of a different check, or of only some of the commands, refreshes nothing.
+  A merge of the base counts only for files it changes against both parents:
+  files both sides touched, or edited while merging. Any other merge counts for
+  everything it brings in. Evidence at the head is current by definition,
+  however many commits the PR has.
+
+It checks form, not truth: whether the output shows what the PR claims is for
+review. Editing the description re-runs **Attestation**. The fast-tracks skip
+the check for the same reason they skip the sign-off, except as above. There is
+no warning period: the check fails a PR from the moment it reaches the default
+branch. A PR whose **Attestation** last ran before then stays green until its
+next event, and re-running that run does not help: a re-run keeps the run's
+original workflow file, which has no evidence step. So once the check lands, a
+maintainer gives each open PR a fresh event (editing its description is
+enough), and removes and re-adds any PR already in the merge queue, whose entry
+rests on the earlier green check. A Git or API error while verifying the checker
+fails the check rather than skipping it, and a default branch without the module
+fails every PR except the one that introduced the check.
+
+Like the rest of **Attestation**, the check runs the workflow file from the PR's
+merge commit, as every `pull_request` workflow does, so a PR that edits `pr.yml`
+can change what it checks, and a PR that changes `pr_evidence.mjs` is judged by
+the copy already on the default branch, not by its own. Code-owner review of
+those changes guards both: running a PR's own checker inside **Attestation** would
+put the PR's code in the job that decides it.
+
+Workflows that open PRs with generated commits (snapshot and schema updates)
+write the section with `.github/scripts/bot_pr_evidence.sh`: an entry naming the
+generated commit and linking the run, with the workload's command in a fenced
+block. They key each branch, and so each PR, on one workload (query set, scale,
+Spicepod and query options), and run one at a time per workload, so the helper
+replaces the section on every run. The helper writes only while its commit is
+the PR's head, reads the description back, and fails its run, before the held
+runs are released, if its entry is gone or the head moved while it wrote. When a maintainer adds
+commits to such a PR, or to a Dependabot bump that has left its fast-track, they
+add an entry for their own run, as for any other PR.
+
 ### Reverts are fast-tracked
 
 A pull request that only reverts commits already on the base branch passes
@@ -578,6 +644,14 @@ checks the PR's head commit first, then walks backward through clean, unmodified
 base merges on the first-parent chain. Make sure the commit under review is
 pushed, then run `make signoff` again. Any new code or manual merge resolution
 needs a fresh sign-off.
+
+### "The PR description's Evidence section is incomplete"
+
+**Attestation** lists what is missing from the description's Evidence section
+(see [Fill in the Evidence section](#fill-in-the-evidence-section)). Most often
+the evidence names an older commit and a later push changed shipped code:
+re-run the check at the new head and put that SHA in the section. Editing the
+description re-runs the check; you don't need to push.
 
 ### "Runner out of disk — checks did not complete"
 

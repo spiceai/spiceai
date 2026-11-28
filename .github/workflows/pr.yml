@@ -3,6 +3,9 @@ name: pr
 
 on:
   pull_request:
+    # `edited` as well as the defaults: Attestation checks the description's
+    # Evidence section, so editing it must re-run the check.
+    types: [opened, synchronize, reopened, edited]
     branches:
       - trunk
       - release-*
@@ -297,6 +300,14 @@ jobs:
               }
             }
 
+            // The evidence check still judges a PR that changes the check or the rules
+            // it enforces, though a sign-off would run no Rust checks on it: otherwise
+            // a PR could weaken the check and merge with Attestation green.
+            const evidenceGate = /^(\.github\/scripts\/(pr_evidence\.mjs|bot_pr_evidence\.sh|test_pr_evidence\.mjs|test_pr_attestation_signoff\.mjs)|\.github\/workflows\/(pr|attestation_script_test|agent_evals_selftest)\.yml|\.github\/PULL_REQUEST_TEMPLATE\.md|AGENTS\.md|\.github\/evals\/.+)$/;
+            if (files.some((file) => [file.filename, file.previous_filename].some((path) => path && evidenceGate.test(path)))) {
+              core.setOutput('evidence_gate', 'true');
+            }
+
             core.setOutput('fast_track', 'true');
             // Name the pattern rather than a subset of what it matches: the two drift
             // apart every time a path is added to the gate.
@@ -543,6 +554,128 @@ jobs:
               `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
               `clean base merge(s).`
             );
+
+      # Every claim a PR makes needs evidence in its description (AGENTS.md,
+      # Evidence): entries that name a PR commit and carry its output, a reason on
+      # each check not run, and no later change to shipped code an entry has not
+      # been re-run after. The rule lives in .github/scripts/pr_evidence.mjs and is
+      # read from the default branch, never the PR, so a PR cannot rewrite the
+      # module that judges it, and a PR into an older release branch is judged by
+      # the current rule. It gets a checkout of its own, made here, after `Check
+      # out pull request history`: that step checks the PR out over the workspace
+      # root, and the checkout action empties a destination that is not a
+      # repository, so the `trusted` checkout above is gone by now and the PR could
+      # have put files at its path. The fast-tracks skip the check for the reason
+      # they skip the sign-off: those PRs change no shipped code. The no-Rust one
+      # does not skip it for a PR that changes the check itself (`evidence_gate`).
+      # `!cancelled()` so a failed sign-off and missing evidence are reported in
+      # one run.
+      #
+      # This job runs the workflow file from the PR's merge commit, as every
+      # `pull_request` workflow does, so a PR that edits this file can change what
+      # it checks. That holds for the whole Attestation job, sign-off included, and
+      # code-owner review of workflow changes is what guards it.
+      # The tip is resolved first and the checkout pinned to it, so the step below
+      # can require the exact commit rather than any ancestor of the branch.
+      - name: Resolve the default branch's tip
+        id: evidence_tip
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && (steps.no_rust.outputs.fast_track != 'true' || steps.no_rust.outputs.evidence_gate == 'true') && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const branch = context.payload.repository.default_branch;
+            const { data } = await github.rest.repos.getBranch({ owner: context.repo.owner, repo: context.repo.repo, branch });
+            core.setOutput('sha', data.commit.sha);
+
+      - name: Check out the default branch's evidence rule
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && (steps.no_rust.outputs.fast_track != 'true' || steps.no_rust.outputs.evidence_gate == 'true') && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.evidence_tip.outputs.sha }}
+          path: evidence-rule
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # The checker is imported only from a checkout of exactly the tip resolved
+      # above. A tree without the module is accepted only from the PR that introduced
+      # the check (BOOTSTRAP_PR); anywhere else a missing module fails, so deleting it
+      # cannot switch the check off, and adding a different one back cannot skip it. Anything that
+      # stops the check reaching a verdict fails Attestation, a Git or API error
+      # included: a check that passes when it cannot run checks nothing.
+      - name: Check the pull request's evidence
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && (steps.no_rust.outputs.fast_track != 'true' || steps.no_rust.outputs.evidence_gate == 'true') && steps.revert.outputs.fast_track != 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EVIDENCE_TIP: ${{ steps.evidence_tip.outputs.sha }}
+        with:
+          script: |
+            const checkout = `${process.env.GITHUB_WORKSPACE}/evidence-rule`;
+            const defaultBranch = context.payload.repository.default_branch;
+            const tip = process.env.EVIDENCE_TIP;
+            const git = (...args) => exec.getExecOutput('git', ['-C', checkout, ...args], { ignoreReturnCode: true, silent: true });
+            const unverified = (why) =>
+              core.setFailed(`The evidence rule could not be verified as ${defaultBranch}'s (${why}), so the evidence check could not run. Re-run the job.`);
+
+            if (!/^[0-9a-f]{40}$/.test(tip ?? '')) {
+              unverified('its tip was not resolved');
+              return;
+            }
+            const head = await git('rev-parse', 'HEAD');
+            if (head.exitCode !== 0 || head.stdout.trim() !== tip) {
+              unverified(`the checkout is not ${defaultBranch}'s tip ${tip.slice(0, 12)}`);
+              return;
+            }
+            const module = '.github/scripts/pr_evidence.mjs';
+            const listed = await git('ls-tree', '--name-only', 'HEAD', '--', module);
+            if (listed.exitCode !== 0) {
+              unverified(`git could not read the tree: ${listed.stderr.trim()}`);
+              return;
+            }
+            if (listed.stdout.trim() !== module) {
+              let adds = false;
+              try {
+                const files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.payload.pull_request.number,
+                  per_page: 100,
+                });
+                adds = files.some((file) => file.filename === module && file.status === 'added');
+              } catch (error) {
+                unverified(`listing the PR's files failed: ${error.message}`);
+                return;
+              }
+              // Only the PR that introduced the check may run without it, so this
+              // exemption cannot be reused by a later PR that adds a module back.
+              const BOOTSTRAP_PR = 16914;
+              if (adds && context.payload.pull_request.number === BOOTSTRAP_PR) {
+                core.notice(`This PR adds the evidence check (${module}), which ${defaultBranch} does not have yet, so it was skipped.`);
+              } else {
+                core.setFailed(`${defaultBranch} has no evidence rule (${module}), so the evidence check could not run. Restore it on ${defaultBranch}.`);
+              }
+              return;
+            }
+
+            const { checkEvidence, describeProblems } = await import(`${checkout}/${module}`);
+            let result;
+            try {
+              result = await checkEvidence({
+                github,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pullNumber: context.payload.pull_request.number,
+              });
+            } catch (error) {
+              core.setFailed(`Could not read the pull request to check its evidence: ${error.message}. Re-run the job.`);
+              return;
+            }
+
+            if (result.problems.length === 0) {
+              core.info(`The Evidence section is complete and current as of ${result.cited.slice(0, 12)}.`);
+              return;
+            }
+            core.setFailed(describeProblems(result.problems));
+
       - name: Dependabot fast-track passthrough
         if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track == 'true' }}
         run: echo "Single-commit Dependabot bump fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."

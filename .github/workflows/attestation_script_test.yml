@@ -24,6 +24,9 @@ on:
       - '.github/scripts/fake_github.mjs'
       - '.github/scripts/test_pure_revert.mjs'
       - '.github/scripts/test_trunk_health.mjs'
+      - '.github/scripts/pr_evidence.mjs'
+      - '.github/scripts/test_pr_evidence.mjs'
+      - '.github/scripts/bot_pr_evidence.sh'
   push:
     branches:
       - trunk
@@ -37,6 +40,9 @@ on:
       - '.github/scripts/fake_github.mjs'
       - '.github/scripts/test_pure_revert.mjs'
       - '.github/scripts/test_trunk_health.mjs'
+      - '.github/scripts/pr_evidence.mjs'
+      - '.github/scripts/test_pr_evidence.mjs'
+      - '.github/scripts/bot_pr_evidence.sh'
   workflow_dispatch:
 
 concurrency:
@@ -74,3 +80,7 @@ jobs:
 
       - name: Run Trunk Health tests
         run: node .github/scripts/test_trunk_health.mjs
+
+      # The evidence rule Attestation applies to a PR's description.
+      - name: Run PR evidence tests
+        run: node .github/scripts/test_pr_evidence.mjs

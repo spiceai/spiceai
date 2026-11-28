@@ -32,6 +32,15 @@ jobs:
   run-schema:
     # The service principal's federation policy trusts this environment's subject.
     environment: ci
+    # Runs with the same inputs (ref, Spicepod, spiced commit or the ref's head, and
+    # minimum table count) share a snapshot branch and its PR ("Upload schema
+    # snapshots to branch"), so they run one at a time: two at once could publish
+    # the PR's evidence out of order. The group is the same string the branch key
+    # hashes, so only duplicates share it, and a pending duplicate GitHub replaces
+    # loses nothing.
+    concurrency:
+      group: testoperator-schema-${{ github.ref_name }}|${{ github.event.inputs.spicepod_path }}|${{ github.event.inputs.spiced_commit || github.sha }}|${{ github.event.inputs.min_tables }}
+      cancel-in-progress: false
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
@@ -407,7 +416,10 @@ jobs:
           SLUG="$(printf '%s' '${{ github.ref_name }}/${{ github.event.inputs.spicepod_path }}' \
             | sed -e 's/\.[Yy][Aa][Mm][Ll]$//' -e 's/[^A-Za-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' \
             | tr '[:upper:]' '[:lower:]')"
-          BRANCH_NAME="testoperator-snapshot-update/${SLUG}"
+          # The slug is for reading; the key, a hash of the same inputs the job's
+          # concurrency group names, keeps distinct inputs on distinct branches.
+          SNAPSHOT_KEY="$(printf '%s' "${SNAPSHOT_INPUTS}" | git hash-object --stdin | cut -c1-8)"
+          BRANCH_NAME="testoperator-snapshot-update/${SLUG}-${SNAPSHOT_KEY}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
@@ -452,13 +464,15 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
             echo "Updated the open PR -> ${PR_URL}"
+            # Before the held runs are released below, so Attestation reads the new evidence.
+            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "testoperator run schema ${{ github.event.inputs.spicepod_path }}"
           else
             # Target the branch the run was dispatched on: a release branch's
             # snapshots describe that branch, not trunk. enforce-pull-with-spice, a
             # required check, fails a PR without both a kind/ and an area/ label.
             gh pr create \
               --title "fix: Update schema snapshots for ${{ github.event.inputs.spicepod_path }}" \
-              --body "Updates the schema snapshots for \`${{ github.event.inputs.spicepod_path }}\` on \`${{ github.ref_name }}\`." \
+              --body "$(printf 'Updates the schema snapshots for `%s` on `%s`.\n\n%s' "${{ github.event.inputs.spicepod_path }}" "${{ github.ref_name }}" "$(bash .github/scripts/bot_pr_evidence.sh section "testoperator run schema ${{ github.event.inputs.spicepod_path }}")")" \
               --base "${{ github.ref_name }}" \
               --head "${BRANCH_NAME}" \
               --label kind/bug \
@@ -468,6 +482,7 @@ jobs:
           bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_INPUTS: ${{ github.ref_name }}|${{ github.event.inputs.spicepod_path }}|${{ github.event.inputs.spiced_commit || github.sha }}|${{ github.event.inputs.min_tables }}
           # Never fall back to an interactive prompt; fail fast if auth is rejected.
           GIT_TERMINAL_PROMPT: '0'
           GCM_INTERACTIVE: 'never'
