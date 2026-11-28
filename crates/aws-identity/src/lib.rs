@@ -56,12 +56,14 @@ pub fn apn_app_name() -> &'static AppName {
     &APN_APP_NAME
 }
 
-/// The AWS SDK configuration every AWS component starts from: the behavior version Spice is
-/// tested with, the Spice APN user-agent, and the credential chain every AWS component uses
-/// ([`named_chain::default_named_chain`]) unless the component sets credentials of its own.
+/// The AWS SDK configuration every AWS component starts from: the latest behavior version of
+/// the `aws-config` release in `Cargo.lock`, as the other AWS clients use, so an SDK bump
+/// also moves the behavior version; the Spice APN user-agent; and the credential chain every
+/// AWS component uses ([`named_chain::default_named_chain`]) unless the component sets
+/// credentials of its own.
 pub fn default_aws_config() -> AwsConfigLoader {
     AwsConfigLoader {
-        loader: aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone()),
+        loader: aws_config::defaults(BehaviorVersion::latest()).app_name(APN_APP_NAME.clone()),
         credentials: CredentialsFrom::NamedChain { profile: None },
     }
 }
