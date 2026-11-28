@@ -6,13 +6,6 @@ so `s3://b//a/./c` and `s3://b/a/c` share one cache entry.
 
 from __future__ import annotations
 
-import pathlib
-import sys
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-
-from _harness import record  # noqa: E402
-
 
 def normalize(path: str) -> str:
     scheme, sep, rest = path.partition("://")
