@@ -679,7 +679,9 @@ after the upgrade is committed: `SELECT pg_drop_replication_slot('<name>')`.
 An explicitly configured slot is shared by both copies; rolling back after the
 object-native copy has acknowledged past it forces a full re-read
 (`rebuild_cause=acknowledged_past`). Operator guidance is in
-[PostgreSQL logical replication](../features/postgres-replication.md#leftover-slots-after-upgrading-to-object-native-cayenne).
+[PostgreSQL logical replication](../features/postgres-replication.md#leftover-slots-after-upgrading-to-object-native-cayenne);
+the startup inspect, WARN, and gauges landed in
+[#16917](https://github.com/spiceai/spiceai/pull/16917).
 
 ## Multi-region
 

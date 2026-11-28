@@ -817,8 +817,8 @@ record as the state it covers (decision 1.9):
 copy kept for rollback used an instance-scoped name, so acknowledging the
 object-native copy does not advance that leftover. It stays inactive and retains
 WAL on the source until it is dropped. Startup inspects it, logs a WARN, and
-exposes retained WAL bytes; the drop command and `max_slot_wal_keep_size`
-guidance are in
+exposes retained WAL bytes ([#16917](https://github.com/spiceai/spiceai/pull/16917));
+the drop command and `max_slot_wal_keep_size` guidance are in
 [PostgreSQL logical replication](../features/postgres-replication.md#leftover-slots-after-upgrading-to-object-native-cayenne).
 An explicitly configured `pg_replication_slot` is shared by both copies, so a
 rollback after the object-native copy has acknowledged past it rebuilds with
