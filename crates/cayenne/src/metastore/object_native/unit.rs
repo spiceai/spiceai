@@ -358,6 +358,13 @@ fn consumer_file(consumer: &str) -> String {
     format!("consumer-{slug}-{}", &digest[..16])
 }
 
+/// The log prefix `prefix` was recorded from: a `Path`'s own string, parsed
+/// back as it is rather than encoded again, which would name another object
+/// for a part holding an encoded character.
+fn stored_prefix(prefix: &str) -> Path {
+    Path::parse(prefix).unwrap_or_else(|_| Path::from(prefix))
+}
+
 /// The handoff request beside the lease at `lease`.
 fn request_path(lease: &Path) -> Path {
     let mut parts: Vec<_> = lease.parts().collect();
@@ -476,7 +483,7 @@ impl UnitLease {
             .prefixes
             .lock()
             .iter()
-            .map(|prefix| Path::from(prefix.as_str()))
+            .map(|prefix| stored_prefix(prefix.as_str()))
             .collect();
         prefixes.extend(also.cloned());
         let mut floor = previous;
@@ -649,7 +656,7 @@ impl UnitLease {
         if !self.shared {
             return Ok(true);
         }
-        let path = Path::from(prefix).join("leases").join("writer.json");
+        let path = stored_prefix(prefix).join("leases").join("writer.json");
         let role = self
             .member_lease(prefix)
             .acquire(
@@ -685,9 +692,7 @@ impl UnitLease {
         // Read every lease before taking any, so an instance writing one of
         // the datasets on its own is never left waiting for another.
         for prefix in &prefixes {
-            let path = Path::from(prefix.as_str())
-                .join("leases")
-                .join("writer.json");
+            let path = stored_prefix(prefix).join("leases").join("writer.json");
             let elsewhere = self
                 .member_lease(prefix)
                 .held_elsewhere(self.store.as_ref(), &path)
@@ -722,9 +727,7 @@ impl UnitLease {
             .map(|(prefix, lease)| (prefix.clone(), lease.clone()))
             .collect();
         for (prefix, lease) in leases {
-            let path = Path::from(prefix.as_str())
-                .join("leases")
-                .join("writer.json");
+            let path = stored_prefix(&prefix).join("leases").join("writer.json");
             if let Err(error) = lease.release_to(self.store.as_ref(), &path, to).await {
                 tracing::debug!("Failed to hand back writer lease {path}: {error}");
             }
@@ -1093,6 +1096,17 @@ mod tests {
             super::consumer_file("postgres slot orders_slot"),
             "consumer-postgres-slot-orders-slot-9fdd25a64dea6427"
         );
+    }
+
+    /// A recorded prefix names the same object it was recorded from, even when
+    /// a part of it holds a character the path encodes.
+    #[test]
+    fn a_recorded_prefix_names_the_log_it_was_recorded_from() {
+        let prefix = object_store::path::Path::from("cayenne/v1")
+            .join("datasets")
+            .join("orders%2025-0193");
+        assert_eq!(super::stored_prefix(prefix.as_ref()), prefix);
+        assert_ne!(object_store::path::Path::from(prefix.as_ref()), prefix);
     }
 
     /// A store whose version is a hash of the content would give a repeated
