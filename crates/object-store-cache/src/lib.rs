@@ -59,8 +59,8 @@ pub mod testing {
     #[cfg(unix)]
     pub use crate::block_store::slab::SlabStore;
     pub use crate::block_store::{
-        BlockHeat, BlockKey, BlockStore, Digest, ObjectInfo, ObjectKey, Reclaimed, StoreCounters,
-        StoredMeta,
+        BlockHeat, BlockKey, BlockStore, Digest, ObjectInfo, ObjectKey, Parts, PartsError,
+        Reclaimed, StoreCounters, StoredMeta,
     };
     pub use crate::node_cache::{Tuning, open_with, with_block_store};
     pub use crate::volume::Reserve;

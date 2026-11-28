@@ -27,7 +27,9 @@ pub(crate) mod objects;
 pub(crate) mod slab;
 
 use std::fmt::Debug;
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -272,6 +274,32 @@ pub struct Reclaimed {
     pub error: Option<crate::Error>,
 }
 
+/// What one [`BlockStore::get_parts`] call read.
+#[derive(Debug, Default)]
+pub struct Parts {
+    /// One entry per requested part, in request order: the verified bytes,
+    /// or `None` for a block that is not resident, did not verify (and was
+    /// dropped), was asked for an empty or out-of-range part, or was in a
+    /// read that failed.
+    pub found: Vec<Option<Bytes>>,
+    /// The errors of the call: reads that failed, each with the number of
+    /// parts it left `None`, and removals of corrupt entries that could not
+    /// be made durable (zero parts).
+    pub errors: Vec<PartsError>,
+    /// The longest any one disk read of the call took. A call coalesces
+    /// adjacent blocks into one read and runs independent reads at once, so
+    /// this, not the call's duration, is what a slow disk shows in.
+    pub slowest_read: Duration,
+}
+
+/// One error of a [`BlockStore::get_parts`] call.
+#[derive(Debug)]
+pub struct PartsError {
+    /// Parts the error left unread.
+    pub parts: usize,
+    pub error: crate::Error,
+}
+
 /// Counters every store reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StoreCounters {
@@ -298,8 +326,16 @@ pub trait BlockStore: Send + Sync + Debug {
     /// belongs to. Returns once the entry is written.
     async fn put(&self, key: &BlockKey, bytes: Bytes, meta: &StoredMeta) -> Result<()>;
 
-    /// The block's bytes, verified, or `None`.
+    /// The block's bytes, verified, or `None`. The entry is returned at the
+    /// length it was stored with; [`BlockStore::get_parts`] also checks that
+    /// length against the key.
     async fn get(&self, key: &BlockKey) -> Result<Option<Bytes>>;
+
+    /// For each `(key, part)`, the bytes of `part` of the block, verified
+    /// chunk by chunk, in input order. An entry whose length is not the
+    /// key's block length is corrupt and dropped. A failed read leaves only
+    /// its own parts unread; parts that verified are still returned.
+    async fn get_parts(&self, reads: &[(BlockKey, Range<u64>)]) -> Parts;
 
     /// True when the index lists the block. Reads nothing from disk, so the
     /// block may still fail verification on `get`.

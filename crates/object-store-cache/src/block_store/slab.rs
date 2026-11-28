@@ -72,10 +72,12 @@ limitations under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
+use std::ops::Range;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -85,8 +87,8 @@ use snafu::{OptionExt, ResultExt, ensure};
 use super::codec::{self, HEADER_LEN, entry_len};
 use super::objects::Objects;
 use super::{
-    BlockHeat, BlockKey, BlockStore, Digest, ObjectInfo, ObjectKey, Reclaimed, StoreCounters,
-    StoredMeta,
+    BlockHeat, BlockKey, BlockStore, Digest, ObjectInfo, ObjectKey, Parts, PartsError, Reclaimed,
+    StoreCounters, StoredMeta,
 };
 use crate::Result;
 use crate::error::{BlockTooLargeSnafu, IoSnafu, JoinSnafu, NoSlabIdSnafu};
@@ -98,7 +100,16 @@ const OPEN_CONCURRENCY: usize = 8;
 /// Open slab descriptors kept.
 const FD_CACHE: usize = 512;
 const IDX_MAGIC: [u8; 4] = *b"OSCI";
-const IDX_VERSION: u16 = 3;
+const IDX_VERSION: u16 = 4;
+/// Buffers at most this large are kept for cache-hit reads.
+const READ_BUFFER_LEN: usize = 2 << 20;
+/// The open path already limits disk work to `OPEN_CONCURRENCY`; retaining
+/// twice that many read buffers caps idle pool memory at 32 MiB. Concurrent
+/// reads past the cap allocate temporary buffers that are dropped on return.
+const READ_POOL_BUFFERS: usize = OPEN_CONCURRENCY * 2;
+/// Most blocking tasks one `get_parts` call spreads its independent reads
+/// over.
+const READ_TASKS: usize = 16;
 /// Digest, offset, data length, object ordinal.
 const IDX_ENTRY: usize = 16 + 8 + 4 + 4;
 /// Offset and its CRC32C.
@@ -260,6 +271,80 @@ struct Completed {
     ready: ReadyIdx,
 }
 
+#[derive(Debug, Default)]
+struct ReadBufferPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl ReadBufferPool {
+    /// A buffer holding at least `len` bytes. Pooled buffers are zeroed once
+    /// when allocated and reused as they are: a read overwrites `0..len`, and
+    /// only that prefix is ever exposed.
+    fn take(self: &Arc<Self>, len: usize) -> ReadBuffer {
+        if len <= READ_BUFFER_LEN {
+            let bytes = self
+                .buffers
+                .lock()
+                .pop()
+                .unwrap_or_else(|| vec![0u8; READ_BUFFER_LEN]);
+            return ReadBuffer {
+                bytes,
+                len,
+                pool: Some(Arc::clone(self)),
+            };
+        }
+        ReadBuffer {
+            bytes: vec![0u8; len],
+            len,
+            pool: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.buffers.lock().len()
+    }
+}
+
+/// A read buffer whose storage returns to its pool only when the last
+/// [`Bytes`] slice backed by it is dropped.
+struct ReadBuffer {
+    bytes: Vec<u8>,
+    /// The prefix of `bytes` the last read filled.
+    len: usize,
+    pool: Option<Arc<ReadBufferPool>>,
+}
+
+impl ReadBuffer {
+    fn into_bytes(mut self) -> Bytes {
+        if self.pool.is_some() {
+            Bytes::from_owner(self)
+        } else {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            bytes.truncate(self.len);
+            Bytes::from(bytes)
+        }
+    }
+}
+
+impl AsRef<[u8]> for ReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Drop for ReadBuffer {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
+        let mut buffers = pool.buffers.lock();
+        if buffers.len() < READ_POOL_BUFFERS {
+            buffers.push(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
 /// Locks are taken in the order `slabs`, `index`, `objects`: none is taken
 /// while one after it is held. `fds` and `tombstones` are taken with none of
 /// the others held.
@@ -273,6 +358,7 @@ pub struct SlabStore {
     objects: Arc<Mutex<Objects>>,
     slabs: Arc<Mutex<Slabs>>,
     fds: Arc<Mutex<HashMap<u32, Arc<File>>>>,
+    read_pool: Arc<ReadBufferPool>,
     /// Held across each batch of tombstone appends, so an append that finds
     /// a slab's `.del` already there knows the append that created it synced
     /// its directory entry.
@@ -451,7 +537,7 @@ pub(crate) fn owner_dir(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-/// The `.idx` format (version 3), little-endian:
+/// The `.idx` format (version 4), little-endian:
 ///
 /// ```text
 /// magic "OSCI", version u16, reserved u16, entry count u32, object count u32
@@ -971,6 +1057,7 @@ impl SlabStore {
             objects: Arc::new(Mutex::new(objects)),
             slabs: Arc::new(Mutex::new(slabs)),
             fds: Arc::new(Mutex::new(HashMap::new())),
+            read_pool: Arc::new(ReadBufferPool::default()),
             tombstones: Arc::new(Mutex::new(())),
             resident: AtomicU64::new(resident),
             disk: Arc::new(AtomicU64::new(disk)),
@@ -1055,15 +1142,6 @@ impl SlabStore {
         }
         self.tombstone(by_slab).await?;
         Ok(bytes)
-    }
-
-    /// [`SlabStore::forget_copy`], made durable.
-    async fn forget_copy_durably(&self, d: &Digest, read: &Loc) -> Result<()> {
-        let Some(loc) = self.forget_copy(d, read) else {
-            return Ok(());
-        };
-        self.tombstone(BTreeMap::from([(loc.slab, vec![loc.offset])]))
-            .await
     }
 
     /// Records tombstones for entries no longer in the index (every slab's
@@ -1436,61 +1514,154 @@ impl SlabStore {
         out
     }
 
-    /// Reads and verifies the copy of block `key` (digest `d`) at `loc`, off
-    /// the async threads. A copy whose slab is gone or cut short is forgotten,
-    /// and a corrupt one is tombstoned, each only while the index still lists
-    /// that copy.
-    async fn get_copy(&self, key: &BlockKey, d: &Digest, loc: Loc) -> Result<Option<Bytes>> {
-        enum Read {
-            Gone,
-            Corrupt,
-            Verified(Bytes),
+    /// Reads and verifies the copy of block `key` (digest `d`) at `loc`,
+    /// which must be `expected` bytes long, off the async threads. A copy
+    /// whose slab is gone or cut short is forgotten, and a corrupt one is
+    /// tombstoned, each only while the index still lists that copy.
+    async fn get_copy(
+        &self,
+        key: &BlockKey,
+        d: &Digest,
+        loc: Loc,
+        expected: u64,
+    ) -> Result<Option<Bytes>> {
+        let part = 0..usize::try_from(expected).unwrap_or(usize::MAX);
+        let mut parts = self
+            .read_wanted(1, vec![Wanted::new(0, key, *d, loc, part, expected)])
+            .await;
+        if let Some(failed) = parts.errors.into_iter().next() {
+            return Err(failed.error);
         }
-        let slab = loc.slab;
-        let fds = Arc::clone(&self.fds);
-        let root = self.root.clone();
-        let enc = key.encode();
-        let at = loc.clone();
-        let read = tokio::task::spawn_blocking(move || -> std::io::Result<Read> {
-            let file = match open_slab(&fds, &root, at.slab, false) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Read::Gone),
-                Err(e) => return Err(e),
-            };
-            let mut buf = vec![0u8; HEADER_LEN + at.data_len as usize];
-            match file.read_exact_at(&mut buf, at.offset) {
-                Ok(()) if codec::verify_entry(&buf, &enc) => {
-                    let mut data = Bytes::from(buf);
-                    Ok(Read::Verified(data.split_off(HEADER_LEN)))
+        Ok(parts.found.pop().flatten())
+    }
+
+    async fn get_parts_impl(&self, reads: &[(BlockKey, Range<u64>)]) -> Parts {
+        let located: Vec<Option<(Digest, Loc)>> = {
+            let index = self.index.read();
+            reads
+                .iter()
+                .map(|(key, part)| {
+                    // An empty part is a caller error, never a reason to read.
+                    if part.start >= part.end {
+                        return None;
+                    }
+                    let digest = key.digest();
+                    index.get(&digest).map(|loc| (digest, loc.clone()))
+                })
+                .collect()
+        };
+        let wanted = reads
+            .iter()
+            .zip(located)
+            .enumerate()
+            .filter_map(|(pos, ((key, part), located))| {
+                let (digest, loc) = located?;
+                let part = usize::try_from(part.start).ok()?..usize::try_from(part.end).ok()?;
+                Some(Wanted::new(pos, key, digest, loc, part, expected_len(key)))
+            })
+            .collect();
+        self.read_wanted(reads.len(), wanted).await
+    }
+
+    /// Reads the `wanted` parts (positions below `n`) and settles what the
+    /// reads found: copies whose slab is gone are forgotten, and corrupt ones
+    /// are tombstoned together, in one durable write per slab.
+    async fn read_wanted(&self, n: usize, wanted: Vec<Wanted>) -> Parts {
+        let mut parts = Parts {
+            found: vec![None; n],
+            ..Parts::default()
+        };
+        let mut corrupt = Vec::new();
+        let mut plans = Vec::with_capacity(wanted.len());
+        for w in wanted {
+            match w.plan() {
+                Planned::Read(plan) => plans.push(plan),
+                Planned::Corrupt(digest, loc) => corrupt.push((digest, loc)),
+                Planned::Invalid => {}
+            }
+        }
+        for run in self.read_runs(coalesce(plans)).await {
+            parts.slowest_read = parts.slowest_read.max(run.took);
+            match run.read {
+                Ok(reads) => {
+                    for (plan, read) in run.plans.into_iter().zip(reads) {
+                        match read {
+                            PartRead::Verified(bytes) => parts.found[plan.pos] = Some(bytes),
+                            PartRead::Gone => {
+                                self.forget_copy(&plan.digest, &plan.loc);
+                            }
+                            PartRead::Corrupt => corrupt.push((plan.digest, plan.loc)),
+                        }
+                    }
                 }
-                // A slab cut short reads as a corrupt entry.
-                Ok(()) => Ok(Read::Corrupt),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Read::Corrupt),
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .context(JoinSnafu)?
-        .context(IoSnafu {
-            action: "read",
-            path: dat_path(&self.root, slab),
-        })?;
-        match read {
-            Read::Verified(data) => Ok(Some(data)),
-            Read::Gone => {
-                self.forget_copy(d, &loc);
-                Ok(None)
-            }
-            Read::Corrupt => {
-                // Tombstoned as well, so a sealed slab's `.idx` does not list
-                // the entry again after a restart.
-                self.corrupt.fetch_add(1, Ordering::Relaxed);
-                self.corrupt_bytes
-                    .fetch_add(u64::from(loc.data_len), Ordering::Relaxed);
-                self.forget_copy_durably(d, &loc).await?;
-                Ok(None)
+                Err(error) => parts.errors.push(PartsError {
+                    parts: run.parts,
+                    error,
+                }),
             }
         }
+        if let Err(error) = self.forget_corrupt(&corrupt).await {
+            parts.errors.push(PartsError { parts: 0, error });
+        }
+        parts
+    }
+
+    /// Counts and tombstones corrupt copies, each only while the index still
+    /// lists it. Tombstoned, not only forgotten, so a sealed slab's `.idx`
+    /// does not list the entry again after a restart.
+    async fn forget_corrupt(&self, corrupt: &[(Digest, Loc)]) -> Result<()> {
+        let mut by_slab: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+        for (digest, loc) in corrupt {
+            self.corrupt.fetch_add(1, Ordering::Relaxed);
+            self.corrupt_bytes
+                .fetch_add(u64::from(loc.data_len), Ordering::Relaxed);
+            if let Some(forgotten) = self.forget_copy(digest, loc) {
+                by_slab
+                    .entry(forgotten.slab)
+                    .or_default()
+                    .push(forgotten.offset);
+            }
+        }
+        self.tombstone(by_slab).await
+    }
+
+    /// Runs `runs` on at most [`READ_TASKS`] blocking tasks at once, each
+    /// task reading its share of the runs in turn. A run that fails, or whose
+    /// task panicked, fails alone.
+    async fn read_runs(&self, runs: Vec<Vec<PartPlan>>) -> Vec<RunRead> {
+        if runs.is_empty() {
+            return Vec::new();
+        }
+        let per_task = runs.len().div_ceil(READ_TASKS);
+        let mut tasks = Vec::with_capacity(runs.len().div_ceil(per_task));
+        let mut runs = runs.into_iter().peekable();
+        while runs.peek().is_some() {
+            let share: Vec<Vec<PartPlan>> = runs.by_ref().take(per_task).collect();
+            let fds = Arc::clone(&self.fds);
+            let root = self.root.clone();
+            let pool = Arc::clone(&self.read_pool);
+            let parts: usize = share.iter().map(Vec::len).sum();
+            let task = tokio::task::spawn_blocking(move || {
+                share
+                    .into_iter()
+                    .map(|run| read_one_run(&fds, &root, &pool, run))
+                    .collect::<Vec<RunRead>>()
+            });
+            tasks.push(async move { (parts, task.await) });
+        }
+        let mut out = Vec::new();
+        for (parts, joined) in futures::future::join_all(tasks).await {
+            match joined {
+                Ok(reads) => out.extend(reads),
+                Err(source) => out.push(RunRead {
+                    plans: Vec::new(),
+                    parts,
+                    read: Err(crate::Error::Join { source }),
+                    took: Duration::ZERO,
+                }),
+            }
+        }
+        out
     }
 
     async fn persist_idx(&self, ready: ReadyIdx) -> Result<()> {
@@ -1513,6 +1684,268 @@ impl SlabStore {
             path: idx_path(&self.root, id),
         })
     }
+}
+
+/// One requested part of a located copy, before it is checked.
+struct Wanted {
+    pos: usize,
+    enc: Vec<u8>,
+    digest: Digest,
+    loc: Loc,
+    part: Range<usize>,
+    /// The block's length, from its key.
+    expected: u64,
+}
+
+enum Planned {
+    Read(PartPlan),
+    /// The index lists a copy of the wrong length.
+    Corrupt(Digest, Loc),
+    /// A part the block does not hold: a caller error, so not a reason to
+    /// drop the copy.
+    Invalid,
+}
+
+impl Wanted {
+    fn new(
+        pos: usize,
+        key: &BlockKey,
+        digest: Digest,
+        loc: Loc,
+        part: Range<usize>,
+        expected: u64,
+    ) -> Self {
+        Self {
+            pos,
+            enc: key.encode(),
+            digest,
+            loc,
+            part,
+            expected,
+        }
+    }
+
+    /// Checks the part against the block's length before any read, so a
+    /// copy that cannot be read is never coalesced with its neighbours.
+    fn plan(self) -> Planned {
+        if self.part.start > self.part.end || self.part.end as u64 > self.expected {
+            return Planned::Invalid;
+        }
+        if u64::from(self.loc.data_len) != self.expected {
+            return Planned::Corrupt(self.digest, self.loc);
+        }
+        let Some(covering) = codec::covering(self.loc.data_len as usize, &self.part) else {
+            return Planned::Invalid;
+        };
+        Planned::Read(PartPlan {
+            pos: self.pos,
+            enc: self.enc,
+            digest: self.digest,
+            loc: self.loc,
+            part: self.part,
+            covering,
+        })
+    }
+}
+
+/// A checked part read: `part` lies within the copy at `loc`, whose length
+/// is the block's, and `covering` is its chunk-aligned range.
+struct PartPlan {
+    pos: usize,
+    enc: Vec<u8>,
+    digest: Digest,
+    loc: Loc,
+    part: Range<usize>,
+    covering: Range<usize>,
+}
+
+enum PartRead {
+    Gone,
+    Corrupt,
+    Verified(Bytes),
+}
+
+/// What one run's read found, one result per plan, and how long it took.
+struct RunRead {
+    plans: Vec<PartPlan>,
+    /// The parts the run covers. A task that panicked reports its runs as
+    /// one, with their plans lost.
+    parts: usize,
+    read: Result<Vec<PartRead>>,
+    took: Duration,
+}
+
+/// Groups plans, in order, into runs of adjacent entries of one slab, each
+/// read with one spanning read.
+fn coalesce(plans: Vec<PartPlan>) -> Vec<Vec<PartPlan>> {
+    let mut runs: Vec<Vec<PartPlan>> = Vec::new();
+    for plan in plans {
+        if let Some(run) = runs.last_mut()
+            && let Some(previous) = run.last()
+            && previous.pos + 1 == plan.pos
+            && previous.loc.slab == plan.loc.slab
+            && previous.loc.offset + entry_len(u64::from(previous.loc.data_len)) == plan.loc.offset
+        {
+            run.push(plan);
+        } else {
+            runs.push(vec![plan]);
+        }
+    }
+    runs
+}
+
+fn read_one_run(
+    fds: &Mutex<HashMap<u32, Arc<File>>>,
+    root: &Path,
+    pool: &Arc<ReadBufferPool>,
+    run: Vec<PartPlan>,
+) -> RunRead {
+    let started = Instant::now();
+    let Some(slab) = run.first().map(|plan| plan.loc.slab) else {
+        return RunRead {
+            plans: run,
+            parts: 0,
+            read: Ok(Vec::new()),
+            took: Duration::ZERO,
+        };
+    };
+    let read = match open_slab(fds, root, slab, false) {
+        Ok(file) => read_run(&file, pool, &run),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(run.iter().map(|_| PartRead::Gone).collect())
+        }
+        Err(e) => Err(e),
+    };
+    RunRead {
+        parts: run.len(),
+        read: read.context(IoSnafu {
+            action: "read",
+            path: dat_path(root, slab),
+        }),
+        plans: run,
+        took: started.elapsed(),
+    }
+}
+
+fn expected_len(key: &BlockKey) -> u64 {
+    let start = key.index.saturating_mul(key.block_size);
+    start.saturating_add(key.block_size).min(key.object_size) - start.min(key.object_size)
+}
+
+fn read_buffer(
+    file: &File,
+    pool: &Arc<ReadBufferPool>,
+    len: usize,
+    offset: u64,
+) -> std::io::Result<Option<ReadBuffer>> {
+    let mut buffer = pool.take(len);
+    match file.read_exact_at(&mut buffer.bytes[..len], offset) {
+        Ok(()) => Ok(Some(buffer)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads adjacent entries with a header read followed by one read spanning
+/// only the chunks that cover their requested parts. Every returned
+/// slice is backed by that spanning buffer and keeps it out of the pool.
+/// Each entry is verified on its own, so one that does not verify leaves its
+/// neighbours' results intact.
+fn read_run(
+    file: &File,
+    pool: &Arc<ReadBufferPool>,
+    run: &[PartPlan],
+) -> std::io::Result<Vec<PartRead>> {
+    let (Some(first), Some(last)) = (run.first(), run.last()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut first_page = [0u8; HEADER_LEN];
+    match file.read_exact_at(&mut first_page, first.loc.offset) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && run.len() > 1 => {
+            return read_separately(file, pool, run);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(vec![PartRead::Corrupt]);
+        }
+        Err(e) => return Err(e),
+    }
+    let region_start = first
+        .loc
+        .offset
+        .checked_add(HEADER_LEN as u64)
+        .and_then(|at| at.checked_add(first.covering.start as u64))
+        .ok_or_else(|| std::io::Error::other("read offset is out of range"))?;
+    let region_end = last
+        .loc
+        .offset
+        .checked_add(HEADER_LEN as u64)
+        .and_then(|at| at.checked_add(last.covering.end as u64))
+        .ok_or_else(|| std::io::Error::other("read offset is out of range"))?;
+    let region_len = usize::try_from(region_end.saturating_sub(region_start))
+        .map_err(|_| std::io::Error::other("read length is out of range"))?;
+    let Some(buffer) = read_buffer(file, pool, region_len, region_start)? else {
+        if run.len() > 1 {
+            return read_separately(file, pool, run);
+        }
+        return Ok(vec![PartRead::Corrupt]);
+    };
+    let region = buffer.into_bytes();
+    Ok(run
+        .iter()
+        .enumerate()
+        .map(|(index, plan)| {
+            let page = if index == 0 {
+                Some(&first_page[..])
+            } else {
+                plan.loc
+                    .offset
+                    .checked_sub(region_start)
+                    .and_then(|at| usize::try_from(at).ok())
+                    .and_then(|start| region.get(start..start.checked_add(HEADER_LEN)?))
+            };
+            page.and_then(|page| verified_part(page, &region, region_start, plan))
+                .map_or(PartRead::Corrupt, PartRead::Verified)
+        })
+        .collect())
+}
+
+/// The requested part of `plan`'s entry, whose header page is `page` and
+/// whose covering chunks lie in `region` (read from slab offset
+/// `region_start`), when the header and those chunks verify.
+fn verified_part(page: &[u8], region: &Bytes, region_start: u64, plan: &PartPlan) -> Option<Bytes> {
+    let header = codec::decode_header(page)?;
+    if header.data_len != plan.loc.data_len as usize {
+        return None;
+    }
+    let data_start = plan
+        .loc
+        .offset
+        .checked_add(HEADER_LEN as u64)?
+        .checked_add(plan.covering.start as u64)?
+        .checked_sub(region_start)
+        .and_then(|at| usize::try_from(at).ok())?;
+    let data = region.get(data_start..data_start.checked_add(plan.covering.len())?)?;
+    if !codec::verify_part(page, &header, &plan.enc, &plan.covering, data) {
+        return None;
+    }
+    let from = data_start + plan.part.start - plan.covering.start;
+    let to = from.checked_add(plan.part.len())?;
+    (to <= region.len()).then(|| region.slice(from..to))
+}
+
+fn read_separately(
+    file: &File,
+    pool: &Arc<ReadBufferPool>,
+    run: &[PartPlan],
+) -> std::io::Result<Vec<PartRead>> {
+    let mut out = Vec::with_capacity(run.len());
+    for plan in run {
+        let mut read = read_run(file, pool, std::slice::from_ref(plan))?;
+        out.push(read.pop().unwrap_or(PartRead::Corrupt));
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -1620,7 +2053,12 @@ impl BlockStore for SlabStore {
         let Some(loc) = self.index.read().get(&d).cloned() else {
             return Ok(None);
         };
-        self.get_copy(key, &d, loc).await
+        let stored = u64::from(loc.data_len);
+        self.get_copy(key, &d, loc, stored).await
+    }
+
+    async fn get_parts(&self, reads: &[(BlockKey, Range<u64>)]) -> Parts {
+        self.get_parts_impl(reads).await
     }
 
     async fn remove(&self, key: &BlockKey) -> Result<()> {
@@ -1767,6 +2205,11 @@ impl BlockStore for SlabStore {
 mod tests {
     use super::*;
 
+    /// The lengths of `found`, which print far shorter than the bytes.
+    fn lens(found: &[Option<Bytes>]) -> Vec<Option<usize>> {
+        found.iter().map(|b| b.as_ref().map(Bytes::len)).collect()
+    }
+
     fn key(i: u64) -> BlockKey {
         BlockKey {
             store: "s3://bucket/".to_string(),
@@ -1775,6 +2218,218 @@ mod tests {
             block_size: 1 << 20,
             index: i,
         }
+    }
+
+    /// Block 0 of a 2 MiB object stored at 512 KiB instead of 1 MiB, then a
+    /// valid block 1 right after it in the same slab: a read of both drops
+    /// only block 0, durably, and serves block 1.
+    #[tokio::test]
+    async fn wrong_length_entry_does_not_poison_an_adjacent_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SlabStore::open(tmp.path(), 8 << 20).await.expect("open");
+        let block = |index| BlockKey {
+            object_size: 2 << 20,
+            ..key(index)
+        };
+        let (first, second) = (block(0), block(1));
+        let valid = Bytes::from(
+            (0..1 << 20)
+                .map(|i| u8::try_from(i % 241).expect("byte"))
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(
+                &first,
+                Bytes::from(vec![0x51; 512 << 10]),
+                &StoredMeta::NONE,
+            )
+            .await
+            .expect("put short entry");
+        store
+            .put(&second, valid.clone(), &StoredMeta::NONE)
+            .await
+            .expect("put valid entry");
+        let (a, b) = {
+            let index = store.index.read();
+            let a = index.get(&first.digest()).cloned().expect("first listed");
+            let b = index.get(&second.digest()).cloned().expect("second listed");
+            (a, b)
+        };
+        assert_eq!(a.slab, b.slab, "both entries are in one slab");
+        assert_eq!(
+            a.offset + entry_len(u64::from(a.data_len)),
+            b.offset,
+            "the entries are adjacent"
+        );
+
+        let parts = store
+            .get_parts(&[(first.clone(), 0..1 << 20), (second.clone(), 0..1 << 20)])
+            .await;
+
+        assert!(parts.errors.is_empty(), "{:?}", parts.errors);
+        assert_eq!(lens(&parts.found), vec![None, Some(1 << 20)]);
+        assert!(
+            parts.found[1] == Some(valid.clone()),
+            "block 1 bytes differ"
+        );
+        assert_eq!(store.counters().corrupt_reads, 1);
+        assert!(!store.contains(&first));
+        assert!(store.contains(&second));
+        store.close().await.expect("close");
+        drop(store);
+        let reopened = SlabStore::open(tmp.path(), 8 << 20).await.expect("reopen");
+        assert!(!reopened.contains(&first), "the short entry came back");
+        let found = reopened.get_parts(&[(second, 0..1 << 20)]).await.found;
+        assert!(found == vec![Some(valid)], "block 1 after reopen");
+    }
+
+    /// A run whose slab cannot be opened fails alone: the other run's part is
+    /// still returned, the error names the failed slab, and nothing is
+    /// dropped.
+    #[tokio::test]
+    async fn failed_run_does_not_fail_other_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // One 1 MiB entry per slab.
+        let store = SlabStore::open(tmp.path(), (1 << 20) + 8192)
+            .await
+            .expect("open");
+        let bytes = Bytes::from(
+            (0..1 << 20)
+                .map(|i| u8::try_from(i % 233).expect("byte"))
+                .collect::<Vec<_>>(),
+        );
+        let (bad, good) = (key(0), key(1));
+        for k in [&bad, &good] {
+            store
+                .put(k, bytes.clone(), &StoredMeta::NONE)
+                .await
+                .expect("put");
+        }
+        let slab_of = |k: &BlockKey| store.index.read().get(&k.digest()).expect("listed").slab;
+        let (bad_slab, good_slab) = (slab_of(&bad), slab_of(&good));
+        assert_ne!(bad_slab, good_slab, "the entries are in two slabs");
+        // A directory where the slab file was: opening it fails, and not
+        // as a missing file.
+        store.fds.lock().remove(&bad_slab);
+        let bad_path = dat_path(&store.root, bad_slab);
+        std::fs::rename(&bad_path, tmp.path().join("moved.dat")).expect("move slab");
+        std::fs::create_dir(&bad_path).expect("dir in place of slab");
+
+        let parts = store
+            .get_parts(&[(bad.clone(), 0..4096), (good.clone(), 4096..8192)])
+            .await;
+
+        assert_eq!(lens(&parts.found), vec![None, Some(4096)]);
+        assert!(
+            parts.found[1] == Some(bytes.slice(4096..8192)),
+            "good bytes"
+        );
+        assert_eq!(parts.errors.len(), 1, "{:?}", parts.errors);
+        assert_eq!(parts.errors[0].parts, 1);
+        let message = parts.errors[0].error.to_string();
+        assert!(
+            message.contains(&bad_path.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(store.counters().corrupt_reads, 0);
+        assert!(store.contains(&bad), "a failed read dropped the block");
+    }
+
+    /// Empty, inverted and past-the-end parts are caller errors: they read
+    /// nothing and drop nothing, alone or beside a valid part.
+    #[tokio::test]
+    #[expect(
+        clippy::reversed_empty_ranges,
+        reason = "an inverted part is under test"
+    )]
+    async fn invalid_parts_do_not_tombstone_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SlabStore::open(tmp.path(), 8 << 20).await.expect("open");
+        let bytes = Bytes::from(
+            (0..1 << 20)
+                .map(|i| u8::try_from(i % 239).expect("byte"))
+                .collect::<Vec<_>>(),
+        );
+        let keys = [key(0), key(1), key(2)];
+        for k in &keys {
+            store
+                .put(k, bytes.clone(), &StoredMeta::NONE)
+                .await
+                .expect("put");
+        }
+
+        let parts = store
+            .get_parts(&[
+                (keys[0].clone(), 17..17),
+                (keys[1].clone(), 23..11),
+                (keys[2].clone(), 0..(1 << 20) + 1),
+            ])
+            .await;
+        assert!(parts.errors.is_empty(), "{:?}", parts.errors);
+        assert_eq!(lens(&parts.found), vec![None, None, None]);
+        let parts = store
+            .get_parts(&[(keys[0].clone(), 5..5), (keys[1].clone(), 100..200)])
+            .await;
+        assert_eq!(lens(&parts.found), vec![None, Some(100)]);
+        assert!(parts.found[1] == Some(bytes.slice(100..200)), "valid part");
+
+        assert_eq!(store.counters().corrupt_reads, 0);
+        for k in &keys {
+            assert!(store.contains(k));
+            assert_eq!(store.get(k).await.expect("get"), Some(bytes.clone()));
+        }
+        store.close().await.expect("close");
+        drop(store);
+        let reopened = SlabStore::open(tmp.path(), 8 << 20).await.expect("reopen");
+        assert_eq!(reopened.len(), 3, "an invalid part tombstoned an entry");
+    }
+
+    #[tokio::test]
+    async fn returned_bytes_hold_their_read_buffer_out_of_the_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SlabStore::open(tmp.path(), 8 << 20).await.expect("open");
+        let bytes = Bytes::from(
+            (0..1 << 20)
+                .map(|i| u8::try_from(i % 251).expect("byte"))
+                .collect::<Vec<_>>(),
+        );
+        let key = key(0);
+        store
+            .put(&key, bytes.clone(), &StoredMeta::NONE)
+            .await
+            .expect("put");
+
+        let held_range = 123u64..16_507;
+        let held_start = usize::try_from(held_range.start).expect("held start");
+        let held_end = usize::try_from(held_range.end).expect("held end");
+        let mut held = store
+            .get_parts(&[(key.clone(), held_range.clone())])
+            .await
+            .found;
+        let held = held.pop().flatten().expect("resident part");
+        assert_eq!(held, bytes.slice(held_start..held_end));
+        assert_eq!(store.read_pool.available(), 0, "held buffer was pooled");
+
+        for i in 0..READ_POOL_BUFFERS * 4 {
+            let start = (i % 16) * (64 << 10) + (i * 97) % 4096;
+            let end = start + 1024;
+            let range = u64::try_from(start).expect("start")..u64::try_from(end).expect("end");
+            let mut got = store.get_parts(&[(key.clone(), range)]).await.found;
+            let got = got.pop().flatten().expect("resident part");
+            assert_eq!(got, bytes.slice(start..end), "later hit {i}");
+        }
+        assert_eq!(held, bytes.slice(held_start..held_end));
+        assert_eq!(
+            store.read_pool.available(),
+            1,
+            "later hits did not reuse a buffer"
+        );
+        drop(held);
+        assert_eq!(
+            store.read_pool.available(),
+            2,
+            "held buffer was not returned"
+        );
     }
 
     /// A read that looked a block up, then found that copy's slab gone or the
@@ -1810,7 +2465,10 @@ mod tests {
             slab: stale.slab + 1000,
             ..stale.clone()
         };
-        assert_eq!(store.get_copy(&k, &d, gone).await.expect("read"), None);
+        assert_eq!(
+            store.get_copy(&k, &d, gone, 10_000).await.expect("read"),
+            None
+        );
         assert_eq!(store.len(), 1, "a vanished stale copy dropped the block");
 
         // The stale copy is corrupt.
@@ -1825,7 +2483,10 @@ mod tests {
         byte[0] ^= 0xFF;
         file.write_all_at(&byte, at).expect("corrupt byte");
         drop(file);
-        assert_eq!(store.get_copy(&k, &d, stale).await.expect("read"), None);
+        assert_eq!(
+            store.get_copy(&k, &d, stale, 10_000).await.expect("read"),
+            None
+        );
         assert_eq!(
             store.counters().corrupt_reads,
             1,

@@ -19,20 +19,26 @@ limitations under the License.
 //!
 //! ```text
 //! 0..4    magic "OSCB"
-//! 4..6    version (2)
+//! 4..6    version (3)
 //! 6..8    metadata length
-//! 8..12   key length
+//! 8..10   key length
+//! 10      log2 of the chunk size (16 for blocks up to 4 MiB)
+//! 11      zero
 //! 12..16  data length
 //! 16..20  CRC32C of the data
-//! 20..24  CRC32C of bytes 0..20, the key and the metadata
+//! 20..24  CRC32C of bytes 0..20, the key, metadata and chunk table
 //! 24..    key (BlockKey::encode), then the object's metadata
-//!         (StoredMeta::encode), zero padding to 4096
+//!         (StoredMeta::encode), then one little-endian CRC32C for each
+//!         data chunk, then zero padding to 4096. Chunks are 64 KiB for
+//!         blocks up to 4 MiB and grow to keep the table at 64 entries.
 //! 4096..  data
 //! ```
 //!
 //! The metadata lets a rescan (the slab active at a crash has no index)
 //! restore an object's e-tag and modification time. Metadata that does not
-//! fit beside the key is left out.
+//! fit beside the key and mandatory chunk table is left out. The whole-data
+//! CRC lets a rescan verify a complete entry; the chunk table lets a cache
+//! hit read and verify only the chunks that cover its requested range.
 
 use snafu::ensure;
 
@@ -56,8 +62,10 @@ fn crc32c_concat(a: &[u8], b: &[u8]) -> u32 {
 }
 
 pub(crate) const HEADER_LEN: usize = 4096;
+const MIN_CHUNK_LOG2: u8 = 16;
+const MAX_CHUNKS: usize = 64;
 const MAGIC: [u8; 4] = *b"OSCB";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const FIXED: usize = 24;
 pub(crate) const MAX_KEY: usize = HEADER_LEN - FIXED;
 
@@ -79,23 +87,60 @@ pub(crate) struct Header {
     pub meta_len: usize,
     pub data_len: usize,
     pub data_crc: u32,
+    chunk_log2: u8,
+}
+
+fn chunk_log2_for(data_len: usize) -> u8 {
+    let mut log2 = MIN_CHUNK_LOG2;
+    while data_len.div_ceil(1usize << log2) > MAX_CHUNKS {
+        log2 += 1;
+    }
+    log2
+}
+
+fn chunk_count(data_len: usize, chunk_log2: u8) -> usize {
+    data_len.div_ceil(1usize << chunk_log2)
+}
+
+fn chunk_table_len(data_len: usize, chunk_log2: u8) -> Option<usize> {
+    chunk_count(data_len, chunk_log2).checked_mul(std::mem::size_of::<u32>())
+}
+
+/// The chunk-aligned range of an entry of `data_len` bytes that covers
+/// `part`, or `None` when `part` is inverted or ends past the data. An empty
+/// part is accepted, so an empty entry can be read whole.
+pub(crate) fn covering(
+    data_len: usize,
+    part: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    if part.start > part.end || part.end > data_len {
+        return None;
+    }
+    let chunk_len = 1usize << chunk_log2_for(data_len);
+    let start = part.start / chunk_len * chunk_len;
+    let end = part.end.div_ceil(chunk_len).checked_mul(chunk_len)?;
+    Some(start..end.min(data_len))
 }
 
 /// Checks that a key of `key_len` bytes and a block of `data_len` bytes fit
 /// one entry, so [`encode_header`] cannot fail for them.
 pub(crate) fn check_entry(key_len: usize, data_len: usize) -> Result<()> {
     ensure!(
-        key_len <= MAX_KEY,
-        KeyTooLongSnafu {
-            len: key_len,
-            max: MAX_KEY
-        }
-    );
-    ensure!(
         u32::try_from(data_len).is_ok(),
         BlockTooLargeSnafu {
             len: data_len,
             max: u32::MAX as usize,
+        }
+    );
+    let table_len = chunk_table_len(data_len, chunk_log2_for(data_len)).unwrap_or(usize::MAX);
+    let max_key = MAX_KEY.saturating_sub(table_len);
+    ensure!(
+        key_len
+            .checked_add(table_len)
+            .is_some_and(|len| len <= MAX_KEY),
+        KeyTooLongSnafu {
+            len: key_len,
+            max: max_key
         }
     );
     Ok(())
@@ -106,8 +151,15 @@ pub(crate) fn check_entry(key_len: usize, data_len: usize) -> Result<()> {
 pub(crate) fn encode_header(key: &[u8], meta: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     check_entry(key.len(), data.len())?;
     let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
-    let key_len = u32::try_from(key.len()).unwrap_or(u32::MAX);
-    let meta = if key.len() + meta.len() <= MAX_KEY {
+    let key_len = u16::try_from(key.len()).unwrap_or(u16::MAX);
+    let chunk_log2 = chunk_log2_for(data.len());
+    let table_len = chunk_table_len(data.len(), chunk_log2).unwrap_or(usize::MAX);
+    let meta = if key
+        .len()
+        .checked_add(meta.len())
+        .and_then(|len| len.checked_add(table_len))
+        .is_some_and(|len| len <= MAX_KEY)
+    {
         meta
     } else {
         &[]
@@ -118,12 +170,19 @@ pub(crate) fn encode_header(key: &[u8], meta: &[u8], data: &[u8]) -> Result<Vec<
     h[0..4].copy_from_slice(&MAGIC);
     h[4..6].copy_from_slice(&VERSION.to_le_bytes());
     h[6..8].copy_from_slice(&meta_len.to_le_bytes());
-    h[8..12].copy_from_slice(&key_len.to_le_bytes());
+    h[8..10].copy_from_slice(&key_len.to_le_bytes());
+    h[10] = chunk_log2;
     h[12..16].copy_from_slice(&data_len.to_le_bytes());
     h[16..20].copy_from_slice(&crc32c(data).to_le_bytes());
     h[FIXED..FIXED + key.len()].copy_from_slice(key);
     h[FIXED + key.len()..FIXED + key.len() + meta.len()].copy_from_slice(meta);
-    let header_crc = crc32c_concat(&h[0..20], &h[FIXED..FIXED + key.len() + meta.len()]);
+    let table = FIXED + key.len() + meta.len();
+    for (i, chunk) in data.chunks(1usize << chunk_log2).enumerate() {
+        let at = table + i * std::mem::size_of::<u32>();
+        h[at..at + std::mem::size_of::<u32>()].copy_from_slice(&crc32c(chunk).to_le_bytes());
+    }
+    let meaningful = table + table_len;
+    let header_crc = crc32c_concat(&h[0..20], &h[FIXED..meaningful]);
     h[20..24].copy_from_slice(&header_crc.to_le_bytes());
     Ok(h)
 }
@@ -146,27 +205,37 @@ fn u32_at(buf: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b)
 }
 
-/// Parses and checks a header page (magic, version, header CRC). Says nothing
-/// about the data, which [`verify_entry`] checks.
+/// Parses and checks a header page (magic, version, chunk size, header CRC).
+/// Says nothing about the data, which [`verify_part`] checks.
 pub(crate) fn decode_header(page: &[u8]) -> Option<Header> {
     if page.len() < HEADER_LEN || page[0..4] != MAGIC {
         return None;
     }
     let version = u16::from_le_bytes([page[4], page[5]]);
     let meta_len = usize::from(u16::from_le_bytes([page[6], page[7]]));
-    let key_len = u32_at(page, 8) as usize;
-    if version != VERSION || key_len + meta_len > MAX_KEY {
+    let key_len = usize::from(u16::from_le_bytes([page[8], page[9]]));
+    let chunk_log2 = page[10];
+    let data_len = u32_at(page, 12) as usize;
+    // One chunk size per data length, so a reader can compute the covering
+    // chunks from the length alone.
+    if version != VERSION || page[11] != 0 || chunk_log2 != chunk_log2_for(data_len) {
         return None;
     }
-    let crc = crc32c_concat(&page[0..20], &page[FIXED..FIXED + key_len + meta_len]);
+    let table_len = chunk_table_len(data_len, chunk_log2)?;
+    let meaningful = key_len.checked_add(meta_len)?.checked_add(table_len)?;
+    if meaningful > MAX_KEY {
+        return None;
+    }
+    let crc = crc32c_concat(&page[0..20], &page[FIXED..FIXED + meaningful]);
     if crc != u32_at(page, 20) {
         return None;
     }
     Some(Header {
         key_len,
         meta_len,
-        data_len: u32_at(page, 12) as usize,
+        data_len,
         data_crc: u32_at(page, 16),
+        chunk_log2,
     })
 }
 
@@ -181,24 +250,45 @@ pub(crate) fn header_meta<'a>(page: &'a [u8], header: &Header) -> &'a [u8] {
     &page[FIXED + header.key_len..FIXED + header.key_len + header.meta_len]
 }
 
-/// True when `entry` (the header page followed by exactly the data) holds
-/// `key` and data whose length and CRC32C match its header.
-pub(crate) fn verify_entry(entry: &[u8], key: &[u8]) -> bool {
-    let Some(h) = decode_header(entry) else {
-        return false;
-    };
-    if h.key_len != key.len()
-        || entry[FIXED..FIXED + h.key_len] != *key
-        || entry.len() != HEADER_LEN + h.data_len
+/// True when `page` names `key` and every chunk in `data` matches the chunk
+/// table for the chunk-aligned `covering` range.
+pub(crate) fn verify_part(
+    page: &[u8],
+    header: &Header,
+    key: &[u8],
+    covering: &std::ops::Range<usize>,
+    data: &[u8],
+) -> bool {
+    if header.key_len != key.len()
+        || page[FIXED..FIXED + header.key_len] != *key
+        || !covering.start.is_multiple_of(1usize << header.chunk_log2)
+        || covering.end > header.data_len
+        || data.len() != covering.end.saturating_sub(covering.start)
     {
         return false;
     }
-    crc32c(&entry[HEADER_LEN..]) == h.data_crc
+    let table = FIXED + header.key_len + header.meta_len;
+    let chunk_len = 1usize << header.chunk_log2;
+    let first = covering.start / chunk_len;
+    data.chunks(chunk_len).enumerate().all(|(i, chunk)| {
+        let at = table + (first + i) * std::mem::size_of::<u32>();
+        at.checked_add(std::mem::size_of::<u32>())
+            .is_some_and(|end| end <= HEADER_LEN && crc32c(chunk) == u32_at(page, at))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True when `entry` (the header page followed by exactly the data) holds
+    /// `key` and every data chunk matches the chunk table.
+    fn verify_entry(entry: &[u8], key: &[u8]) -> bool {
+        decode_header(entry).is_some_and(|h| {
+            entry.len() == HEADER_LEN + h.data_len
+                && verify_part(entry, &h, key, &(0..h.data_len), &entry[HEADER_LEN..])
+        })
+    }
 
     #[test]
     fn checksums_are_crc32c() {
@@ -209,6 +299,17 @@ mod tests {
         assert_eq!(crc32c_concat(b"", b""), 0);
         // RFC 3720 (iSCSI) B.4 test vector: 32 bytes of zeros.
         assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
+    }
+
+    #[test]
+    fn decode_rejects_a_noncanonical_chunk_size() {
+        let mut header = encode_header(b"key", &[], &[0x5A; 10_000]).expect("header");
+        header[10] += 1;
+        let meaningful = FIXED + 3 + std::mem::size_of::<u32>();
+        let crc = crc32c_concat(&header[0..20], &header[FIXED..meaningful]);
+        header[20..24].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(decode_header(&header), None);
     }
 
     #[test]
@@ -232,7 +333,11 @@ mod tests {
         assert!(!verify_entry(&entry, b"store/path/1/2/4"));
         // Every byte of the meaningful header (metadata included) and a
         // sample of data bytes.
-        let positions: Vec<usize> = (0..FIXED + key.len() + meta_bytes.len())
+        let meaningful = FIXED
+            + key.len()
+            + meta_bytes.len()
+            + chunk_table_len(data.len(), chunk_log2_for(data.len())).expect("chunk table");
+        let positions: Vec<usize> = (0..meaningful)
             .chain((HEADER_LEN..entry.len()).step_by(97))
             .collect();
         for at in positions {

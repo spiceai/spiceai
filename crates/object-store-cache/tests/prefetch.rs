@@ -958,9 +958,10 @@ async fn omitted_metadata_is_asked_of_the_store() {
     // cache.
     let store = Arc::new(TestStore::default());
     // key = 8 + store URL + 8 + path + 24 bytes; the header holds 4072 bytes
-    // of key and metadata, and the metadata here takes 16.
+    // of key, metadata and the 64-byte chunk table, and the metadata here
+    // takes 16.
     let key_overhead = 8 + BUCKET.len() + 8 + 24;
-    let path_len = 4072 - 4 - key_overhead;
+    let path_len = 4072 - 64 - 4 - key_overhead;
     let p = Path::from(format!("t/{}", "x".repeat(path_len - 2)));
     assert_eq!(p.as_ref().len(), path_len);
     let obj = data(52, 3 * MIB);

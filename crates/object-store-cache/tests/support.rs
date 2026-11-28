@@ -18,15 +18,17 @@ limitations under the License.
 //! injectable faults, a volume with plenty of room, polling, and reclaiming
 //! one slab at a time.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store_cache::testing::{
-    BlockHeat, BlockKey, BlockStore, ObjectInfo, ObjectKey, Reclaimed, StoreCounters, StoredMeta,
+    BlockHeat, BlockKey, BlockStore, ObjectInfo, ObjectKey, Parts, PartsError, Reclaimed,
+    StoreCounters, StoredMeta,
 };
 use object_store_cache::{Error, Space, VolumeSpace};
 use tokio::sync::Notify;
@@ -36,8 +38,9 @@ use tokio::sync::Notify;
 ///
 /// - each `put` waits `put_delay` first, and, while `gate_puts` is set,
 ///   signals `put_started` and waits for `release_puts`;
-/// - each `get` waits `get_delay` first while `slow_gets` is set, and fails
-///   with an I/O error while `fail_gets` is set;
+/// - each `get` and `get_parts` call waits `get_delay` first while
+///   `slow_gets` is set (a `get_parts` call reports that wait as its slowest
+///   read), and fails with an I/O error while `fail_gets` is set;
 /// - `remove_objects` fails, removing nothing, while `fail_remove` is set.
 #[derive(Debug)]
 pub(crate) struct FaultStore {
@@ -119,6 +122,28 @@ impl BlockStore for FaultStore {
             return Err(injected("read", "slabs/slab-00000000.dat", "read"));
         }
         self.inner.get(key).await
+    }
+    async fn get_parts(&self, reads: &[(BlockKey, Range<u64>)]) -> Parts {
+        let started = Instant::now();
+        let slow = self.slow_gets.load(Ordering::SeqCst);
+        if slow {
+            tokio::time::sleep(self.get_delay).await;
+        }
+        if self.fail_gets.load(Ordering::SeqCst) {
+            return Parts {
+                found: vec![None; reads.len()],
+                errors: vec![PartsError {
+                    parts: reads.len(),
+                    error: injected("read", "slabs/slab-00000000.dat", "read"),
+                }],
+                slowest_read: started.elapsed(),
+            };
+        }
+        let mut parts = self.inner.get_parts(reads).await;
+        if slow {
+            parts.slowest_read = parts.slowest_read.max(started.elapsed());
+        }
+        parts
     }
     fn contains(&self, key: &BlockKey) -> bool {
         self.inner.contains(key)

@@ -420,19 +420,19 @@ async fn restart_keeps_entries() {
         u16::from_le_bytes([b[4], b[5]])
     };
     // Round 0: the slab active when the cache was dropped has no index and is
-    // rescanned (and its index written). Round 1: that index (version 3)
+    // rescanned (and its index written). Round 1: that index (version 4)
     // alone.
     for round in 0..2 {
         if round == 0 {
             assert!(!idx.exists(), "no index before the first restart");
         } else {
-            assert_eq!(idx_version(&idx), 3);
+            assert_eq!(idx_version(&idx), 4);
         }
         let (gets, heads) = (store.gets(), store.heads.load(Ordering::SeqCst));
         let cache = open(tmp.path(), 1 << 30, MIB, roomy()).await;
         let cached = wrap(&cache, "s3://bucket/", &store);
         assert_eq!(cache.stats().entries, 5, "round {round}");
-        assert_eq!(idx_version(&idx), 3, "round {round}");
+        assert_eq!(idx_version(&idx), 4, "round {round}");
         let whole = cached.get(&a).await.expect("get");
         assert_eq!(whole.meta.size, 3 * MIB, "round {round}");
         assert_same(

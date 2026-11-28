@@ -82,7 +82,7 @@ then whole files only into free space.
 | **Single flight per block, with a bounded wait** | Two queries reading one block cost one GET. A waiter gives up after 1 s and reads the store itself. |
 | **Entry writes after the read returns** | A slow disk write never delays or fails a query. On the harness, one slow entry write was inside 52 of 54 slow first queries. |
 | **Packed slabs with a per-slab index** | Opening a cache of 1,000,000 entries took 0.10–0.16 s across the index formats measured, against 2.7–2.8 s with one file per block. |
-| **CRC32C on every entry, verified on every read** | A same-length corruption reads as a miss and is refetched, never served. |
+| **CRC32C per 64 KiB chunk, verified on every read** | A hit reads and verifies only the chunks it needs, so a small read costs a small read. A same-length corruption in a chunk that is read reads as a miss and is refetched, never served. |
 | **Durable tombstones that fail closed** | A removed block never returns after a restart. An unreadable tombstone file discards its whole slab. |
 | **A budget that follows free space**, reclaimed by whole slab weighed by a read-frequency sketch | The cache yields when another writer fills the volume, and keeps the slabs whose blocks are read most per byte. |
 | **Reconciliation with committed state** | Retired and dropped files leave the cache; footers of new files arrive before the first query that needs them. |
@@ -278,7 +278,7 @@ A read of bytes `[start, end)` touches blocks `start / 1 MiB` through
 `(end − 1) / 1 MiB`. Block `i` covers `[i × 1 MiB, min((i + 1) × 1 MiB,
 size))`; the last block of an object is short. Products saturate before they
 are capped at the size, so the math is exact for any `u64` size. The read
-returns one buffer per block, sliced to the requested range, without copies.
+returns one slice per block, cut to the requested range, without copies.
 
 ### Claim, look up, fetch
 
@@ -287,9 +287,14 @@ returns one buffer per block, sliced to the requested range, without copies.
 2. **Claim.** Every block is claimed in the process's in-flight map before
    any lookup. A block another read or a prefetch already holds is awaited.
    Query reads count each block in the frequency sketch here.
-3. **Look up.** Claimed blocks are read from the slab store, 16 at once, on
-   blocking threads. Each read verifies the entry's key, length and CRC32C. A
-   hit is handed to readers waiting on the block.
+3. **Look up.** Claimed blocks are read from the slab store in one batch.
+   Entries of the object that sit next to each other in a slab are read with
+   one `pread` of only the 64 KiB chunks that cover the requested range, into
+   a reused 2 MiB buffer from a bounded pool; independent runs go to up to 16
+   blocking threads. Each entry is checked on its own: its header, key and
+   length, and the CRC32C of every chunk read. A corrupt entry is tombstoned
+   alone, and a failed run sends only its own blocks to the store. A hit is
+   handed to readers waiting on the block.
 4. **Fetch.** Missing blocks are grouped into runs of consecutive blocks.
    Each run goes out as one ranged GET of at most 8 MiB, with 16 GETs in
    flight per read. Each GET runs as its own task, so a cancelled query does
@@ -496,17 +501,25 @@ entry.
 | Bytes | Field |
 |---|---|
 | 0..4 | Magic `OSCB` |
-| 4..6 | Version (2) |
+| 4..6 | Version (3) |
 | 6..8 | Metadata length |
-| 8..12 | Key length |
+| 8..10 | Key length |
+| 10 | Log2 of the chunk size: 16 (64 KiB) for blocks up to 4 MiB, larger so the table holds at most 64 chunks |
+| 11 | Zero |
 | 12..16 | Data length |
 | 16..20 | CRC32C of the data |
-| 20..24 | CRC32C of bytes 0..20, the key and the metadata |
-| 24.. | Canonical key, then the object's metadata (e-tag, modification time), zero padding to 4096 |
+| 20..24 | CRC32C of bytes 0..20, the key, the metadata and the chunk table |
+| 24.. | Canonical key, the object's metadata (e-tag, modification time), one CRC32C per data chunk, zero padding to 4096 |
 | 4096.. | Data, zero padding to a 4 KiB boundary |
 
-Metadata that does not fit beside the key is left out, and the object then
-reads back without a modification time. An e-tag longer than 65,535 bytes is
+A hit verifies only the chunks it reads, so corruption in a chunk that no
+read covers stays undetected and is never served. The whole-data CRC32C is
+what the rescan after a crash verifies. A directory written in an earlier
+entry or index version is not served: its indexes are quarantined and its
+unindexed entries fail to decode.
+
+Metadata that does not fit beside the key and the chunk table is left out, and
+the object then reads back without a modification time. An e-tag longer than 65,535 bytes is
 not stored at all, so the metadata reads as unknown, never as an object with
 no e-tag.
 
@@ -516,7 +529,7 @@ A sealed slab's `.idx` is written once its last reserved write completes: to a
 temporary name, then renamed into place.
 
 ```text
-magic "OSCI", version u16 (3), reserved u16, entry count u32, object count u32
+magic "OSCI", version u16 (4), reserved u16, entry count u32, object count u32
 objects: namespace, path, object size u64, block size u64, metadata
 entries: digest [16], offset u64, data length u32, object ordinal u32
 CRC32C of everything before it
@@ -1032,7 +1045,8 @@ Each invariant names what keeps it.
    namespace and the object size; the full key is compared on read; a fill
    checks the size the store reports.
 2. **Never serve unverified bytes.** Every hit verifies its header, key,
-   length and CRC32C; a rescan lists only entries that verify in full.
+   length and the CRC32C of every chunk it returns; a rescan lists only
+   entries that verify in full.
 3. **A removed block never returns after a restart.** Tombstones are synced
    before removal completes; an unverifiable tombstone file discards its slab;
    older copies of a block are tombstoned at open.

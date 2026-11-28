@@ -176,8 +176,6 @@ const PREFETCH_BACKOFF: Duration = Duration::from_secs(1);
 pub(crate) const MAX_MATERIALIZED_BYTES: u64 = 64 << 20;
 /// A read of more than this fraction of the budget is a scan.
 const SCAN_SHARE: u64 = 8;
-/// Block-store lookups one read issues at once.
-const LOOKUPS_IN_FLIGHT: usize = 16;
 
 /// Where the cache lives and how much it may hold.
 #[derive(Debug, Clone)]
@@ -327,7 +325,6 @@ struct Counters {
     fill_bytes: AtomicU64,
     evicted_size: AtomicU64,
     evicted_unreferenced: AtomicU64,
-    evicted_corrupt: AtomicU64,
     cache_errors: AtomicU64,
     bypass_reads: AtomicU64,
     admission_bypass_reads: AtomicU64,
@@ -345,16 +342,21 @@ fn add(counter: &AtomicU64, n: u64) {
 enum Slot {
     Pending,
     Ready(Bytes),
+    /// The leader read its requested part from a resident block. A waiter
+    /// reads its own part from that block.
+    Resident,
     Failed,
+}
+
+enum Shared {
+    Bytes(Bytes),
+    Resident,
+    Missing,
 }
 
 /// A block another read is fetching: its position in this read and the
 /// fetch's state.
 type Waiter = (usize, watch::Receiver<Slot>);
-
-/// A block a read leads, looked up: its position, its claim, and its bytes
-/// on a hit.
-type Looked = (usize, SlotGuard, Option<Bytes>);
 
 /// A block's digest and the eviction generation of the read that claimed it:
 /// reads of another generation never share a fetch.
@@ -616,6 +618,10 @@ struct SlotGuard {
 impl SlotGuard {
     fn ready(&self, bytes: Bytes) {
         self.tx.send_replace(Slot::Ready(bytes));
+    }
+
+    fn resident(&self) {
+        self.tx.send_replace(Slot::Resident);
     }
 }
 
@@ -1055,7 +1061,7 @@ impl NodeCache {
             fill_bytes: load(&c.fill_bytes),
             evicted_bytes_size: load(&c.evicted_size),
             evicted_bytes_unreferenced: load(&c.evicted_unreferenced),
-            evicted_bytes_corrupt: load(&c.evicted_corrupt) + store_counters.corrupt_bytes,
+            evicted_bytes_corrupt: store_counters.corrupt_bytes,
             fallbacks: load(&c.cache_errors) + store_counters.corrupt_reads,
             bypass_reads: load(&c.bypass_reads),
             admission_bypass_reads: load(&c.admission_bypass_reads),
@@ -1282,29 +1288,26 @@ impl NodeCache {
         // disk: never a second fetch.
         let (leading, waiting) = self.core.claim(&keys, true, ticket.generation);
         let mut blocks: Vec<Option<Bytes>> = vec![None; keys.len()];
-        let keys_ref = &keys;
-        let looked: Vec<Looked> = stream::iter(leading)
-            .map(|(j, slot)| async move {
-                let started = Instant::now();
-                let found = self
-                    .core
-                    .lookup(&keys_ref[j], block_len(b, ctx.size, first + j as u64))
-                    .await;
-                self.core.note_disk_read(started.elapsed());
-                (j, slot, found)
-            })
-            .buffered(LOOKUPS_IN_FLIGHT)
-            .collect()
-            .await;
+        let mut partial = vec![false; keys.len()];
+        let part_of = |j: usize| {
+            let block = span(j);
+            range.start.max(block.start) - block.start..range.end.min(block.end) - block.start
+        };
         let mut hit = 0;
         let mut to_fetch = Vec::new();
-        for (j, slot, found) in looked {
+        let reads: Vec<(BlockKey, Range<u64>)> = leading
+            .iter()
+            .map(|(j, _)| (keys[*j].clone(), part_of(*j)))
+            .collect();
+        let found = self.core.lookup_parts(&reads).await;
+        for ((j, slot), found) in leading.into_iter().zip(found) {
             match found {
                 Some(bytes) => {
-                    // Hand the resident block to reads waiting on this one.
-                    slot.ready(bytes.clone());
+                    // Reads waiting on this block read their own parts.
+                    slot.resident();
                     hit += 1;
                     blocks[j] = Some(bytes);
+                    partial[j] = true;
                 }
                 None => to_fetch.push((j, slot)),
             }
@@ -1319,13 +1322,32 @@ impl NodeCache {
             blocks[j] = Some(bytes);
         }
         let mut unresolved = Vec::new();
+        let mut resident = Vec::new();
         for (j, got) in shared {
             match got {
-                Some(bytes) => {
+                Shared::Bytes(bytes) => {
                     hit += 1;
                     blocks[j] = Some(bytes);
                 }
-                None => unresolved.push(j),
+                Shared::Resident => resident.push(j),
+                Shared::Missing => unresolved.push(j),
+            }
+        }
+        if !resident.is_empty() {
+            let reads: Vec<(BlockKey, Range<u64>)> = resident
+                .iter()
+                .map(|&j| (keys[j].clone(), part_of(j)))
+                .collect();
+            let found = self.core.lookup_parts(&reads).await;
+            for (j, found) in resident.into_iter().zip(found) {
+                match found {
+                    Some(bytes) => {
+                        hit += 1;
+                        blocks[j] = Some(bytes);
+                        partial[j] = true;
+                    }
+                    None => unresolved.push(j),
+                }
             }
         }
         add(&self.core.counters.hits, hit);
@@ -1354,6 +1376,9 @@ impl NodeCache {
                         .into(),
                     })
                 })?;
+                if partial[j] {
+                    return Ok(blk);
+                }
                 let from = range.start.max(s.start) - s.start;
                 let to = range.end.min(s.end) - s.start;
                 Ok(blk.slice(to_usize(from)..to_usize(to)))
@@ -1570,29 +1595,35 @@ impl Core {
         *self.last_error.lock() = Some(message);
     }
 
-    /// The resident block, verified, or `None`. Errors and entries of the
-    /// wrong length are counted and read as misses.
-    async fn lookup(&self, key: &BlockKey, expected_len: u64) -> Option<Bytes> {
-        match self.store.get(key).await {
-            Ok(Some(bytes)) if bytes.len() as u64 == expected_len => Some(bytes),
-            Ok(Some(bytes)) => {
-                add(&self.counters.evicted_corrupt, bytes.len() as u64);
-                self.record_error(format!(
-                    "A cached block of '{}' is {} bytes instead of {expected_len}",
-                    key.path,
-                    bytes.len()
-                ));
-                if let Err(e) = self.store.remove(key).await {
-                    self.record_error(e.to_string());
-                }
-                None
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.record_error(e.to_string());
-                None
-            }
+    /// The requested parts of resident blocks, `None` for each part not
+    /// read. Every part a store error left unread counts as one cache
+    /// fallback, and the store's slowest disk read is noted for prefetch.
+    async fn lookup_parts(&self, reads: &[(BlockKey, Range<u64>)]) -> Vec<Option<Bytes>> {
+        if reads.is_empty() {
+            return Vec::new();
         }
+        let parts = self.store.get_parts(reads).await;
+        self.note_disk_read(parts.slowest_read);
+        for failed in parts.errors {
+            add(
+                &self.counters.cache_errors,
+                failed.parts.saturating_sub(1) as u64,
+            );
+            self.record_error(failed.error.to_string());
+        }
+        if parts.found.len() == reads.len() {
+            return parts.found;
+        }
+        add(
+            &self.counters.cache_errors,
+            reads.len().saturating_sub(1) as u64,
+        );
+        self.record_error(format!(
+            "A cache part read returned {} results for {} blocks",
+            parts.found.len(),
+            reads.len()
+        ));
+        vec![None; reads.len()]
     }
 
     /// Counts a query's read of each block in the frequency sketch. When a
@@ -1760,8 +1791,9 @@ impl Core {
     }
 
     /// Waits, until one shared deadline, for blocks other reads are fetching.
-    /// `None` for a block whose fetch failed or did not finish in time.
-    async fn await_shared(&self, wait: Vec<Waiter>) -> Vec<(usize, Option<Bytes>)> {
+    /// [`Shared::Missing`] for a block whose fetch failed or did not finish
+    /// in time.
+    async fn await_shared(&self, wait: Vec<Waiter>) -> Vec<(usize, Shared)> {
         if wait.is_empty() {
             return Vec::new();
         }
@@ -1771,12 +1803,13 @@ impl Core {
                 .await
             {
                 Ok(Ok(slot)) => match &*slot {
-                    Slot::Ready(bytes) => (j, Some(bytes.clone()), false),
-                    Slot::Pending | Slot::Failed => (j, None, false),
+                    Slot::Ready(bytes) => (j, Shared::Bytes(bytes.clone()), false),
+                    Slot::Resident => (j, Shared::Resident, false),
+                    Slot::Pending | Slot::Failed => (j, Shared::Missing, false),
                 },
                 // The leader went away without a result.
-                Ok(Err(_)) => (j, None, false),
-                Err(_) => (j, None, true),
+                Ok(Err(_)) => (j, Shared::Missing, false),
+                Err(_) => (j, Shared::Missing, true),
             }
         }))
         .await;
@@ -1787,7 +1820,7 @@ impl Core {
         add(&self.counters.shared_wait_timeouts, timeouts as u64);
         results
             .into_iter()
-            .map(|(j, bytes, _)| (j, bytes))
+            .map(|(j, shared, _)| (j, shared))
             .collect()
     }
 

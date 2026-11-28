@@ -42,7 +42,7 @@ use object_store::{
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions,
 };
-use object_store_cache::testing::{self, BlockStore, SlabStore, Tuning};
+use object_store_cache::testing::{self, BlockKey, BlockStore, SlabStore, StoredMeta, Tuning};
 use object_store_cache::{Cacheable, NodeCache, NodeCacheConfig, NodeCacheStats};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -343,6 +343,63 @@ pub(crate) fn find_in_slabs(dir: &std::path::Path, needle: &[u8]) -> (PathBuf, u
         "expected one copy of the block in the slabs, found {found:?}"
     );
     found.remove(0)
+}
+
+fn crc32c_parts(parts: &[&[u8]]) -> u32 {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    for part in parts {
+        digest.update(part);
+    }
+    let [b0, b1, b2, b3, ..] = digest.finalize().to_le_bytes();
+    u32::from_le_bytes([b0, b1, b2, b3])
+}
+
+/// Re-encodes the one-entry fixture as entry version 2 and slab-index
+/// version 3, including their checksums.
+fn write_old_format(dir: &std::path::Path) {
+    const HEADER: usize = 4096;
+    let mut dat = None;
+    let mut idx = None;
+    for entry in std::fs::read_dir(dir.join("slabs")).expect("list slabs") {
+        let path = entry.expect("entry").path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("dat") => dat = Some(path),
+            Some("idx") => idx = Some(path),
+            _ => {}
+        }
+    }
+    let dat = dat.expect("slab data");
+    let mut page = vec![0u8; HEADER];
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dat)
+        .expect("open slab data");
+    file.read_exact_at(&mut page, 0).expect("read header");
+    let meta_len = usize::from(u16::from_le_bytes([page[6], page[7]]));
+    let key_len = usize::from(u16::from_le_bytes([page[8], page[9]]));
+    let chunk_len = 1usize << page[10];
+    let data_len = u32::from_le_bytes(page[12..16].try_into().expect("data length")) as usize;
+    let table = 24 + key_len + meta_len;
+    let table_end = table + data_len.div_ceil(chunk_len) * 4;
+    page[4..6].copy_from_slice(&2u16.to_le_bytes());
+    page[8..12].copy_from_slice(
+        &u32::try_from(key_len)
+            .expect("old key length")
+            .to_le_bytes(),
+    );
+    page[table..table_end].fill(0);
+    let crc = crc32c_parts(&[&page[0..20], &page[24..table]]);
+    page[20..24].copy_from_slice(&crc.to_le_bytes());
+    file.write_all_at(&page, 0).expect("write old header");
+
+    let idx = idx.expect("slab index");
+    let mut index = std::fs::read(&idx).expect("read index");
+    let crc_at = index.len() - 4;
+    index[4..6].copy_from_slice(&3u16.to_le_bytes());
+    let crc = crc_fast::crc32_iscsi(&index[..crc_at]);
+    index[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(idx, index).expect("write old index");
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1146,170 @@ async fn corrupt_block_same_length_is_refetched() {
     assert_same(&got, &obj, "read after refetch");
     assert_eq!(store.gets(), 2);
     assert_eq!(cache.stats().hits - hits_before, 3);
+}
+
+#[tokio::test]
+async fn corrupt_requested_chunk_is_dropped_and_refetched() {
+    const CHUNK: u64 = 64 << 10;
+    let store = Arc::new(TestStore::default());
+    let obj = data(0x00C0_FFEE, MIB);
+    put(&store, "d/chunk.vortex", &obj).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = NodeCache::open(config(tmp.path())).await.expect("open");
+    let cached = cache.wrap(
+        "s3://bucket/",
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        all_paths(),
+    );
+    let path = Path::from("d/chunk.vortex");
+    let filled = cached.get_range(&path, 0..MIB).await.expect("fill");
+    assert_same(&filled, &obj, "fill bytes");
+    cache.wait_idle().await;
+    assert_eq!(store.gets(), 1);
+
+    let (slab, data_at) = find_in_slabs(tmp.path(), &obj[..64]);
+    let corrupt_at = 5 * CHUNK + 123;
+    let slab_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(slab)
+        .expect("open slab");
+    let mut byte = [0u8; 1];
+    slab_file
+        .read_exact_at(&mut byte, data_at + corrupt_at)
+        .expect("read byte");
+    byte[0] ^= 0x80;
+    slab_file
+        .write_all_at(&byte, data_at + corrupt_at)
+        .expect("write byte");
+
+    let range = 5 * CHUNK + 100..5 * CHUNK + 16_484;
+    let got = cached.get_range(&path, range.clone()).await.expect("read");
+    let expected = usize::try_from(range.start).expect("range start")
+        ..usize::try_from(range.end).expect("range end");
+    assert_same(&got, &obj.slice(expected), "read after chunk corruption");
+    let stats = cache.stats();
+    assert_eq!(stats.fallbacks, 1, "{stats:?}");
+    assert_eq!(stats.evicted_bytes_corrupt, MIB, "{stats:?}");
+    assert_eq!(store.gets(), 2, "corrupt chunk did not fall back");
+}
+
+#[tokio::test]
+async fn old_format_directory_is_quarantined_and_refilled() {
+    let store = Arc::new(TestStore::default());
+    let obj = data(0x0D1D_F04D, MIB);
+    put(&store, "d/old.vortex", &obj).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = BlockKey {
+        store: "s3://bucket/".to_string(),
+        path: "d/old.vortex".to_string(),
+        object_size: MIB,
+        block_size: MIB,
+        index: 0,
+    };
+    let slabs = SlabStore::open(tmp.path(), 8 * MIB)
+        .await
+        .expect("open slabs");
+    slabs
+        .put(&key, obj.clone(), &StoredMeta::NONE)
+        .await
+        .expect("put old entry");
+    slabs.close().await.expect("close slabs");
+    drop(slabs);
+    write_old_format(tmp.path());
+
+    let cache = NodeCache::open(config(tmp.path()))
+        .await
+        .expect("open cache");
+    let stats = cache.stats();
+    assert_eq!(stats.quarantined_slabs, 1, "{stats:?}");
+    assert_eq!(stats.entries, 0, "old entry was listed: {stats:?}");
+    let cached = cache.wrap(
+        "s3://bucket/",
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        all_paths(),
+    );
+    let path = Path::from("d/old.vortex");
+    let range = 77..77 + 32_000;
+    let first = cached
+        .get_range(&path, range.clone())
+        .await
+        .expect("refill");
+    let expected = usize::try_from(range.start).expect("range start")
+        ..usize::try_from(range.end).expect("range end");
+    assert_same(&first, &obj.slice(expected.clone()), "refilled bytes");
+    assert_eq!(store.gets(), 1, "old entry was served");
+    cache.wait_idle().await;
+    let hits = cache.stats().hits;
+    let second = cached.get_range(&path, range.clone()).await.expect("hit");
+    assert_same(&second, &obj.slice(expected), "bytes after refill");
+    assert_eq!(store.gets(), 1, "refilled entry missed");
+    assert_eq!(cache.stats().hits - hits, 1, "refilled entry was not hit");
+}
+
+#[tokio::test]
+async fn seeded_subranges_match_source_across_chunk_and_block_boundaries() {
+    const CHUNK: u64 = 64 << 10;
+    const SEED: u64 = 0x51A8_7EED_1A2B_3C4D;
+    eprintln!("random sub-range seed: {SEED:#018x}");
+    let store = Arc::new(TestStore::default());
+    let obj = data(SEED, 5 * MIB + 12_345);
+    put(&store, "d/ranges.vortex", &obj).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = NodeCache::open(config(tmp.path())).await.expect("open");
+    let cached = cache.wrap(
+        "s3://bucket/",
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        all_paths(),
+    );
+    let path = Path::from("d/ranges.vortex");
+    let fill = cached
+        .get(&path)
+        .await
+        .expect("fill")
+        .bytes()
+        .await
+        .expect("fill bytes");
+    assert_same(&fill, &obj, "fill");
+    cache.wait_idle().await;
+    let before = cache.stats();
+    assert_eq!(store.gets(), 1);
+
+    let mut rng = Rng(SEED);
+    for case in 0..256 {
+        let boundary = if case % 2 == 0 {
+            let block = rng.below(5);
+            let chunk = 1 + rng.below(15);
+            block * MIB + chunk * CHUNK
+        } else {
+            (1 + rng.below(4)) * MIB
+        };
+        let start = boundary - 1 - rng.below(CHUNK - 1);
+        let end = (boundary + 1 + rng.below(CHUNK - 1)).min(obj.len() as u64);
+        let got = cached
+            .get_range(&path, start..end)
+            .await
+            .unwrap_or_else(|error| panic!("seed {SEED:#018x} case {case}: {error}"));
+        let expected =
+            usize::try_from(start).expect("range start")..usize::try_from(end).expect("range end");
+        assert_same(
+            &got,
+            &obj.slice(expected),
+            &format!("seed {SEED:#018x} case {case} range {start}..{end}"),
+        );
+    }
+    let after = cache.stats();
+    assert_eq!(store.gets(), 1, "a random sub-range missed");
+    assert_eq!(after.fallbacks - before.fallbacks, 0, "{after:?}");
+    assert_eq!(
+        after.hits - before.hits,
+        after.accesses - before.accesses,
+        "not every block access was a cache hit: {after:?}"
+    );
+    assert!(
+        after.accesses - before.accesses > 256,
+        "block boundaries were not crossed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
