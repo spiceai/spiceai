@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  EVIDENCE_GATE,
   RUST_AFFECTING,
   checkEvidence,
   describeProblems,
@@ -31,9 +32,10 @@ const HEAD = '4d'.repeat(20);
 const BASE = 'f'.repeat(40);
 const ON_BASE = 'e'.repeat(40);
 const ELSEWHERE = '9'.repeat(40);
-// Run 42 ran at HEAD, run 7 at FIRST, run 9 at the base.
+// Finished runs: 42 at HEAD, 7 at FIRST, 9 at the base. Run 5 is still queued at HEAD.
 const RUN = 'https://github.com/o/r/actions/runs/42';
-const RUN_AT = { 42: HEAD, 7: FIRST, 9: BASE };
+const done = (headSha) => ({ head_sha: headSha, status: 'completed', conclusion: 'success' });
+const RUN_AT = { 42: done(HEAD), 7: done(FIRST), 9: done(BASE), 5: { head_sha: HEAD, status: 'queued', conclusion: null } };
 
 const TEMPLATE_COMMENT = '<!--\nList every check in scope you did not run as `Not run — <reason>`.\n## Not a heading\n-->';
 
@@ -84,7 +86,7 @@ function stubGithub({ body, commits = [{ sha: HEAD }], changes = {}, compares = 
         getWorkflowRun: async ({ owner, repo, run_id: runId }) => {
           assert.equal(`${owner}/${repo}`, 'o/r', 'only this repository is asked about runs');
           reads.push(`run ${runId}`);
-          return { data: { head_sha: runs[runId] } };
+          return { data: runs[runId] };
         },
       },
     },
@@ -218,7 +220,7 @@ test('a bare SHA with an unrelated link is not evidence', async () => {
   const result = await check({ body: describe(line) });
   assert.deepEqual(result.problems, [
     `"${line}" names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
-      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
   ]);
   assert.equal(result.cited, null);
 });
@@ -230,9 +232,10 @@ test('a run of this repository that ran at the entry\'s commit counts as output'
   assert.deepEqual(reads, ['run 42']);
 });
 
-test('a run at another commit, another repository\'s run, a checks page, a gist, or an upload is not output', async () => {
+test('a run at another commit, a queued run, another repository\'s run, a checks page, a gist, or an upload is not output', async () => {
   for (const link of [
     'https://github.com/o/r/actions/runs/9',
+    'https://github.com/o/r/actions/runs/5',
     'https://github.com/other/repo/actions/runs/42',
     'https://github.com/o/r/pull/7/checks',
     'https://gist.github.com/someone/abc123',
@@ -266,7 +269,7 @@ test('naming the head without output does not refresh an older run', async () =>
   const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\nThe head is ${HEAD.slice(0, 12)}.`) });
   assert.deepEqual(result.problems, [
     `"The head is ${HEAD.slice(0, 12)}." names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
-      `or link a run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
     afterHead(`Ran at ${FIRST.slice(0, 12)}:`),
   ]);
   assert.equal(result.cited, FIRST);
@@ -288,6 +291,33 @@ test('a later change to test inputs makes the evidence stale too', async () => {
     changes: { [HEAD]: files('test/spicescript/feed-chaos.yaml') },
   });
   assert.deepEqual(result.problems, [stale(`Ran at ${FIRST.slice(0, 12)}:`, FIRST, `${HEAD.slice(0, 12)} (test/spicescript/feed-chaos.yaml)`)]);
+});
+
+test('a later change to the evidence check itself makes the evidence stale', async () => {
+  for (const file of ['.github/scripts/pr_evidence.mjs', '.github/workflows/pr.yml', '.github/evals/evidence-rule/score_eval.py', 'AGENTS.md']) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await check({ body: describe(ran(FIRST)), commits: [{ sha: FIRST }, { sha: HEAD }], changes: { [HEAD]: files(file) } });
+    assert.deepEqual(result.problems, [stale(`Ran at ${FIRST.slice(0, 12)}:`, FIRST, `${HEAD.slice(0, 12)} (${file})`)], file);
+  }
+});
+
+test('a fenced command with no output is not output, and is no re-run of it', async () => {
+  const line = `At ${HEAD.slice(0, 12)}:`;
+  const result = await check({ ...withLaterChange, body: describe(`${ran(FIRST)}\n\n${line}\n\n\`\`\`\n$ make test\n\`\`\``) });
+  assert.deepEqual(result.problems, [
+    `"${line}" names ${HEAD.slice(0, 12)} but carries no output: put the output in a fenced block under it, ` +
+      `or link a finished run of this repository's workflows that ran at ${HEAD.slice(0, 12)}.`,
+    afterHead(`Ran at ${FIRST.slice(0, 12)}:`),
+  ]);
+});
+
+test('a fence closes only on its own character: a literal ~~~ inside a backtick block hides nothing', async () => {
+  const body = `## Evidence\n\nRan at ${HEAD.slice(0, 12)}:\n\n\`\`\`\n~~~\n12 passed\n\`\`\`\n\n## 🧪 Evidence\n\nS3: Not run\n`;
+  const result = await check({ body });
+  assert.deepEqual(result.problems, [
+    'A check is marked not run without a reason: "S3: Not run". Write `Not run — <reason>`.',
+    'The description has 2 Evidence sections. Keep all the evidence in one.',
+  ]);
 });
 
 test('a rename out of shipped code counts as a change to it', async () => {
@@ -457,6 +487,13 @@ test('shipped code means what the no-Rust fast-track in pr.yml says it means', (
   );
 });
 
+test('changes to the check are judged by the same list pr.yml uses to keep the check on', () => {
+  const workflow = readFileSync(fileURLToPath(new URL('../workflows/pr.yml', import.meta.url)), 'utf8');
+  const match = /^\s*const evidenceGate = \/(.*)\/;\s*$/m.exec(workflow);
+  assert.ok(match, 'pr.yml no longer declares `const evidenceGate = /.../;`');
+  assert.equal(EVIDENCE_GATE.source, match[1], 'EVIDENCE_GATE in pr_evidence.mjs differs from evidenceGate in pr.yml; copy the pattern across');
+});
+
 // --- The section bots write ----------------------------------------------------
 
 const HELPER = fileURLToPath(new URL('./bot_pr_evidence.sh', import.meta.url));
@@ -477,7 +514,7 @@ test('the section bot_pr_evidence.sh writes passes the check, on its fenced outp
   });
   assert.equal(section, `## 🧪 Evidence\n\n${botEntry(repoHead, 'testoperator run bench tpch sf1 federated/x.yaml')}`);
   // The run ran at the commit it was dispatched on, not the generated one, so the fence is the output.
-  const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }], runs: { 123: BASE } });
+  const result = await check({ body: `Automated snapshot update.\n\n${section}`, commits: [{ sha: repoHead }], runs: { 123: done(BASE) } });
   assert.deepEqual(result.problems, []);
 });
 
@@ -486,7 +523,7 @@ test('the section bot_pr_evidence.sh writes passes the check, on its fenced outp
  * a file. `overwrites` edits are undone right after they land, as a concurrent
  * writer working from an older read would. Returns { body, status, stderr }.
  */
-function runUpdate(body, command, { sha = repoHead, overwrites = 0 } = {}) {
+function runUpdate(body, command, { sha = repoHead, overwrites = 0, head = sha } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'bot-evidence-'));
   try {
     writeFileSync(join(dir, 'body.md'), body);
@@ -495,7 +532,7 @@ function runUpdate(body, command, { sha = repoHead, overwrites = 0 } = {}) {
     writeFileSync(
       join(dir, 'gh'),
       `#!/usr/bin/env bash\nd="${dir}"\n` +
-        'if [ "$1 $2" = "pr view" ]; then cat "$d/body.md"; fi\n' +
+        `if [ "$1 $2" = "pr view" ]; then case "$*" in *headRefOid*) echo ${head};; *) cat "$d/body.md";; esac; fi\n` +
         'if [ "$1 $2" = "pr edit" ]; then\n' +
         '  while [ $# -gt 0 ]; do [ "$1" = --body-file ] && cp "$2" "$d/body.md"; shift; done\n' +
         '  n=$(cat "$d/overwrites"); if [ "$n" -gt 0 ]; then cp "$d/original.md" "$d/body.md"; echo $((n - 1)) > "$d/overwrites"; fi\n' +
@@ -526,8 +563,17 @@ test('bot_pr_evidence.sh update replaces the section and keeps every other part 
     body: edited,
     commits: [{ sha: FIRST }, { sha: SECOND }],
     changes: { [SECOND]: files('crates/runtime/tests/snapshots/plan.snap') },
+    runs: { 123: done(BASE) },
   });
   assert.deepEqual(result.problems, []);
+});
+
+test('bot_pr_evidence.sh update closes a fence only on its own character', () => {
+  const command = 'testoperator run schema tpch/sf1/x.yaml';
+  const body = `## 🧪 Evidence\n\nOld notes:\n\n\`\`\`\n~~~\n## printed by a run, inside the block\n\`\`\`\n\n## Notes\n\nKeep me.`;
+  const { body: edited, status, stderr } = runUpdate(body, command);
+  assert.equal(status, 0, stderr);
+  assert.equal(edited, `## 🧪 Evidence\n\n${botEntry(repoHead, command)}\n## Notes\n\nKeep me.\n`);
 });
 
 test('bot_pr_evidence.sh update adds the section to a description without one', () => {
@@ -541,6 +587,15 @@ test('bot_pr_evidence.sh update writes again after a concurrent update replaced 
   assert.equal(status, 0, stderr);
   assert.match(stderr, /missing from 7 after a concurrent update; writing it again\./);
   assert.match(body, /^Generated at [0-9a-f]{12} by https:\/\/github\.com\/o\/r\/actions\/runs\/123:$/m);
+});
+
+test('bot_pr_evidence.sh update leaves a newer run\'s evidence alone', () => {
+  const command = 'testoperator run bench tpch sf1 a.yaml';
+  const body = `Automated update.\n\n## 🧪 Evidence\n\n${botEntry(SECOND, command)}`;
+  const { body: after, status, stderr } = runUpdate(body, command, { sha: FIRST, head: SECOND });
+  assert.equal(status, 0, stderr);
+  assert.match(stderr, /head is no longer 1a1a1a1a1a1a; the run that pushed the head writes its evidence\./);
+  assert.equal(after, body);
 });
 
 test('bot_pr_evidence.sh update fails the run when the entry cannot be kept', () => {
@@ -562,6 +617,7 @@ test('snapshot workflows key each branch, and its evidence, on one workload', ()
   assert.equal((bench.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator run bench \$\{WORKLOAD\}"/g) ?? []).length, 2);
   const cluster = read('testoperator_run_cluster_bench.yml');
   assert.match(cluster, /^\s*BRANCH_NAME="testoperator-cluster-snapshot-update\/\$\{BRANCH_ID\}-\$\{slug\}-\$\{WORKLOAD_KEY\}"$/m);
+  assert.match(cluster, /WORKLOAD="\$\{WORKLOAD\} queries=\$\{CB_SCENARIO_QUERY_FILE\}"/, 'scenario queries are part of the workload');
   assert.equal((cluster.match(/bot_pr_evidence\.sh (?:update "\$\{PR_URL\}"|section) "testoperator cluster bench \$\{WORKLOAD\}"/g) ?? []).length, 2);
   const schema = read('testoperator_run_schema.yml');
   assert.match(schema, /^\s*BRANCH_NAME="testoperator-snapshot-update\/\$\{SLUG\}"$/m);

@@ -649,10 +649,11 @@ jobs:
           # Sanitize the spicepod path for use in the branch name (slashes/
           # brackets aren't great ref characters).
           slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
-          # One branch per workload (query set, scale and Spicepod), named in the PR's
+          # One branch per workload (query set, scale, Spicepod and scenario queries), named in the PR's
           # evidence the same way, so another workload's snapshots never make it
           # stale (.github/scripts/pr_evidence.mjs).
           WORKLOAD="${CB_QUERY_SET} sf${CB_SCALE_FACTOR} ${CB_SPICEPOD_PATH}"
+          if [ -n "${CB_SCENARIO_QUERY_FILE}" ]; then WORKLOAD="${WORKLOAD} queries=${CB_SCENARIO_QUERY_FILE}"; fi
           WORKLOAD_KEY="$(printf '%s' "${WORKLOAD}" | git hash-object --stdin | cut -c1-8)"
           BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}-${WORKLOAD_KEY}"
 

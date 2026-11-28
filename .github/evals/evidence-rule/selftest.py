@@ -376,6 +376,30 @@ round trips: 12/12 passed
 """,
         run_release_checks,
     ), (
+        "passes negated",
+        """# Evidence
+
+```
+12/12 unit cases did not pass
+437/437 round trips did not pass
+```
+
+- S3 integration check: Not run — `SPICE_TEST_S3_BUCKET` is unset.
+""",
+        run_release_checks,
+    ), (
+        "right variable, unrelated blocker",
+        """# Evidence
+
+```
+12/12 unit cases passed
+437/437 round trips passed (seed 16927)
+```
+
+- S3 integration check: Not run — `SPICE_TEST_S3_BUCKET` is set, but the TLS certificate is missing.
+""",
+        run_release_checks,
+    ), (
         "misreported after running",
         """# Evidence
 

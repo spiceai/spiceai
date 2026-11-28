@@ -36,15 +36,24 @@ const MAX_COMPARED_FILES = 300;
 // The files that need a developer sign-off: the same pattern Attestation's no-Rust
 // fast-track uses in pr.yml. test_pr_evidence.mjs fails if the two copies differ.
 export const RUST_AFFECTING = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls|cayenne_data_path_fs)\.py$|^scripts\/cayenne_data_path_fs_allowlist\.json$|^scripts\/(test_)?rust_guard_common\.py$|^scripts\/(test_)?nextest_build_targets\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$|^test\/source_versions\.json$|^\.schema\/spicepod\.schema\.json$)/;
-// What makes earlier evidence stale: shipped code, and every test input (spicescript
+// The evidence check's own files and the rules it enforces. A PR changing them is
+// judged even when the no-Rust fast-track covers it (`evidenceGate` in pr.yml, a
+// copy test_pr_evidence.mjs keeps equal), and a later change to them makes earlier
+// evidence stale, so the check cannot be weakened under evidence from before.
+export const EVIDENCE_GATE = /^(\.github\/scripts\/(pr_evidence\.mjs|bot_pr_evidence\.sh|test_pr_evidence\.mjs|test_pr_attestation_signoff\.mjs)|\.github\/workflows\/pr\.yml|\.github\/PULL_REQUEST_TEMPLATE\.md|AGENTS\.md|\.github\/evals\/.+)$/;
+// What makes earlier evidence stale: shipped code, every test input (spicescript
 // scenarios, Spicepods, expected rows), which can change a check's outcome without
-// changing code. Documentation does not.
-const STALENESS_INPUT = (path) => RUST_AFFECTING.test(path) || /^test\//.test(path);
+// changing code, and the evidence check itself. Documentation does not.
+const STALENESS_INPUT = (path) => RUST_AFFECTING.test(path) || /^test\//.test(path) || EVIDENCE_GATE.test(path);
 
 const HEADING = /^(#{1,6})\s+(.*)$/;
 const EXACT_EVIDENCE = /^[^a-z0-9]*evidence[^a-z0-9]*$/i;
 const COMMENT = /<!--[\s\S]*?-->/g;
-const FENCE = /^\s*(```|~~~)/;
+// GitHub-flavoured fences: an opening run of three or more backticks or tildes
+// (with an info string after it), closed only by a run of the same character at
+// least as long, with nothing after it.
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})\s*$/;
 const SHA_TOKEN = /\b[0-9a-f]{7,40}\b/gi;
 // A check marked not run with nothing after the mark ("Tests: not run", "Not run:",
 // "| S3 | not run |"), or with only a placeholder for a reason ("Not run — <reason>",
@@ -64,17 +73,26 @@ const runLinks = (repoSlug) =>
 
 /** Each line of a body with HTML comments removed, marked as inside a fenced block or not. */
 function markedLines(text) {
-  let fenced = false;
+  let open = null;
   return text
     .replace(/\r\n/g, '\n')
     .replace(COMMENT, '')
     .split('\n')
     .map((line) => {
-      if (FENCE.test(line)) {
-        fenced = !fenced;
+      if (open === null) {
+        const opening = FENCE_OPEN.exec(line);
+        if (opening && !(opening[1][0] === '`' && opening[2].includes('`'))) {
+          open = opening[1];
+          return { line, fence: true, fenced: false };
+        }
+        return { line, fence: false, fenced: false };
+      }
+      const closing = FENCE_CLOSE.exec(line);
+      if (closing && closing[1][0] === open[0] && closing[1].length >= open.length) {
+        open = null;
         return { line, fence: true, fenced: false };
       }
-      return { line, fence: false, fenced };
+      return { line, fence: false, fenced: true };
     });
 }
 
@@ -113,27 +131,35 @@ export function evidenceSection(body) {
 /**
  * The section's evidence entries. An entry starts at a line, outside a fenced
  * block, naming a commit `resolve` recognizes, and runs to the next such line. It
- * records whether it holds a fenced block with content, the run ids of this
- * repository's run links on its lines, and its commands: the `$ ` lines in its
- * output. Output before the first entry belongs to the first entry.
+ * records whether it holds a fenced block with output (a line that is not a `$ `
+ * command), the run ids of this repository's run links on its lines, and its
+ * commands: the `$ ` lines of the blocks that carry output. A command with no
+ * output is no run of it. Output before the first entry belongs to the first entry.
  */
 export function evidenceEntries(section, resolve, repoSlug) {
   const linkPattern = runLinks(repoSlug);
   const entries = [];
   let current = null;
   const pending = { fenced: false, runs: [], commands: new Set() };
-  let blockHasContent = false;
+  let block = null;
   const target = () => current ?? pending;
+  const closeBlock = () => {
+    if (block?.output) {
+      target().fenced = true;
+      for (const command of block.commands) target().commands.add(command);
+    }
+    block = null;
+  };
   for (const { line, fence, fenced } of markedLines(section)) {
     if (fence) {
-      if (blockHasContent) target().fenced = true;
-      blockHasContent = false;
+      if (block) closeBlock();
+      else block = { output: false, commands: [] };
       continue;
     }
     if (fenced) {
-      if (line.trim()) blockHasContent = true;
       const prompt = PROMPT.exec(line);
-      if (prompt) target().commands.add(prompt[1].trim());
+      if (prompt) block.commands.push(prompt[1].trim());
+      else if (line.trim()) block.output = true;
       continue;
     }
     const runs = [...line.matchAll(linkPattern)].map((match) => match[1]);
@@ -148,7 +174,7 @@ export function evidenceEntries(section, resolve, repoSlug) {
       target().runs.push(...runs);
     }
   }
-  if (blockHasContent) target().fenced = true;
+  if (block) closeBlock();
   return entries;
 }
 
@@ -279,20 +305,21 @@ export async function checkEvidence({ github, owner, repo, pullNumber }) {
     );
   }
 
-  // A run link is output only for the commit the run ran at.
+  // A run link is output only for the commit the run ran at, and only once the run
+  // has finished (with any conclusion: a failing run is evidence too).
   const single = entries.filter((entry) => entry.shas.length === 1 && !unlisted(entry));
   const runAt = new Map();
   for (const id of new Set(single.flatMap((entry) => entry.runs))) {
     // eslint-disable-next-line no-await-in-loop
     const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(id) });
-    runAt.set(id, String(data.head_sha ?? '').toLowerCase());
+    runAt.set(id, data.status === 'completed' ? String(data.head_sha ?? '').toLowerCase() : null);
   }
   for (const entry of single) {
     entry.hasOutput = entry.fenced || entry.runs.some((id) => runAt.get(id) === entry.shas[0]);
     if (!entry.hasOutput) {
       problems.push(
         `"${entry.line}" names ${short(entry.shas[0])} but carries no output: put the output in a fenced block under it, ` +
-          `or link a run of this repository's workflows that ran at ${short(entry.shas[0])}.`
+          `or link a finished run of this repository's workflows that ran at ${short(entry.shas[0])}.`
       );
     }
   }

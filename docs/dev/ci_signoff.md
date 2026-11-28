@@ -187,11 +187,13 @@ review. Editing the description re-runs **Attestation**. The fast-tracks skip
 the check for the same reason they skip the sign-off, except as above. There is
 no warning period: the check fails a PR from the moment it reaches the default
 branch. A PR whose **Attestation** last ran before then stays green until its
-next event, so a maintainer re-runs **Attestation** on open PRs once it lands
-(`gh run rerun <run-id>` on each PR's latest `pull_request` run of `pr`). A Git
-or API error while verifying the checker fails the check rather than skipping
-it, and a default branch without the module fails every PR except the one that
-adds it.
+next event, and re-running that run does not help: a re-run keeps the run's
+original workflow file, which has no evidence step. So once the check lands, a
+maintainer gives each open PR a fresh event (editing its description is
+enough), and removes and re-adds any PR already in the merge queue, whose entry
+rests on the earlier green check. A Git or API error while verifying the checker
+fails the check rather than skipping it, and a default branch without the module
+fails every PR except the one that adds it.
 
 Like the rest of **Attestation**, the check runs the workflow file from the PR's
 merge commit, as every `pull_request` workflow does, so a PR that edits `pr.yml`

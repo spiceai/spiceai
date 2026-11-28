@@ -22,13 +22,17 @@
 #
 # Call `update` before approve_bot_pr_runs.sh releases the runs GitHub holds on
 # the push, so the Attestation run they start reads the new description: an edit
-# made with GITHUB_TOKEN starts no `edited` run of its own. GitHub has no
-# conditional edit, so two runs of the same workload updating one PR at once can
-# leave the older one's entry. The check then finds it stale and fails, rather
-# than passes. `update` also reads the description back and writes its entry
-# again if a later write replaced it, and exits non-zero if it is still gone after
-# three tries. EVIDENCE_RECHECK_DELAY sets the pause before each read-back
-# (default: 5 to 14 seconds, jittered).
+# made with GITHUB_TOKEN starts no `edited` run of its own.
+#
+# Two runs of the same workload can update one PR. Only the run whose commit is
+# the PR's head writes: an older run that finishes later leaves the newer run's
+# entry alone, since that entry covers the head and the edit would start no new
+# Attestation run to catch the regression. GitHub has no conditional edit, so the
+# head is read again before every write, and after writing `update` reads the
+# description back, writes its entry again if a later write replaced it while its
+# commit is still the head, and exits non-zero if it is still gone after three
+# tries. EVIDENCE_RECHECK_DELAY sets the pause before each read-back (default: 5
+# to 14 seconds, jittered).
 set -euo pipefail
 
 sha="$(git rev-parse HEAD)"
@@ -51,7 +55,17 @@ case "${1:-}" in
     write_section() {
       gh pr view "${pr}" --json body --jq .body | ENTRY="${new_entry}" awk '
         function heading_level(line) { match(line, /^#+ /); return RLENGTH - 1 }
-        /^[[:space:]]*(```|~~~)/ { fenced = !fenced; if (!in_section) print; next }
+        # GitHub-flavoured fences: closed only by a run of the same character, at
+        # least as long, with nothing after it.
+        {
+          if (match($0, /^ ? ? ?(````*|~~~~*)/)) {
+            run = substr($0, RSTART, RLENGTH); sub(/^ */, "", run); rest = substr($0, RSTART + RLENGTH)
+            if (!fenced) { fenced = 1; fence = run; if (!in_section) print; next }
+            if (substr(run, 1, 1) == substr(fence, 1, 1) && length(run) >= length(fence) && rest ~ /^[[:space:]]*$/) {
+              fenced = 0; if (!in_section) print; next
+            }
+          }
+        }
         !fenced && /^#+ / {
           level = heading_level($0)
           if (in_section && level <= section_level) { print ENVIRON["ENTRY"]; print ""; in_section = 0; done = 1 }
@@ -67,6 +81,15 @@ case "${1:-}" in
       gh pr edit "${pr}" --body-file "${file}"
     }
     has_entry() { gh pr view "${pr}" --json body --jq .body | grep -qxF -- "${first_line}"; }
+    is_head() { [ "$(gh pr view "${pr}" --json headRefOid --jq .headRefOid)" = "${sha}" ]; }
+    yield_if_behind() {
+      if ! is_head; then
+        echo "${pr}'s head is no longer ${sha:0:12}; the run that pushed the head writes its evidence." >&2
+        rm -f "${file}"
+        exit 0
+      fi
+    }
+    yield_if_behind
     write_section
     for _ in 1 2 3; do
       sleep "${EVIDENCE_RECHECK_DELAY:-$((RANDOM % 10 + 5))}"
@@ -74,6 +97,7 @@ case "${1:-}" in
         rm -f "${file}"
         exit 0
       fi
+      yield_if_behind
       echo "The evidence entry for ${sha:0:12} is missing from ${pr} after a concurrent update; writing it again." >&2
       write_section
     done
