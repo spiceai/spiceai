@@ -716,6 +716,59 @@ mod tests {
         assert_eq!(flags, vec![false, true]);
     }
 
+    /// The chunk-at-a-time helper the `release/2.4` changes stream used: with
+    /// the default fix alone, one undecodable event still fails the whole poll
+    /// chunk, so the old event (which now has a default) and the current event
+    /// in the same chunk are dropped with it. The Kafka changes stream decodes
+    /// per event instead (see `kafka::tests::replay_applies_old_event_with_default_and_skips_only_the_bad_event`).
+    #[test]
+    fn one_bad_event_fails_the_whole_chunk_even_with_defaults() {
+        let old_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+        ]);
+        let new_fields = serde_json::json!([
+            {"type": "int64", "optional": false, "field": "id"},
+            {"type": "boolean", "optional": false, "default": false, "field": "flag"},
+        ]);
+        let old = apps_event(&old_fields, &serde_json::json!({"id": 1}));
+        let bad = apps_event(&new_fields, &serde_json::json!({"flag": true}));
+        let new = apps_event(&new_fields, &serde_json::json!({"id": 3, "flag": true}));
+        let (table_schema, defaults) = adopted(&new);
+        let pk = ["id".to_string()];
+
+        let err = vector_to_change_batch_with_defaults(
+            &table_schema,
+            &pk,
+            &[&old, &bad, &new],
+            None,
+            &defaults,
+        )
+        .expect_err("one bad event fails the whole vector");
+        assert_eq!(err.kind(), "missing_required_field");
+
+        let mut ids = Vec::new();
+        for change in [&old, &bad, &new] {
+            if let Ok(batch) =
+                vector_to_change_batch_with_defaults(&table_schema, &pk, &[change], None, &defaults)
+            {
+                ids.push(
+                    batch
+                        .data(0)
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("id is Int64")
+                        .value(0),
+                );
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "decoded one at a time, only the bad event is lost"
+        );
+    }
+
     /// Without a declared default, a required column an event lacks is still
     /// an error: there is no value to give it.
     #[test]
@@ -771,5 +824,65 @@ mod tests {
         .expect("change batch");
         assert!(batch.data(0).column(1).is_null(0));
         assert!(!batch.data(1).column(1).is_null(0));
+    }
+
+    const SECRET: &str = "s3cr3t-token-value";
+
+    fn required_id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    /// HTTP ingest still uses [`vector_to_change_batch`]: one bad event fails the
+    /// whole vector. The Kafka changes stream decodes per event instead.
+    #[test]
+    fn vector_to_change_batch_fails_the_whole_chunk_when_one_event_is_bad() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+        let err = vector_to_change_batch(&schema, &pk, &[&valid, &bad, &later], None)
+            .expect_err("one bad event must fail the whole vector");
+        assert_eq!(err.kind(), "missing_required_field");
+    }
+
+    #[test]
+    fn decoding_each_event_keeps_valid_neighbors_of_a_bad_event() {
+        let schema = required_id_schema();
+        let pk = ["id".to_string()];
+        let valid = event("c", serde_json::Value::Null, serde_json::json!({"id": 1}));
+        let bad = event(
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({"secret": SECRET}),
+        );
+        let later = event("c", serde_json::Value::Null, serde_json::json!({"id": 3}));
+
+        let mut ids = Vec::new();
+        let mut skipped_kind = None;
+        for change in [&valid, &bad, &later] {
+            match to_change_batch(&schema, &pk, change, None) {
+                Ok(batch) => ids.push(id_of(&batch.data(0))),
+                Err(err) => {
+                    assert_eq!(err.kind(), "missing_required_field");
+                    assert!(
+                        !err.kind().contains(SECRET),
+                        "kind must not carry the field value, got {}",
+                        err.kind()
+                    );
+                    skipped_kind = Some(err.kind());
+                }
+            }
+        }
+        assert_eq!(ids, vec![Some(1), Some(3)]);
+        assert_eq!(skipped_kind, Some("missing_required_field"));
     }
 }

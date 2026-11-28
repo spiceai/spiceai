@@ -39,6 +39,7 @@ runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-status = { path = "../runtime-status" }
 serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }

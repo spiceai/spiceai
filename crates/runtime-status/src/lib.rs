@@ -109,6 +109,11 @@ pub struct RuntimeStatus {
     /// another status. [`Self::release_dataset_ready`] applies those and
     /// returns to `None`.
     dataset_ready_hold: Arc<RwLock<Option<HashSet<TableReference>>>>,
+    /// Datasets that skipped at least one CDC change event because it could not
+    /// be decoded. [`ComponentStatus::Ready`] is ignored for these until
+    /// [`Self::clear_changes_decode_degraded`] (a successful full refresh or
+    /// snapshot) or process restart, so a later valid event cannot hide the gap.
+    changes_decode_degraded: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Default for RuntimeStatus {
@@ -122,6 +127,7 @@ impl Default for RuntimeStatus {
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
             dataset_ready_hold: Arc::new(RwLock::new(None)),
+            changes_decode_degraded: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
@@ -326,11 +332,46 @@ impl RuntimeStatus {
 
     /// Apply a dataset status without consulting [`Self::dataset_ready_hold`].
     fn apply_dataset_status_now(&self, dataset: &TableReference, status: ComponentStatus) {
+        if status == ComponentStatus::Ready && self.is_changes_decode_degraded(dataset) {
+            return;
+        }
         let ds_name = dataset.to_string();
         let metric_value = status.discriminant();
         self.update_component_status(&format!("dataset:{ds_name}"), status);
         runtime_metrics::datasets::STATUS
             .record(metric_value, &[KeyValue::new("dataset", ds_name)]);
+    }
+
+    /// Record that `dataset` skipped a CDC change event that could not be decoded.
+    ///
+    /// Sets dataset status to [`ComponentStatus::Error`] with `message` (which must
+    /// not contain payload or field values) and ignores later `Ready` updates until
+    /// [`Self::clear_changes_decode_degraded`].
+    pub fn mark_changes_decode_degraded(&self, dataset: &TableReference, message: String) {
+        self.changes_decode_degraded
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dataset.to_string());
+        self.update_dataset(dataset, ComponentStatus::error_with_message(message));
+    }
+
+    /// Allow `dataset` to become [`ComponentStatus::Ready`] again after a successful
+    /// full refresh, snapshot load, or equivalent resnapshot. Does not set `Ready`;
+    /// the caller does that after this returns.
+    pub fn clear_changes_decode_degraded(&self, dataset: &TableReference) {
+        self.changes_decode_degraded
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&dataset.to_string());
+    }
+
+    /// Whether `dataset` is holding a sticky CDC decode-error condition.
+    #[must_use]
+    pub fn is_changes_decode_degraded(&self, dataset: &TableReference) -> bool {
+        self.changes_decode_degraded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&dataset.to_string())
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
@@ -1536,5 +1577,73 @@ mod tests {
         assert_eq!(status.unavailable_embedding_reason("m"), None);
         assert!(status.unavailable_embedding_reason("e").is_some());
         assert_eq!(status.unavailable_model_reason("e"), None);
+    }
+
+    #[test]
+    fn changes_decode_error_stays_error_until_cleared() {
+        const SECRET: &str = "s3cr3t-token-value";
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+        let message = "Failed to decode a change event for dataset 'orders' from Kafka topic 't' partition 0 offset 1, so that event was skipped and the dataset is Error until a full refresh or restart. Cause: missing_required_field. See: https://spiceai.org/docs/components/data-connectors/debezium";
+        assert!(
+            !message.contains(SECRET),
+            "the sticky Error message must not include payload values"
+        );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.mark_changes_decode_degraded(&dataset, message.to_string());
+
+        assert!(status.is_changes_decode_degraded(&dataset));
+        let error = status.get_dataset_status(&dataset).expect("status");
+        assert!(error.is_error());
+        assert_eq!(error.error_message(), Some(message));
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        let still_error = status.get_dataset_status(&dataset).expect("status");
+        assert!(
+            still_error.is_error(),
+            "Ready must not clear a sticky CDC decode error, got {still_error:?}"
+        );
+        assert_eq!(still_error.error_message(), Some(message));
+
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Refreshing)
+        );
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Refreshing),
+            "Ready is ignored while the sticky decode error is set, so a refresh in progress stays Refreshing"
+        );
+
+        status.clear_changes_decode_degraded(&dataset);
+        assert!(!status.is_changes_decode_degraded(&dataset));
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn releasing_held_ready_does_not_clear_a_decode_error() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.hold_dataset_ready();
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.mark_changes_decode_degraded(
+            &dataset,
+            "Failed to decode a change event for dataset 'orders' from Kafka topic 't' partition 0 offset 1, so that event was skipped and the dataset is Error until a full refresh or restart. Cause: json_parse. See: https://spiceai.org/docs/components/data-connectors/debezium".to_string(),
+        );
+        status.release_dataset_ready();
+
+        let error = status.get_dataset_status(&dataset).expect("status");
+        assert!(
+            error.is_error(),
+            "a held Ready applied on release must not hide a sticky decode error"
+        );
     }
 }
