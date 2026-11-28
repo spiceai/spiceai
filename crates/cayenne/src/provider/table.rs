@@ -44,8 +44,9 @@ use super::delete::{
 use super::inlined_cache::{self, InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
-    PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction, RetentionPass,
-    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
+    PostWriteMaintenanceHold, PostWriteMaintenanceState, PublishedLiveRowsDelta, QueuedStatistics,
+    RetentionFailureAction, RetentionPass, SnapshotMaintenanceTrigger, duration_millis_saturating,
+    protected_snapshot_maintenance_trigger,
 };
 use super::maintenance_metrics::{
     self, CompactionKind, CompactionOutcome, CompactionTrigger, MaintenanceOp, MaintenanceOutcome,
@@ -206,6 +207,106 @@ struct BakeOutput<'a> {
     snapshot_at_capture: &'a str,
     merged_snapshot_id: &'a str,
     input_ids: &'a [String],
+}
+
+/// Whether a seq-prefix bake waits for the process-wide bake slot or skips when
+/// another table's bake holds it (see `compaction::bake_budget`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BakeSlotWait {
+    Wait,
+    Skip,
+}
+
+/// One seq-prefix bake input's files, split by whether the bake's deletion
+/// filter removes a row from them
+/// ([`CayenneTableProvider::bake_partition_input_files`]).
+struct BakeInputFiles {
+    snapshot_id: String,
+    /// The input's deletion threshold, as the bake applies it.
+    threshold: i64,
+    /// The files the filter removes a row from, as the capture their scan reads.
+    rewrite: CapturedSnapshotFiles,
+    /// File names of [`Self::rewrite`].
+    rewrite_names: Vec<String>,
+    /// The files the filter removes no row from, by file name. The bake links
+    /// them into its output instead of re-encoding them.
+    keep_names: Vec<String>,
+}
+
+/// The files of every input of a seq-prefix bake that keeps some of them.
+struct BakeFilePartition {
+    inputs: Vec<BakeInputFiles>,
+    rewritten_bytes: u64,
+    kept_bytes: u64,
+}
+
+impl BakeFilePartition {
+    fn rewritten_files(&self) -> usize {
+        self.inputs
+            .iter()
+            .map(|input| input.rewrite_names.len())
+            .sum()
+    }
+
+    fn kept_files(&self) -> usize {
+        self.inputs.iter().map(|input| input.keep_names.len()).sum()
+    }
+
+    /// The inputs with a file to rewrite, and those files' captures by input.
+    fn rewrite_inputs(&self) -> (Vec<(String, i64)>, HashMap<String, CapturedSnapshotFiles>) {
+        self.inputs
+            .iter()
+            .filter(|input| !input.rewrite_names.is_empty())
+            .map(|input| {
+                (
+                    (input.snapshot_id.clone(), input.threshold),
+                    (input.snapshot_id.clone(), input.rewrite.clone()),
+                )
+            })
+            .unzip()
+    }
+}
+
+/// The first of `kept` that appears twice in it or is already in `written`.
+///
+/// A bake links the files it keeps from several input directories into one
+/// output directory, so two with one name would leave only one of them, and a
+/// kept file named like one the bake wrote would replace it.
+fn first_bake_link_collision<'a>(
+    kept: impl IntoIterator<Item = &'a str>,
+    written: &HashSet<String>,
+) -> Option<&'a str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    kept.into_iter()
+        .find(|name| written.contains(*name) || !seen.insert(name))
+}
+
+/// Rows `plan` yields.
+async fn count_plan_rows(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<datafusion::execution::TaskContext>,
+) -> DataFusionResult<u64> {
+    use futures::TryStreamExt as _;
+    let mut stream = datafusion_physical_plan::execute_stream(plan, task_ctx)?;
+    let mut rows: u64 = 0;
+    while let Some(batch) = stream.try_next().await? {
+        rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+    }
+    Ok(rows)
+}
+
+/// Test-only view of what the last seq-prefix bake of a table kept, and a
+/// switch to make it rewrite every file.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestBakeFiles {
+    /// Rewrite every input file, as the bake did before it could keep any.
+    pub(crate) rewrite_all: bool,
+    /// `(files rewritten, files kept)` by the last committed bake that split
+    /// its inputs, or `None` when it rewrote every file unsplit.
+    pub(crate) last: Option<(usize, usize)>,
+    /// In place of [`BAKE_LINK_MIN_FILE_BYTES`].
+    pub(crate) link_min_file_bytes: Option<u64>,
 }
 
 /// An on-conflict deletion update with the deletion index it extends to, built
@@ -647,7 +748,9 @@ impl CayenneCdcWrite {
             // that so we can re-arm the recovery flags after `finish()` clears
             // them (see the re-arm after `finish()` below).
             let mut staging_wal_removal_failed = false;
-            let superseded_rows = if let Some(prepared_on_conflict) = self.prepared_on_conflict {
+            let (superseded_rows, statistics_epoch) = if let Some(prepared_on_conflict) =
+                self.prepared_on_conflict
+            {
                 // Authoritative superseded-row count, captured at validation time.
                 // Do NOT recompute from `deleted_pk_i64`/`deleted_row_keys`: for an
                 // `Int64Pk` table those hold the SAME deletions in two encodings, so
@@ -769,17 +872,18 @@ impl CayenneCdcWrite {
                     "publish_deletion_apply",
                     deletion_apply_start,
                 );
-                superseded
+                (superseded, self.table.statistics_epoch())
             } else {
-                prepared_append.apply_under_barrier().await?;
-                0
+                (0, prepared_append.apply_under_barrier().await?)
             };
             // Both branches above have made this commit's rows visible. From
             // here the claim survives a cancellation or a failure — `finish()`
             // and `sequence_high_water()` below are both suspension points, and
             // a commit that dies at one has published rows it will never queue a
             // delta for.
-            let published_live_rows_delta = reserved_live_rows_delta.published();
+            let published_live_rows_delta = reserved_live_rows_delta.published(statistics_epoch);
+            #[cfg(test)]
+            self.table.run_test_post_staged_publish_hook().await;
             let rows = prepared_append.finish().await?;
             if staging_wal_removal_failed {
                 // `finish()` -> `mark_inflight_complete()` just cleared
@@ -1094,7 +1198,7 @@ impl OneRecordPublish {
                 "publish_deletion_apply",
                 deletion_apply_start,
             );
-            reserved_live_rows_delta.published()
+            reserved_live_rows_delta.published(table.statistics_epoch())
         };
         let rows = prepared_append.row_count();
         if let Err(error) = prepared_append.finish().await {
@@ -1268,6 +1372,15 @@ pub(crate) struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
+    /// The position deletes as they stood when `files` was captured, which a
+    /// scan of these files applies instead of the live cache: a compaction that
+    /// commits after the capture clears that cache while the scan still reads
+    /// these files. Statistics adjusted for them reach the shared caches only
+    /// while they are still the live vectors; the pending-deletes gate on
+    /// exact statistics keeps `COUNT(*)` and the `LIMIT` early stop correct
+    /// when an older adjustment gets there anyway.
+    /// Held past the live cache only by the cached scan view and running scans.
+    positions: Arc<PositionBitmap>,
     /// Whether `files` is the snapshot's whole file set. Only a whole one may
     /// become [`CayenneTableProvider::cached_snapshot_listing`], which every
     /// later scan of the snapshot plans from.
@@ -1280,11 +1393,17 @@ pub(crate) struct CapturedSnapshotFiles {
 
 impl CapturedSnapshotFiles {
     /// The whole file set of a snapshot.
-    fn new(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
+    fn new(
+        dir_generation: u64,
+        listing_epoch: u64,
+        files: Arc<Vec<PartitionedFile>>,
+        positions: Arc<PositionBitmap>,
+    ) -> Self {
         Self {
             dir_generation,
             listing_epoch,
             files,
+            positions,
             whole_snapshot: true,
             with_statistics: Arc::default(),
         }
@@ -1293,11 +1412,27 @@ impl CapturedSnapshotFiles {
     /// Some of a snapshot's files, such as the ones a compaction picked to
     /// merge: a scan of them reads only them, and no other scan reuses their
     /// listing as the snapshot's.
-    fn subset(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
+    fn subset(
+        dir_generation: u64,
+        listing_epoch: u64,
+        files: Arc<Vec<PartitionedFile>>,
+        positions: Arc<PositionBitmap>,
+    ) -> Self {
         Self {
             whole_snapshot: false,
-            ..Self::new(dir_generation, listing_epoch, files)
+            ..Self::new(dir_generation, listing_epoch, files, positions)
         }
+    }
+
+    /// `files`, some of this capture's files, as a [`Self::subset`] under this
+    /// capture's generations and position deletes.
+    fn narrowed_to(&self, files: Vec<PartitionedFile>) -> Self {
+        Self::subset(
+            self.dir_generation,
+            self.listing_epoch,
+            Arc::new(files),
+            Arc::clone(&self.positions),
+        )
     }
 }
 
@@ -1913,6 +2048,7 @@ impl RawScanInput {
             maintained_aggregate_epoch: self.maintained_aggregate_epoch,
             mem_tier_versions: self.mem_tier_shards.iter().map(|s| s.version).collect(),
             deletion_index_ptr: self.deletion_snapshot.index_ptr(),
+            position_deletions_ptr: Arc::as_ptr(&self.warm_files.positions).addr(),
             protected_map_ptr: Arc::as_ptr(&self.protected_map).addr(),
             inlined_view_ptr: Arc::as_ptr(&self.inlined_view).addr(),
             lookup_index_ptr: self
@@ -2045,6 +2181,8 @@ struct ScanViewKey {
     maintained_aggregate_epoch: Option<u64>,
     mem_tier_versions: Vec<u64>,
     deletion_index_ptr: Option<usize>,
+    /// The position deletes the view's files are read with.
+    position_deletions_ptr: usize,
     protected_map_ptr: usize,
     inlined_view_ptr: usize,
     /// A background build publishing for the same snapshot must mint a new
@@ -2208,6 +2346,15 @@ pub enum ScanViewReuse {
 /// every delta it stopped holding before.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CurrentScanView;
+
+/// Session config extension marking a maintenance pass's read of files that the
+/// pass replaces. Such a scan collects its files' statistics but does not
+/// persist them: once the pass publishes, no scan reads a replaced file's row,
+/// and each row is a metastore commit that the table's writers would wait
+/// behind. A query that joins such a collection shares its answer unpersisted,
+/// so a later process reads that file's footer instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReplacedFilesScan;
 
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
 /// Replaces the per-scan merge-on-read memos: a bundle is built only for a
@@ -2762,6 +2909,11 @@ pub struct CayenneTableProvider {
     /// serve a short list. A hit skips object-store LIST and per-file
     /// footer/catalog fetches; the query still prunes with its own predicate.
     cached_snapshot_listing: Arc<ArcSwapOption<CachedSnapshotListing>>,
+    /// Triggered seq-prefix bakes skipped in a row because another table's bake
+    /// held the process-wide bake slot (see
+    /// [`Self::bake_seq_prefix_protected_snapshots_on_trigger`]). Shared across
+    /// writer clones.
+    bake_slot_skips: Arc<AtomicUsize>,
     /// Bumped whenever [`Self::cached_snapshot_listing`] is dropped. Distinct
     /// from [`Self::current_dir_generation`]: bumping that generation aborts
     /// compaction. An in-flight LIST samples this at start and skips storing
@@ -2945,6 +3097,14 @@ pub struct CayenneTableProvider {
     /// first fire.
     #[cfg(test)]
     test_pre_bake_prune_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired when a seq-prefix bake's encode first pulls its input,
+    /// so after the write has taken its encode permits and before it encodes a
+    /// row. Lets a test hold a bake mid-encode. Consumed on first fire.
+    #[cfg(test)]
+    test_bake_input_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// See [`TestBakeFiles`].
+    #[cfg(test)]
+    test_bake_files: Arc<ParkingMutex<TestBakeFiles>>,
     /// Test-only seam fired after a mem-tier checkpoint has built its deletion-index
     /// extension and before it takes the listing fence to publish it. Consumed on
     /// first fire.
@@ -3007,6 +3167,10 @@ pub struct CayenneTableProvider {
     /// in that window. Consumed on first fire.
     #[cfg(test)]
     test_post_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by a pipelined staged append after it publishes its
+    /// rows and before it queues their live-row delta. Consumed on first fire.
+    #[cfg(test)]
+    test_post_staged_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by the inline write after it commits its rows to the
     /// metastore and before it publishes them, so a test can land a checkpoint in
     /// that window. Consumed on first fire.
@@ -3669,7 +3833,7 @@ pub struct CayenneTableProvider {
     /// as it does an in-flight append's.
     staging_deletes_after_commit: Arc<ParkingMutex<HashSet<String>>>,
     /// Admission of change-stream appends to staging: each holds it shared while
-    /// it stages, and a write that tombstones keys holds it exclusively while it
+    /// it stages, and a key delete or an overwrite holds it exclusively while it
     /// waits for the appends staged before it to commit
     /// ([`Self::lock_write_after_staged_appends`]), so no new append stages ahead
     /// of it meanwhile.
@@ -3725,9 +3889,17 @@ pub struct CayenneTableProvider {
     /// exclusively and skip via `try_write` when it is held: the current-snapshot
     /// rewrite, the seq-prefix bake, the manifest rebuild, cold promotion, and
     /// the reopen drain. Key-delete subset merges take it shared, so small
-    /// merges can run during a long large-tier merge. The write lock
-    /// still serializes inserts independently.
+    /// merges can run during a long large-tier merge. A datalake merge also
+    /// takes it shared: it rewrites only datalake files, so the protected set
+    /// keeps merging while it uploads, and [`Self::cold_merge_lock`] keeps two
+    /// datalake merges apart. The write lock still serializes inserts
+    /// independently.
     compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes datalake merges ([`Self::compact_cold_tier`]) with each
+    /// other. Taken before [`Self::compaction_lock`]. Cold promotion needs no
+    /// share of it: it holds `compaction_lock` exclusively, which already
+    /// excludes a datalake merge holding it shared.
+    cold_merge_lock: Arc<tokio::sync::Mutex<()>>,
     /// Runs claimed by in-flight subset merges, which keeps concurrent merges
     /// on disjoint inputs. See [`ProtectedMergeClaims`].
     protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
@@ -3971,6 +4143,7 @@ pub struct CayenneTableProviderBuilder {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -4000,13 +4173,35 @@ fn validated_lookup_index_keys(
     schema: &arrow_schema::Schema,
     indexes: &[Vec<String>],
     memory_mode: bool,
+    automatic_index_columns: &[String],
 ) -> CatalogResult<Vec<super::lookup_index::KeySpec>> {
     let invalid = |message| Error::InvalidConfiguration {
         table: table_name.to_string(),
         message,
     };
     let mut keys: Vec<super::lookup_index::KeySpec> = Vec::new();
-    for key in super::lookup_index::KeySpec::from_indexes(indexes) {
+    let mut indexes = indexes.to_vec();
+    // Requested metadata also covers tables whose stored column predates the
+    // marker. Only columns present in the opened schema receive an index.
+    indexes.extend(
+        automatic_index_columns
+            .iter()
+            .filter(|name| schema.column_with_name(name).is_some())
+            .map(|name| vec![name.clone()]),
+    );
+    indexes.extend(
+        schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| vec![field.name().clone()]),
+    );
+    for key in super::lookup_index::KeySpec::from_indexes(&indexes) {
         let mut columns = Vec::with_capacity(key.columns().len());
         for column in key.columns() {
             let column =
@@ -4126,6 +4321,7 @@ struct CayenneTableProviderOpenOptions {
     durable_write_back: bool,
     scan_view_reuse: ScanViewReuse,
     secondary_indexes: Vec<Vec<String>>,
+    automatic_index_columns: Vec<String>,
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
@@ -4183,6 +4379,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: false,
             scan_view_reuse: ScanViewReuse::UntilInvalidated,
             secondary_indexes: Vec::new(),
+            automatic_index_columns: Vec::new(),
             index_persistence: IndexPersistence::default(),
             index_word_bits: None,
             dataset_name: None,
@@ -4313,6 +4510,24 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Request internal indexes from field metadata, independently of configured
+    /// indexes. Missing columns in an older stored schema are ignored on open.
+    #[must_use]
+    pub fn with_schema_indexes(mut self, schema: &arrow_schema::Schema) -> Self {
+        self.automatic_index_columns = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get(arrow_tools::metadata_keys::AUTOMATIC_INDEX_METADATA_KEY)
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|field| field.name().clone())
+            .collect();
+        self
+    }
+
     /// Whether the secondary index runs persist as run files. Hidden, for
     /// testing.
     #[doc(hidden)]
@@ -4350,6 +4565,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -4376,6 +4592,7 @@ impl CayenneTableProviderBuilder {
             &options.schema,
             &self.secondary_indexes,
             options.vortex_config.memory_mode,
+            &self.automatic_index_columns,
         )?;
         // A create of a table the catalog holds opens it (a restart creates
         // every table again); an error reading it counts as a new table, which
@@ -4392,6 +4609,7 @@ impl CayenneTableProviderBuilder {
             durable_write_back: self.durable_write_back,
             scan_view_reuse: self.scan_view_reuse,
             secondary_indexes: self.secondary_indexes,
+            automatic_index_columns: self.automatic_index_columns,
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
@@ -4485,6 +4703,25 @@ pub(crate) fn refused_until_reload(refuses_queries: bool) -> &'static str {
         "writes and queries are refused"
     } else {
         "writes are refused"
+    }
+}
+
+/// The error of a commit by `writer` (such as "a write") to `table` that failed
+/// with `error`, and whose outcome could not be read back (`read_error`): its
+/// files are kept, and the table refuses what [`refused_until_reload`] names.
+pub(crate) fn unresolved_commit_error(
+    table: String,
+    writer: &str,
+    error: &dyn std::fmt::Display,
+    read_error: &dyn std::fmt::Display,
+    refuses_queries: bool,
+) -> Error {
+    Error::IncompleteWrite {
+        table,
+        message: format!(
+            "{writer}'s commit failed ({error}), and reading back whether it committed failed too ({read_error}). Its files are kept, and {} until the table is reloaded from its catalog. Restart Spice to reload it",
+            refused_until_reload(refuses_queries)
+        ),
     }
 }
 
@@ -4647,6 +4884,25 @@ fn protected_merge_input_budget_for_pool(
 /// or below the size-tier merge's trigger — see
 /// [`CayenneTableProvider::bake_keep_recent_snapshots`].
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// Size below which a seq-prefix bake rewrites an input file even when it
+/// removes no row from it, rather than link it into its output.
+///
+/// A bake's output is one large protected snapshot that the size-tier merge
+/// leaves alone, so a small file linked into it stays a file of its own for as
+/// long as the snapshot lives, and every scan opens it. The full rewrite folded
+/// the settled prefix's small checkpoint files into a few large ones; on the rig
+/// the first bakes of a partial bake linked 104-372 checkpoint files of about
+/// 30-90 KB each into their outputs instead (4-10 MB in all), while the files a
+/// bake writes are about 10 MB. Rewriting the small ones costs little and keeps
+/// the consolidation; a file of a megabyte or more is already worth reading as
+/// it is.
+const BAKE_LINK_MIN_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Triggered seq-prefix bakes a table skips in a row, while other tables hold
+/// the process-wide bake slot, before its next one waits for the slot (see
+/// `CayenneTableProvider::bake_seq_prefix_protected_snapshots_on_trigger`).
+const BAKE_SLOT_SKIPS_BEFORE_WAIT: usize = 3;
 
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
@@ -7342,12 +7598,20 @@ impl CayenneTableProvider {
         !self.pk_deletion_strategy.is_position_based() && self.upsert_bloom_eligible()
     }
 
-    /// `write_lock`, for a write that tombstones keys, taken once every append
-    /// staged before this call has committed or been abandoned, so the write
-    /// acts on the appended rows like on every other committed row (see
-    /// [`Self::key_tombstones_wait_for_staged_appends`]). The wait holds
-    /// [`Self::append_admission`] so no append stages meanwhile, and not
-    /// `write_lock`, which an append into the current snapshot takes to commit.
+    /// `write_lock`, taken once every append staged before this call has
+    /// committed or been abandoned, so the write acts on the appended rows like
+    /// on every other committed row: a key delete (see
+    /// [`Self::key_tombstones_wait_for_staged_appends`]) or an overwrite, which
+    /// replaces them. `write` names the waiting write in the timeout error.
+    ///
+    /// The wait holds [`Self::append_admission`], so no new append stages
+    /// meanwhile, and not `write_lock`, which an append into the current
+    /// snapshot takes to commit. A same-record scope that already holds
+    /// unpublished changes to this table writes past it: the wait is for that
+    /// scope's record, which commits only after the scope's last write. Such a
+    /// write can stage while the wait holds admission, so the lock is taken
+    /// only once nothing is in flight under it, which no append can change
+    /// while it is held.
     ///
     /// # Errors
     ///
@@ -7355,21 +7619,41 @@ impl CayenneTableProvider {
     /// committed within the drain timeout.
     pub(crate) async fn lock_write_after_staged_appends(
         &self,
+        write: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
-        let _admission = self.append_admission.write().await;
-        if !self
-            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
-            .await
-        {
-            return Err(Error::Internal {
-                table: self.table_metadata.table_name.clone(),
-                message: format!(
-                    "A change-stream write did not commit within {} s, so the delete or update was not applied; retry it",
-                    STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
-                ),
-            });
+        let _admission = if self.scope_has_unpublished_changes() {
+            None
+        } else {
+            Some(self.append_admission.write().await)
+        };
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        loop {
+            if !self
+                .drain_inflight_staged_writes(deadline.saturating_duration_since(Instant::now()))
+                .await
+            {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!(
+                        "A change-stream write did not commit within {} s, so {write} was not applied; retry it",
+                        STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+            let write_guard = self.write_lock_arc().lock_owned().await;
+            if !self.staged_writes_inflight_by_others() {
+                return Ok(write_guard);
+            }
         }
-        Ok(self.write_lock_arc().lock_owned().await)
+    }
+
+    /// Whether a key delete or an overwrite holds [`Self::append_admission`]
+    /// while it waits for the appends staged before it, so a test can start a
+    /// write only once that wait has begun. `#[doc(hidden)]`: not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn append_admission_held_exclusively(&self) -> bool {
+        self.append_admission.try_read().is_err()
     }
 
     /// Wait for in-flight pipelined Stage-B publishes (staged WALs, staged
@@ -7388,15 +7672,19 @@ impl CayenneTableProvider {
     /// lock + listing fence and therefore completes under the held lock.
     pub(crate) async fn drain_inflight_staged_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while self.staging_appends_inflight_by_others()
-            || self.inline_changes_unpublished_by_others()
-        {
+        while self.staged_writes_inflight_by_others() {
             if Instant::now() >= deadline {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// Whether a write of another same-record scope, or of none, has staged or
+    /// committed a change that is not yet published.
+    fn staged_writes_inflight_by_others(&self) -> bool {
+        self.staging_appends_inflight_by_others() || self.inline_changes_unpublished_by_others()
     }
 
     pub(crate) fn staging_wal_present(&self) -> &AtomicBool {
@@ -7501,15 +7789,18 @@ impl CayenneTableProvider {
         ));
 
         let lock_wait_start = Instant::now();
-        // Held while this append stages: a key delete waiting for the appends
-        // staged before it holds it exclusively
+        // Held while this append stages: a key delete or an overwrite waiting
+        // for the appends staged before it holds it exclusively
         // (`lock_write_after_staged_appends`). Not taken under an outer
-        // `write_lock` hold, which already excludes that delete.
-        let _admission = if super::write_lock_held::is_held() {
-            None
-        } else {
-            Some(self.append_admission.read().await)
-        };
+        // `write_lock` hold, which already excludes that write, nor by a
+        // same-record scope that already holds unpublished changes here, whose
+        // record that write may be waiting for.
+        let _admission =
+            if super::write_lock_held::is_held() || self.scope_has_unpublished_changes() {
+                None
+            } else {
+                Some(self.append_admission.read().await)
+            };
         // Autocommit UPDATE already holds `write_lock`. A second acquire
         // deadlocks. `acquire_or_share` reuses that hold; spawned commit
         // keeps a clone of it (task-locals do not cross `tokio::spawn`).
@@ -7756,6 +8047,17 @@ impl CayenneTableProvider {
             // The overwrite's catalog commit deleted every inline row of this table,
             // any seal shadow included, so no bake has a shadow left to clear.
             self.mem_tier_shadow_present.store(false, Ordering::Release);
+            {
+                // The statistics of the replaced rows go with them, in the same
+                // flip: a write that published before it stamped the old epoch
+                // and its delta is dropped, and a persist in progress finishes
+                // before the cached aggregate is cleared. Fence, then persistence
+                // lock: the order schema evolution and checkpoints take.
+                let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+                self.post_write_maintenance
+                    .start_statistics_epoch_after_overwrite();
+                self.clear_cached_table_statistics_unlocked();
+            }
             self.publish_overwrite_snapshot_fenced(
                 new_snapshot_id,
                 new_listing_table,
@@ -9663,38 +9965,16 @@ impl CayenneTableProvider {
         self.context.scan_from_manifest() || self.data_in_object_native_location()
     }
 
-    /// Records the files of `snapshot_id`, a protected snapshot this write has
-    /// just written under a new id and is about to publish at `sequence`, in its
-    /// manifest, for a table in the object-native location: its scans read only
-    /// the manifest, so the files must be there before the snapshot is visible.
-    /// The range is `[sequence, sequence]`, as the post-write rebuild tags a
-    /// protected snapshot. The files are the ones this write put there (see
-    /// [`super::uncommitted_files`]), never a listing of the directory. Other
-    /// tables are left to the post-write rebuild.
-    pub(crate) async fn record_new_protected_snapshot_files(
-        &self,
-        snapshot_id: &str,
-        sequence: i64,
-    ) -> CatalogResult<()> {
-        if !self.data_in_object_native_location() {
-            return Ok(());
-        }
-        self.upsert_snapshot_manifest_from_files(
-            snapshot_id,
-            ManifestSequenceTag::Uniform {
-                min: sequence,
-                max: sequence,
-            },
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// The manifest rows [`Self::record_new_protected_snapshot_files`] would
-    /// record, for a commit that names them itself; empty for a table outside
-    /// the object-native location. The files stay in the writer's record until
-    /// that commit lands.
-    async fn new_protected_snapshot_manifest(
+    /// The manifest of `snapshot_id`, a protected snapshot this write has just
+    /// written under a new id and publishes at `sequence`, for the commit that
+    /// makes it live to name; empty for a table outside the object-native
+    /// location, which the post-write rebuild records. Such a table scans only
+    /// its manifest, so the files must be named no later than that commit. The
+    /// range is `[sequence, sequence]`, as the post-write rebuild tags a
+    /// protected snapshot, and the files are the ones this write put there (see
+    /// [`super::uncommitted_files`]), never a listing of the directory. They stay
+    /// in the writer's record until that commit lands.
+    pub(crate) async fn new_protected_snapshot_manifest(
         &self,
         snapshot_id: &str,
         sequence: i64,
@@ -9702,17 +9982,8 @@ impl CayenneTableProvider {
         if !self.data_in_object_native_location() {
             return Ok(Vec::new());
         }
-        let (_, rows) = self
-            .snapshot_manifest_rows(
-                snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: sequence,
-                    max: sequence,
-                },
-                Vec::new(),
-            )
-            .await?;
-        Ok(rows)
+        self.uniform_snapshot_manifest_rows(snapshot_id, sequence, sequence)
+            .await
     }
 
     /// Records `files` (`(file name, size)` in `snapshot_id`'s directory) in the
@@ -9818,8 +10089,11 @@ impl CayenneTableProvider {
             });
         }
 
-        let path = url.path().trim_start_matches('/');
-        Ok(ObjectStorePath::from(path))
+        crate::dataset_storage::object_key_of_url(&url).map_err(|source| Error::ObjectStore {
+            operation: "resolve the object path of a data URL",
+            table: self.table_metadata.table_name.clone(),
+            source: source.into(),
+        })
     }
 
     /// Releases everything the Vortex caches still hold for files this table has
@@ -10057,13 +10331,13 @@ impl CayenneTableProvider {
                 source,
             })?;
 
-        let mut base_prefix = base_url.path().trim_start_matches('/').to_string();
-        if !base_prefix.ends_with('/') {
-            base_prefix.push('/');
-        }
-
-        let prefix =
-            ObjectStorePath::from(format!("{base_prefix}{}/", self.table_metadata.table_id));
+        let prefix = crate::dataset_storage::object_key_of_url(&base_url)
+            .map_err(|source| Error::ObjectStore {
+                operation: "resolve the object path of a data URL",
+                table: self.table_metadata.table_name.clone(),
+                source: source.into(),
+            })?
+            .join(self.table_metadata.table_id.as_str());
 
         let list_result = config
             .store
@@ -10667,9 +10941,21 @@ impl CayenneTableProvider {
         strategy: &PkDeletionStrategyWithCache,
         session_config: &SessionConfig,
     ) -> SnapshotScanOptions {
-        let file_format: Arc<dyn FileFormat> = Arc::new(
-            vortex_format.with_access_plan_provider(Self::position_deletion_plans(strategy)),
-        );
+        Self::snapshot_scan_options(
+            vortex_format,
+            Self::position_deletion_plans(strategy),
+            session_config,
+        )
+    }
+
+    /// [`Self::create_listing_options`] over the access plans in `plans`.
+    fn snapshot_scan_options(
+        vortex_format: &Arc<VortexFormat>,
+        plans: Arc<dyn VortexAccessPlanProvider>,
+        session_config: &SessionConfig,
+    ) -> SnapshotScanOptions {
+        let file_format: Arc<dyn FileFormat> =
+            Arc::new(vortex_format.with_access_plan_provider(plans));
         SnapshotScanOptions {
             listing: ListingOptions::new(file_format),
             target_partitions: session_config.target_partitions(),
@@ -10697,6 +10983,20 @@ impl CayenneTableProvider {
         Arc::new(PositionDeletionAccessPlanProvider::new(Arc::clone(
             strategy.position_cache(),
         )))
+    }
+
+    /// [`Self::position_deletion_plans`] over the vectors captured with
+    /// `captured`'s files.
+    fn scan_position_deletion_plans(
+        &self,
+        captured: Option<&CapturedSnapshotFiles>,
+    ) -> Arc<dyn VortexAccessPlanProvider> {
+        match captured {
+            Some(captured) => Arc::new(PositionDeletionAccessPlanProvider::new(Arc::new(
+                ArcSwap::new(Arc::clone(&captured.positions)),
+            ))),
+            None => Self::position_deletion_plans(&self.pk_deletion_strategy),
+        }
     }
 
     /// The URL of the directory that holds `snapshot_id`'s data files: the
@@ -12079,6 +12379,7 @@ impl CayenneTableProvider {
             durable_write_back,
             scan_view_reuse,
             secondary_indexes,
+            automatic_index_columns,
             index_persistence,
             index_word_bits,
             dataset_name,
@@ -12338,6 +12639,7 @@ impl CayenneTableProvider {
             &table_metadata.schema,
             &secondary_indexes,
             table_metadata.vortex_config.memory_mode,
+            &automatic_index_columns,
         )?;
         // Shared with the lookup index, which invalidates cached scan views when
         // its published index changes.
@@ -12404,6 +12706,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_bake_input_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_bake_files: Arc::new(ParkingMutex::new(TestBakeFiles::default())),
+            #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
@@ -12431,6 +12737,8 @@ impl CayenneTableProvider {
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_staged_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_pre_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
@@ -12474,6 +12782,7 @@ impl CayenneTableProvider {
             ),
             scan_file_statistics_flights: Arc::default(),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
+            bake_slot_skips: Arc::new(AtomicUsize::new(0)),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer_inexact: table_statistics
@@ -12627,6 +12936,7 @@ impl CayenneTableProvider {
             current_dir_generation: Arc::new(AtomicU64::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
+            cold_merge_lock: Arc::new(tokio::sync::Mutex::new(())),
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             maintenance_closed: Arc::new(AtomicBool::new(false)),
@@ -13180,13 +13490,32 @@ impl CayenneTableProvider {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         self.sync_local_snapshot_dir(snapshot_id).await?;
-        self.record_new_protected_snapshot_files(snapshot_id, sequence_number)
-            .await?;
+        self.set_new_protected_snapshot_sequence(snapshot_id, sequence_number)
+            .await
+    }
 
+    /// Records `snapshot_id`, a protected snapshot this write has just written
+    /// under a new id, at `sequence`, naming its files in the same commit for a
+    /// table in the object-native location: committed apart, a crash between the
+    /// two leaves the files of a snapshot that never became live named, where no
+    /// sweep reclaims them.
+    async fn set_new_protected_snapshot_sequence(
+        &self,
+        snapshot_id: &str,
+        sequence: i64,
+    ) -> CatalogResult<()> {
+        let files = self
+            .new_protected_snapshot_manifest(snapshot_id, sequence)
+            .await?;
         self.catalog
-            .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
+            .set_snapshot_sequence(
+                &self.table_metadata.table_id,
+                snapshot_id,
+                sequence,
+                (!files.is_empty()).then_some(files.as_slice()),
+            )
             .await?;
-
+        self.uncommitted_files.forget(snapshot_id);
         Ok(())
     }
 
@@ -13367,6 +13696,7 @@ impl CayenneTableProvider {
             fan_out,
             encode_budget,
             routing,
+            max_shards,
         } = policy;
         // A range plan routes on its key column, whatever the policy asked for.
         let routing = if range.is_some() {
@@ -13403,12 +13733,15 @@ impl CayenneTableProvider {
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
-        let shard_count = self.snapshot_shard_count(
-            target_partitions,
-            target_size_bytes,
-            estimated_bytes,
-            fan_out,
-        );
+        let shard_count = self
+            .snapshot_shard_count(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                fan_out,
+            )
+            .min(max_shards.unwrap_or(usize::MAX))
+            .max(1);
         // `snapshot_write_concurrency` already clamps the fan-out to
         // `target_partitions`, so there is no second clamp here — one place owns
         // the rule. Permitting for that count is what keeps a
@@ -13430,7 +13763,7 @@ impl CayenneTableProvider {
         // deadlocks the demux against the permit holders (see `write_budget`
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits = match encode_budget {
+        let encode_permits = match encode_budget {
             super::delta_encoding::EncodeBudgetUse::Shared => {
                 super::write_budget::acquire_encode_permits(
                     shard_count,
@@ -13446,6 +13779,19 @@ impl CayenneTableProvider {
             "encode_permit_wait",
             encode_permit_wait_start,
         );
+        // A delta write may be granted fewer permits than shards (it takes what is
+        // free rather than wait; see `write_budget::acquire_from`), and encodes no
+        // wider than it paid for. A maintenance write waits for its permits and
+        // keeps the fan-out it sized, as it always has: its permits are clamped to
+        // the maintenance slice, not its shards.
+        let encode_shards = match write_class {
+            super::delta_encoding::WriteClass::Delta => encode_permits
+                .as_ref()
+                .map_or(shard_count, super::write_budget::EncodePermits::granted)
+                .min(shard_count)
+                .max(1),
+            super::delta_encoding::WriteClass::Maintenance => shard_count,
+        };
 
         // Construct snapshot directory URL. An append writing at its final keys
         // writes into the snapshot directory it commits to.
@@ -13500,6 +13846,9 @@ impl CayenneTableProvider {
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
                 }
+                // The range bounds beyond the last shard are dropped by the sink,
+                // so a narrower write keeps the ascending prefix of the split.
+                config.write_concurrency = config.write_concurrency.min(encode_shards);
                 config
             });
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
@@ -14938,6 +15287,7 @@ impl CayenneTableProvider {
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             scan_file_statistics_flights: Arc::clone(&self.scan_file_statistics_flights),
             cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
+            bake_slot_skips: Arc::clone(&self.bake_slot_skips),
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
@@ -14976,6 +15326,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
             #[cfg(test)]
+            test_bake_input_hook: Arc::clone(&self.test_bake_input_hook),
+            #[cfg(test)]
+            test_bake_files: Arc::clone(&self.test_bake_files),
+            #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::clone(
                 &self.test_pre_checkpoint_deletion_publish_hook,
             ),
@@ -15009,6 +15363,8 @@ impl CayenneTableProvider {
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
+            #[cfg(test)]
+            test_post_staged_publish_hook: Arc::clone(&self.test_post_staged_publish_hook),
             #[cfg(test)]
             test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
             #[cfg(test)]
@@ -15131,6 +15487,7 @@ impl CayenneTableProvider {
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
+            cold_merge_lock: Arc::clone(&self.cold_merge_lock),
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             maintenance_closed: Arc::clone(&self.maintenance_closed),
@@ -16850,9 +17207,10 @@ impl CayenneTableProvider {
     /// a multi-threaded test worker over the default 2 MiB stack. Issue #12436 records
     /// the same budget for neighbouring tests in this family; boxing keeps this rarely
     /// taken I/O arm off the parent frame for one allocation on a background path.
-    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<u64> {
+    /// Returns the bytes and the number of files.
+    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<(u64, usize)> {
         match self.list_snapshot_files_with_sizes(snapshot_id).await {
-            Ok(files) => Some(files.iter().map(|(_, sz)| *sz).sum()),
+            Ok(files) => Some((files.iter().map(|(_, sz)| *sz).sum(), files.len())),
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -16919,12 +17277,6 @@ impl CayenneTableProvider {
                 message: format!("Position capture: invalid snapshot URL: {err}"),
             }
         })?;
-        let options = Self::create_listing_options(
-            self.context.file_format(),
-            &self.pk_deletion_strategy,
-            state.config(),
-        );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
         // Listed under the fence (see `snapshot_file_list`); a file missed here
         // only keeps its key deletes, but the listing would fill the cache entry
         // queries read.
@@ -16934,6 +17286,12 @@ impl CayenneTableProvider {
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
             })?;
+        let options = Self::snapshot_scan_options(
+            self.context.file_format(),
+            self.scan_position_deletion_plans(Some(&captured)),
+            state.config(),
+        );
+        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
         let listed = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
                 state: &state,
@@ -20393,37 +20751,6 @@ impl CayenneTableProvider {
         }
     }
 
-    /// After a checkpoint flushes rows to a Vortex file at `flush_sequence`,
-    /// upgrade any pre-existing tombstone that still hides one of the flushed
-    /// PKs (`insert_seq` absent or older than `delete_seq`) to record
-    /// `insert_seq=flush_sequence`, durably and then in memory.
-    ///
-    /// Without this upgrade, listing-time pruning via
-    /// `vortex_key_delete_pushdown_filter` and the runtime
-    /// `Int64PkDeletionFilterExec` keep treating those PKs as fully hidden and
-    /// drop the brand-new checkpoint file's rows. A caller that commits its own
-    /// metastore change carries [`Self::flushed_pk_insert_records`] in it and
-    /// calls [`Self::upgrade_flushed_pk_tombstones_in_memory`] after publishing.
-    async fn upgrade_tombstones_for_flushed_pks(
-        &self,
-        flushed_pks: &[i64],
-        flush_sequence: i64,
-    ) -> Result<()> {
-        let insert_pk_bytes = self.flushed_pk_insert_records(flushed_pks, false).await?;
-        if !insert_pk_bytes.is_empty() {
-            self.catalog
-                .add_insert_records_batch(
-                    &self.table_metadata.table_id,
-                    insert_pk_bytes,
-                    flush_sequence,
-                )
-                .await
-                .map_err(|err| Error::Catalog { source: err })?;
-        }
-        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, flush_sequence);
-        Ok(())
-    }
-
     /// The flushed PKs to persist as insert records at the flush sequence, so
     /// restart rebuilds the upgrade [`Self::upgrade_flushed_pk_tombstones_in_memory`]
     /// makes. `adds_delete_files` says whether the commit carrying them also adds
@@ -20502,8 +20829,11 @@ impl CayenneTableProvider {
     }
 
     /// Stamp `insert_seq=flush_sequence` on the live in-memory tombstones that
-    /// still hide a flushed PK, so scans see the flushed rows. The durable side
-    /// is [`Self::flushed_pk_insert_records`].
+    /// still hide a flushed PK, so scans see the flushed rows: otherwise
+    /// listing-time pruning via `vortex_key_delete_pushdown_filter` and the
+    /// runtime `Int64PkDeletionFilterExec` drop them from the new file. The
+    /// durable side is [`Self::flushed_pk_insert_records`], committed with the
+    /// flush before this runs.
     fn upgrade_flushed_pk_tombstones_in_memory(&self, flushed_pks: &[i64], flush_sequence: i64) {
         let PkDeletionStrategyWithCache::Int64Pk {
             deletion_snapshot, ..
@@ -22923,21 +23253,29 @@ impl CayenneTableProvider {
         &self,
         state: &dyn Session,
         inputs: &[(String, i64)],
+        subsets: Option<&HashMap<String, CapturedSnapshotFiles>>,
         target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> Option<OverwriteRangePlan> {
         // As `overwrite_range_plan`.
         const MAX_SAMPLE_ROWS: usize = 65_536;
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if inputs.is_empty()
+            || self.context.has_cluster_by()
+            || self.context.sort_columns_are_authoritative()
+        {
             return None;
         }
-        let shards = self.snapshot_shard_count(
-            target_partitions,
-            target_size_bytes,
-            estimated_bytes,
-            EncodeFanOut::Sized,
-        );
+        // Split for the shards the bake's write will run (see
+        // `write_budget::bake_encode_shard_cap`).
+        let shards = self
+            .snapshot_shard_count(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                EncodeFanOut::Sized,
+            )
+            .min(super::write_budget::bake_encode_shard_cap().unwrap_or(usize::MAX));
         if shards < 2 {
             return None;
         }
@@ -22948,7 +23286,7 @@ impl CayenneTableProvider {
             };
             let key_type = schema.field(index).data_type().clone();
             let sample = match self
-                .sample_snapshots_column(state, inputs, index, &key_type, MAX_SAMPLE_ROWS)
+                .sample_snapshots_column(state, inputs, subsets, index, &key_type, MAX_SAMPLE_ROWS)
                 .await
             {
                 Ok(Some(sample)) => sample,
@@ -22983,11 +23321,13 @@ impl CayenneTableProvider {
     }
 
     /// A strided sample of column `index` across the files of the `inputs`
-    /// snapshots; see [`Self::sample_plan_column`].
+    /// snapshots — only the files of an input's capture in `subsets`, when it
+    /// has one; see [`Self::sample_plan_column`].
     async fn sample_snapshots_column(
         &self,
         state: &dyn Session,
         inputs: &[(String, i64)],
+        subsets: Option<&HashMap<String, CapturedSnapshotFiles>>,
         index: usize,
         data_type: &DataType,
         max_rows: usize,
@@ -22995,10 +23335,17 @@ impl CayenneTableProvider {
         let projection = vec![index];
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
         for (snapshot_id, _) in inputs {
-            plans.push(
-                self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
-                    .await?,
-            );
+            let plan = match subsets.and_then(|subsets| subsets.get(snapshot_id)) {
+                Some(files) => {
+                    self.scan_bake_files(state, snapshot_id, Some(&projection), files)
+                        .await?
+                }
+                None => {
+                    self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
+                        .await?
+                }
+            };
+            plans.push(plan);
         }
         let plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
             plans.remove(0)
@@ -24542,6 +24889,7 @@ impl CayenneTableProvider {
                     &new_snapshot_id,
                 )
                 .await
+                && !self.compaction_commit_landed(&new_snapshot_id, &e).await?
             {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
@@ -24860,6 +25208,7 @@ impl CayenneTableProvider {
                 self.current_dir_generation.load(Ordering::Acquire),
                 self.listing_cache_epoch.load(Ordering::Acquire),
                 Arc::new(files),
+                self.pk_deletion_strategy.position_cache().load_full(),
             ),
             unpicked_rows,
         ))
@@ -24937,6 +25286,13 @@ impl CayenneTableProvider {
                     "Hard-link of compaction file unavailable; copying"
                 );
                 tokio::fs::copy(&source, &destination).await?;
+                // A hard link shares data the source already made durable; a copy
+                // is new data, so it is synced before the caller syncs the
+                // directory and publishes the snapshot that references it.
+                tokio::fs::File::open(&destination)
+                    .await?
+                    .sync_all()
+                    .await?;
             }
         }
         Ok(())
@@ -26081,6 +26437,15 @@ impl CayenneTableProvider {
             );
             return OrphanDvSweepPass::Complete;
         }
+        // The writer record holds a deletion vector from before its upload until
+        // something releases it, and the retirement sweep skips a held file. The
+        // commit above dropped these, so nothing else would release them.
+        super::delete::vector_io::release_deletion_files(
+            self.dataset_storage.as_deref(),
+            orphaned
+                .iter()
+                .map(|df| std::path::Path::new(df.path.as_str())),
+        );
         let reclaimed_tombstones = orphaned.iter().fold(0_u64, |total, df| {
             total.saturating_add(u64::try_from(df.delete_count).unwrap_or(0))
         });
@@ -26438,6 +26803,11 @@ impl CayenneTableProvider {
         self.post_write_maintenance.reserve_live_rows_delta()
     }
 
+    /// See [`PostWriteMaintenance::statistics_epoch`].
+    pub(crate) fn statistics_epoch(&self) -> u64 {
+        self.post_write_maintenance.statistics_epoch()
+    }
+
     /// Queue post-write maintenance for a commit.
     ///
     /// `published` is the claim the caller staked with
@@ -26462,29 +26832,38 @@ impl CayenneTableProvider {
 
         {
             let mut maintenance_state = self.post_write_maintenance.state.lock();
-            if let Some(stats) = stats {
-                if let Some(existing) = &maintenance_state.stats {
-                    existing.merge_from(&stats);
+            // Published before an overwrite that has since replaced its rows, or
+            // before a full rewrite that has since counted them: the persisted
+            // count already describes the table with this commit's rows.
+            let statistics_epoch = published.statistics_epoch();
+            let (stats, live_rows_delta) =
+                if statistics_epoch < self.post_write_maintenance.counted_below_epoch() {
+                    (None, 0)
                 } else {
-                    maintenance_state.stats = Some(stats);
-                }
-            }
+                    (stats, live_rows_delta)
+                };
             maintenance_state.refresh_listing |= refresh_listing;
             maintenance_state.retention_requested |= retention_requested;
-            maintenance_state.live_rows_delta = maintenance_state
-                .live_rows_delta
-                .saturating_add(live_rows_delta);
+            if stats.is_some() || live_rows_delta != 0 {
+                maintenance_state
+                    .statistics
+                    .entry(statistics_epoch)
+                    .or_default()
+                    .merge(QueuedStatistics {
+                        stats,
+                        live_rows_delta,
+                        live_rows_delta_count: u64::from(live_rows_delta != 0),
+                    });
+            }
             if live_rows_delta == 0 {
                 // This commit's rows left the net live count where it was, so
                 // there is no delta to persist and nothing would ever retire
                 // the claim.
                 published.release();
             } else {
-                // Count this delta under the same lock that folds it in, so
+                // Counted under the same lock that folds it in, so
                 // `has_unapplied_live_rows_delta` reports this write until the
                 // persist that folds it into `num_rows` lands.
-                maintenance_state.live_rows_delta_count =
-                    maintenance_state.live_rows_delta_count.saturating_add(1);
                 published.queue();
             }
         }
@@ -26596,12 +26975,8 @@ impl CayenneTableProvider {
                 .retention_backoff
                 .lock()
                 .retry_owed();
-            let state = {
-                let mut guard = self.post_write_maintenance.state.lock();
-                let mut state = std::mem::take(&mut *guard);
-                state.retention_requested |= retention_owed;
-                state
-            };
+            let mut state = self.post_write_maintenance.take_state();
+            state.retention_requested |= retention_owed;
             if !state.is_empty() {
                 self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
                     .await?;
@@ -26646,8 +27021,9 @@ impl CayenneTableProvider {
         state: PostWriteMaintenanceState,
         retention_failure_action: RetentionFailureAction,
     ) -> CatalogResult<()> {
-        let had_stats = state.stats.is_some();
-        if let Some(stats) = state.stats {
+        let had_stats = if state.statistics.is_empty() {
+            false
+        } else {
             #[cfg(test)]
             {
                 let hook = self.test_pre_maintenance_statistics_hook.lock().take();
@@ -26673,28 +27049,16 @@ impl CayenneTableProvider {
             // `COUNT(*)` as `Exact`.
             let delta_is_exact =
                 self.table_metadata.on_conflict.is_none() && !state.retention_requested;
-            let persisted = self
-                .persist_table_stats(
-                    &stats,
-                    RowCountUpdate::Delta {
-                        delta: state.live_rows_delta,
-                        exact: delta_is_exact,
-                    },
-                )
+            let (counted, persisted_stats) = self
+                .persist_queued_table_stats(state.statistics, delta_is_exact)
                 .await;
-            if persisted {
-                // Only now does the persisted count describe these rows. Until
-                // this point the exactness gate must serve `Inexact`, because
-                // the rows have been visible to scans since their commit.
-                //
-                // Retire only what this drain persisted. A drain that lands
-                // here with `persisted == false` abandoned its delta, and
-                // leaving it outstanding is what stops the *next* drain's
-                // success from declaring the count exact over that gap.
-                self.post_write_maintenance
-                    .retire_applied_live_rows_deltas(state.live_rows_delta_count);
-            }
-        }
+            // Only now does the persisted count describe these rows. Until this
+            // point the exactness gate must serve `Inexact`, because the rows
+            // have been visible to scans since their commit.
+            self.post_write_maintenance
+                .retire_applied_live_rows_deltas(counted);
+            persisted_stats
+        };
 
         let mut retention_deleted = 0_u64;
         // After a failed background pass the retry is owned by the timer that
@@ -26936,10 +27300,7 @@ impl CayenneTableProvider {
         loop {
             tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
 
-            let state = {
-                let mut guard = self.post_write_maintenance.state.lock();
-                std::mem::take(&mut *guard)
-            };
+            let state = self.post_write_maintenance.take_state();
 
             if let Err(e) = self
                 .run_maintenance_state(state, RetentionFailureAction::Requeue)
@@ -27924,7 +28285,7 @@ impl CayenneTableProvider {
     /// The manifest rows of `files`, written at their final keys into
     /// `snapshot_id`, a protected snapshot that a write publishes at
     /// `sequence`: the range `[sequence, sequence]`, as
-    /// [`Self::record_new_protected_snapshot_files`] tags them.
+    /// [`Self::new_protected_snapshot_manifest`] tags them.
     pub(crate) async fn new_protected_snapshot_manifest_rows(
         &self,
         snapshot_id: &str,
@@ -28004,6 +28365,48 @@ impl CayenneTableProvider {
             )
             .await?;
         Ok(rows)
+    }
+
+    /// The manifest of `snapshot_id`, the output of a `pass` merge, tagged
+    /// `[min, max]`. A table in the object-native location gets it back for the
+    /// swap that makes the snapshot live to record, so no crash between two
+    /// commits leaves its files named but never live; such a table scans only
+    /// its manifest, so a failure discards the output. Other tables record it
+    /// here, ahead of the swap, and get `None`, best-effort: a failure leaves
+    /// the scan on directory listing.
+    async fn merged_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        (min_sequence, max_sequence): (i64, i64),
+        pass: &str,
+    ) -> Result<Option<Vec<SnapshotFile>>> {
+        let in_location = self.data_in_object_native_location();
+        let recorded = match self
+            .uniform_snapshot_manifest_rows(snapshot_id, min_sequence, max_sequence)
+            .await
+        {
+            Ok(rows) if in_location => return Ok(Some(rows)),
+            Ok(rows) => self.record_snapshot_manifest(snapshot_id, &rows).await,
+            Err(error) => Err(error),
+        };
+        match recorded {
+            Ok(()) => Ok(None),
+            Err(error) if in_location => {
+                self.cleanup_failed_compaction_snapshot(snapshot_id).await;
+                Err(Error::Catalog { source: error })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = snapshot_id,
+                    "Failed to record the files of dataset '{}' merged by {pass}, so its queries find the merged files by listing storage until the next rebuild records them. Cause: {error}",
+                    self.table_metadata.table_name
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Fold the manifest of every snapshot in `snapshot_ids` into one
@@ -28922,9 +29325,10 @@ impl CayenneTableProvider {
         // is the ordered one: executing it executes the scan, so the rewrite
         // pins its inputs exactly where the fenced scan does.
 
-        let (stream, scope, generation_before, snapshot_id_before, rewrite_plan): (
+        let (stream, scope, generation_before, input_epoch, snapshot_id_before, rewrite_plan): (
             SendableRecordBatchStream,
             RewriteScope,
+            u64,
             u64,
             String,
             Arc<dyn ExecutionPlan>,
@@ -28942,7 +29346,7 @@ impl CayenneTableProvider {
                 self.checkpoint_inlined_data().await?;
             }
             let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before, rewrite_plan) =
+            let (stream, generation_before, input_epoch, rewrite_plan) =
                 self.visible_file_stream_for_rewrite(&ctx, &order).await?;
             if folded_before != self.protected_snapshot_ids() {
                 tracing::debug!(
@@ -28964,11 +29368,12 @@ impl CayenneTableProvider {
                     folded: folded_before,
                 },
                 generation_before,
+                input_epoch,
                 snapshot_id_before,
                 rewrite_plan,
             )
         } else {
-            let (scan_view, scope, generation_before, snapshot_id_before) = {
+            let (scan_view, scope, generation_before, input_epoch, snapshot_id_before) = {
                 let _capture_guard = self.write_lock_arc().lock_owned().await;
                 #[cfg(test)]
                 let capture_probe = self.test_rewrite_capture_probe.lock().take().map(
@@ -29016,7 +29421,8 @@ impl CayenneTableProvider {
                 // plan is built after the lock is released, from the view alone, as a
                 // query's plan is, so writers wait for the capture but not for the plan
                 // build, which under load took most of the time this held the lock.
-                let (scan_view, generation_before) = self.rewrite_scan_view(&ctx).await?;
+                let (scan_view, generation_before, input_epoch) =
+                    self.rewrite_scan_view(&ctx, false).await?;
                 let cutoff = self.sequence_high_water().await;
                 #[cfg(test)]
                 if let Some(captured) = capture_probe {
@@ -29047,6 +29453,7 @@ impl CayenneTableProvider {
                         folded: folded_before,
                     },
                     generation_before,
+                    input_epoch,
                     snapshot_id_before,
                 )
             };
@@ -29066,6 +29473,7 @@ impl CayenneTableProvider {
                 stream,
                 scope,
                 generation_before,
+                input_epoch,
                 snapshot_id_before,
                 rewrite_plan,
             )
@@ -29438,6 +29846,7 @@ impl CayenneTableProvider {
             if let Err(e) = self
                 .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope, cold_cap)
                 .await
+                && !self.compaction_commit_landed(&new_snapshot_id, &e).await?
             {
                 drop(listing_guard);
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
@@ -29571,7 +29980,7 @@ impl CayenneTableProvider {
 
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot.
-            self.persist_table_stats_after_snapshot_rewrite(&stats_acc)
+            self.persist_table_stats_after_snapshot_rewrite(&stats_acc, input_epoch)
                 .await;
         };
 
@@ -29648,17 +30057,45 @@ impl CayenneTableProvider {
     /// `refresh_mode: changes` dataset lets a query serve a view up to a second
     /// old, and a rewrite reading such a view would fold, and drop, a protected
     /// snapshot published after it without that snapshot's rows in its output.
-    async fn rewrite_scan_view(&self, ctx: &SessionContext) -> Result<(Arc<ScanView>, u64)> {
+    ///
+    /// Also returns the statistics epoch started for the view: every write
+    /// stamped below it has its rows in the view, and none stamped with it
+    /// does. The epoch drops nothing until the rewrite writes its count; a
+    /// rewrite that aborts leaves those deltas queued. The caller holds `write_lock`; `publications_held` says whether it
+    /// also holds the visibility lock, which is otherwise taken here around the
+    /// epoch and the capture. A write publishes its rows and stamps its delta
+    /// under one of the two, so none can land between them.
+    async fn rewrite_scan_view(
+        &self,
+        ctx: &SessionContext,
+        publications_held: bool,
+    ) -> Result<(Arc<ScanView>, u64, u64)> {
+        let generation_before = self.prepare_rewrite_scan(ctx).await?;
+        // Taken after the inline flush, which waits for held publishes that need
+        // this lock.
+        let _publications = if publications_held {
+            None
+        } else {
+            Some(self.visibility_lock_arc().lock_owned().await)
+        };
+        let input_epoch = self
+            .post_write_maintenance
+            .start_statistics_epoch_for_rewrite();
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
+        Ok((scan_view, generation_before, input_epoch))
+    }
+
+    /// Flush the inline memtable and prepare the scan a rewrite captures, and
+    /// return the current-dir generation sampled between the two.
+    async fn prepare_rewrite_scan(&self, ctx: &SessionContext) -> Result<u64> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-        let state = ctx.state();
-        self.prepare_scan(&state, &[]).await?;
-        let scan_view = self
-            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
-            .await?;
-        Ok((scan_view, generation_before))
+        self.prepare_scan(&ctx.state(), &[]).await?;
+        Ok(generation_before)
     }
 
     /// The rewrite's stream over `scan_view` (see [`Self::rewrite_scan_view`]), in
@@ -29669,40 +30106,52 @@ impl CayenneTableProvider {
         order: &RewriteOrder,
         scan_view: Arc<ScanView>,
     ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
-        let state = ctx.state();
-        let plan = self
-            .plan_scan_from_view(&state, None, &[], None, scan_view, TombstonePushdown::Skip)
-            .await?;
-        let task_ctx = ctx.task_ctx();
-        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
-        let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
-        Ok((stream, ordered))
-    }
-
-    async fn visible_file_stream_for_rewrite(
-        &self,
-        ctx: &SessionContext,
-        order: &RewriteOrder,
-    ) -> Result<(SendableRecordBatchStream, u64, Arc<dyn ExecutionPlan>)> {
-        let (plan, generation_before) = self.rewrite_scan_plan(ctx).await?;
+        let plan = self.rewrite_plan_from_view(ctx, scan_view).await?;
         let task_ctx = ctx.task_ctx();
         let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
         // Executing the ordered plan executes the scan beneath it (each
         // operator executes its input when it is executed), so the stream
         // pins the same scan inputs, at the same point, as the scan alone did.
         let stream = datafusion_physical_plan::execute_stream(Arc::clone(&ordered), task_ctx)?;
-        Ok((stream, generation_before, ordered))
+        Ok((stream, ordered))
     }
 
-    /// The scan plan [`Self::visible_file_stream_for_rewrite`] reads, and the
-    /// current-dir generation sampled before it listed its files. Flushes the
-    /// inline memtable first, so the plan covers every visible row.
+    /// The rewrite's stream when the caller holds `write_lock` and the
+    /// visibility lock for the whole pass, with the current-dir generation and
+    /// the statistics epoch from [`Self::rewrite_scan_view`].
+    async fn visible_file_stream_for_rewrite(
+        &self,
+        ctx: &SessionContext,
+        order: &RewriteOrder,
+    ) -> Result<(SendableRecordBatchStream, u64, u64, Arc<dyn ExecutionPlan>)> {
+        let (scan_view, generation_before, input_epoch) = self.rewrite_scan_view(ctx, true).await?;
+        let (stream, ordered) = self.rewrite_stream_from_view(ctx, order, scan_view).await?;
+        Ok((stream, generation_before, input_epoch, ordered))
+    }
+
+    /// The full visible scan plan of the datalake move, and the current-dir
+    /// generation sampled before it listed its files. Flushes the inline
+    /// memtable first, so the plan covers every visible row. Starts no
+    /// statistics epoch.
     async fn rewrite_scan_plan(
         &self,
         ctx: &SessionContext,
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
-        let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
-        let plan = self
+        let generation_before = self.prepare_rewrite_scan(ctx).await?;
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
+        let plan = self.rewrite_plan_from_view(ctx, scan_view).await?;
+        Ok((plan, generation_before))
+    }
+
+    /// The unordered scan plan of a rewrite over `scan_view`.
+    async fn rewrite_plan_from_view(
+        &self,
+        ctx: &SessionContext,
+        scan_view: Arc<ScanView>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self
             .plan_scan_from_view(
                 &ctx.state(),
                 None,
@@ -29711,8 +30160,7 @@ impl CayenneTableProvider {
                 scan_view,
                 TombstonePushdown::Skip,
             )
-            .await?;
-        Ok((plan, generation_before))
+            .await?)
     }
 
     /// Order `plan` for a rewrite, as one output partition when ordered.
@@ -30959,9 +31407,11 @@ impl CayenneTableProvider {
     /// cleared, durably and in memory, at or below the newest cold file's
     /// sequence.
     ///
-    /// Locks: `compaction_lock` for the whole pass, which serializes it with
-    /// promotion and warm-tier compaction (both rewrite what the retention
-    /// decision reads); no `write_lock` while reading, encoding, and uploading;
+    /// Locks: `cold_merge_lock`, then `compaction_lock` shared for the whole
+    /// pass, which serializes it with promotion (which rewrites what the
+    /// retention decision reads) and every other pass that holds the lock
+    /// exclusively, while the protected-snapshot subset merge keeps running;
+    /// no `write_lock` while reading, encoding, and uploading;
     /// `write_lock` then `listing_fence` for writing around the swap, and
     /// `write_lock` again around the tombstone clear, so a DELETE — which
     /// captures its datalake sources and scans them inside one `write_lock`
@@ -30988,7 +31438,22 @@ impl CayenneTableProvider {
         let cold_location = vc.cold_tier_location.clone().unwrap_or_default();
         let table_id = self.table_metadata.table_id.clone();
 
-        let _compaction_guard = self.compaction_lock.write().await;
+        // A merge reads and rewrites datalake files only, and can run for a
+        // minute against a remote store, so it holds `compaction_lock` shared:
+        // the protected-snapshot subset merge, which also holds it shared,
+        // keeps folding the small snapshots appends publish meanwhile, while
+        // every pass that holds it exclusively stays out. That includes cold
+        // promotion, the other writer of the datalake manifest, and the bake
+        // and current-snapshot rewrite, which prune tombstones against it.
+        //
+        // The subset merge never prunes a tombstone and never reads the
+        // datalake, and this merge never touches a warm snapshot. The one
+        // shared state is the deletion index: the subset merge rewrites from
+        // the deletion snapshot it captured, so the clear below cannot reach
+        // into a rewrite in flight, and the clear removes only tombstones at or
+        // below the newest datalake file's sequence, which hide no warm row.
+        let _cold_merge_guard = self.cold_merge_lock.lock().await;
+        let _compaction_guard = self.compaction_lock.read().await;
         if !self.maintenance_still_admitted() {
             return Ok(false);
         }
@@ -31009,19 +31474,48 @@ impl CayenneTableProvider {
             .map(|(max_sequence, (bytes, _))| (max_sequence.to_string(), *max_sequence, *bytes))
             .collect();
         // The same per-pass input budget as a protected-snapshot merge, so a tier
-        // of large generations merges a few at a time.
+        // of large generations merges a few at a time. Subset merges can run
+        // alongside this one, so it selects within what they leave and reserves
+        // its input bytes for the whole pass: the table's merges together stay
+        // within one budget, which bounds the encode memory the pool does not
+        // account.
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
+        let remaining_bytes = self
+            .protected_merge_claims
+            .lock()
+            .view()
+            .remaining_budget(max_pass_bytes);
         let ProtectedMergeSelection::Merge(selected) = select_protected_snapshot_merge_tier(
             &runs,
             COLD_MERGE_MIN_RUNS,
             COLD_MERGE_MAX_WIDTH,
             COLD_TIER_BASE_BYTES,
             COLD_TIER_GROWTH,
-            self.protected_merge_input_budget_bytes(),
+            remaining_bytes,
             None,
         ) else {
             return Ok(false);
         };
         let selected_sequences: HashSet<i64> = selected.iter().map(|(_, seq)| *seq).collect();
+        let selected_bytes = runs
+            .iter()
+            .filter(|(_, max_sequence, _)| selected_sequences.contains(max_sequence))
+            .fold(0u64, |total, (_, _, bytes)| total.saturating_add(*bytes));
+        let Some(_budget_reservation) = ProtectedMergeClaimGuard::try_reserve(
+            &self.protected_merge_claims,
+            selected_bytes,
+            max_pass_bytes,
+        ) else {
+            // A subset merge claimed budget after the view above; a later tick
+            // retries.
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                selected_bytes,
+                "Skipping datalake merge: running protected-snapshot merges hold the pass budget",
+            );
+            return Ok(false);
+        };
         let Some(output_max_sequence) = selected_sequences.iter().copied().max() else {
             return Ok(false);
         };
@@ -31894,48 +32388,31 @@ impl CayenneTableProvider {
 
         // Manifest snapshot model: AUTHOR the merged output's manifest with its
         // true merged commit-seq range — `[min, max]` over the SELECTED INPUTS'
-        // manifest files — BEFORE the swap publishes the new snapshot. This is
-        // the data-commit range, NOT the protected-set value the swap stores
-        // (`fence_max_delete_seq`, a DELETE sequence — never a write range). The
-        // later `rebuild_live_snapshot_manifests` re-lists this (now-protected)
-        // snapshot in PreserveOrUniform mode, which keeps the range authored here
-        // rather than clobbering it with `[fence_max_delete_seq, ...]`. When no
-        // input manifest is available, fall back to the conservative
-        // `[0, fence_max_delete_seq]` (always bake-eligible — `min = 0` — so a
-        // missing input manifest can never make the output wrongly referenced and
-        // resurrect a deleted row). Best-effort + upsert-only (matches the
+        // manifest files — no later than the swap that publishes the new
+        // snapshot (in that swap's record, for a table in the object-native
+        // location). This is the data-commit range, NOT the protected-set value
+        // the swap stores (`fence_max_delete_seq`, a DELETE sequence — never a
+        // write range). The later `rebuild_live_snapshot_manifests` re-lists this
+        // (now-protected) snapshot in PreserveOrUniform mode, which keeps the
+        // range authored here rather than clobbering it with
+        // `[fence_max_delete_seq, ...]`. When no input manifest is available,
+        // fall back to the conservative `[0, fence_max_delete_seq]` (always
+        // bake-eligible — `min = 0` — so a missing input manifest can never make
+        // the output wrongly referenced and resurrect a deleted row). Outside
+        // the object-native location it is best-effort (matches the
         // full-rewrite path): a manifest failure leaves the scan on directory
         // listing, never loses rows.
         let (merged_min, merged_max) = self
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
-            .upsert_snapshot_manifest_from_files(
+        let manifest = self
+            .merged_snapshot_manifest(
                 &new_snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: merged_min,
-                    max: merged_max,
-                },
+                (merged_min, merged_max),
+                "subset-compaction",
             )
-            .await
-        {
-            // A table in the object-native location scans only its manifest, so
-            // its compaction does not commit a snapshot the manifest lacks.
-            if self.data_in_object_native_location() {
-                self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                    .await;
-                return Err(Error::Catalog { source: error });
-            }
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged subset-compaction manifest before swap; \
-                 scan falls back to directory listing"
-            );
-        }
+            .await?;
 
         // --- Phase 3: CAS commit. ---
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
@@ -31947,6 +32424,7 @@ impl CayenneTableProvider {
                 &old_ids,
                 &new_snapshot_id,
                 fence_max_delete_seq,
+                manifest.as_deref(),
             )
             .await
         {
@@ -31976,6 +32454,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
@@ -32232,11 +32711,52 @@ impl CayenneTableProvider {
 
     /// Exposed (hidden) for property tests that drive the seq-prefix bake directly
     /// (`mutation_property_test`); production only reaches it via
-    /// `run_compaction_trigger`.
+    /// `run_compaction_trigger`, through
+    /// [`Self::bake_seq_prefix_protected_snapshots_on_trigger`].
+    ///
+    /// An explicit bake waits for the process-wide bake slot (see
+    /// `compaction::bake_budget`) rather than skip: a caller that asks for a bake
+    /// gets one, and two callers baking different tables at once — two tests
+    /// running side by side in one process — run one after the other instead of
+    /// one of them seeing `Ok(false)`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        self.bake_seq_prefix_protected_snapshots_accounted(BakeSlotWait::Wait)
+            .await
+    }
+
+    /// The compaction trigger's bake. It skips, returning `Ok(false)`, while
+    /// another table's bake holds the process-wide bake slot, so the background
+    /// pass goes on to its other work and the bake runs on a later tick.
+    ///
+    /// After [`BAKE_SLOT_SKIPS_BEFORE_WAIT`] skips in a row, or with its deletion
+    /// index over its memory ceiling, it waits for the slot instead. Skipping
+    /// alone is not fair: a table whose ticks keep landing while other tables
+    /// bake would skip for as long as they keep baking, and its deletion index —
+    /// which only a bake shrinks — would grow without bound. The slot is a
+    /// semaphore that hands a released permit to its waiters in order, so a
+    /// waiting table bakes next, ahead of any table that merely tries. Waiting
+    /// only after repeated skips keeps the common case — the slot free, or one
+    /// other bake briefly in the way — from parking a background pass, and with
+    /// it the compaction permit it holds, for a whole bake.
+    pub(crate) async fn bake_seq_prefix_protected_snapshots_on_trigger(&self) -> Result<bool> {
+        let wait = if self.deletion_index_over_memory_ceiling()
+            || self.bake_slot_skips.load(Ordering::Relaxed) >= BAKE_SLOT_SKIPS_BEFORE_WAIT
+        {
+            BakeSlotWait::Wait
+        } else {
+            BakeSlotWait::Skip
+        };
+        self.bake_seq_prefix_protected_snapshots_accounted(wait)
+            .await
+    }
+
+    async fn bake_seq_prefix_protected_snapshots_accounted(
+        &self,
+        slot: BakeSlotWait,
+    ) -> Result<bool> {
         let pass_start = std::time::Instant::now();
-        let result = self.bake_seq_prefix_protected_snapshots_tracked().await;
+        let result = self.bake_seq_prefix_protected_snapshots_tracked(slot).await;
 
         // Same accounting the size-tier merge does: count only passes that did
         // real work or attempted one and failed, so the pass count matches the
@@ -32282,7 +32802,30 @@ impl CayenneTableProvider {
         result
     }
 
-    async fn bake_seq_prefix_protected_snapshots_tracked(&self) -> Result<bool> {
+    async fn bake_seq_prefix_protected_snapshots_tracked(
+        &self,
+        slot: BakeSlotWait,
+    ) -> Result<bool> {
+        // One bake at a time in the process (see `compaction::bake_budget`).
+        let budget = super::compaction::bake_budget();
+        let _bake_permit = if slot == BakeSlotWait::Wait {
+            budget.acquire_owned().await.ok()
+        } else if let Ok(permit) = budget.try_acquire_owned() {
+            Some(permit)
+        } else {
+            let skips = self
+                .bake_slot_skips
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                skips,
+                "Skipping seq-prefix bake: another table's bake is running"
+            );
+            return Ok(false);
+        };
+        self.bake_slot_skips.store(0, Ordering::Relaxed);
         // Boxed so the whole bake body lives on the heap rather than in the caller's
         // frame. This is one of the largest async fns in the crate, and its future is
         // inlined into every caller's — the compaction trigger, and the property tests
@@ -32432,6 +32975,7 @@ impl CayenneTableProvider {
         // blocked bake pays no listings.
         let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut selected_input_bytes: u64 = 0;
+        let mut selected_input_files: usize = 0;
         // Why the prefix stopped short, for the skip log below. A budget stop is
         // expected steady state; a sizing failure is an I/O problem that must not
         // masquerade as one.
@@ -32456,28 +33000,27 @@ impl CayenneTableProvider {
                 stopped_early = Some("above_fence");
                 break;
             }
-            if let Some(budget) = max_pass_bytes {
-                // On-disk bytes, sized as the size-tier path sizes its candidates.
-                // An unknown size must NOT count as 0: the budget is a memory ceiling,
-                // and counting an unsizeable run as free would let an arbitrarily large
-                // one in and defeat the bound. End the prefix instead; the next tick
-                // retries once it can be sized.
-                let Some(candidate_bytes) =
-                    Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
-                else {
-                    stopped_early = Some("sizing_failed");
-                    break;
-                };
-                let next = selected_input_bytes.saturating_add(candidate_bytes);
-                if next > budget {
-                    // Stop here. `cutoff` has only accumulated over already-selected
-                    // snapshots, so T matches the truncated set; the next tick bakes
-                    // the rest.
-                    stopped_early = Some("over_budget");
-                    break;
-                }
-                selected_input_bytes = next;
+            // On-disk bytes, sized as the size-tier path sizes its candidates.
+            // An unknown size must NOT count as 0: the budget is a memory ceiling,
+            // and counting an unsizeable run as free would let an arbitrarily large
+            // one in and defeat the bound. End the prefix instead; the next tick
+            // retries once it can be sized.
+            let Some((candidate_bytes, candidate_files)) =
+                Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
+            else {
+                stopped_early = Some("sizing_failed");
+                break;
+            };
+            let next = selected_input_bytes.saturating_add(candidate_bytes);
+            if max_pass_bytes.is_some_and(|budget| next > budget) {
+                // Stop here. `cutoff` has only accumulated over already-selected
+                // snapshots, so T matches the truncated set; the next tick bakes
+                // the rest.
+                stopped_early = Some("over_budget");
+                break;
             }
+            selected_input_bytes = next;
+            selected_input_files += candidate_files;
             if files.is_empty() {
                 // Empty manifest ⟹ a CDC-published snapshot whose async manifest
                 // population has not landed yet — both compaction paths author the
@@ -32588,28 +33131,62 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
+        // Split each input's files by whether the deletion filter below removes a
+        // row from them, and re-encode only those that it does. A file it removes
+        // no row from would come out of the rewrite row for row as it went in, so
+        // the bake links it into its output as it is: the output holds the same
+        // rows under the same threshold either way, and the prune below is the
+        // same. `None` rewrites every file.
+        let partition = Box::pin(self.bake_partition_input_files(
+            &state,
+            &selected,
+            &pk_indices,
+            &deletion_snapshot,
+        ))
+        .await;
+
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
-        for (snapshot_id, threshold) in &selected {
-            let plan = self
-                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
-                .await?;
-            let filtered = self.apply_partial_deletion_filter(
-                plan,
-                &pk_indices,
-                *threshold,
-                &deletion_snapshot,
-            )?;
-            plans.push(filtered);
-        }
-        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
-            plans.remove(0)
+        if let Some(partition) = &partition {
+            for input in &partition.inputs {
+                if input.rewrite_names.is_empty() {
+                    continue;
+                }
+                let plan = self
+                    .scan_bake_files(&state, &input.snapshot_id, None, &input.rewrite)
+                    .await?;
+                plans.push(self.apply_partial_deletion_filter(
+                    plan,
+                    &pk_indices,
+                    input.threshold,
+                    &deletion_snapshot,
+                )?);
+            }
         } else {
-            UnionExec::try_new(plans)?
+            for (snapshot_id, threshold) in &selected {
+                let plan = self
+                    .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+                    .await?;
+                let filtered = self.apply_partial_deletion_filter(
+                    plan,
+                    &pk_indices,
+                    *threshold,
+                    &deletion_snapshot,
+                )?;
+                plans.push(filtered);
+            }
+        }
+        let merged_plan: Arc<dyn ExecutionPlan> = match plans.len() {
+            // Every file is kept: the bake writes nothing and links them all.
+            0 => Arc::new(EmptyExec::new(self.table_schema())),
+            1 => plans.remove(0),
+            _ => UnionExec::try_new(plans)?,
         };
         // Kept to read its deletion filters' counts once the stream is drained.
         let bake_plan = Arc::clone(&merged_plan);
         let bake_position_deletes = self.holds_position_deletes();
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+        #[cfg(test)]
+        let stream = self.gate_bake_input_for_test(stream);
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.data_in_store();
@@ -32623,28 +33200,27 @@ impl CayenneTableProvider {
         // not apply; size the parallel-encode fan-out from the selected inputs'
         // on-disk bytes exactly as the size-tier path does. `is_position_based()`
         // is false here (gated above), so `keeps_positions_serial` is false.
-        let total_input_bytes = if max_pass_bytes.is_some() {
-            // Summed by the budget-bounded selection above.
-            selected_input_bytes
-        } else {
-            let mut bytes: u64 = 0;
-            for (snapshot_id, _) in &selected {
-                bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
-                    Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
-                    Err(_) => 0,
-                };
-            }
-            bytes
-        };
+        // The bytes it re-encodes: the selection's, or the rewritten files'.
+        let total_input_bytes = partition
+            .as_ref()
+            .map_or(selected_input_bytes, |partition| partition.rewritten_bytes);
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             /* keeps_positions_serial */ false,
             state.config().target_partitions(),
             total_input_bytes,
         );
+        let (range_inputs, range_subsets) = partition.as_ref().map_or_else(
+            || (selected.clone(), None),
+            |partition| {
+                let (inputs, subsets) = partition.rewrite_inputs();
+                (inputs, Some(subsets))
+            },
+        );
         // Boxed for the reason `snapshot_bytes_for_merge_budget` is.
         let range_plan = Box::pin(self.bake_range_plan(
             &state,
-            &selected,
+            &range_inputs,
+            range_subsets.as_ref(),
             target_partitions,
             target_size_bytes,
             estimated_bytes,
@@ -32657,7 +33233,10 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                super::delta_encoding::WritePolicy {
+                    max_shards: super::write_budget::bake_encode_shard_cap(),
+                    ..super::delta_encoding::WritePolicy::MAINTENANCE
+                },
                 range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
@@ -32680,7 +33259,17 @@ impl CayenneTableProvider {
             // Page-cache hygiene (see the size-tier compaction path): drop the
             // merged output's just-written pages while it is durable but not yet
             // query-visible, so the bake doesn't evict the hot query working set.
+            // Before the kept files are linked in: their pages are the inputs'.
             self.evict_compaction_output_pages(&new_snapshot_id).await;
+        }
+
+        if let Some(partition) = &partition
+            && let Err(error) =
+                Box::pin(self.link_bake_kept_files(&new_snapshot_id, partition)).await
+        {
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
+                .await;
+            return Err(error);
         }
 
         let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
@@ -32693,32 +33282,13 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&old_ids)
             .await
             .unwrap_or((0, fence_max_delete_seq));
-        if let Err(error) = self
-            .upsert_snapshot_manifest_from_files(
+        let manifest = self
+            .merged_snapshot_manifest(
                 &new_snapshot_id,
-                ManifestSequenceTag::Uniform {
-                    min: merged_min,
-                    max: merged_max,
-                },
+                (merged_min, merged_max),
+                "seq-prefix-bake",
             )
-            .await
-        {
-            // A table in the object-native location scans only its manifest, so
-            // its compaction does not commit a snapshot the manifest lacks.
-            if self.data_in_object_native_location() {
-                self.cleanup_failed_compaction_snapshot(&new_snapshot_id)
-                    .await;
-                return Err(Error::Catalog { source: error });
-            }
-            tracing::warn!(
-                target: "cayenne::compaction",
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                new_snapshot_id = new_snapshot_id.as_str(),
-                "Failed to author merged seq-prefix-bake manifest before swap; \
-                 scan falls back to directory listing"
-            );
-        }
+            .await?;
 
         // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
         let swapped = match self
@@ -32728,6 +33298,7 @@ impl CayenneTableProvider {
                 &old_ids,
                 &new_snapshot_id,
                 fence_max_delete_seq,
+                manifest.as_deref(),
             )
             .await
         {
@@ -32753,6 +33324,7 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        self.uncommitted_files.forget(&new_snapshot_id);
 
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
@@ -32844,6 +33416,11 @@ impl CayenneTableProvider {
             let reclaimed =
                 held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
             self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
+            self.context.record_bake_prune(held_before_prune, reclaimed);
+        } else {
+            // The prune was withheld: the bake pruned nothing.
+            self.context
+                .record_bake_prune(self.pk_deletion_snapshot().delete_len(), 0);
         }
 
         if clean_prefix_holds {
@@ -32884,8 +33461,18 @@ impl CayenneTableProvider {
         // Page-cache hygiene for the merged-away INPUTS (Tier 1) — see the
         // size-tier path. After the swap + retire so new scans see the merged
         // output; drops the inputs' clean pages the bake just read. Best-effort.
+        // A kept file's pages are the output's, so only rewritten files go.
         if !is_s3 {
-            self.evict_compaction_input_pages(&old_ids).await;
+            match &partition {
+                Some(partition) => self.evict_bake_rewritten_input_pages(partition).await,
+                None => self.evict_compaction_input_pages(&old_ids).await,
+            }
+        }
+        #[cfg(test)]
+        {
+            self.test_bake_files.lock().last = partition
+                .as_ref()
+                .map(|partition| (partition.rewritten_files(), partition.kept_files()));
         }
 
         // The bake writes as much as any other merge, so it belongs in the same
@@ -32909,12 +33496,40 @@ impl CayenneTableProvider {
                 selected_input_bytes
             }
         };
+        // Bytes the bake wrote: the files it kept are in its output but were
+        // linked, not written.
+        let (files_rewritten, files_kept, bytes_kept) =
+            partition
+                .as_ref()
+                .map_or((selected_input_files, 0, 0), |partition| {
+                    (
+                        partition.rewritten_files(),
+                        partition.kept_files(),
+                        partition.kept_bytes,
+                    )
+                });
+        let written_bytes = merged_output_bytes.saturating_sub(bytes_kept);
         telemetry::cayenne::track_compaction_merged_bytes(
-            merged_output_bytes,
+            written_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
                 telemetry::KeyValue::new("kind", "bake"),
             ],
+        );
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            input_snapshots = selected.len(),
+            input_files = selected_input_files,
+            input_bytes = selected_input_bytes,
+            files_rewritten,
+            bytes_rewritten = total_input_bytes,
+            files_kept,
+            bytes_kept,
+            bytes_written = written_bytes,
+            rows_written = total_rows,
+            duration_ms = compaction_start.elapsed().as_millis(),
+            "Seq-prefix bake finished"
         );
 
         // The publication is complete in BOTH the catalog and this provider's
@@ -32926,6 +33541,297 @@ impl CayenneTableProvider {
         Ok(true)
     }
 
+    /// Split each bake input's files by whether the bake's deletion filter removes
+    /// a row from them (see [`Self::bake_file_holds_deleted_rows`]), or `None`
+    /// when the bake must rewrite every file: no file can be kept, the table keeps
+    /// state keyed by file path that a linked file would lose (a secondary
+    /// index, position deletes), its layout requires the rewrite (cluster or
+    /// authoritative sort columns), or its data is in the object-native location,
+    /// which carries a file into a snapshot only by naming it in the manifest,
+    /// never by the link or copy that keeps a file here
+    /// ([`Self::link_or_copy_snapshot_files`]).
+    ///
+    /// Each input is split over one capture of its directory listing — what its
+    /// scan reads — so its rewritten and kept files are exactly its files. A file
+    /// whose check fails is rewritten.
+    async fn bake_partition_input_files(
+        &self,
+        state: &dyn Session,
+        selected: &[(String, i64)],
+        pk_indices: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
+    ) -> Option<BakeFilePartition> {
+        #[cfg(test)]
+        if self.test_bake_files.lock().rewrite_all {
+            return None;
+        }
+        if self.lookup_index.is_some()
+            || self.holds_position_deletes()
+            || self.context.has_cluster_by()
+            || self.context.sort_columns_are_authoritative()
+            || self.data_in_object_native_location()
+            || pk_indices.is_empty()
+        {
+            return None;
+        }
+        #[cfg(test)]
+        let link_min_file_bytes = self
+            .test_bake_files
+            .lock()
+            .link_min_file_bytes
+            .unwrap_or(BAKE_LINK_MIN_FILE_BYTES);
+        #[cfg(not(test))]
+        let link_min_file_bytes = BAKE_LINK_MIN_FILE_BYTES;
+        let mut inputs = Vec::with_capacity(selected.len());
+        let (mut rewritten_bytes, mut kept_bytes) = (0_u64, 0_u64);
+        for (snapshot_id, threshold) in selected {
+            let captured = match self.capture_snapshot_files_under_fence(snapshot_id).await {
+                Ok(captured) => captured,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_name(),
+                        snapshot_id = snapshot_id.as_str(),
+                        %error,
+                        "Seq-prefix bake rewrites every file: an input could not be listed"
+                    );
+                    return None;
+                }
+            };
+            let mut rewrite: Vec<PartitionedFile> = Vec::new();
+            let (mut rewrite_names, mut keep_names) = (Vec::new(), Vec::new());
+            for file in captured.files.iter() {
+                let name = file.object_meta.location.filename()?.to_string();
+                // A small file is rewritten whatever it holds (see
+                // `BAKE_LINK_MIN_FILE_BYTES`), so it needs no check.
+                let holds = file.object_meta.size < link_min_file_bytes
+                    || match Box::pin(self.bake_file_holds_deleted_rows(
+                        state,
+                        snapshot_id,
+                        &captured,
+                        file,
+                        *threshold,
+                        pk_indices,
+                        deletion_snapshot,
+                    ))
+                    .await
+                    {
+                        Ok(holds) => holds,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "cayenne::compaction",
+                                table = self.table_name(),
+                                file = name.as_str(),
+                                %error,
+                                "Seq-prefix bake rewrites a file it could not check for deleted rows"
+                            );
+                            true
+                        }
+                    };
+                if holds {
+                    rewritten_bytes = rewritten_bytes.saturating_add(file.object_meta.size);
+                    rewrite.push(file.clone());
+                    rewrite_names.push(name);
+                } else {
+                    kept_bytes = kept_bytes.saturating_add(file.object_meta.size);
+                    keep_names.push(name);
+                }
+            }
+            inputs.push(BakeInputFiles {
+                snapshot_id: snapshot_id.clone(),
+                threshold: *threshold,
+                rewrite: captured.narrowed_to(rewrite),
+                rewrite_names,
+                keep_names,
+            });
+        }
+        let partition = BakeFilePartition {
+            inputs,
+            rewritten_bytes,
+            kept_bytes,
+        };
+        (partition.kept_files() > 0).then_some(partition)
+    }
+
+    /// Whether the bake's deletion filter for an input at `threshold` removes a
+    /// row from `file`: the same filter over the file's key columns alone, with
+    /// the rows it lets through counted against the rows the file holds.
+    #[expect(clippy::too_many_arguments)]
+    async fn bake_file_holds_deleted_rows(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        captured: &CapturedSnapshotFiles,
+        file: &PartitionedFile,
+        threshold: i64,
+        pk_indices: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
+    ) -> DataFusionResult<bool> {
+        let one_file = captured.narrowed_to(vec![file.clone()]);
+        let projection = pk_indices.to_vec();
+        let scan = self
+            .scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
+            .await?;
+        let schema = self.table_schema();
+        let scan_schema = scan.schema();
+        let pk_in_scan = pk_indices
+            .iter()
+            .map(|&index| scan_schema.index_of(schema.field(index).name()))
+            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        // The rows the file holds: its footer's row count, when exact.
+        let footer_rows = self.bake_file_row_count(state, snapshot_id, file).await?;
+        let filtered =
+            self.apply_partial_deletion_filter(scan, &pk_in_scan, threshold, deletion_snapshot)?;
+        let task_ctx = state.task_ctx();
+        let surviving = count_plan_rows(filtered, Arc::clone(&task_ctx)).await?;
+        let held = match footer_rows {
+            Some(rows) => rows,
+            // Otherwise count them. A scan plan yields its rows once: a second
+            // execution of the plan the filter wraps comes back empty, so they are
+            // counted through a plan of their own.
+            None => {
+                count_plan_rows(
+                    self.scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
+                        .await?,
+                    task_ctx,
+                )
+                .await?
+            }
+        };
+        Ok(surviving != held)
+    }
+
+    /// The rows `file` of `snapshot_id` holds, from its footer statistics — the
+    /// raw physical row count the `COUNT(*)` fold also trusts — or `None` when
+    /// they report no exact count.
+    ///
+    /// Read through the file-statistics cache the scan path fills, not off the
+    /// bake's key scan: that scan collects no statistics, so it reports none.
+    async fn bake_file_row_count(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        file: &PartitionedFile,
+    ) -> DataFusionResult<Option<u64>> {
+        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))?;
+        let store = state.runtime_env().object_store(&table_url)?;
+        let statistics = self
+            .collect_scan_file_statistics(
+                state,
+                snapshot_id,
+                &store,
+                self.context.file_format().as_ref(),
+                file,
+                &self.table_schema(),
+            )
+            .await?;
+        Ok(match statistics.num_rows {
+            DFPrecision::Exact(rows) => Some(u64::try_from(rows).unwrap_or(u64::MAX)),
+            DFPrecision::Inexact(_) | DFPrecision::Absent => None,
+        })
+    }
+
+    /// A scan of `files`, a capture of some of `snapshot_id`'s files, read as
+    /// [`Self::create_snapshot_scan_plan`] reads the whole snapshot.
+    async fn scan_bake_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        projection: Option<&Vec<usize>>,
+        files: &CapturedSnapshotFiles,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.create_snapshot_scan_plan_with_config(
+            state,
+            snapshot_id,
+            projection,
+            &[],
+            None,
+            state.config(),
+            false,
+            None,
+            self.table_schema(),
+            false,
+            Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+            Some(files),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Link (or, on object storage, copy) the files a bake keeps into its output
+    /// snapshot, after the files it wrote, and confirm the output then holds
+    /// exactly both. Refuses — before linking anything — a kept file whose name
+    /// another kept or written file already has.
+    async fn link_bake_kept_files(
+        &self,
+        new_snapshot_id: &str,
+        partition: &BakeFilePartition,
+    ) -> Result<()> {
+        let written: HashSet<String> = self
+            .list_snapshot_files_with_sizes(new_snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let kept = partition
+            .inputs
+            .iter()
+            .flat_map(|input| input.keep_names.iter().map(String::as_str));
+        if let Some(name) = first_bake_link_collision(kept, &written) {
+            return InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "seq-prefix bake would link two files named '{name}' into snapshot                      {new_snapshot_id}; its output is discarded"
+                ),
+            }
+            .fail();
+        }
+        for input in &partition.inputs {
+            let names: Vec<&str> = input.keep_names.iter().map(String::as_str).collect();
+            self.link_or_copy_snapshot_files(&input.snapshot_id, new_snapshot_id, &names)
+                .await?;
+        }
+        if !self.table_metadata.path.starts_with("s3://") {
+            Self::sync_snapshot_dir(&self.snapshot_dir_path_for(new_snapshot_id))
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+        }
+        let listed = self.list_snapshot_files_with_sizes(new_snapshot_id).await?;
+        let expected = written.len() + partition.kept_files();
+        ensure!(
+            listed.len() == expected,
+            InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "seq-prefix bake output {new_snapshot_id} holds {} files after linking,                      expected {expected}; its output is discarded",
+                    listed.len()
+                ),
+            }
+        );
+        Ok(())
+    }
+
+    /// Drop the page cache of the input files a bake rewrote. Best-effort.
+    async fn evict_bake_rewritten_input_pages(&self, partition: &BakeFilePartition) {
+        let paths: Vec<std::path::PathBuf> = partition
+            .inputs
+            .iter()
+            .flat_map(|input| {
+                let dir = self.snapshot_dir_path_for(&input.snapshot_id);
+                input.rewrite_names.iter().map(move |name| dir.join(name))
+            })
+            .collect();
+        if !paths.is_empty() {
+            super::fadvise_tier::evict_clean_files(paths).await;
+        }
+    }
+
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str) {
         if let Err(e) = self.clear_snapshot_dir(new_snapshot_id).await {
             tracing::warn!(
@@ -32933,6 +33839,56 @@ impl CayenneTableProvider {
                 new_snapshot_id,
                 self.table_metadata.table_name
             );
+        }
+    }
+
+    /// Whether the compaction commit that makes `new_snapshot_id` current
+    /// landed although it reported `error`. A commit to a table in the
+    /// object-native location may land with its response lost; the table then
+    /// reads its state back in the background, and this waits for that and reads
+    /// the current snapshot, as a failed write does
+    /// ([`super::append_commit::resolve_failed_commit`]). The caller holds the
+    /// listing fence, so no append commits to the replaced snapshot meanwhile,
+    /// and publishes the output when it landed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IncompleteWrite`] when the state cannot be read back: the output
+    /// is kept, and the table refuses writes and queries until it is reloaded.
+    async fn compaction_commit_landed(
+        &self,
+        new_snapshot_id: &str,
+        error: &crate::catalog::CatalogError,
+    ) -> Result<bool> {
+        if !self.data_in_object_native_location() {
+            return Ok(false);
+        }
+        let table = self.table_metadata.table_name.as_str();
+        match super::append_commit::once_readable(|| self.catalog.get_table(table)).await {
+            Ok(metadata) => {
+                let landed = metadata.current_snapshot_id == new_snapshot_id;
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table,
+                    new_snapshot_id,
+                    landed,
+                    %error,
+                    "Read back the outcome of a compaction commit that reported a failure"
+                );
+                Ok(landed)
+            }
+            Err(read_error) => {
+                self.uncommitted_files.forget(new_snapshot_id);
+                self.publication_outcome_unknown
+                    .store(true, Ordering::Release);
+                Err(unresolved_commit_error(
+                    table.to_string(),
+                    "a compaction",
+                    error,
+                    &read_error,
+                    true,
+                ))
+            }
         }
     }
 
@@ -33565,6 +34521,29 @@ impl CayenneTableProvider {
             return;
         }
 
+        self.rebuild_stale_maintained_aggregates().await;
+    }
+
+    /// Rebuild a stale maintained-aggregate registry now, once, from the
+    /// table's visible rows.
+    ///
+    /// A write that the registry cannot absorb incrementally, such as a first
+    /// load published as one append, marks it stale. The checkpoint rearm
+    /// would rebuild it, but a table loaded in one append has no mem-tier
+    /// checkpoint to wait for, so the write rebuilds it itself. The rebuild
+    /// shares the rearm's failure budget and logging.
+    pub(crate) async fn rebuild_stale_maintained_aggregates(&self) {
+        if self.maintained_aggregates.is_empty() || !self.maintained_aggregates.is_stale() {
+            return;
+        }
+        if self
+            .maintained_aggregate_rebuild_failures
+            .load(Ordering::Acquire)
+            >= MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES
+        {
+            return;
+        }
+
         let (retained, budget) = self.maintained_aggregates.retained_bytes_and_budget();
         match self
             .rebuild_maintained_aggregates_from_visible_state()
@@ -33678,7 +34657,11 @@ impl CayenneTableProvider {
         if let Some(store_config) = self.object_store_config.as_ref() {
             self.register_object_store_for_runtime(&runtime_env, store_config);
         }
-        SessionContext::new_with_config_rt(config, runtime_env)
+        // Every pass that scans through this session replaces the files it scans.
+        SessionContext::new_with_config_rt(
+            config.with_extension(Arc::new(ReplacedFilesScan)),
+            runtime_env,
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
@@ -34971,6 +35954,24 @@ impl CayenneTableProvider {
         self.visibility_lock_arc().lock_owned().await
     }
 
+    /// Keep post-write maintenance from starting until the returned guard
+    /// drops, so writes' statistics stay queued. `None` when a pass is already
+    /// scheduled or running, so call it after draining maintenance. Exposed for
+    /// tests of what another operation does while statistics are queued; drop
+    /// the guard and then drain maintenance, since a write made while held
+    /// starts no pass.
+    #[doc(hidden)]
+    #[must_use = "maintenance starts again once the hold is dropped"]
+    pub fn hold_post_write_maintenance(&self) -> Option<impl Drop + Send + Sync + use<>> {
+        self.post_write_maintenance
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| PostWriteMaintenanceHold {
+                maintenance: Arc::clone(&self.post_write_maintenance),
+            })
+    }
+
     /// Get the current snapshot ID.
     ///
     /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
@@ -35006,6 +36007,29 @@ impl CayenneTableProvider {
         if let Some(hook) = hook {
             hook().await;
         }
+    }
+
+    /// `stream`, firing (and consuming) the test-only bake input hook, if one is
+    /// installed, when the stream is first polled. See
+    /// [`Self::test_bake_input_hook`].
+    #[cfg(test)]
+    fn gate_bake_input_for_test(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        use futures::StreamExt as _;
+        let Some(hook) = self.test_bake_input_hook.lock().take() else {
+            return stream;
+        };
+        let schema = stream.schema();
+        let gate = futures::stream::once(hook())
+            .filter_map(|()| futures::future::ready(None::<DataFusionResult<RecordBatch>>));
+        Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                gate.chain(stream),
+            ),
+        )
     }
 
     /// Fire (and consume) the test-only hook between a checkpoint's deletion-index
@@ -35161,6 +36185,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     pub(super) async fn run_test_post_inline_publish_hook(&self) {
         let hook = self.test_post_inline_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-staged-publish hook, if one is
+    /// installed. See [`Self::test_post_staged_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_post_staged_publish_hook(&self) {
+        let hook = self.test_post_staged_publish_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -35948,16 +36982,81 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Persist the statistics a maintenance pass took from the queue, adding
+    /// their net row delta to the count. Returns how many queued deltas the
+    /// persisted count now includes, and whether any statistics were persisted.
+    ///
+    /// Statistics stamped below
+    /// [`PostWriteMaintenance::counted_below_epoch`] are dropped: an overwrite
+    /// has replaced their rows or a full rewrite has counted them since the
+    /// pass took them, so adding them would count those rows again. They are
+    /// included in the returned count. The rest are persisted, and included
+    /// only when the persist lands: a drain that abandons its delta leaves it
+    /// outstanding, which is what stops the next drain's success from
+    /// declaring the count exact over that gap.
+    async fn persist_queued_table_stats(
+        &self,
+        queued: BTreeMap<u64, QueuedStatistics>,
+        delta_is_exact: bool,
+    ) -> (u64, bool) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+        let counted_below = self.post_write_maintenance.counted_below_epoch();
+        let mut counted = 0_u64;
+        let mut pending = QueuedStatistics::default();
+        for (statistics_epoch, queued) in queued {
+            if statistics_epoch < counted_below {
+                counted = counted.saturating_add(queued.live_rows_delta_count);
+            } else {
+                pending.merge(queued);
+            }
+        }
+        let Some(stats) = pending.stats else {
+            return (counted, false);
+        };
+        let persisted = self
+            .persist_table_stats_locked(
+                &stats,
+                RowCountUpdate::Delta {
+                    delta: pending.live_rows_delta,
+                    exact: delta_is_exact,
+                },
+                false,
+            )
+            .await;
+        if persisted {
+            counted = counted.saturating_add(pending.live_rows_delta_count);
+        }
+        (counted, persisted)
+    }
+
     /// Replace the aggregate entirely with the overwrite's accumulator and reset
     /// the live count to the rewritten row count (the prior data is gone, so the
-    /// old min/max/NDV must not survive — see [`RowCountUpdate`]).
+    /// old min/max/NDV must not survive — see [`RowCountUpdate`]). An overwrite
+    /// with no rows clears the record instead. The flip in
+    /// [`Self::publish_overwrite_snapshot`] has already dropped the statistics
+    /// queued for the replaced rows and the cached aggregate.
     pub(crate) async fn reset_table_stats_after_overwrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
         live_rows: Option<u64>,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
-        self.clear_cached_table_statistics_unlocked();
+        if accumulator.row_count() == 0 {
+            // The overwrite's commit cleared the record, but a maintenance pass for
+            // the replaced rows can write one again between that commit and the
+            // flip that starts the new epoch. With no rows there is no record to
+            // write over it, so clear it again.
+            if let Err(e) = self
+                .catalog
+                .clear_table_statistics(&self.table_metadata.table_id)
+                .await
+            {
+                self.abandon_table_stats_update(&format!(
+                    "the statistics record of the replaced rows could not be cleared: {e}"
+                ));
+            }
+            return;
+        }
         // The accumulator counts every row written; an overwrite that hid some of
         // them with position deletes passes the rows that stay live.
         let new_rows = live_rows.map_or_else(
@@ -35990,9 +37089,16 @@ impl CayenneTableProvider {
     /// A survivor's delta is persisted under the same persistence lock this takes,
     /// after its publish: one published before the check below is seen by it, and
     /// one published after lands its delta on top of the count written here.
+    ///
+    /// `input_epoch` is the statistics epoch the rewrite started when it captured
+    /// its input. Every write stamped below it has its rows in `accumulator`, but
+    /// its delta may still be queued or held by a maintenance pass; once the count
+    /// is written those deltas are dropped, or they would count the rows again.
+    /// Survivors are stamped with `input_epoch` or later and keep theirs.
     pub(crate) async fn persist_table_stats_after_snapshot_rewrite(
         &self,
         accumulator: &ColumnStatsAccumulator,
+        input_epoch: u64,
     ) {
         let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
         let new_rows = accumulator.row_count();
@@ -36003,8 +37109,12 @@ impl CayenneTableProvider {
         } else {
             RowCountUpdate::Estimate(new_rows)
         };
-        self.persist_table_stats_locked(accumulator, num_rows_update, measured_every_live_row)
-            .await;
+        if self
+            .persist_table_stats_locked(accumulator, num_rows_update, measured_every_live_row)
+            .await
+        {
+            self.post_write_maintenance.count_below_epoch(input_epoch);
+        }
     }
 
     /// Abandon a statistics update, arming the row-count taint on the way out.
@@ -38092,6 +39202,7 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<CapturedSnapshotFiles> {
         let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
         let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let positions = self.pk_deletion_strategy.position_cache().load_full();
         let files = if let Some(cached) = self.cached_snapshot_listing.load_full()
             && cached.snapshot_id == snapshot_id
             && cached.dir_generation == dir_generation
@@ -38107,6 +39218,7 @@ impl CayenneTableProvider {
             dir_generation,
             listing_epoch,
             files,
+            positions,
         ))
     }
 
@@ -38122,6 +39234,7 @@ impl CayenneTableProvider {
         }
         let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
         let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let positions = self.pk_deletion_strategy.position_cache().load_full();
         let ctx = self.create_session_context();
         let state = ctx.state();
         let mut captured = HashMap::with_capacity(protected.len());
@@ -38129,7 +39242,12 @@ impl CayenneTableProvider {
             let files = self.list_snapshot_dir_files(&state, snapshot_id).await?;
             captured.insert(
                 snapshot_id.clone(),
-                CapturedSnapshotFiles::new(dir_generation, listing_epoch, files),
+                CapturedSnapshotFiles::new(
+                    dir_generation,
+                    listing_epoch,
+                    files,
+                    Arc::clone(&positions),
+                ),
             );
         }
         Ok(captured)
@@ -40801,7 +41919,7 @@ impl CayenneTableProvider {
         // pure-delete tombstone split at durable-commit time (see
         // `CheckpointCorpusKeys`). Needed whenever the tier carries tombstones
         // on a keyed strategy — and ALWAYS for `Int64Pk`, where the flushed
-        // PKs additionally feed `upgrade_tombstones_for_flushed_pks`: a row
+        // PKs additionally feed `flushed_pk_insert_records`: a row
         // re-inserted cleanly (no in-tier tombstone) after an EARLIER
         // checkpoint's delete-only tombstone would otherwise stay hidden by
         // the sequence-blind pushdown filter once flushed to a file.
@@ -41318,7 +42436,8 @@ impl CayenneTableProvider {
                 false,
                 true,
                 0,
-                self.reserve_live_rows_delta().published(),
+                self.reserve_live_rows_delta()
+                    .published(self.statistics_epoch()),
             );
         }
     }
@@ -42771,86 +43890,6 @@ impl CayenneTableProvider {
         partitions
     }
 
-    pub(crate) async fn insert_to_new_snapshot_with_sequence(
-        &self,
-        stream: SendableRecordBatchStream,
-        sequence_number: i64,
-        target_partitions: usize,
-        estimated_bytes: Option<u64>,
-    ) -> CatalogResult<(u64, Arc<ColumnStatsAccumulator>)> {
-        let target_size_bytes = self.context.target_file_size_bytes();
-
-        // Generate a new snapshot ID
-        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-        // Write data to the new snapshot
-        let (total_rows, chunk_count, stats_acc) = self
-            .write_to_snapshot(
-                stream,
-                target_size_bytes,
-                &new_snapshot_id,
-                target_partitions,
-                estimated_bytes,
-                super::delta_encoding::WritePolicy::DELTA,
-            )
-            .await?;
-
-        // Sync the new snapshot directory for durability before recording the
-        // sequence number in the catalog. This is required for the same reason
-        // as in the sort-rewrite and normal append paths: the Vortex files must
-        // be durably present before the catalog metadata that makes them
-        // visible (via sequence number / protected snapshot) is committed.
-        let is_s3 = self.data_in_store();
-        if !is_s3 {
-            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-            Self::sync_snapshot_dir(&snapshot_dir).await?;
-        }
-
-        tracing::debug!(
-            "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
-            new_snapshot_id,
-            total_rows,
-            chunk_count
-        );
-
-        // A table in the object-native location scans only its manifest: the
-        // snapshot's files are recorded before the commit that publishes it.
-        self.record_new_protected_snapshot_files(&new_snapshot_id, sequence_number)
-            .await?;
-        // Record the snapshot's sequence number in the catalog
-        self.catalog
-            .set_snapshot_sequence(
-                &self.table_metadata.table_id,
-                &new_snapshot_id,
-                sequence_number,
-            )
-            .await?;
-
-        // Protect this snapshot using its OWN allocated `sequence_number` as the
-        // deletion threshold: the same value just persisted to
-        // `cayenne_snapshot_sequence` and reloaded by `load_protected_snapshots` on
-        // restart. The in-memory threshold MUST match the persisted one, or the
-        // partial-deletion filter (`delete_seq > threshold`) returns different rows
-        // before vs after a reload. The live `get_max_delete_sequence()` must NOT be
-        // used here: an unrelated deletion committed between this snapshot's sequence
-        // allocation and this publish can raise the global max past this snapshot's
-        // own sequence, so the in-memory threshold would skip a delete that the
-        // reloaded threshold applies. See `load_protected_snapshots` for the matching
-        // rationale.
-        //
-        // We do NOT clear old protected snapshots because they may still hold valid
-        // data; each applies its own partial deletion filter from when it was created.
-        // Publish under `scan_state_lock` so scans that capture the deletion view,
-        // protected map, and inlined data under `.read()` observe a consistent view.
-        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
-            .await;
-
-        // The listing table stays as-is. Protected snapshots are handled at scan time.
-        // See the doc comment above for why we do NOT update current_snapshot.
-
-        Ok((total_rows, stats_acc))
-    }
-
     /// Durably record a newly written snapshot's sequence number in the catalog
     /// (syncing the snapshot directory first on local filesystems).
     ///
@@ -43009,33 +44048,29 @@ impl CayenneTableProvider {
                 // Lever B2: the checkpoint flush's new snapshot sequence comes
                 // from the same allocator as every other handout for this table.
                 let sequence_number = self.reserve_sequences_local(1).await?;
-                let (_rows, stats) = self
-                    .insert_to_new_snapshot_with_sequence(
-                        stream,
-                        sequence_number,
-                        ctx.state().config().target_partitions(),
-                        estimated_bytes,
-                    )
-                    .await?;
-                // Pair every PK now in the new file with `sequence_number` on
-                // any pre-existing delete-only tombstone, so listing-time
-                // pruning and the runtime deletion filter stop hiding rows
-                // from the just-written checkpoint file.
-                self.upgrade_tombstones_for_flushed_pks(&flushed_int64_pks, sequence_number)
-                    .await?;
-                stats
+                self.fold_inline_into_new_snapshot(
+                    stream,
+                    sequence_number,
+                    ctx.state().config().target_partitions(),
+                    estimated_bytes,
+                    &flushed_int64_pks,
+                )
+                .await?
             };
 
             // A table in the object-native location scans only its manifest, so
             // the files the flush wrote into the current snapshot are recorded in
             // the same record that clears the inline rows they hold.
+            let inline_cleared = !self.pk_deletion_strategy.is_position_based();
             let current_snapshot_id = self.get_current_snapshot_id();
-            let flushed_into_current = if self.data_in_object_native_location() {
+            let flushed_into_current = if self.data_in_object_native_location() && !inline_cleared {
                 self.uncommitted_files.files(&current_snapshot_id)
             } else {
                 Vec::new()
             };
-            if flushed_into_current.is_empty() {
+            if inline_cleared {
+                self.clear_inlined_state_after_checkpoint();
+            } else if flushed_into_current.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
             } else {
                 let (recorded, deletes) = crate::catalog::with_same_record_commits(async {
@@ -43067,6 +44102,65 @@ impl CayenneTableProvider {
             .await;
 
         Ok(u64::try_from(total_rows).unwrap_or(u64::MAX))
+    }
+
+    /// Writes the inline corpus `stream` of a keyed table into a new protected
+    /// snapshot at `sequence_number` and commits it in one metastore
+    /// transaction: the switch that makes the snapshot live, its files for a
+    /// table in the object-native location, the insert records that keep the
+    /// re-inserted `flushed_pks` visible after a restart, and the clear of the
+    /// inline rows it now holds. Committed apart, a crash after the snapshot is
+    /// live and before the clear serves every flushed row twice after a restart.
+    async fn fold_inline_into_new_snapshot(
+        &self,
+        stream: SendableRecordBatchStream,
+        sequence_number: i64,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        flushed_pks: &[i64],
+    ) -> Result<Arc<ColumnStatsAccumulator>> {
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let (_rows, _chunks, stats) = self
+            .write_to_snapshot(
+                stream,
+                self.context.target_file_size_bytes(),
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WritePolicy::DELTA,
+            )
+            .await?;
+        // The files must be durable before the commit that makes them live.
+        self.sync_local_snapshot_dir(&new_snapshot_id).await?;
+        let manifest_files = self
+            .new_protected_snapshot_manifest(&new_snapshot_id, sequence_number)
+            .await?;
+        let insert_records = self.flushed_pk_insert_records(flushed_pks, false).await?;
+        self.catalog
+            .commit_mem_tier_durable(MemTierDurableCommit {
+                table_id: self.table_metadata.table_id.clone(),
+                sequence_number,
+                snapshot_sequence: Some(SnapshotSequenceCommit {
+                    snapshot_id: new_snapshot_id.clone(),
+                    sequence_number,
+                }),
+                clear_inlined: true,
+                insert_records,
+                manifest_files,
+                ..MemTierDurableCommit::default()
+            })
+            .await?;
+        self.uncommitted_files.forget(&new_snapshot_id);
+        // The snapshot's own sequence is its deletion threshold: the value just
+        // committed, which `load_protected_snapshots` reloads on restart. The
+        // live `get_max_delete_sequence()` would differ once an unrelated delete
+        // lands after the sequence was allocated, and the partial-deletion
+        // filter (`delete_seq > threshold`) would then return different rows
+        // before and after a reload.
+        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
+            .await;
+        self.upgrade_flushed_pk_tombstones_in_memory(flushed_pks, sequence_number);
+        Ok(stats)
     }
 
     async fn clear_inlined_metadata_after_checkpoint(&self) -> Result<()> {
@@ -44419,9 +45513,10 @@ impl CayenneTableProvider {
             &self.table_metadata.table_id,
             snapshot_id,
         )?;
-        let mut options = Self::create_listing_options(
+        let position_plans = self.scan_position_deletion_plans(captured_files);
+        let mut options = Self::snapshot_scan_options(
             self.context.file_format(),
-            &self.pk_deletion_strategy,
+            Arc::clone(&position_plans),
             scan_config,
         );
         let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
@@ -44500,10 +45595,8 @@ impl CayenneTableProvider {
         // never resurrected.
         let mut lookup_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>> = None;
         if let Some(selection) = lookup_selection {
-            let (restricted_files, provider, explain, uncovered) = selection.restrict(
-                partitioned_file_lists,
-                Self::position_deletion_plans(&self.pk_deletion_strategy),
-            );
+            let (restricted_files, provider, explain, uncovered) =
+                selection.restrict(partitioned_file_lists, Arc::clone(&position_plans));
             // Files no run covers were read in full; have them indexed.
             if uncovered {
                 self.shared_handle().request_runtime_lookup_index_build();
@@ -44709,9 +45802,7 @@ impl CayenneTableProvider {
             (None, Some(runtime)) => Arc::new(
                 self.context
                     .file_format()
-                    .with_access_plan_provider(Self::position_deletion_plans(
-                        &self.pk_deletion_strategy,
-                    ))
+                    .with_access_plan_provider(position_plans)
                     .with_runtime_access_plan_provider(runtime),
             ),
             (None, None) => Arc::clone(&options.listing.format),
@@ -45213,7 +46304,10 @@ impl CayenneTableProvider {
         // footer row counts are not live-row counts, however, so pending
         // deletions separately disable LIMIT early-stop and exact aggregates.
         let collect_stats = request.options.collect_stat;
-        let has_pending_deletions = self.has_rows_hidden_from_file_statistics();
+        let has_pending_deletions = self.has_rows_hidden_from_file_statistics()
+            || request
+                .captured_files
+                .is_some_and(|captured| !captured.positions.is_empty());
         let use_stats_for_limit = collect_stats && !has_pending_deletions;
         let dir_generation = request.captured_files.map_or_else(
             || self.current_dir_generation.load(Ordering::Acquire),
@@ -45467,6 +46561,12 @@ impl CayenneTableProvider {
                 .meta_fetch_concurrency,
         );
 
+        let publishes_statistics = request.captured_files.is_none_or(|captured| {
+            Arc::ptr_eq(
+                &captured.positions,
+                &self.pk_deletion_strategy.position_cache().load(),
+            )
+        });
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
             if let Some(captured) = request.captured_files {
                 stream::iter(captured.files.iter().cloned().map(Ok)).boxed()
@@ -45477,7 +46577,7 @@ impl CayenneTableProvider {
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
-                let statistics = if collect_stats {
+                let statistics = if collect_stats && publishes_statistics {
                     self.collect_scan_file_statistics(
                         request.state,
                         request.snapshot_id,
@@ -45487,6 +46587,20 @@ impl CayenneTableProvider {
                         &request.file_statistics_schema,
                     )
                     .await?
+                } else if collect_stats {
+                    Arc::new(
+                        request
+                            .options
+                            .listing
+                            .format
+                            .infer_stats(
+                                request.state,
+                                &store,
+                                Arc::clone(&request.file_statistics_schema),
+                                &part_file.object_meta,
+                            )
+                            .await?,
+                    )
                 } else {
                     Arc::new(Statistics::new_unknown(&request.file_statistics_schema))
                 };
@@ -45504,7 +46618,7 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
         let mut current = false;
-        if collect_stats && !truncated {
+        if collect_stats && !truncated && publishes_statistics {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
             if gen_after == dir_generation && epoch_after == listing_epoch {
@@ -45651,13 +46765,19 @@ impl CayenneTableProvider {
         // metastore. A misjudged clock only trades a catalog read for a footer
         // read, or the reverse.
         let written_since_open = part_file.object_meta.last_modified >= self.opened_at;
-        // Schema validation and catalog reads share evolution's publication fence.
-        // Footer I/O below remains outside this mutex.
-        let persisted = if written_since_open {
-            None
-        } else {
-            let _guard = self.table_statistics_persistence_lock.lock().await;
-            if table_schema.as_ref() == self.table_schema().as_ref() {
+        // The row is read without `table_statistics_persistence_lock`, whose
+        // holders write statistics through the metastore and would make this scan
+        // wait for their commits. A row is written only while the live schema is
+        // the one it was collected under, and evolution only widens the schema, so
+        // a row read while the live schema equals `table_schema` before and after
+        // the read was collected under `table_schema` or an older, narrower one,
+        // never a newer one; it is decoded against `table_schema`. A schema that
+        // changed during the read never returns to `table_schema`, so the row is
+        // not used. Footer I/O below stays outside the lock.
+        let persisted =
+            if written_since_open || table_schema.as_ref() != self.table_schema().as_ref() {
+                None
+            } else {
                 self.catalog
                     .get_snapshot_file_statistics(
                         &self.table_metadata.table_id,
@@ -45667,10 +46787,8 @@ impl CayenneTableProvider {
                     .await
                     .ok()
                     .flatten()
-            } else {
-                None
-            }
-        };
+                    .filter(|_| table_schema.as_ref() == self.table_schema().as_ref())
+            };
         if let Some(persisted) = persisted
             && persisted.file_size_bytes == file_size_bytes
             && let Some(restored) = crate::stats::restore_persisted_statistics(
@@ -45709,8 +46827,14 @@ impl CayenneTableProvider {
                 .await?,
         );
 
-        if let Some(blob) =
-            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
+        let persist = request
+            .state
+            .config()
+            .get_extension::<ReplacedFilesScan>()
+            .is_none();
+        if persist
+            && let Some(blob) =
+                crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
         {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
@@ -48362,17 +49486,21 @@ impl InlinedWritePublish {
     /// visible (generation bump) and hiding the superseded file-backed row
     /// (deletion cache) under one `.write()` closes the duplicate-key window.
     /// Only synchronous in-memory work runs under the guard.
-    pub(crate) async fn run(self) {
+    ///
+    /// Returns the statistics epoch the rows were published under.
+    pub(crate) async fn run(self) -> u64 {
         if self.total_rows == 0 {
-            return;
+            return self.table.statistics_epoch();
         }
         let table = &self.table;
         #[cfg(test)]
         table.run_test_pre_inline_publish_hook().await;
+        let statistics_epoch;
         let maintained_aggregate_insert = {
             let _visibility = table.visibility_lock_arc().lock_owned().await;
             let _fence = table.lock_listing_fence_write_owned().await;
             let _view_guard = table.scan_state_lock.write().await;
+            statistics_epoch = table.statistics_epoch();
             table.release_replaced_inlined_entries(&self.awaiting_publish);
             if let Some(commit) = self.commit {
                 // `inlined_row_count` must reflect the actual number of rows
@@ -48417,6 +49545,7 @@ impl InlinedWritePublish {
             file_pk_deletions = self.file_deleted_pk_i64.len() + self.file_deleted_row_keys.len(),
             "Inlined write"
         );
+        statistics_epoch
     }
 }
 
@@ -49341,7 +50470,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                         "Forcing seq-prefix bake: deletion index over memory ceiling (OOM backstop, overriding apply back-pressure)",
                     );
                 }
-                match self.bake_seq_prefix_protected_snapshots().await {
+                match self.bake_seq_prefix_protected_snapshots_on_trigger().await {
                     // Fall through to the size-tier subset pass below (same tick —
                     // both serialize on `compaction_lock`) so the consolidated output
                     // is leveled and superseded predecessors are reclaimed. Without
@@ -67102,7 +68231,7 @@ mod tests {
         // A full rewrite materializes exactly the live rows, so it — and only it —
         // may re-baseline.
         reopened
-            .persist_table_stats_after_snapshot_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator, reopened.statistics_epoch())
             .await;
         assert!(
             reopened.table_statistics.read().count_exact,
@@ -67197,7 +68326,7 @@ mod tests {
         let accumulator = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
         provider
-            .persist_table_stats_after_snapshot_rewrite(&accumulator)
+            .persist_table_stats_after_snapshot_rewrite(&accumulator, provider.statistics_epoch())
             .await;
         assert!(
             provider
@@ -72814,6 +73943,64 @@ mod tests {
         );
     }
 
+    /// A first load into an empty table publishes as one append without feeding
+    /// the maintained aggregates, which marks them stale. The load rebuilds them
+    /// before it returns, so the registry serves the loaded rows as soon as the
+    /// write is visible, with no later write or checkpoint to rearm it. A CDC
+    /// initial snapshot loads an empty acceleration this way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_first_load_leaves_maintained_aggregates_serving_its_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_maintained_aggregates(
+            "ma_first_load",
+            ctx.runtime_env(),
+            vec![id_count_sum_spec()],
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        assert!(
+            provider.takes_first_load() && provider.holds_no_rows().await,
+            "precondition: the append is taken as a first load"
+        );
+
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![id_value_batch(
+                Arc::clone(&schema),
+                &[1, 2, 3],
+                &[10, 20, 30],
+            )]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("memory exec created");
+        let insert = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+        collect(insert, ctx.task_ctx())
+            .await
+            .expect("first load publishes");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_first_load").await,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "precondition: the table holds the loaded rows"
+        );
+        // No polling: the load returned only after the rebuild installed.
+        let epoch = provider
+            .maintained_aggregate_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let served = provider
+            .maintained_aggregates
+            .batch_for_aggregate(&build_id_count_sum_aggregate_exec(), epoch)
+            .expect("maintained serve must not error")
+            .expect("the registry serves the first load as soon as it returns");
+        assert_eq!(
+            collect_id_count_sum(&served),
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+        );
+    }
+
     /// A stale maintained-aggregate registry is rebuilt from a scan while CDC
     /// writes continue. A write that becomes visible during that scan is not in
     /// the scanned rows, so the views the rebuild installs must take its delta in
@@ -74281,7 +75468,9 @@ mod tests {
             false,
             false,
             QUEUED_DELTA,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
 
         let stats = provider
@@ -74345,6 +75534,402 @@ mod tests {
                 stats.num_rows,
             );
         }
+    }
+
+    /// A hook that reports it was reached, then waits to be released.
+    fn parking_hook() -> (
+        TestPostCaptureHook,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook: TestPostCaptureHook = Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        });
+        (hook, entered_rx, release_tx)
+    }
+
+    /// Replace the table's rows with ids `100..100 + rows`.
+    async fn overwrite_with_rows(provider: &CayenneTableProvider, rows: i64) {
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let prepared = provider
+            .begin_overwrite(
+                single_batch_stream(id_value_batch_for_range(schema, 100, rows)),
+                1,
+            )
+            .await
+            .expect("begin the overwrite");
+        prepared
+            .apply_owned_txn()
+            .await
+            .expect("commit the overwrite");
+        prepared.finish().await.expect("publish the overwrite");
+    }
+
+    /// The persisted and the served row count, once maintenance has drained.
+    async fn drained_row_counts(
+        provider: &CayenneTableProvider,
+        catalog: &Arc<dyn MetadataCatalog>,
+    ) -> ((i64, bool), DFPrecision<usize>) {
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        let persisted = catalog
+            .get_table_statistics(&provider.table_metadata.table_id)
+            .await
+            .expect("read table statistics")
+            .expect("table statistics exist");
+        let served = provider
+            .optimizer_table_statistics()
+            .expect("optimizer statistics")
+            .num_rows;
+        ((persisted.num_rows, persisted.num_rows_exact), served)
+    }
+
+    /// A maintenance pass that took a write's queued statistics before an
+    /// overwrite and persists them after it must not add the replaced rows to
+    /// the overwrite's count.
+    #[tokio::test]
+    async fn overwrite_discards_statistics_taken_by_in_flight_maintenance() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("overwrite_in_flight_maintenance", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+        insert_batch(&provider, id_value_batch_for_range(schema, 0, 3)).await;
+        tokio::time::timeout(Duration::from_secs(30), entered)
+            .await
+            .expect("maintenance takes the insert's statistics")
+            .expect("maintenance reports the take");
+
+        overwrite_with_rows(&provider, 2).await;
+        release.send(()).expect("release maintenance");
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((2, true), DFPrecision::Exact(2))
+        );
+    }
+
+    /// A maintenance pass that persists a write's statistics after an overwrite
+    /// commits but before its in-memory flip must not leave the replaced rows'
+    /// count in the metastore, where a reopen serves it as exact.
+    #[tokio::test]
+    async fn overwrite_replaces_statistics_persisted_between_its_commit_and_flip() {
+        for (overwrite_rows, expected) in [(0_i64, None), (2, Some((2, true)))] {
+            let table_name = format!("overwrite_commit_flip_window_{overwrite_rows}");
+            let ctx = SessionContext::new();
+            let (provider, catalog, _tmp) =
+                create_append_only_table(&table_name, ctx.runtime_env()).await;
+            let table_id = provider.table_metadata.table_id.clone();
+            let schema = Arc::clone(&provider.table_metadata.schema);
+
+            let (hook, entered, release) = parking_hook();
+            *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+            insert_batch(
+                &provider,
+                id_value_batch_for_range(Arc::clone(&schema), 0, 3),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("maintenance takes the insert's statistics")
+                .expect("maintenance reports the take");
+
+            let prepared = provider
+                .begin_overwrite(
+                    single_batch_stream(id_value_batch_for_range(schema, 100, overwrite_rows)),
+                    1,
+                )
+                .await
+                .expect("begin the overwrite");
+            prepared
+                .apply_owned_txn()
+                .await
+                .expect("commit the overwrite");
+            release.send(()).expect("release maintenance");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let persisted = catalog
+                    .get_table_statistics(&table_id)
+                    .await
+                    .expect("read table statistics");
+                if persisted.is_some() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "maintenance never persisted the insert's statistics, so the window \
+                     this test exists to cover never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            prepared.finish().await.expect("publish the overwrite");
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain post-write maintenance");
+
+            let persisted = catalog
+                .get_table_statistics(&table_id)
+                .await
+                .expect("read table statistics")
+                .map(|stats| (stats.num_rows, stats.num_rows_exact));
+            assert_eq!(persisted, expected, "overwrite with {overwrite_rows} rows");
+            drop(provider);
+            let reopened =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                    .open(&table_name)
+                    .await
+                    .expect("reopen the table");
+            let served = reopened
+                .optimizer_table_statistics()
+                .map(|stats| stats.num_rows);
+            let expected_served = expected.map(|(rows, _)| {
+                DFPrecision::Exact(usize::try_from(rows).expect("row count fits"))
+            });
+            assert_eq!(
+                served, expected_served,
+                "reopened after an overwrite with {overwrite_rows} rows"
+            );
+        }
+    }
+
+    /// An overwrite that starts while a pipelined staged append has published
+    /// its rows but not finished waits for the append, whose delta is then
+    /// queued before the overwrite's reset. The overwrite must discard that
+    /// delta rather than add the replaced rows to its count.
+    #[tokio::test]
+    async fn overwrite_discards_the_delta_of_a_staged_append_published_before_it() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("overwrite_staged_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 3)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(staged.has_pending_finalize(), "the append owes a publish");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_post_staged_publish_hook.lock() = Some(hook);
+        let race = async {
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("the append publishes its rows")
+                .expect("the append reports its publish");
+            let release_once_waiting = async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !provider.append_admission_held_exclusively() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the overwrite waits for the staged append");
+                release.send(()).expect("release the append");
+            };
+            tokio::join!(overwrite_with_rows(&provider, 2), release_once_waiting);
+        };
+        let (finished, ()) = tokio::join!(staged.finish(), race);
+        assert_eq!(finished.expect("the append finishes"), 3);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((2, true), DFPrecision::Exact(2))
+        );
+    }
+
+    /// Run a full rewrite that must commit.
+    async fn full_rewrite(provider: &CayenneTableProvider) {
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("full rewrite"),
+            "the full rewrite commits"
+        );
+    }
+
+    /// A full rewrite counts the rows it read. A write whose rows it read but
+    /// whose delta is still queued must not add them again once maintenance
+    /// runs. Position-delete scope, which holds `write_lock` for the whole pass.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_queued_delta_of_rows_it_read() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_queued_delta", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 4),
+        )
+        .await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("persist the first insert's statistics");
+
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
+        insert_batch(&provider, id_value_batch_for_range(schema, 4, 3)).await;
+        assert!(
+            provider
+                .post_write_maintenance
+                .has_unapplied_live_rows_delta(),
+            "precondition: the second insert's delta is queued"
+        );
+        full_rewrite(&provider).await;
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((7, true), DFPrecision::Exact(7))
+        );
+    }
+
+    /// The fenced shape of the test above: a key-delete table, whose rewrite
+    /// holds `write_lock` only while it captures its input.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_queued_delta_of_rows_it_read_on_a_key_delete_table() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_queued_delta", &ctx).await;
+        let catalog = Arc::clone(&provider.catalog);
+
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
+        insert_batch(
+            &provider,
+            id_value_batch(provider.table_schema(), &[3], &[30]),
+        )
+        .await;
+        full_rewrite(&provider).await;
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((4, true), DFPrecision::Exact(4))
+        );
+    }
+
+    /// A maintenance pass that took a write's statistics before a full rewrite
+    /// read that write's rows, and persists them after the rewrite's count,
+    /// must drop them.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_delta_held_by_an_in_flight_maintenance_pass() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_in_flight_maintenance", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 4),
+        )
+        .await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("persist the first insert's statistics");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(hook);
+        insert_batch(&provider, id_value_batch_for_range(schema, 4, 3)).await;
+        tokio::time::timeout(Duration::from_secs(30), entered)
+            .await
+            .expect("maintenance takes the insert's statistics")
+            .expect("maintenance reports the take");
+        full_rewrite(&provider).await;
+        release.send(()).expect("release maintenance");
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((7, true), DFPrecision::Exact(7))
+        );
+    }
+
+    /// A pipelined staged append that published its rows before a full rewrite
+    /// read them, and queues its delta after the rewrite's count, must not add
+    /// them again.
+    #[tokio::test]
+    async fn full_rewrite_drops_the_delta_of_a_staged_append_published_before_it() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("rewrite_staged_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(schema, 0, 3)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(staged.has_pending_finalize(), "the append owes a publish");
+
+        let (hook, entered, release) = parking_hook();
+        *provider.test_post_staged_publish_hook.lock() = Some(hook);
+        let race = async {
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("the append publishes its rows")
+                .expect("the append reports its publish");
+            full_rewrite(&provider).await;
+            release.send(()).expect("release the append");
+        };
+        let (finished, ()) = tokio::join!(staged.finish(), race);
+        assert_eq!(finished.expect("the append finishes"), 3);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((3, true), DFPrecision::Exact(3))
+        );
+    }
+
+    /// A write that lands during a key-delete rewrite's re-encode is not in
+    /// the rows it read, so its queued delta must survive the rewrite's count.
+    /// The commit retains the write's protected snapshot, so the count is
+    /// recorded inexact.
+    #[tokio::test]
+    async fn full_rewrite_keeps_the_queued_delta_of_a_write_during_its_re_encode() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table("key_rewrite_late_delta", &ctx).await;
+        let catalog = Arc::clone(&provider.catalog);
+
+        let held = provider
+            .hold_post_write_maintenance()
+            .expect("no maintenance pass is scheduled");
+        {
+            let provider_in_hook = provider.clone_for_write();
+            *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let schema = provider_in_hook.table_schema();
+                    insert_batch(&provider_in_hook, id_value_batch(schema, &[99], &[990])).await;
+                })
+            }));
+        }
+        full_rewrite(&provider).await;
+        assert!(
+            !provider.protected_snapshots.load().is_empty(),
+            "precondition: the commit retains the late write's snapshot"
+        );
+        drop(held);
+
+        assert_eq!(
+            drained_row_counts(&provider, &catalog).await,
+            ((4, false), DFPrecision::Inexact(4))
+        );
     }
 
     /// A commit must claim its live-row delta *before* it publishes the rows
@@ -74582,7 +76167,9 @@ mod tests {
             false,
             false,
             0,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
         // ...and the in-lock exit: there is maintenance to do, just no row-count
         // delta behind it.
@@ -74591,7 +76178,9 @@ mod tests {
             true,
             false,
             0,
-            provider.reserve_live_rows_delta().published(),
+            provider
+                .reserve_live_rows_delta()
+                .published(provider.statistics_epoch()),
         );
 
         provider
@@ -88306,6 +89895,10 @@ mod tests {
 
     mod auto_deletion_mode;
 
+    mod bake_isolation;
+
+    mod bake_partial;
+
     mod first_load_pk_filter;
 
     /// A snapshot reader reclaims the directories a reload leaves unreferenced
@@ -88919,5 +90512,6 @@ mod tests {
     mod layered_upsert_state;
     mod object_native_scan_consistency;
     mod repeated_keys;
+    mod scan_deletes_across_compaction;
     mod update_visibility;
 }

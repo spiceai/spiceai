@@ -1,4 +1,5 @@
 name: snapshots-reader-concurrent
+duration: 60s
 description: >
   Concurrent queries see one complete generation while a snapshot reader swaps
   providers: the original 200 rows, or the replacement 100 rows with ten changed
@@ -10,7 +11,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne, sqlite]
+  engine: [cayenne]
 
 variants:
   writer:

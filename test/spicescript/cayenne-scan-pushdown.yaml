@@ -1,4 +1,5 @@
 name: cayenne-scan-pushdown
+duration: 5s
 description: >
   Filters that Cayenne evaluates inside its Vortex scan answer as PostgreSQL
   answers them over the same rows: an IN list holding a column, SQL's

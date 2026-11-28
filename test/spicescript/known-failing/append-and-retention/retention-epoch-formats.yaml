@@ -1,4 +1,5 @@
 name: retention-epoch-formats
+duration: 89s
 description: >
   Known failing (#15542). Time retention over an epoch time column (`unix_seconds`,
   `unix_millis`, `unix_nanos`) refuses to create the acceleration:

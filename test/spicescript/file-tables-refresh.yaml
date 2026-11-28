@@ -1,4 +1,5 @@
 name: file-tables-refresh
+duration: 124s
 tags: [long]
 description: >
   A table of Parquet or CSV part files, on local disk or in an S3-compatible

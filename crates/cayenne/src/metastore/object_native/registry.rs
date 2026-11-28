@@ -19,6 +19,7 @@ limitations under the License.
 use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog},
+    dataset_storage::{object_key_of_url, url_of_object_key},
     metadata::CreateTableOptions,
 };
 use cayenne_metastore_actions::proto;
@@ -481,8 +482,11 @@ impl ObjectNativeCatalog {
     }
 
     /// Dropping a dataset removes its name from the registry, which ends its
-    /// log; its bookkeeping values move to the registry, where they were kept
-    /// before datasets had logs, so they outlive the table as they did then.
+    /// log, and forgets its bookkeeping (load record, append cursor and every
+    /// source position) in the same commit: the next dataset created under the
+    /// name starts empty, so its source must not resume from where this one
+    /// stopped. Values the registry holds for the name while no log has it are
+    /// forgotten with them.
     pub(super) async fn drop_dataset(&self, name: &str) -> CatalogResult<bool> {
         let (domain, own) = {
             let routes = self.routes.read();
@@ -517,11 +521,11 @@ impl ObjectNativeCatalog {
                 .map_err(invalid)?;
             let mut unregister = vec![position(REGISTRY, name, None)];
             unregister.extend(
-                domain
+                self.registry
                     .positions_of(name)
                     .await
                     .into_iter()
-                    .map(|((source, partition), value)| position(&source, &partition, Some(value))),
+                    .map(|((source, partition), _)| position(&source, &partition, None)),
             );
             self.registry.commit_actions(unregister).await?;
             {
@@ -652,8 +656,13 @@ fn location_anchor(location: &str, prefix: &Path) -> Option<Arc<str>> {
     }
     let folder: Vec<_> = prefix.parts().collect();
     let folder = Path::from_iter(folder[..folder.len().checked_sub(1)?].iter().cloned());
-    (url.path().trim_matches('/') == folder.as_ref())
-        .then(|| Arc::from(location.trim_end_matches('/')))
+    if object_key_of_url(&url).ok()? != folder {
+        return None;
+    }
+    // Rebuilt from its keys, so a location that spells an escape differently
+    // (`state%2Ddir`) is encoded as the data paths it is compared with are.
+    let anchor = url_of_object_key(&url, &folder)?;
+    Some(Arc::from(anchor.as_str().trim_end_matches('/')))
 }
 
 /// A new folder for dataset `name`: its slug and a fresh `UUIDv7`. A caller that
@@ -872,9 +881,9 @@ impl ObjectNativeCatalog {
     /// `…/<datasets>/<folder>/data` in this catalog's location whose folder is one
     /// [`new_dataset_folder`] makes for `name`.
     pub(super) fn folder_named_by(&self, name: &str, base_path: &str) -> Option<String> {
-        let url = url::Url::parse(base_path).ok()?;
-        let path = url.path().trim_matches('/');
-        let rest = path
+        let key = object_key_of_url(&url::Url::parse(base_path).ok()?).ok()?;
+        let rest = key
+            .as_ref()
             .strip_prefix(self.datasets.as_ref())?
             .strip_prefix('/')?;
         let folder = rest.strip_suffix("/data")?;
@@ -927,33 +936,34 @@ impl ObjectNativeCatalog {
     /// `datasets/<folder>/data`.
     #[must_use]
     pub fn holds_data_at(&self, path: &str) -> bool {
-        let in_datasets = match url::Url::parse(path) {
-            Ok(url) => {
-                // Opened at a location URL: the data must be under that URL, not
-                // under the same key prefix of another bucket.
-                if let Some(anchor) = self.anchor.as_deref()
-                    && !path
-                        .strip_prefix(anchor)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                {
-                    return false;
-                }
-                url.path()
-                    .trim_matches('/')
-                    .strip_prefix(self.datasets.as_ref())
-                    .and_then(|rest| rest.strip_prefix('/'))
-                    .map(str::to_string)
-            }
-            Err(_) => path
+        let Ok(url) = url::Url::parse(path) else {
+            return path
                 .trim_matches('/')
                 .strip_prefix("datasets/")
-                .map(str::to_string),
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(folder, rest)| {
+                    !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+                });
         };
-        in_datasets
-            .as_deref()
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(folder, rest)| {
-                !folder.is_empty() && (rest == "data" || rest.starts_with("data/"))
+        let Ok(key) = object_key_of_url(&url) else {
+            return false;
+        };
+        // Opened at a location URL: the data must be under that URL, not under
+        // the same key prefix of another bucket. Both are compared as encoded
+        // from their keys.
+        if let Some(anchor) = self.anchor.as_deref()
+            && !url_of_object_key(&url, &key).is_some_and(|canonical| {
+                canonical
+                    .as_str()
+                    .strip_prefix(anchor)
+                    .is_some_and(|rest| rest.starts_with('/'))
             })
+        {
+            return false;
+        }
+        // `<folder>/data[/…]` under the datasets prefix.
+        key.prefix_match(&self.datasets).is_some_and(|mut rest| {
+            rest.next().is_some() && rest.next().is_some_and(|part| part.as_ref() == "data")
+        })
     }
 }

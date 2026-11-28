@@ -1,5 +1,6 @@
 # Known failing (#16321).
 name: reload-failed-dataset-removal
+duration: 32s
 description: >
   A dataset edited in a watched spicepod to a configuration that fails to
   load, here an acceleration engine that does not exist, keeps answering

@@ -1,4 +1,5 @@
 name: cayenne-transactions
+duration: 35s
 tags: [long]
 description: >
   A SQL transaction (`BEGIN; SELECT assert(<gate>); UPDATE …; INSERT …;

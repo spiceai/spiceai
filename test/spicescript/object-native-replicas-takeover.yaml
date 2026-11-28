@@ -1,4 +1,5 @@
 name: object-native-replicas-takeover
+duration: 422s
 tags: [long]
 description: >
   The setup of object-native-replicas.yaml, over each change source a writer

@@ -1,4 +1,5 @@
 name: append-iso-offset
+duration: 9s
 description: >
   Append refresh with an ISO 8601 text time column compares each value with the
   stored maximum as the instant it names, not by its digits: a value written with

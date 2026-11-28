@@ -119,7 +119,7 @@ fn http_dataset(base_url: &str, name: &str, accelerated: bool) -> Dataset {
         params.insert("caching_ttl".to_string(), "1h".to_string());
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("arrow".to_string()),
+            engine: Some("cayenne".to_string()),
             mode: Mode::Memory,
             refresh_mode: Some(RefreshMode::Caching),
             params: Some(Params::from_string_map(params)),
@@ -585,7 +585,15 @@ fn paginated_dataset(base_url: &str, name: &str, accelerated: bool) -> Dataset {
         .collect(),
     ));
     if accelerated {
-        dataset.acceleration = http_dataset(base_url, name, true).acceleration;
+        // Cayenne, regression test for #16676: it cached none of a paginated
+        // response.
+        dataset.acceleration =
+            http_dataset(base_url, name, true)
+                .acceleration
+                .map(|acceleration| Acceleration {
+                    engine: Some("cayenne".to_string()),
+                    ..acceleration
+                });
     }
     dataset
 }

@@ -21,6 +21,7 @@ fundu = { workspace = true }
 globset.workspace = true
 logos.workspace = true
 key-index = { path = "../key-index" }
+redact = { path = "../redact" }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-config = { path = "../runtime-config" }
 serde = { workspace = true, features = ["derive"] }

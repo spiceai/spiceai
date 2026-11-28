@@ -42,7 +42,7 @@ sqllogictest = "0.29.1"
 tokio = { workspace = true, features = ["full"] }
 tonic.workspace = true
 yaml = { path = "../../crates/yaml" }
-zstd = "0.13.5"
+zstd = "0.13.6"
 
 [lints]
 workspace = true

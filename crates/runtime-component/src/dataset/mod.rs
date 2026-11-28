@@ -361,10 +361,10 @@ pub struct DatasetSpec {
 impl std::fmt::Debug for DatasetSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatasetSpec")
-            .field("from", &self.from)
+            .field("from", &redact::redact_source_credentials(&self.from))
             .field("name", &self.name)
             .field("access", &self.access)
-            .field("params", &self.params)
+            .field("params", &crate::RedactedParams(&self.params))
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
             .field("schema", &self.schema)

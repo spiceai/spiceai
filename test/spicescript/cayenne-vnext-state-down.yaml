@@ -1,4 +1,5 @@
 name: cayenne-vnext-state-down
+duration: 11s
 description: >
   With `runtime.params.cayenne_vnext` off, a Cayenne dataset already on the
   SQLite metastore does not depend on `runtime.state.location`: after the

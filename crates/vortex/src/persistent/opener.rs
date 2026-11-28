@@ -287,7 +287,7 @@ impl FileOpener for VortexOpener {
                 .with_metrics_registry(Arc::clone(&metrics_registry))
                 .with_labels(labels);
 
-            if let Some(segment_cache) = segment_cache {
+            if let Some(segment_cache) = segment_cache.as_ref() {
                 open_opts = open_opts.with_segment_cache(segment_cache.for_path(
                     Arc::clone(&object_store_url),
                     file.object_meta.location.clone(),
@@ -319,11 +319,15 @@ impl FileOpener for VortexOpener {
             // `synthetic_object_meta`) is only ever rewritten under a new
             // path, so the size-and-mtime validity check cannot serve a stale
             // footer; a listing with real store mtimes invalidates on change.
-            // Preserve the uncached open when its initial read also supplies
+            // Vortex puts complete segments covered by the initial read into a
+            // supplied segment cache before returning from `open_read`, so a
+            // cached footer can reuse those bytes. Without a segment cache,
+            // preserve the uncached open when its initial read also supplies
             // row data that a footer-only cache entry would leave out.
             if !footer_cached
                 && let Some(file_metadata_cache) = file_metadata_cache.as_ref()
-                && can_cache_footer_after_open(vxf.footer(), file.object_meta.size)
+                && (segment_cache.is_some()
+                    || can_cache_footer_after_open(vxf.footer(), file.object_meta.size))
             {
                 cache_footer(
                     file_metadata_cache,

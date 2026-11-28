@@ -1,4 +1,5 @@
 name: http-caching-request-key
+duration: 3s
 description: >
   Known failing (#15548). A caching acceleration whose primary key is the request
   columns says one row per request; a response of three rows contradicts it.

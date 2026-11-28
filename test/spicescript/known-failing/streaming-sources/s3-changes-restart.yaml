@@ -3,6 +3,7 @@
 # stays in flight on the queue ("answer differs ... n: expected 31, actual 30";
 # the queue reports 0 visible, 1 in flight).
 name: s3-changes-restart
+duration: 178s
 description: >
   S3 event notifications through SQS keep being applied after spiced restarts
   over a non-empty Cayenne acceleration: an object created after the restart

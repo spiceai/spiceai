@@ -120,7 +120,6 @@ pub struct CayenneRuntimeConfig {
 pub enum AcceleratorRuntimeConfig {
     Arrow,
     PartitionedArrow,
-    Sqlite,
     Cayenne(CayenneRuntimeConfig),
 }
 
@@ -131,7 +130,6 @@ impl AcceleratorRuntimeConfig {
         match self {
             Self::Arrow => Engine::Arrow,
             Self::PartitionedArrow => Engine::PartitionedArrow,
-            Self::Sqlite => Engine::Sqlite,
             Self::Cayenne(_) => Engine::Cayenne,
         }
     }
@@ -146,7 +144,6 @@ impl AcceleratorRuntimeConfig {
         match engine {
             Engine::Arrow => Self::Arrow,
             Engine::PartitionedArrow => Self::PartitionedArrow,
-            Engine::Sqlite => Self::Sqlite,
             Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
         }
     }
@@ -221,7 +218,7 @@ pub fn registered_engine_names() -> Vec<String> {
     names
 }
 
-/// [`registered_engine_names`] as a user-facing list — `"arrow, duckdb, and sqlite"`.
+/// [`registered_engine_names`] as a user-facing list — `"arrow and cayenne"`.
 ///
 /// Separate from the message that embeds it so the wording can be asserted directly;
 /// the link order of the registration slice is not stable, hence the sort above.
@@ -348,7 +345,7 @@ pub enum Error {
     InvalidConfiguration { msg: String },
 
     #[snafu(display(
-        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, sqlite, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     UnknownEngine { engine: Arc<str> },
 
@@ -429,24 +426,6 @@ impl AcceleratorEngineRegistry {
         ctx: Arc<SessionContext>,
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
-
-        // Normalize Dictionary-encoded types to their value types only for
-        // accelerator engines that do not natively support Arrow Dictionary
-        // encoding (SQLite).  Other engines (Arrow, Cayenne) handle Dictionary
-        // types natively and benefit from the
-        // compact encoding.
-        let needs_dictionary_normalization = matches!(engine.to_unpartitioned(), Engine::Sqlite);
-        let schema = if needs_dictionary_normalization
-            && arrow_tools::schema::has_dictionary_types(&schema)
-        {
-            let normalized = arrow_tools::type_rewrite::normalize_dictionary_types(&schema);
-            tracing::debug!(
-                "Normalized Arrow Dictionary types in schema for {engine} acceleration"
-            );
-            Arc::new(normalized)
-        } else {
-            schema
-        };
 
         let accelerator = self
             .get_accelerator_engine(acceleration_settings.engine)
@@ -1562,7 +1541,7 @@ mod tests {
                 );
 
                 let other_engine = Acceleration {
-                    engine: Engine::Sqlite,
+                    engine: Engine::Arrow,
                     params: acceleration.params.clone(),
                     ..Acceleration::default()
                 };
@@ -1671,12 +1650,7 @@ mod tests {
     /// fails to compile in `engine`.
     #[test]
     fn the_default_config_for_an_engine_is_that_engines_own_variant() {
-        for engine in [
-            Engine::Arrow,
-            Engine::PartitionedArrow,
-            Engine::Sqlite,
-            Engine::Cayenne,
-        ] {
+        for engine in [Engine::Arrow, Engine::PartitionedArrow, Engine::Cayenne] {
             assert_eq!(
                 AcceleratorRuntimeConfig::default_for(engine).engine(),
                 engine,

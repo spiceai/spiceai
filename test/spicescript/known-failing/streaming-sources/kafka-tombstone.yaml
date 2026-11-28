@@ -2,6 +2,7 @@
 # dataset loading ("Unable to deserialize JSON message from Kafka: expected
 # value at line 1 column 1").
 name: kafka-tombstone
+duration: 38s
 description: >
   A Kafka topic holding a tombstone (a message with no value) loads its other
   messages.
