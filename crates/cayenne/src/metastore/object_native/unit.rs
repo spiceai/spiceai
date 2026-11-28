@@ -324,7 +324,6 @@ impl Units {
 
 /// A file name for a consumer's lease: readable, and unique to the consumer.
 fn consumer_file(consumer: &str) -> String {
-    use std::hash::{Hash, Hasher};
     let slug: String = consumer
         .chars()
         .map(|c| {
@@ -336,10 +335,11 @@ fn consumer_file(consumer: &str) -> String {
         })
         .take(40)
         .collect();
-    // A stable digest, so every instance names the same object.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    consumer.hash(&mut hasher);
-    format!("consumer-{slug}-{:016x}", hasher.finish())
+    // A digest whose output is specified (BLAKE3), so every instance names the
+    // same object whatever build it runs; `DefaultHasher`'s output may change
+    // between Rust releases.
+    let digest = blake3::hash(consumer.as_bytes()).to_hex();
+    format!("consumer-{slug}-{}", &digest[..16])
 }
 
 /// The handoff request beside the lease at `lease`.
@@ -898,6 +898,16 @@ impl UnitLease {
 #[cfg(test)]
 mod tests {
     use super::HandoffRequest;
+
+    /// Instances running different builds name one consumer's lease the same
+    /// object, so its name is pinned.
+    #[test]
+    fn a_consumer_lease_name_is_the_same_in_every_build() {
+        assert_eq!(
+            super::consumer_file("postgres slot orders_slot"),
+            "consumer-postgres-slot-orders-slot-9fdd25a64dea6427"
+        );
+    }
 
     /// A store whose version is a hash of the content would give a repeated
     /// request the version of the one the holder already answered, and the
