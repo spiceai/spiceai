@@ -24,13 +24,14 @@ use adbc_core::options::OptionDatabase;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
+use datafusion::sql::unparser::dialect::{BigQueryDialect, DefaultDialect, Dialect};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape};
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
@@ -513,10 +514,12 @@ pub fn build_db_options(
     opts
 }
 
-/// Returns the SQL dialect for a given ADBC driver name, if a non-default one is
-/// needed.
+/// Returns the SQL dialect for a given ADBC driver name, in any letter case, if
+/// a non-default one is needed.
 ///
-/// These are the stock `DataFusion` dialects, which rewrite no Spice function.
+/// These are the stock `DataFusion` dialects, which rewrite no Spice function,
+/// with string literals written as the engine reads them: `BigQuery` and
+/// Snowflake read `\` as an escape character inside a string literal.
 ///
 /// The catalog connector uses these for drivers other than `DuckDB`. Its
 /// `DuckDB` dialect and function-support policy must stay paired in the runtime.
@@ -524,8 +527,15 @@ pub fn build_db_options(
 /// only be used with its matching policy; the catalog keeps the stock dialect.
 #[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
+    match driver_name.to_ascii_lowercase().as_str() {
+        "bigquery" => Some(Arc::new(BackslashEscapedStrings::new(
+            BigQueryDialect::new(),
+            QuoteEscape::Unicode,
+        ))),
+        "snowflake" => Some(Arc::new(BackslashEscapedStrings::new(
+            DefaultDialect {},
+            QuoteEscape::Doubled,
+        ))),
         _ => None,
     }
 }
@@ -770,6 +780,50 @@ fn bigquery_string_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_dialect_relation_names_read_back_as_their_name() {
+        use datafusion::sql::unparser::Unparser;
+        use util::sql_string_literal::test_support::assert_bigquery_relation_names_read_back;
+
+        let dialect = super::dialect_for_driver("bigquery").expect("dialect");
+        let unparser = Unparser::new(dialect.as_ref());
+        assert_bigquery_relation_names_read_back(|plan| {
+            unparser.plan_to_sql(plan).expect("unparse").to_string()
+        });
+    }
+
+    #[test]
+    fn driver_dialect_string_literals_read_back_as_their_value() {
+        use datafusion::logical_expr::Expr;
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use datafusion::sql::unparser::Unparser;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, UNICODE_QUOTE_LITERALS, assert_string_literals, read_bigquery,
+            read_with_tokenizer,
+        };
+
+        let unparse = |driver: &str| {
+            let dialect = super::dialect_for_driver(driver).expect("dialect");
+            move |expr: &Expr| {
+                Unparser::new(dialect.as_ref())
+                    .expr_to_sql(expr)
+                    .expect("unparse")
+                    .to_string()
+            }
+        };
+        for (bigquery, snowflake) in [("bigquery", "snowflake"), ("BigQuery", "Snowflake")] {
+            assert_string_literals(
+                unparse(bigquery),
+                "`c`",
+                UNICODE_QUOTE_LITERALS,
+                read_bigquery,
+            );
+            assert_string_literals(unparse(snowflake), "c", DOUBLED_QUOTE_LITERALS, |sql| {
+                read_with_tokenizer(&SnowflakeDialect, sql)
+            });
+        }
+    }
+
     #[test]
     fn managed_duckdb_version_floor() {
         for (version, expected) in [

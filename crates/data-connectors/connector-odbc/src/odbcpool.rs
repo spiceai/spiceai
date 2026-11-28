@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::odbcconn::ODBCConnection;
-use crate::odbcconn::{ODBCDbConnection, ODBCParameter};
+use crate::odbcconn::{ODBCDbConnection, ODBCParameter, SqlCheck};
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use odbc_api::{Connection, ConnectionOptions, Environment, sys::AttrConnectionPooling};
@@ -58,6 +58,7 @@ pub struct ODBCPool {
     params: Arc<HashMap<String, SecretString>>,
     connection_string: String,
     connection_id: String,
+    sql_check: Option<SqlCheck>,
 }
 
 fn hash_string(val: &str) -> String {
@@ -91,7 +92,16 @@ impl ODBCPool {
             connection_string,
             connection_id,
             pool: &ENV,
+            sql_check: None,
         })
+    }
+
+    /// Runs `sql_check` on the SQL text of every statement before a
+    /// connection sends it.
+    #[must_use]
+    pub fn with_sql_check(mut self, sql_check: Option<SqlCheck>) -> Self {
+        self.sql_check = sql_check;
+        self
     }
 
     #[must_use]
@@ -116,6 +126,7 @@ where
         let odbc_cxn = ODBCConnection {
             conn: Arc::new(cxn.into()),
             params: Arc::clone(&self.params),
+            sql_check: self.sql_check,
         };
 
         Ok(Box::new(odbc_cxn))

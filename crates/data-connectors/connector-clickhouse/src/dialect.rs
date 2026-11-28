@@ -84,6 +84,10 @@ impl Dialect for ClickHouseDialect {
         self.inner.identifier_quote_style(identifier)
     }
 
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        self.inner.quoted_identifier_escapes()
+    }
+
     fn use_array_keyword_for_array_literals(&self) -> bool {
         self.inner.use_array_keyword_for_array_literals()
     }

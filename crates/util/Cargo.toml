@@ -39,6 +39,7 @@ parking_lot.workspace = true
 default = ["datafusion"]
 datafusion = ["dep:cpu-budget", "dep:datafusion", "dep:datafusion-proto"]
 http = ["dep:http-body", "dep:pin-project", "dep:tokio-util"]
+test-support = ["datafusion"]
 
 [lints]
 workspace = true

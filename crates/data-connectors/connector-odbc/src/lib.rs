@@ -24,7 +24,7 @@ pub mod odbcconn;
 pub mod odbcpool;
 
 use crate::odbc::ODBCTableFactory;
-use crate::odbcconn::ODBCDbConnectionPool;
+use crate::odbcconn::{ODBCDbConnectionPool, SqlCheck};
 use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
@@ -48,6 +48,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape, refuse_variable_reference};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -106,13 +107,14 @@ enum ODBCProfile {
     Unknown,
 }
 
-fn databricks_dialect() -> CustomDialect {
-    CustomDialectBuilder::new()
+fn databricks_dialect() -> BackslashEscapedStrings<CustomDialect> {
+    let dialect = CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
         .with_interval_style(IntervalStyle::MySQL)
         .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
         .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
-        .build()
+        .build();
+    BackslashEscapedStrings::new(dialect, QuoteEscape::Unicode)
 }
 
 /// Athena (Trino) SQL. Identifiers are double-quoted: the statement names
@@ -155,6 +157,15 @@ impl ODBCProfile {
             ODBCProfile::Sqlite => Some("sqlite"),
             ODBCProfile::Athena => Some("athena"),
             ODBCProfile::Databricks | ODBCProfile::Unknown => None,
+        }
+    }
+
+    /// The check a connection runs on SQL text before it sends the text to
+    /// the engine behind the profile.
+    fn sql_check(&self) -> Option<SqlCheck> {
+        match self {
+            ODBCProfile::Databricks => Some(refuse_variable_reference),
+            _ => None,
         }
     }
 }
@@ -358,11 +369,13 @@ impl DataConnectorFactory for ODBCFactory {
                 return Err(Error::DirectDriverNotPermitted {}.into());
             }
 
+            let sql_check;
             let (dialect, engine): (
                 Result<Option<Arc<dyn Dialect + Send + Sync>>>,
                 Option<String>,
             ) = if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
                 let engine = sql_dialect.to_string();
+                sql_check = ODBCProfile::from(sql_dialect).sql_check();
                 let sql_dialect = SQLDialectParam::new(sql_dialect);
                 (sql_dialect.try_into(), Some(engine))
             } else {
@@ -380,13 +393,15 @@ impl DataConnectorFactory for ODBCFactory {
 
                 let profile = ODBCProfile::from(driver);
                 let engine = profile.engine().map(str::to_string);
+                sql_check = profile.sql_check();
                 (Ok(profile.into()), engine)
             };
             let dialect = dialect?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
                 ODBCPool::new(params.parameters.to_secret_map())
-                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
+                    .context(UnableToCreateODBCConnectionPoolSnafu)?
+                    .with_sql_check(sql_check),
             );
 
             let odbc_factory = ODBCTableFactory::new(pool, dialect)
@@ -450,6 +465,50 @@ mod test {
     use datafusion::logical_expr::cast;
     use datafusion::prelude::col;
     use datafusion::sql::unparser::Unparser;
+
+    #[test]
+    fn databricks_string_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{
+            UNICODE_QUOTE_LITERALS, assert_string_literals, read_spark,
+        };
+
+        let dialect = databricks_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_spark,
+        );
+    }
+
+    /// A Databricks connection unparses a plan with this dialect and checks
+    /// the statement before it sends it, whether `sql_dialect` or the driver
+    /// name selects the profile.
+    #[test]
+    fn databricks_statements_holding_a_variable_reference_are_refused() {
+        use datafusion::logical_expr::LogicalPlan;
+        use util::sql_string_literal::test_support::{
+            assert_no_variable_reference_sent, variable_reference_plans,
+        };
+
+        let dialect = databricks_dialect();
+        for selected_by in ["databricks", "driver={databricks odbc driver}"] {
+            let check = ODBCProfile::from(selected_by)
+                .sql_check()
+                .expect("a Databricks connection checks SQL text");
+            let send = |plan: &LogicalPlan| -> Result<String> {
+                let sql = Unparser::new(&dialect).plan_to_sql(plan)?.to_string();
+                check(&sql)?;
+                Ok(sql)
+            };
+            let (refused, literal) = variable_reference_plans();
+            for plan in &refused {
+                assert_no_variable_reference_sent(send(plan));
+            }
+            send(&literal).expect("a string literal that holds ${ is sent");
+        }
+    }
 
     #[test]
     fn test_athena_dialect_overrides() -> Result<()> {

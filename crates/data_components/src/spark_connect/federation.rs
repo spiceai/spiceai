@@ -23,11 +23,12 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::unparser::dialect::{CustomDialectBuilder, Dialect},
+    sql::unparser::dialect::{CustomDialect, CustomDialectBuilder, Dialect},
 };
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use futures::Stream;
+use util::sql_string_literal::{BackslashEscapedStrings, QuoteEscape, refuse_variable_reference};
 
 use crate::function_support::contains_unsupported_functions;
 use crate::spark_connect::map_error_to_datafusion_err;
@@ -68,14 +69,7 @@ impl SQLExecutor for SparkConnectTableProvider {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(
-            CustomDialectBuilder::new()
-                .with_interval_style(datafusion::sql::unparser::dialect::IntervalStyle::SQLStandard)
-                .with_identifier_quote_style('`')
-                .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
-                .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
-                .build(),
-        )
+        Arc::new(spark_sql_dialect())
     }
 
     /// Refuses to federate a plan naming a function Spark cannot evaluate, so
@@ -96,6 +90,7 @@ impl SQLExecutor for SparkConnectTableProvider {
         schema: SchemaRef,
         _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        refuse_variable_reference(query)?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             spark_query_to_stream(self.spark_connect.clone(), query.to_string()),
@@ -142,5 +137,60 @@ fn spark_query_to_stream(
             .await
             .map_err(map_error_to_datafusion_err)?;
         yield (Ok(data))
+    }
+}
+
+fn spark_sql_dialect() -> BackslashEscapedStrings<CustomDialect> {
+    BackslashEscapedStrings::new(
+        CustomDialectBuilder::new()
+            .with_interval_style(datafusion::sql::unparser::dialect::IntervalStyle::SQLStandard)
+            .with_identifier_quote_style('`')
+            .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
+            .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
+            .build(),
+        QuoteEscape::Unicode,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::logical_expr::LogicalPlan;
+    use datafusion::sql::unparser::Unparser;
+    use util::sql_string_literal::refuse_variable_reference;
+    use util::sql_string_literal::test_support::{
+        UNICODE_QUOTE_LITERALS, assert_no_variable_reference_sent, assert_string_literals,
+        read_spark, variable_reference_plans,
+    };
+
+    use super::spark_sql_dialect;
+
+    #[test]
+    fn string_literals_read_back_as_their_value() {
+        let dialect = spark_sql_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_spark,
+        );
+    }
+
+    /// Federation unparses a plan with this dialect and `execute` checks the
+    /// statement before it sends it.
+    #[test]
+    fn statements_holding_a_variable_reference_are_refused() {
+        let dialect = spark_sql_dialect();
+        let send = |plan: &LogicalPlan| -> DataFusionResult<String> {
+            let sql = Unparser::new(&dialect).plan_to_sql(plan)?.to_string();
+            refuse_variable_reference(&sql)?;
+            Ok(sql)
+        };
+        let (refused, literal) = variable_reference_plans();
+        for plan in &refused {
+            assert_no_variable_reference_sent(send(plan));
+        }
+        send(&literal).expect("a string literal that holds ${ is sent");
     }
 }

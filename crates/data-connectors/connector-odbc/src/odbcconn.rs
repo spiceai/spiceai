@@ -93,9 +93,19 @@ pub enum Error {
     ChannelError { message: String },
 }
 
+/// A check of SQL text that a connection runs before it sends the text.
+pub type SqlCheck = fn(&str) -> datafusion::common::Result<()>;
+
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
     pub params: Arc<HashMap<String, SecretString>>,
+    pub sql_check: Option<SqlCheck>,
+}
+
+impl ODBCConnection<'_> {
+    fn check_sql(&self, sql: &str) -> std::result::Result<(), DataFusionError> {
+        self.sql_check.map_or(Ok(()), |check| check(sql))
+    }
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -156,13 +166,18 @@ where
         &self,
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
+        let sql = format!(
+            "SELECT * FROM {} LIMIT 1",
+            table_reference.to_quoted_string()
+        );
+        self.check_sql(&sql)
+            .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                source: Box::new(e),
+            })?;
         let cxn = self.conn.lock().await;
 
         let mut prepared = cxn
-            .prepare(&format!(
-                "SELECT * FROM {} LIMIT 1",
-                table_reference.to_quoted_string()
-            ))
+            .prepare(&sql)
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
@@ -180,6 +195,7 @@ where
         params: &[ODBCParameter],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
+        self.check_sql(sql)?;
         // prepare some tokio channels to communicate query results back from the thread
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
         let (schema_tx, mut schema_rx) = tokio::sync::mpsc::channel::<SchemaRef>(1);
@@ -339,6 +355,7 @@ where
     }
 
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
+        self.check_sql(query)?;
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_handle();

@@ -32,6 +32,7 @@ use datafusion::error::Result as DFResult;
 use futures::stream::{self, StreamExt};
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
+use util::sql_string_literal::{QuoteEscape, backslash_escaped_string_literal};
 
 use crate::{Read, ReadWrite, RefreshableCatalogProvider};
 
@@ -85,7 +86,7 @@ fn quote_sql_string_literal(value: &str) -> Result<String> {
         }
     );
 
-    Ok(format!("'{}'", value.replace('\'', "''")))
+    Ok(backslash_escaped_string_literal(value, QuoteEscape::Doubled).to_string())
 }
 
 /// Maximum number of concurrent Snowflake API requests during catalog discovery.
@@ -546,6 +547,19 @@ mod tests {
             quote_sql_identifier("schema\"name").expect("identifier should be quoted"),
             "\"schema\"\"name\""
         );
+    }
+
+    #[test]
+    fn quoted_string_literals_read_back_as_their_value() {
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, VALUES, read_with_tokenizer,
+        };
+
+        for (value, literal) in VALUES.into_iter().zip(DOUBLED_QUOTE_LITERALS) {
+            assert_eq!(quote_sql_string_literal(value).expect("quote"), literal);
+            assert_eq!(read_with_tokenizer(&SnowflakeDialect {}, literal), value);
+        }
     }
 
     #[test]

@@ -56,6 +56,9 @@ use tokio::sync::Semaphore;
 use util::{
     fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
     format_datafusion_error,
+    sql_string_literal::{
+        QuoteEscape, backslash_escaped_string_literal, refuse_variable_reference,
+    },
 };
 
 #[cfg(test)]
@@ -281,6 +284,9 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire Databricks SQL Warehouse rate-control permit: {source}"))]
     RateControl { source: runtime_rate_control::Error },
+
+    #[snafu(display("{source}"))]
+    SqlNotSendable { source: DataFusionError },
 
     #[snafu(display(
         "Failed to parse response from Databricks SQL Warehouse: {}",
@@ -1047,12 +1053,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
-        // Escape single quotes by doubling them to prevent SQL injection
-        let escaped_table = table.table().replace('\'', "''");
-        let escaped_schema = table_schema.replace('\'', "''");
-        let escaped_catalog = table_catalog.replace('\'', "''");
+        let literal = |s: &str| backslash_escaped_string_literal(s, QuoteEscape::Unicode);
         let sql = format!(
-            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = '{escaped_table}' AND c.table_schema = '{escaped_schema}' AND c.table_catalog = '{escaped_catalog}' ORDER BY c.ordinal_position"
+            "SELECT c.column_name, c.{data_type_column}, c.is_nullable, c.comment, t.comment FROM information_schema.columns c LEFT JOIN information_schema.tables t ON c.table_catalog = t.table_catalog AND c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE c.table_name = {} AND c.table_schema = {} AND c.table_catalog = {} ORDER BY c.ordinal_position",
+            literal(table.table()),
+            literal(table_schema),
+            literal(table_catalog),
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
@@ -1159,6 +1165,7 @@ impl SqlWarehouseApi {
             .get("statement")
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
+        refuse_variable_reference(sql_text).context(SqlNotSendableSnafu)?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         async {
@@ -2865,6 +2872,35 @@ mod tests {
     }
 
     #[test]
+    fn schema_payload_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{VALUES, spark_string_literals};
+
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "warehouse-123",
+            Arc::new(StaticTokenProvider("token".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
+            None,
+        )
+        .expect("should create api");
+        for value in VALUES {
+            let [catalog, schema, table] = ["c", "s", "t"].map(|slot| format!("{slot}{value}"));
+            let reference = TableReference::full(catalog.as_str(), schema.as_str(), table.as_str());
+            let payload = api
+                .create_schema_payload(&reference, "data_type")
+                .expect("should create payload");
+            let sql = payload["statement"].as_str().expect("statement");
+            assert_eq!(
+                spark_string_literals(sql),
+                [table, schema, catalog],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_create_schema_payload_missing_schema() {
         let api = SqlWarehouseApi::new(
             "host.example.com",
@@ -2907,38 +2943,6 @@ mod tests {
         assert!(
             matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing catalog")),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_create_schema_payload_sql_injection_prevention() {
-        let api = SqlWarehouseApi::new(
-            "host.example.com",
-            "wh-1",
-            Arc::new(StaticTokenProvider("t".to_string())),
-            &SqlWarehouseConfig::default(),
-            Arc::new(DatabricksMetrics::default()),
-            Arc::new(Semaphore::new(8)),
-            None,
-        )
-        .expect("should create api");
-        let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
-
-        let payload = api
-            .create_schema_payload(&table, "full_data_type")
-            .expect("should create payload");
-        let stmt = payload["statement"]
-            .as_str()
-            .expect("statement should be string");
-
-        // Single quotes should be escaped as double single-quotes
-        assert!(stmt.contains("tab''le"), "table name not escaped: {stmt}");
-        assert!(stmt.contains("sch''ema"), "schema not escaped: {stmt}");
-        assert!(stmt.contains("cat''alog"), "catalog not escaped: {stmt}");
-        // Should NOT contain unescaped single quotes between the SQL string quotes
-        assert!(
-            !stmt.contains("tab'le"),
-            "unescaped table name found: {stmt}"
         );
     }
 
@@ -3476,6 +3480,50 @@ mod tests {
             2,
             "expected the SQL statement request to be retried once"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn statements_holding_a_variable_reference_are_not_sent() {
+        use datafusion::sql::unparser::Unparser;
+        use std::sync::atomic::Ordering;
+        use util::sql_string_literal::test_support::variable_reference_plans;
+
+        let (port, requests) = start_mock_http_server(
+            vec![],
+            MockHttpResponse::json(
+                "200 OK",
+                json!({ "status": { "state": "SUCCEEDED" }, "statement_id": "stmt-1" }).to_string(),
+            ),
+        )
+        .await;
+        let api = create_test_api(port);
+        let dialect = databricks_dialect();
+        let payload = |plan| {
+            let sql = Unparser::new(&dialect)
+                .plan_to_sql(plan)
+                .expect("unparse")
+                .to_string();
+            json!({ "statement": sql })
+        };
+
+        let (refused, literal) = variable_reference_plans();
+        for plan in &refused {
+            let statement = payload(plan);
+            let err = api
+                .execute_sql_statement("token", &statement)
+                .await
+                .expect_err("a statement that holds ${ is not sent");
+            assert!(
+                matches!(&err, Error::SqlNotSendable { .. }),
+                "{statement}: {err}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        api.execute_sql_statement("token", &payload(&literal))
+            .await
+            .expect("a string literal that holds ${ is sent");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

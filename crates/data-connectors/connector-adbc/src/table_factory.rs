@@ -54,7 +54,7 @@ pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + 
     match driver_name {
         BIGQUERY_DRIVER => Some(new_bigquery_dialect()),
         DUCKDB_DRIVER => Some(new_duckdb_dialect()),
-        _ => None,
+        _ => data_components::adbc_helpers::dialect_for_driver(driver_name),
     }
 }
 

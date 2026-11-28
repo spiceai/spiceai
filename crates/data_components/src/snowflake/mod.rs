@@ -39,6 +39,9 @@ use datafusion_table_providers::sql::{
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
+use util::sql_string_literal::{
+    BackslashEscapedStrings, QuoteEscape, backslash_escaped_string_literal,
+};
 
 use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
 use crate::{
@@ -141,8 +144,8 @@ fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableRefer
     }
 }
 
-fn snowflake_dialect() -> dialect::CustomDialect {
-    dialect::CustomDialectBuilder::new()
+fn snowflake_dialect() -> BackslashEscapedStrings<dialect::CustomDialect> {
+    let dialect = dialect::CustomDialectBuilder::new()
         .with_identifier_quote_style('"')
         // Render `expr AT TIME ZONE 'tz'` as `CAST(CONVERT_TIMEZONE('tz', expr) AS
         // TIMESTAMP_NTZ)` rather than dropping the zone name (which silently changed
@@ -152,25 +155,22 @@ fn snowflake_dialect() -> dialect::CustomDialect {
         // TIMEZONE` call in `db_connection_pool::snowflakepool`). Background:
         // https://github.com/spiceai/datafusion/pull/160.
         .with_timezone_cast_style(dialect::TimezoneCastStyle::ConvertTimezone)
-        .build()
+        .build();
+    BackslashEscapedStrings::new(dialect, QuoteEscape::Doubled)
 }
 
-/// Probes `information_schema.columns` for a Snowflake table.
-///
-/// Returns richer metadata than `SHOW COLUMNS`: explicit `IS_NULLABLE`,
-/// `NUMERIC_PRECISION`, `NUMERIC_SCALE`, and standard SQL `DATA_TYPE`.
-async fn probe_snowflake_information_schema(
-    api: &SnowflakeApi,
-    table_reference: &TableReference,
-) -> SchemaProbeResult {
-    let table = table_reference.table().replace('\'', "''");
+/// The `information_schema.columns` query [`probe_snowflake_information_schema`]
+/// runs for `table_reference`.
+fn information_schema_probe_sql(table_reference: &TableReference) -> String {
+    let literal = |s: &str| backslash_escaped_string_literal(s, QuoteEscape::Doubled);
+    let table = literal(table_reference.table());
     let schema_filter = table_reference
         .schema()
-        .map(|s| format!(" AND c.table_schema = '{}'", s.replace('\'', "''")))
+        .map(|s| format!(" AND c.table_schema = {}", literal(s)))
         .unwrap_or_default();
     let catalog_filter = table_reference
         .catalog()
-        .map(|c| format!(" AND c.table_catalog = '{}'", c.replace('\'', "''")))
+        .map(|c| format!(" AND c.table_catalog = {}", literal(c)))
         .unwrap_or_default();
 
     // When a catalog (database) is specified, qualify `information_schema` with it so
@@ -191,16 +191,27 @@ async fn probe_snowflake_information_schema(
         "information_schema.tables".to_string()
     };
 
-    let sql = format!(
+    format!(
         "SELECT c.column_name, c.data_type, c.is_nullable, c.numeric_precision, c.numeric_scale, c.comment, t.comment, t.clustering_key \
          FROM {from_clause} c \
          LEFT JOIN {tables_from_clause} t \
              ON c.table_catalog = t.table_catalog \
              AND c.table_schema = t.table_schema \
              AND c.table_name = t.table_name \
-         WHERE c.table_name = '{table}'{schema_filter}{catalog_filter} \
+         WHERE c.table_name = {table}{schema_filter}{catalog_filter} \
          ORDER BY c.ordinal_position"
-    );
+    )
+}
+
+/// Probes `information_schema.columns` for a Snowflake table.
+///
+/// Returns richer metadata than `SHOW COLUMNS`: explicit `IS_NULLABLE`,
+/// `NUMERIC_PRECISION`, `NUMERIC_SCALE`, and standard SQL `DATA_TYPE`.
+async fn probe_snowflake_information_schema(
+    api: &SnowflakeApi,
+    table_reference: &TableReference,
+) -> SchemaProbeResult {
+    let sql = information_schema_probe_sql(table_reference);
 
     match api.exec(&sql).await {
         Ok(snowflake_api::QueryResult::Json(resp)) => {
@@ -1020,6 +1031,58 @@ mod tests {
         Int32Array, Int64Array, NullArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
         UInt32Array, UInt64Array,
     };
+
+    #[test]
+    fn snowflake_dialect_string_literals_read_back_as_their_value() {
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use datafusion::sql::unparser::Unparser;
+        use util::sql_string_literal::test_support::{
+            DOUBLED_QUOTE_LITERALS, assert_string_literals, read_with_tokenizer,
+        };
+
+        let dialect = snowflake_dialect();
+        let unparser = Unparser::new(&dialect);
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "\"c\"",
+            DOUBLED_QUOTE_LITERALS,
+            |sql| read_with_tokenizer(&SnowflakeDialect {}, sql),
+        );
+    }
+
+    #[test]
+    fn information_schema_probe_literals_read_back_as_their_value() {
+        use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
+        use util::sql_string_literal::test_support::{VALUES, string_literals_with_tokenizer};
+
+        for value in VALUES {
+            let sql = information_schema_probe_sql(&TableReference::full(value, value, value));
+            assert_eq!(
+                string_literals_with_tokenizer(&SnowflakeDialect {}, &sql),
+                [value; 3],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn snowflake_dialect_refuses_a_zone_with_a_quote_or_backslash() {
+        use datafusion::logical_expr::expr::Cast;
+        use datafusion::logical_expr::{Expr, col};
+        use datafusion::sql::unparser::Unparser;
+
+        let dialect = snowflake_dialect();
+        let unparser = Unparser::new(&dialect);
+        for tz in [r"x\", "x'"] {
+            let expr = Expr::Cast(Cast::new(
+                Box::new(col("ts")),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+            ));
+            if let Ok(sql) = unparser.expr_to_sql(&expr) {
+                panic!("{tz:?} written as {sql}");
+            }
+        }
+    }
 
     #[test]
     fn snowflake_dialect_unparses_at_time_zone_as_convert_timezone() {

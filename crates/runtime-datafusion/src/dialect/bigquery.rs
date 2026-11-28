@@ -46,6 +46,7 @@ use datafusion::sql::unparser::dialect::{
     BigQueryDialect, CharacterLengthStyle, DateFieldExtractStyle, Dialect, DistinctFromStyle,
     FloatLiteralStyle, IntervalStyle, ScalarFnToSqlHandler,
 };
+use util::sql_string_literal::{QuoteEscape, backslash_escaped_string_literal};
 
 pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
 pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
@@ -1614,6 +1615,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.identifier_quote_style(identifier)
     }
 
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        self.inner.quoted_identifier_escapes()
+    }
+
     fn use_array_keyword_for_array_literals(&self) -> bool {
         self.inner.use_array_keyword_for_array_literals()
     }
@@ -1810,8 +1815,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.supports_empty_select_list()
     }
 
+    /// `BigQuery` reads `\` as an escape character in a string literal, and
+    /// `'''` as the start of a triple-quoted string.
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
-        self.inner.string_literal_to_sql(s)
+        Some(backslash_escaped_string_literal(s, QuoteEscape::Unicode))
     }
 
     fn group_by_matches_select_subexpressions(&self) -> bool {
@@ -1868,6 +1875,33 @@ mod tests {
             .expr_to_sql(&Expr::ScalarFunction(call(name, args)))
             .expect("the BigQuery dialect renders this call")
             .to_string()
+    }
+
+    #[test]
+    fn string_literals_read_back_as_their_value() {
+        use util::sql_string_literal::test_support::{
+            UNICODE_QUOTE_LITERALS, assert_string_literals, read_bigquery,
+        };
+
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        assert_string_literals(
+            |expr| unparser.expr_to_sql(expr).expect("unparse").to_string(),
+            "`c`",
+            UNICODE_QUOTE_LITERALS,
+            read_bigquery,
+        );
+    }
+
+    #[test]
+    fn relation_names_read_back_as_their_name() {
+        use util::sql_string_literal::test_support::assert_bigquery_relation_names_read_back;
+
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        assert_bigquery_relation_names_read_back(|plan| {
+            unparser.plan_to_sql(plan).expect("unparse").to_string()
+        });
     }
 
     #[test]
