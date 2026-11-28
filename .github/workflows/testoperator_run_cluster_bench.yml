@@ -213,6 +213,15 @@ env:
 jobs:
   run-cluster-bench:
     environment: ci
+    # Runs of one workload against one pinned image share a snapshot branch and its
+    # PR ("Open snapshot-update PR"), so they run one at a time: two at once could
+    # publish the PR's evidence out of order. The group names the same inputs as the
+    # branch key; a run without a pinned image is keyed by its own run id. So only
+    # duplicates share a group, and a pending duplicate GitHub replaces loses
+    # nothing.
+    concurrency:
+      group: testoperator-cluster-bench-${{ github.event.inputs.custom_image_tag || github.run_id }}-${{ github.event.inputs.query_set || 'tpch' }}-sf${{ github.event.inputs.scale_factor || '1' }}-${{ github.event.inputs.spicepod_path || 'federated/s3-public[parquet].yaml' }}-${{ github.event.inputs.scenario_query_file }}
+      cancel-in-progress: false
     permissions:
       # `write` on contents + pull-requests so the "Open snapshot-update PR" step
       # can push a branch and open a PR. `packages: read` covers the spidapter
@@ -649,7 +658,13 @@ jobs:
           # Sanitize the spicepod path for use in the branch name (slashes/
           # brackets aren't great ref characters).
           slug="$(echo "${SPICEPOD_PATH_DISPLAY}" | sed 's#[][/]#-#g' | sed 's#--*#-#g')"
-          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}"
+          # One branch per workload (query set, scale, Spicepod and scenario queries), named in the PR's
+          # evidence the same way, so another workload's snapshots never make it
+          # stale (.github/scripts/pr_evidence.mjs).
+          WORKLOAD="${CB_QUERY_SET} sf${CB_SCALE_FACTOR} ${CB_SPICEPOD_PATH}"
+          if [ -n "${CB_SCENARIO_QUERY_FILE}" ]; then WORKLOAD="${WORKLOAD} queries=${CB_SCENARIO_QUERY_FILE}"; fi
+          WORKLOAD_KEY="$(printf '%s' "${WORKLOAD}" | git hash-object --stdin | cut -c1-8)"
+          BRANCH_NAME="testoperator-cluster-snapshot-update/${BRANCH_ID}-${slug}-${WORKLOAD_KEY}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
@@ -692,6 +707,8 @@ jobs:
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq '.[].url')"
           if [ -n "${PR_URL}" ]; then
             echo "PR already exists -> ${PR_URL}"
+            # Before the held runs are released, so Attestation reads the new evidence.
+            bash .github/scripts/bot_pr_evidence.sh update "${PR_URL}" "testoperator cluster bench ${WORKLOAD}"
             # Release the pull_request runs GitHub holds on a GITHUB_TOKEN push (see the script).
             bash .github/scripts/approve_bot_pr_runs.sh "${BRANCH_NAME}" "$(git rev-parse HEAD)"
             exit 0
@@ -779,6 +796,9 @@ jobs:
             printf -- '- **Updated snapshots**: indicate planner or execution drift. Inspect the diff and cross-reference recent trunk commits touching the runtime / federation / acceleration layer to confirm the change is intentional.\n'
             printf -- '- The cluster-bench harness only opens this PR when `update_snapshots=always` (the default for non-`release/*` branches). To gate snapshot drift in CI, set `update_snapshots=no` on the dispatch.\n'
           } > "${body_file}"
+          # Attestation checks the description's Evidence section (.github/scripts/pr_evidence.mjs).
+          printf '\n' >> "${body_file}"
+          bash .github/scripts/bot_pr_evidence.sh section "testoperator cluster bench ${WORKLOAD}" >> "${body_file}"
 
           # Title carries the same summary that's in the commit message — short
           # but specifies cluster-bench, file counts, spicepod, and query set

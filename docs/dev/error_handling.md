@@ -173,3 +173,18 @@ Related reading:
         tracing::error!("Failed to upload data to {datasource}: {user_facing_err:?}");
     }
     ```
+
+## Log messages
+
+*User-facing surface* refers to that section of [`AGENTS.md`](../../AGENTS.md).
+
+`tracing::` macros only — never the `log::` crate. Keep every log/error message on a single line: no embedded newlines or `\`-continuations that insert them.
+
+**Every `error!`/`warn!`/`info!` a user can see is a user-facing message** and follows the guidelines above: name the affected dataset/model/catalog (and schema/table), give an actionable fix with a docs link, and use no internal vocabulary ("table provider", "read provider", "connection pool", "metadata"). Put the resource *in the message text*, not only in a `tracing` field. Log lines are user-facing surface — see *User-facing surface* for which changes to them need an Enhancement.
+
+- **State one problem, then its impact** — `failed to {action}, so {what the user can no longer do}. Cause: {source}` — never the impact and the failure as two sentences, which reads as two separate incidents and leaves the reader unsure which one to chase. "Catalog 'pg' failed to list the tables of schema 'sales', so no table in that schema is registered and queries against 'pg.sales' will not resolve" beats "registered no table from schema sales … Failed to list its tables: …".
+- **A `warn!` on a degrade-and-continue path must say what the user will observe**, not only what failed internally. That line is the only explanation they will ever get for a table that is silently absent, so it is load-bearing rather than cosmetic.
+- **Quote user strings, backtick our own identifiers.** Single quotes for names the user chose and the qualified paths built from them (`catalog 'pg'`, `schema 'sales'`, `table 'sales.orders'`) — an unquoted name vanishes when it is empty and reads as prose when it is a word like `order`, and a PostgreSQL identifier may legally contain a `.`. Backticks for config keys and system identifiers you are telling them to act on (`` `pg_host` ``, `` `unsupported_type_action` ``, `` `information_schema` ``). Note the repo is not yet uniform: the catalog paths quote, while `Failed to register dataset {dataset_name} ({connector})` and the examples above do not. Quote in new and reworded messages, and keep one style within a single message.
+- **Don't repeat the fix.** When a message embeds a nested error that already carries the action and docs link, the outer message supplies the resource, the failing step and the impact, and lets the cause supply the rest. Word an inner error as the *cause clause* it will appear as.
+- **Link the data connector's docs for anything a dataset would hit identically** (connection parameters, role grants, type handling); reserve a component-specific page for what is genuinely specific to it (for a catalog: include/exclude patterns, registration).
+- **Make the wording testable**: build a message a user depends on in a pure function and assert its text in a unit test (see `empty_catalog_warning` and `schema_discovery_warning` in `crates/data_components/src/postgres/provider.rs`), so a reword cannot quietly drop the resource, the consequence, or the docs link.
