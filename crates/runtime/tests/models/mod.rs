@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod bedrock;
 mod embedding;
+mod fts_and_not;
 #[cfg(feature = "duckdb")]
 mod fts_caching_restart;
 // Cayenne FTS restart coverage does not need the duckdb feature; the DuckDB arm
