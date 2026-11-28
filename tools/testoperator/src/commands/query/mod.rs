@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use super::RowCounts;
-use crate::{args::DatasetTestArgs, health::HealthMonitor};
+use crate::{
+    args::{DatasetTestArgs, Runs},
+    health::HealthMonitor,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -23,13 +26,10 @@ use test_framework::{
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     spiced::SpicedInstance,
-    spicetest::{
-        SpiceTest,
-        datasets::{EndCondition, NotStarted},
-    },
+    spicetest::{SpiceTest, datasets::NotStarted},
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs, runs: Runs) -> anyhow::Result<RowCounts> {
     super::ensure_shared_client_connections(args, "query")?;
     let mut spiced_instance = SpicedInstance::empty();
 
@@ -46,8 +46,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     println!("Running benchmark test");
 
     let test = NotStarted::new()
-        .with_parallel_count(1)
-        .with_end_condition(EndCondition::QuerySetCompleted(5))
+        .with_parallel_count(args.concurrency)
+        .with_end_condition(runs.into())
         .with_validate(args.validate)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
         .with_query_executor(executor);

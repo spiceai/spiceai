@@ -61,7 +61,7 @@ const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_PRINTED_FAILURE_ROWS: usize = 20;
 
 pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
-    if args.test_args.common.concurrency == 0 {
+    if args.test_args.concurrency == 0 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 0 for an append test"
         ));
@@ -94,8 +94,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
                 args.test_args.scale_factor,
             )
             .await?
-            .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_duration(Duration::from_secs(args.test_args.common.duration))
+            .with_parallel_count(args.test_args.concurrency)
+            .with_end_duration(args.duration.duration())
             .with_tempdir_path(start_request.get_tempdir_path())
             .with_load_interval(Duration::from_secs(args.load_interval))
             .with_load_steps(args.load_steps)

@@ -94,7 +94,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let terminals = args
         .terminals
         .unwrap_or_else(|| ((scale_factor * 10.0) as usize).min(DEFAULT_TERMINALS_CAP));
-    let duration = Duration::from_secs(test_args.common.duration);
+    let duration = args.duration.duration();
     // Seeding an SF1000 source runs for the better part of an hour and prints
     // little; without this, `/v1/ready` could not tell it apart from a run stuck
     // on the source connection.
@@ -165,7 +165,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         "scale_factor": scale_factor,
         "terminals": terminals,
         "duration_secs": duration.as_secs(),
-        "concurrency": test_args.common.concurrency,
+        "concurrency": test_args.concurrency,
         "target_oltp_rate": args.rate
             .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
         "spicepod_path": test_args.common.spicepod_path.display().to_string(),
@@ -186,7 +186,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("scale_factor", scale_factor.to_string()),
             KeyValue::new("terminals", terminals.to_string()),
             KeyValue::new("duration_secs", duration.as_secs().to_string()),
-            KeyValue::new("concurrency", test_args.common.concurrency.to_string()),
+            KeyValue::new("concurrency", test_args.concurrency.to_string()),
             KeyValue::new(
                 "target_oltp_rate",
                 args.rate
@@ -253,10 +253,8 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         test_args,
         &app,
         NotStarted::new()
-            .with_parallel_count(test_args.common.concurrency)
-            .with_end_condition(EndCondition::Duration(Duration::from_secs(
-                test_args.common.duration,
-            )))
+            .with_parallel_count(test_args.concurrency)
+            .with_end_condition(EndCondition::Duration(args.duration.duration()))
             .with_validate(test_args.validate)
             .with_scale_factor(test_args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),

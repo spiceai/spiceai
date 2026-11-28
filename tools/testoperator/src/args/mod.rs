@@ -18,6 +18,9 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
+mod runs;
+pub use runs::{BenchArgs, DurationArgs, Runs, RunsArgs, ThroughputArgs};
+
 mod dataset;
 pub use dataset::{
     ClientConnectionsArg, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SourceType,
@@ -70,11 +73,11 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum TestCommands {
     /// Run a throughput test
-    Throughput(DatasetTestArgs),
+    Throughput(ThroughputArgs),
     /// Run an extended load test
     Load(LoadTestArgs),
     /// Run a single-run benchmark
-    Bench(DatasetTestArgs),
+    Bench(BenchArgs),
     /// Measure how long a fresh spiced takes to load its accelerations and report ready
     ColdStart(ColdStartArgs),
     /// Run a data consistency test
@@ -83,7 +86,7 @@ pub enum TestCommands {
     Append(AppendTestArgs),
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
-    Query(DatasetTestArgs),
+    Query(BenchArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
     /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams
@@ -106,10 +109,6 @@ pub struct CommonArgs {
     #[arg(short('z'), long)]
     pub(crate) spicepod_dependencies: Option<PathBuf>,
 
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
-
     /// Path to the spiced binary, or URL to an already-running spiced instance's Flight endpoint
     /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
@@ -118,10 +117,6 @@ pub struct CommonArgs {
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
-
-    /// The duration of the test in seconds
-    #[arg(long, default_value = "60")]
-    pub(crate) duration: u64,
 
     /// Whether to disable progress bars, for CI or non-interactive environments
     #[arg(long)]

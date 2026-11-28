@@ -16,12 +16,15 @@ limitations under the License.
 
 use clap::Parser;
 
-use super::DatasetTestArgs;
+use super::{DatasetTestArgs, DurationArgs};
 
 #[derive(Parser, Debug)]
 pub struct AppendTestArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
+
+    #[command(flatten)]
+    pub(crate) duration: DurationArgs,
 
     /// Interval in seconds between append operations
     #[arg(long, default_value_t = 240)]

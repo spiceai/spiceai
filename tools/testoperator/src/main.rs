@@ -32,8 +32,8 @@ mod system_adapter;
 mod test_support;
 
 use args::{
-    ColdStartArgs, Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs,
-    SchemaTestArgs, TestCommands, TextToSqlArgs,
+    BenchArgs, ColdStartArgs, Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs,
+    LoadTestArgs, SchemaTestArgs, TestCommands, TextToSqlArgs, ThroughputArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -70,8 +70,14 @@ async fn main() -> ExitCode {
 async fn run(subcommand: Commands) -> anyhow::Result<()> {
     match subcommand {
         Commands::Export(
-            TestCommands::Throughput(DatasetTestArgs { common, .. })
-            | TestCommands::Bench(DatasetTestArgs { common, .. })
+            TestCommands::Throughput(ThroughputArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::Bench(BenchArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            })
             | TestCommands::Load(LoadTestArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -94,10 +100,10 @@ async fn run(subcommand: Commands) -> anyhow::Result<()> {
         Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
         Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
         Commands::Run(TestCommands::Bench(args)) => {
-            commands::bench::run(&args).await?;
+            commands::bench::run(&args.test_args, args.runs.runs()).await?;
         }
         Commands::Run(TestCommands::Query(args)) => {
-            commands::query::run(&args).await?;
+            commands::query::run(&args.test_args, args.runs.runs()).await?;
         }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             commands::data_consistency::run(&args).await?;

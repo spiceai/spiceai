@@ -15,20 +15,20 @@ limitations under the License.
 */
 
 use super::bench;
-use crate::args::DataConsistencyArgs;
+use crate::args::{DataConsistencyArgs, Runs};
 use test_framework::anyhow;
 
 pub(crate) async fn run(args: &DataConsistencyArgs) -> anyhow::Result<()> {
     // first benchmark run using the first spicepod
     let mut test_args = args.test_args.clone();
-    let first_row_counts = bench::run(&test_args).await?;
+    let first_row_counts = bench::run(&test_args, Runs::default()).await?;
 
     // second benchmark run using the second spicepod
     test_args
         .common
         .spicepod_path
         .clone_from(&args.compare_spicepod);
-    let second_row_counts = bench::run(&test_args).await?;
+    let second_row_counts = bench::run(&test_args, Runs::default()).await?;
 
     // compare the results
     let mut test_failed = false;

@@ -28,6 +28,10 @@ pub struct SearchTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
     /// A parameterized SQL search pipeline: a path to a file that exists, or the SQL text. When
     /// set, each test query is sent to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The
     /// SQL can use the named parameters `:query` (the query text) and `:limit` (the result limit).

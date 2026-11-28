@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use super::DatasetTestArgs;
+use super::{DatasetTestArgs, DurationArgs};
 
 /// Arguments for the HTAP (Hybrid Transactional/Analytical Processing) test.
 ///
@@ -34,6 +34,9 @@ use super::DatasetTestArgs;
 pub struct HtapArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
+
+    #[command(flatten)]
+    pub(crate) duration: DurationArgs,
 
     /// Override the number of concurrent OLTP terminals (default: `scale_factor` * 10).
     #[arg(long)]
