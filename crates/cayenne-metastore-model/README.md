@@ -20,6 +20,16 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
+The `source-rollback-default` and `source-rollback-shared` runs retain two
+independent durable copies across upgrade, rollback and upgrade again. Default
+consumers acknowledge each copy independently. An explicitly shared consumer
+requires a snapshot rebuild when its acknowledgement is ahead of the copy being
+opened; `source-rollback-shared-no-rebuild` removes that guard and must return a
+wrong caught-up read. These are append-source design checks, not a replay of the
+PostgreSQL connector. The engine regression is
+`test/spicescript/cayenne-vnext-rollback.yaml`, covering default and explicit slots
+on both release lines.
+
 ## Run kinds
 
 Every run demonstrates one of five things; `list` prints the kind first, and

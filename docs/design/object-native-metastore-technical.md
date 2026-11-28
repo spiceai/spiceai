@@ -2126,6 +2126,24 @@ committed file sets, CDC, and the data-file lifecycle.
   - *replay after takeover:* PostgreSQL resumes from the committed position;
     SQS redelivers undeleted messages, so the new holder skips files the log
     already records.
+- **PostgreSQL consumer identity and rollback:** an object-native dataset's
+  generated slot is named for the dataset and the identity recorded in its state
+  location. Instances sharing that location share the slot; another location
+  has its own consumer. The SQLite copy retained for rollback keeps its
+  instance-scoped default slot.
+  Acknowledging the object-native copy therefore does not advance the SQLite
+  copy's default slot. An explicitly configured slot keeps its configured name
+  across upgrades: if its acknowledged position exceeds the durable position in
+  the copy being opened, that copy rebuilds from the source before resuming.
+  Separate slots can retain WAL independently while either copy is stopped;
+  the upgrade does not drop the rollback copy's slot.
+  Model: `source-rollback-default`, `source-rollback-shared` and
+  `source-rollback-shared-no-rebuild`. These finite append-source graphs check
+  two durable copies across upgrade, rollback and upgrade again; they do not
+  model PostgreSQL's snapshot protocol or prove the connector implementation.
+  The engine check is `test/spicescript/cayenne-vnext-rollback.yaml`: both slot
+  policies against both release lines, with source row oracles, slot identities
+  and positions, and a rebuild required only for the explicitly shared slot.
 - **Prerequisites:** data placement (step 6). Until then data files are on the
   writer's local disk, so a standby could neither read them nor take over
   (model: `standby-local-files`).

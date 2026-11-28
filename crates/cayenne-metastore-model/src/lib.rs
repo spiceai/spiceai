@@ -23,6 +23,7 @@ mod replicas;
 mod retention;
 mod seq_order;
 mod source_positions;
+mod source_rollback;
 mod standby;
 mod state_rules;
 mod transactions;
@@ -346,6 +347,30 @@ pub fn runs() -> Vec<Run> {
             bound: 4,
             seed: Some(20_261_024),
             failure: "",
+        },
+        Run {
+            name: "source-rollback-default",
+            family: "source-rollback",
+            mode: "source-rollback-default",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "source-rollback-shared",
+            family: "source-rollback",
+            mode: "source-rollback-shared",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "source-rollback-shared-no-rebuild",
+            family: "source-rollback",
+            mode: "source-rollback-shared-no-rebuild",
+            bound: 2,
+            seed: None,
+            failure: "caught-up reads match the source",
         },
         Run {
             name: "source-positions",
@@ -3105,7 +3130,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && *expectation == Expectation::Sometimes;
     let standby_required = matches!(
         run.family,
-        "standby" | "object-names" | "reads" | "data-files"
+        "standby" | "object-names" | "reads" | "data-files" | "source-rollback"
     ) && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
@@ -3460,6 +3485,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
             None,
         ),
         "dataset-lifecycle" => v.visit(dataset_lifecycle::Protocol::new(r.mode, r.bound), r, None),
+        "source-rollback" => v.visit(source_rollback::Protocol::new(r.mode), r, None),
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
@@ -3889,7 +3915,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 25, "{:?}", render.families);
+        assert_eq!(render.families.len(), 26, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",
