@@ -233,7 +233,7 @@ jobs:
           # stands in for; keep the two lists equal. `http-functions` is for
           # test/spicescript/secret-redaction.yaml, which registers remote
           # functions.
-          features: 'tpc-extension,models,postgres-accel,http-functions'
+          features: 'tpc-extension,models,http-functions'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_linux_x86_64
