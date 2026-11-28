@@ -23,7 +23,6 @@ limitations under the License.
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 
 mod cleanup;
 mod compare;
@@ -46,13 +45,13 @@ mod template;
 mod tlp;
 mod tpch;
 
-#[derive(Parser)]
-#[command(about = "Run scenario scripts against spiced")]
+/// The command-line arguments of a run (`testoperator script`).
+#[derive(clap::Args)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent command-line switches"
 )]
-struct Cli {
+pub struct Args {
     /// Script files, or directories of `*.yaml` scripts.
     #[arg(required = true)]
     scripts: Vec<PathBuf>,
@@ -211,9 +210,12 @@ struct Cli {
     cell_width: usize,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+/// The process exit code for a run's outcome: 0 when every check passed (or
+/// the run only recorded failures), 1 when a check failed, and 2, after
+/// printing the error, when the run could not finish.
+#[must_use]
+pub fn exit_code(outcome: &Result<bool>) -> ExitCode {
+    match outcome {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
@@ -223,7 +225,15 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<bool> {
+/// Runs the scripts `cli` names and reports every check. Returns whether the
+/// run passed: no check failed outside the expected-failure ledgers, or the
+/// run was recording them.
+///
+/// # Errors
+///
+/// When a script or its corpus fails to parse, a `spiced` binary or a source
+/// can't be set up, or a ledger or recording can't be read or written.
+pub async fn run(cli: Args) -> Result<bool> {
     validate_repetitions(&cli)?;
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
@@ -649,7 +659,7 @@ fn not_run_note(count: usize) -> String {
     }
 }
 
-fn validate_repetitions(cli: &Cli) -> Result<()> {
+fn validate_repetitions(cli: &Args) -> Result<()> {
     anyhow::ensure!(
         cli.runs_per_script == 1 || !(cli.record_durations || cli.record_failures),
         "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
@@ -1006,21 +1016,30 @@ mod tests {
         );
     }
 
+    /// Parses `argv` as `testoperator script` would, through a parser that
+    /// flattens [`Args`].
+    fn parse_args<'a>(argv: impl IntoIterator<Item = &'a str>) -> Result<Args, clap::Error> {
+        #[derive(clap::Parser)]
+        struct Command {
+            #[command(flatten)]
+            args: Args,
+        }
+        <Command as clap::Parser>::try_parse_from(argv).map(|command| command.args)
+    }
+
     #[test]
     fn repetition_flags_are_validated() {
-        assert!(Cli::try_parse_from(["spicescript", "--runs-per-script", "0", "s.yaml"]).is_err());
+        assert!(parse_args(["spicescript", "--runs-per-script", "0", "s.yaml"]).is_err());
         for flag in ["--record-durations", "--record-failures"] {
-            let cli =
-                Cli::try_parse_from(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
-                    .expect("valid CLI syntax");
+            let cli = parse_args(["spicescript", "--runs-per-script", "3", flag, "s.yaml"])
+                .expect("valid CLI syntax");
             assert_eq!(
                 validate_repetitions(&cli)
                     .expect_err("recording repetitions is rejected")
                     .to_string(),
                 "--runs-per-script >1 cannot be combined with --record-durations or --record-failures: repetitions would overwrite the recordings"
             );
-            let cli =
-                Cli::try_parse_from(["spicescript", flag, "s.yaml"]).expect("default repetition");
+            let cli = parse_args(["spicescript", flag, "s.yaml"]).expect("default repetition");
             validate_repetitions(&cli).expect("one run may record");
         }
     }

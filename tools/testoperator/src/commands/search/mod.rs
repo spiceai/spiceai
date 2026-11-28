@@ -99,12 +99,12 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search ({})", search_method.name());
 
-    let config = harness::init_search_config(&spiced_instance, Some(10))
+    // Load the relevance judgments first: only judged queries are sent.
+    let qrels = harness::get_query_relevance_data(&spiced_instance).await?;
+
+    let config = harness::init_search_config(&spiced_instance, Some(10), &qrels)
         .await?
         .with_method(search_method);
-
-    // retrieve query relevance data
-    let qrels = harness::get_query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = Instant::now();
 

@@ -46,9 +46,9 @@ runs unchanged on a local directory.
   state survives losing any instance and its disk, and any instance can
   recover or read it. A local directory is the local and on-prem path: it
   needs no object store or credentials and runs the same code path as a
-  bucket. Its state survives a process crash or kill, not the loss of the
-  disk; whether it survives a power loss is an
-  [open decision](object-native-metastore-technical.md#open-decisions).
+  bucket. It is for development, testing and getting started: its state
+  survives a process crash or kill, with no promise for an OS crash, a power
+  loss or the loss of the disk.
 - **The data moves too.** Today a file-mode dataset keeps its Vortex and
   deletion files on the instance's disk, or in S3 Express where configured.
   Here every file a commit references is in the destination before the
