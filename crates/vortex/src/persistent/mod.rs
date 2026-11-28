@@ -31,6 +31,7 @@ pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
 pub use format::bounds_account_for_nan;
 pub use format::column_stats;
+pub use format::footer_statistics;
 pub use format::singleton_distinct_count;
 pub use segment_cache::{
     install_process_segment_cache, process_segment_cache_capacity_bytes,

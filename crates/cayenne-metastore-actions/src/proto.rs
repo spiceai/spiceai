@@ -59,6 +59,23 @@ pub struct FileEntry {
     pub max_seq: i64,
     #[prost(string, optional, tag = "6")]
     pub digest: Option<String>,
+    /// The file's footer statistics, recorded by the writer that wrote it. With
+    /// them, `rows` is the footer's row count; without them, `rows` is a count
+    /// an earlier build recorded, or 0, and the file's scans read its footer.
+    #[prost(message, optional, tag = "7")]
+    pub stats: Option<RecordedStats>,
+}
+
+/// A data file's footer statistics as its writer recorded them.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct RecordedStats {
+    /// The statistics in the encoding a `FileStat` blob holds, with no deletion
+    /// applied, laid out as the table schema `schema` identifies.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub blob: prost::bytes::Bytes,
+    /// The identity of that schema; a scan of another schema does not use them.
+    #[prost(fixed64, tag = "2")]
+    pub schema: u64,
 }
 
 /// One deletion vector (`cayenne_delete_file`).

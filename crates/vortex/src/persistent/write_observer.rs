@@ -8,6 +8,7 @@ use std::fmt::Debug;
 
 use datafusion_common::arrow::array::RecordBatch;
 use object_store::path::Path;
+use vortex::file::Footer;
 
 /// Observes the placement of every batch a Vortex write emits.
 ///
@@ -37,9 +38,9 @@ pub trait VortexWriteObserver: Debug + Send + Sync + 'static {
     /// occupying positions `first_row_position .. first_row_position + num_rows`.
     fn batch_written(&self, file_path: &Path, first_row_position: u64, batch: &RecordBatch);
 
-    /// `file_path` is complete: the write closed it at `size` bytes. Called once
-    /// per file the write produced, after the last batch it holds and before the
-    /// write returns, so a caller can name exactly the files it wrote without
-    /// listing where it wrote them.
-    fn file_written(&self, file_path: &Path, size: u64);
+    /// `file_path` is complete: the write closed it at `size` bytes with
+    /// `footer`. Called once per file the write produced, after the last batch
+    /// it holds and before the write returns, so a caller can name exactly the
+    /// files it wrote, and describe them, without listing or reading them.
+    fn file_written(&self, file_path: &Path, size: u64, footer: &Footer);
 }

@@ -37,6 +37,10 @@ limitations under the License.
 //! their writer cleans them up after a failure, a commit that drops them
 //! releases them, or the orphan sweep finds a commit naming them.
 //!
+//! Each data file the sink closes is held with the footer statistics its writer
+//! computed from the footer it wrote, so the commit that names the file records
+//! them with it and no scan reads the footer or writes them.
+//!
 //! The same record is the writer's intent for the orphan sweep: a file listed
 //! under the table's prefix that no retained snapshot names is reclaimed only
 //! once it is older than the age floor *and* no write of this process still
@@ -50,13 +54,18 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use parking_lot::Mutex;
+use vortex::file::Footer;
+use vortex::session::VortexSession;
 use vortex_datafusion::VortexWriteObserver;
 
+use super::table::LiveSchema;
+use crate::metadata::RecordedFileStatistics;
+
 /// Files written into snapshot directories and not yet named by a commit, by
-/// snapshot id, then file name, with their size in bytes.
+/// snapshot id, then file name.
 #[derive(Debug, Default)]
 pub(crate) struct UncommittedFiles {
-    by_snapshot: Mutex<HashMap<String, BTreeMap<String, u64>>>,
+    by_snapshot: Mutex<HashMap<String, BTreeMap<String, HeldFile>>>,
     /// Appends writing at their final keys, by the write's own key.
     final_key_writes: Mutex<HashMap<String, FinalKeyWrite>>,
     /// Names of deletion-vector files written and not known to be committed.
@@ -68,10 +77,18 @@ pub(crate) struct UncommittedFiles {
 struct FinalKeyWrite {
     /// The snapshot directory the files are written into and committed to.
     directory: String,
-    files: BTreeMap<String, u64>,
+    files: BTreeMap<String, HeldFile>,
     /// The commit naming the files was accepted: discarding the write must
     /// not delete them.
     committed: bool,
+}
+
+/// One held data file.
+#[derive(Debug)]
+struct HeldFile {
+    size: u64,
+    /// The footer statistics its writer computed, for its commit to record.
+    statistics: Option<RecordedFileStatistics>,
 }
 
 /// What discarding a write at final keys leaves to delete.
@@ -89,18 +106,44 @@ pub(crate) enum DiscardedFinalKeyWrite {
 }
 
 impl UncommittedFiles {
-    /// Records `name` (`size` bytes) as written into `snapshot_id`, or into the
-    /// write at final keys whose key `snapshot_id` is.
-    pub(crate) fn note(&self, snapshot_id: &str, name: &str, size: u64) {
+    /// Records `name` (`size` bytes, with the footer `statistics` its writer
+    /// computed) as written into `snapshot_id`, or into the write at final keys
+    /// whose key `snapshot_id` is.
+    pub(crate) fn note(
+        &self,
+        snapshot_id: &str,
+        name: &str,
+        size: u64,
+        statistics: Option<RecordedFileStatistics>,
+    ) {
+        let held = HeldFile { size, statistics };
         if let Some(write) = self.final_key_writes.lock().get_mut(snapshot_id) {
-            write.files.insert(name.to_string(), size);
+            write.files.insert(name.to_string(), held);
             return;
         }
         self.by_snapshot
             .lock()
             .entry(snapshot_id.to_string())
             .or_default()
-            .insert(name.to_string(), size);
+            .insert(name.to_string(), held);
+    }
+
+    /// The footer statistics the writer of `name`, a data file still held,
+    /// computed. A data file's name is unique to the write that made it.
+    pub(crate) fn statistics(&self, name: &str) -> Option<RecordedFileStatistics> {
+        let found = self
+            .by_snapshot
+            .lock()
+            .values()
+            .find_map(|files| files.get(name).map(|held| held.statistics.clone()));
+        found
+            .or_else(|| {
+                self.final_key_writes
+                    .lock()
+                    .values()
+                    .find_map(|write| write.files.get(name).map(|held| held.statistics.clone()))
+            })
+            .flatten()
     }
 
     /// The files written into `snapshot_id`, or by the write at final keys whose
@@ -111,7 +154,7 @@ impl UncommittedFiles {
             return write
                 .files
                 .iter()
-                .map(|(name, size)| (name.clone(), *size))
+                .map(|(name, held)| (name.clone(), held.size))
                 .collect();
         }
         self.by_snapshot
@@ -120,7 +163,7 @@ impl UncommittedFiles {
             .map(|files| {
                 files
                     .iter()
-                    .map(|(name, size)| (name.clone(), *size))
+                    .map(|(name, held)| (name.clone(), held.size))
                     .collect()
             })
             .unwrap_or_default()
@@ -271,12 +314,59 @@ impl UncommittedFiles {
     }
 }
 
-/// Records every file one write closes into [`UncommittedFiles`] under the
-/// snapshot it writes.
-#[derive(Debug)]
+/// Records every file one write closes into [`UncommittedFiles`], with the
+/// footer statistics its commit records.
 pub(crate) struct UncommittedFilesObserver {
     pub(crate) files: Arc<UncommittedFiles>,
     pub(crate) snapshot_id: String,
+    /// The session the write's format converts types with, as its scans do.
+    pub(crate) session: VortexSession,
+    pub(crate) schema: Arc<LiveSchema>,
+}
+
+impl std::fmt::Debug for UncommittedFilesObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UncommittedFilesObserver")
+            .field("snapshot_id", &self.snapshot_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UncommittedFilesObserver {
+    /// The statistics a scan infers from `footer`, before it applies deletions.
+    /// `None` when they cannot be computed: the file's scans then read its
+    /// footer.
+    fn recorded_statistics(
+        &self,
+        file_path: &object_store::path::Path,
+        footer: &Footer,
+    ) -> Option<RecordedFileStatistics> {
+        let schema = self.schema.identity?;
+        let statistics = match vortex_datafusion::footer_statistics(
+            &self.session,
+            file_path,
+            footer,
+            &self.schema.schema,
+        ) {
+            Ok(statistics) => statistics,
+            Err(error) => {
+                tracing::debug!(
+                    file = %file_path,
+                    %error,
+                    "Recording no footer statistics for a written file; its scans read its footer"
+                );
+                return None;
+            }
+        };
+        Some(RecordedFileStatistics {
+            rows: i64::try_from(footer.row_count()).ok()?,
+            blob: bytes::Bytes::from(crate::stats::statistics_to_persisted_blob(
+                &statistics,
+                &self.schema.schema,
+            )?),
+            schema,
+        })
+    }
 }
 
 impl VortexWriteObserver for UncommittedFilesObserver {
@@ -288,9 +378,10 @@ impl VortexWriteObserver for UncommittedFilesObserver {
     ) {
     }
 
-    fn file_written(&self, file_path: &object_store::path::Path, size: u64) {
+    fn file_written(&self, file_path: &object_store::path::Path, size: u64, footer: &Footer) {
         if let Some(name) = file_path.filename() {
-            self.files.note(&self.snapshot_id, name, size);
+            let statistics = self.recorded_statistics(file_path, footer);
+            self.files.note(&self.snapshot_id, name, size, statistics);
         }
     }
 }
@@ -302,19 +393,9 @@ mod tests {
     #[test]
     fn a_closed_file_is_held_under_its_snapshot_until_forgotten() {
         let files = Arc::new(UncommittedFiles::default());
-        let observer = UncommittedFilesObserver {
-            files: Arc::clone(&files),
-            snapshot_id: "s1".to_string(),
-        };
-        observer.file_written(
-            &object_store::path::Path::from("data/t/s1/w_00001.vortex"),
-            20,
-        );
-        observer.file_written(
-            &object_store::path::Path::from("data/t/s1/w_00000.vortex"),
-            10,
-        );
-        files.note("s2", "c.vortex", 5);
+        files.note("s1", "w_00001.vortex", 20, None);
+        files.note("s1", "w_00000.vortex", 10, None);
+        files.note("s2", "c.vortex", 5, None);
         assert_eq!(
             files.files("s1"),
             vec![
@@ -339,13 +420,9 @@ mod tests {
     #[test]
     fn a_final_key_write_is_held_apart_from_the_snapshot_it_writes_into() {
         let files = Arc::new(UncommittedFiles::default());
-        files.note("cur", "flush.vortex", 1);
+        files.note("cur", "flush.vortex", 1, None);
         files.begin_final_key_write("_staging/w1", "cur");
-        let observer = UncommittedFilesObserver {
-            files: Arc::clone(&files),
-            snapshot_id: "_staging/w1".to_string(),
-        };
-        observer.file_written(&object_store::path::Path::from("t/cur/w1_00000.vortex"), 7);
+        files.note("_staging/w1", "w1_00000.vortex", 7, None);
         assert_eq!(files.files("cur"), vec![("flush.vortex".to_string(), 1)]);
         assert_eq!(
             files.files("_staging/w1"),
@@ -373,7 +450,7 @@ mod tests {
         assert!(files.held().is_empty());
 
         files.begin_final_key_write("_staging/w2", "cur");
-        files.note("_staging/w2", "w2_00000.vortex", 3);
+        files.note("_staging/w2", "w2_00000.vortex", 3, None);
         files.mark_final_key_write_committed("_staging/w2");
         assert_eq!(
             files.discard_final_key_write("_staging/w2"),

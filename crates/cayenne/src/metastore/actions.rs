@@ -48,6 +48,13 @@ pub(crate) fn add_files(
                 min_seq: f.min_sequence,
                 max_seq: f.max_sequence,
                 digest: f.digest.clone(),
+                stats: f
+                    .recorded_statistics
+                    .as_ref()
+                    .map(|recorded| proto::RecordedStats {
+                        blob: recorded.blob.clone(),
+                        schema: recorded.schema,
+                    }),
             })
             .collect(),
         upsert,

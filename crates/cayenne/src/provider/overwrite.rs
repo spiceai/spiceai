@@ -1272,7 +1272,16 @@ impl FileStatsObserver {
 }
 
 impl vortex_datafusion::VortexWriteObserver for FileStatsObserver {
-    fn file_written(&self, _file_path: &object_store::path::Path, _size: u64) {}
+    fn file_written(
+        &self,
+        file_path: &object_store::path::Path,
+        size: u64,
+        footer: &vortex::file::Footer,
+    ) {
+        if let Some(inner) = &self.inner {
+            inner.file_written(file_path, size, footer);
+        }
+    }
 
     fn batch_written(
         &self,

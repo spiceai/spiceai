@@ -754,30 +754,40 @@ impl PreparedStagedAppend {
             listed_files
                 .iter()
                 .filter(|(name, _)| source_names.contains(name) && !manifest_names.contains(name))
-                .map(|(file_path, file_size_bytes)| SnapshotFile {
-                    table_id: self.table.table_id().to_string(),
-                    snapshot_id: self.target_snapshot_id.clone(),
-                    file_path: file_path.clone(),
-                    row_count: 0,
-                    file_size_bytes: i64::try_from(*file_size_bytes).unwrap_or(i64::MAX),
-                    min_sequence: 0,
-                    max_sequence: new_sequence,
-                    digest: None,
+                .map(|(file_path, file_size_bytes)| {
+                    let (row_count, recorded_statistics) =
+                        self.table.file_statistics_to_record(file_path, None);
+                    SnapshotFile {
+                        table_id: self.table.table_id().to_string(),
+                        snapshot_id: self.target_snapshot_id.clone(),
+                        file_path: file_path.clone(),
+                        row_count,
+                        file_size_bytes: i64::try_from(*file_size_bytes).unwrap_or(i64::MAX),
+                        min_sequence: 0,
+                        max_sequence: new_sequence,
+                        digest: None,
+                        recorded_statistics,
+                    }
                 }),
         );
         manifest.extend(
             listed_files
                 .into_iter()
                 .filter(|(name, _)| !source_names.contains(name))
-                .map(|(file_path, file_size_bytes)| SnapshotFile {
-                    table_id: self.table.table_id().to_string(),
-                    snapshot_id: self.target_snapshot_id.clone(),
-                    file_path,
-                    row_count: 0,
-                    file_size_bytes: i64::try_from(file_size_bytes).unwrap_or(i64::MAX),
-                    min_sequence: new_sequence,
-                    max_sequence: new_sequence,
-                    digest: None,
+                .map(|(file_path, file_size_bytes)| {
+                    let (row_count, recorded_statistics) =
+                        self.table.file_statistics_to_record(&file_path, None);
+                    SnapshotFile {
+                        table_id: self.table.table_id().to_string(),
+                        snapshot_id: self.target_snapshot_id.clone(),
+                        row_count,
+                        file_path,
+                        file_size_bytes: i64::try_from(file_size_bytes).unwrap_or(i64::MAX),
+                        min_sequence: new_sequence,
+                        max_sequence: new_sequence,
+                        digest: None,
+                        recorded_statistics,
+                    }
                 }),
         );
         manifest.sort_unstable_by(|left, right| left.file_path.cmp(&right.file_path));

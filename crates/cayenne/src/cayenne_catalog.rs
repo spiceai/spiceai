@@ -4685,6 +4685,7 @@ impl MetadataCatalog for CayenneCatalog {
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
                         digest: row.get_optional_string(7)?,
+                        recorded_statistics: None,
                     })
                 },
             )
@@ -4758,6 +4759,7 @@ impl MetadataCatalog for CayenneCatalog {
                         min_sequence: row.get_i64(5)?,
                         max_sequence: row.get_i64(6)?,
                         digest: row.get_optional_string(7)?,
+                        recorded_statistics: None,
                     })
                 },
             )
@@ -7526,6 +7528,7 @@ mod tests {
             min_sequence: 3,
             max_sequence: 4,
             digest: Some("xxh3-128:01".to_string()),
+            recorded_statistics: None,
         };
         let second = SnapshotFile {
             row_count: 10,
@@ -7620,6 +7623,7 @@ mod tests {
             min_sequence: 11,
             max_sequence: 11,
             digest: None,
+            recorded_statistics: None,
         };
         catalog
             .set_snapshot_sequence(
@@ -7671,6 +7675,7 @@ mod tests {
                 min_sequence: i,
                 max_sequence: i + 1,
                 digest: (i % 2 == 0).then(|| format!("xxh3-128:{i:032x}")),
+                recorded_statistics: None,
             })
             .collect();
 
@@ -10870,6 +10875,7 @@ mod tests {
             min_sequence: 1,
             max_sequence: 1,
             digest: None,
+            recorded_statistics: None,
         };
         catalog
             .replace_snapshot_files(&table_id, &snapshot_id, std::slice::from_ref(&old))
@@ -10962,6 +10968,7 @@ mod tests {
             min_sequence: 1,
             max_sequence: 1,
             digest: None,
+            recorded_statistics: None,
         };
         for file in [
             row(&current_snapshot_id, "c0.vortex", 10, 100),
@@ -11172,6 +11179,7 @@ mod tests {
             min_sequence: seq,
             max_sequence: seq,
             digest: None,
+            recorded_statistics: None,
         };
 
         // The per-file stats cache (`cayenne_snapshot_file_statistics`) is the
@@ -11361,6 +11369,7 @@ mod tests {
             min_sequence: seq,
             max_sequence: seq,
             digest: None,
+            recorded_statistics: None,
         };
 
         let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
@@ -11486,6 +11495,7 @@ mod tests {
             min_sequence: seq,
             max_sequence: seq,
             digest: None,
+            recorded_statistics: None,
         };
         let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
             table_id: table_id.clone(),
@@ -13709,6 +13719,7 @@ mod tests {
                 min_sequence: 0,
                 max_sequence: 0,
                 digest: None,
+                recorded_statistics: None,
             });
         }
         catalog
@@ -13906,6 +13917,7 @@ mod tests {
                     min_sequence: 7,
                     max_sequence: 7,
                     digest: None,
+                    recorded_statistics: None,
                 }],
             )
             .await
