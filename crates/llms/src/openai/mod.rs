@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 pub use async_openai::config::AzureConfig;
 use async_openai::config::{Config, OPENAI_API_BASE};
-use async_openai::{Client, config::OpenAIConfig};
+use async_openai::{Client, config::OpenAIConfig, error::OpenAIError};
 use governor::Quota;
 use runtime_rate_control::{JitterConfig, RateController};
 
@@ -144,7 +144,12 @@ pub(crate) fn default_rate_controller() -> Arc<RateController> {
         .build()
 }
 
-#[must_use]
+/// An Azure `OpenAI` client.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_azure_client(
     model: String,
     api_base: Option<&str>,
@@ -152,7 +157,7 @@ pub fn new_azure_client(
     deployment_name: Option<&str>,
     entra_token: Option<&str>,
     api_key: Option<&str>,
-) -> Openai<AzureConfig> {
+) -> Result<Openai<AzureConfig>, OpenAIError> {
     new_azure_client_with_chat_backend(
         model,
         api_base,
@@ -164,7 +169,12 @@ pub fn new_azure_client(
     )
 }
 
-#[must_use]
+/// An Azure `OpenAI` client that serves chat through `chat_backend`.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_azure_client_with_chat_backend(
     model: String,
     api_base: Option<&str>,
@@ -173,7 +183,7 @@ pub fn new_azure_client_with_chat_backend(
     entra_token: Option<&str>,
     api_key: Option<&str>,
     chat_backend: ChatBackend,
-) -> Openai<AzureConfig> {
+) -> Result<Openai<AzureConfig>, OpenAIError> {
     let mut cfg = azure_config(&model, api_base, api_version, deployment_name);
 
     if let Some(api_key) = api_key {
@@ -184,12 +194,12 @@ pub fn new_azure_client_with_chat_backend(
         cfg = cfg.with_entra_token(entra_token);
     }
 
-    Openai {
-        client: crate::provider::client_without_retry(cfg),
+    Ok(Openai {
+        client: crate::provider::client_without_retry(cfg)?,
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
-    }
+    })
 }
 
 /// The deployment URL and `api-version` of an Azure `OpenAI` model, without credentials.
@@ -255,7 +265,11 @@ impl Config for AzureTokenConfig {
 
 /// An Azure `OpenAI` client that authenticates with the current Microsoft Entra token of
 /// `token` on every request.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_azure_client_with_token_provider(
     model: String,
     api_base: &str,
@@ -263,20 +277,25 @@ pub fn new_azure_client_with_token_provider(
     deployment_name: Option<&str>,
     token: Arc<dyn token_provider::TokenProvider>,
     chat_backend: ChatBackend,
-) -> Openai<AzureTokenConfig> {
+) -> Result<Openai<AzureTokenConfig>, OpenAIError> {
     // The empty Entra token replaces the default credential `AzureConfig` reads from
     // `OPENAI_API_KEY`; `AzureTokenConfig` sends the provider's token instead.
     let azure = azure_config(&model, Some(api_base), api_version, deployment_name)
         .with_entra_token(String::new());
-    Openai {
-        client: crate::provider::client_without_retry(AzureTokenConfig { azure, token }),
+    Ok(Openai {
+        client: crate::provider::client_without_retry(AzureTokenConfig { azure, token })?,
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
-    }
+    })
 }
 
-#[must_use]
+/// An `OpenAI` (or OpenAI-compatible) client.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_openai_client(
     model: String,
     api_base: Option<&str>,
@@ -284,7 +303,7 @@ pub fn new_openai_client(
     org_id: Option<&str>,
     project_id: Option<&str>,
     usage_tier: Option<UsageTier>,
-) -> Openai<OpenAIConfig> {
+) -> Result<Openai<OpenAIConfig>, OpenAIError> {
     new_openai_client_with_chat_backend(
         model,
         api_base,
@@ -296,7 +315,12 @@ pub fn new_openai_client(
     )
 }
 
-#[must_use]
+/// An `OpenAI` (or OpenAI-compatible) client that serves chat through `chat_backend`.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_openai_client_with_chat_backend(
     model: String,
     api_base: Option<&str>,
@@ -305,7 +329,7 @@ pub fn new_openai_client_with_chat_backend(
     project_id: Option<&str>,
     usage_tier: Option<UsageTier>,
     chat_backend: ChatBackend,
-) -> Openai<OpenAIConfig> {
+) -> Result<Openai<OpenAIConfig>, OpenAIError> {
     // Default to empty API key to avoid picking up ENV variable in downstream library.
     let mut cfg = OpenAIConfig::new().with_api_key("");
 
@@ -324,12 +348,12 @@ pub fn new_openai_client_with_chat_backend(
         cfg = cfg.with_api_base(api_base);
     }
 
-    Openai {
-        client: crate::provider::client_without_retry(cfg),
+    Ok(Openai {
+        client: crate::provider::client_without_retry(cfg)?,
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
-    }
+    })
 }
 
 /// An `OpenAI` client that authenticates every request with the current token of `token`, a
@@ -338,7 +362,8 @@ pub fn new_openai_client_with_chat_backend(
 ///
 /// # Errors
 ///
-/// When `org_id` or `project_id` is not a valid header value.
+/// When `org_id` or `project_id` is not a valid header value, or the HTTP client cannot be
+/// built.
 pub fn new_openai_client_with_token_provider(
     model: String,
     api_base: &str,
@@ -362,24 +387,29 @@ pub fn new_openai_client_with_token_provider(
         }
     }
     Ok(Openai {
-        client: crate::provider::client_without_retry(cfg),
+        client: crate::provider::client_without_retry(cfg)?,
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
     })
 }
 
-#[must_use]
+/// An OpenAI-compatible client with its own `cfg`.
+///
+/// # Errors
+///
+/// Returns an error when the HTTP client cannot be built (see
+/// [`crate::provider::client_without_retry`]).
 pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     model: String,
     cfg: C,
-) -> Openai<C> {
-    Openai {
-        client: crate::provider::client_without_retry(cfg),
+) -> Result<Openai<C>, OpenAIError> {
+    Ok(Openai {
+        client: crate::provider::client_without_retry(cfg)?,
         model,
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
-    }
+    })
 }
 
 impl<C: Config + Clone> Openai<C> {
@@ -528,7 +558,8 @@ pub(crate) mod authorization_header_tests {
             None,
             None,
             ChatBackend::ChatCompletions,
-        );
+        )
+        .expect("the client builds");
         // The reply is not a chat completion, so this fails; the request it sent
         // first is what the assertions read.
         let _ = tokio::time::timeout(Duration::from_secs(20), client.health()).await;
@@ -655,7 +686,8 @@ mod allowed_tools_wire_tests {
             None,
             None,
             ChatBackend::ChatCompletions,
-        );
+        )
+        .expect("the client builds");
         // The reply is not a chat completion, so this fails; the request it sent
         // first is what the assertion reads.
         let _ = tokio::time::timeout(Duration::from_secs(20), client.chat_request(request)).await;
@@ -698,7 +730,8 @@ mod azure_token_config_tests {
             Some("chat"),
             Arc::clone(&token) as Arc<dyn token_provider::TokenProvider>,
             ChatBackend::ChatCompletions,
-        );
+        )
+        .expect("the client builds");
         let config = client.client.config();
         let authorization = |config: &AzureTokenConfig| {
             let headers = config.headers();

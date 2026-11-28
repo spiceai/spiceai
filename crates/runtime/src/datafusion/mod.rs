@@ -187,6 +187,7 @@ pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
+pub(crate) mod url_table_datasets;
 
 pub(crate) use runtime_datafusion::resolve_table_reference;
 pub use runtime_datafusion::{
@@ -1444,6 +1445,9 @@ struct PlansGeneration(u64);
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
+    /// Resolves `SELECT … FROM 's3://…'` and the other URL tables, when
+    /// `runtime.params.url_tables` enables them.
+    url_table_factory: Option<Arc<runtime_datafusion::url_table::SpiceUrlTableFactory>>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -1642,6 +1646,16 @@ impl std::fmt::Debug for DataFusion {
 }
 
 impl DataFusion {
+    /// Lets object-store URL tables borrow credentials from the datasets `datasets` lists.
+    pub(crate) fn set_url_table_datasets(
+        &self,
+        datasets: Arc<dyn runtime_datafusion::url_table::UrlTableDatasets>,
+    ) {
+        if let Some(factory) = &self.url_table_factory {
+            factory.with_datasets(datasets);
+        }
+    }
+
     #[must_use]
     pub fn builder(
         status: Arc<status::RuntimeStatus>,

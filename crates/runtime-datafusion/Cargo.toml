@@ -29,6 +29,7 @@ datafusion-proto.workspace = true
 datafusion-table-providers.workspace = true
 futures.workspace = true
 itertools.workspace = true
+object_store.workspace = true
 opentelemetry.workspace = true
 parking_lot.workspace = true
 regex-syntax.workspace = true
@@ -60,7 +61,6 @@ datafusion-spark.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
 insta.workspace = true
-object_store.workspace = true
 regex.workspace = true
 secrecy.workspace = true
 tempfile.workspace = true

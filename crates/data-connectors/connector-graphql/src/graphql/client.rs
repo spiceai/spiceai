@@ -827,6 +827,10 @@ fn unnest_json_objects(
 
 pub struct GraphQLClient {
     client: reqwest::Client,
+    /// The egress policy requests follow their redirects under, and whether a redirect may
+    /// leave the endpoint's origin; see [`GraphQLClient::with_egress`].
+    egress: http_egress::Egress,
+    on_origin_change: http_egress::OnOriginChange,
     /// The query memory pool every response body is charged to while it is held.
     memory_pool: Arc<dyn MemoryPool>,
     /// The dataset this client reads for, which a refused response names.
@@ -1045,6 +1049,8 @@ impl GraphQLClient {
 
         Ok(Self {
             client,
+            egress: http_egress::Egress::default(),
+            on_origin_change: http_egress::OnOriginChange::Follow,
             memory_pool,
             dataset: None,
             connector: "graphql",
@@ -1058,6 +1064,22 @@ impl GraphQLClient {
             semaphore,
             nested_pager: None,
         })
+    }
+
+    /// Follow redirects under `egress`, the state the client's resolver was built with by
+    /// [`http_egress::configure`]. Every request is sent through [`http_egress::send`], so the
+    /// configured credentials reach only the endpoint's origin, and with
+    /// [`http_egress::OnOriginChange::Refuse`] a redirect that leaves it fails the request; with
+    /// a client that follows redirects itself, `send` sees no redirect to apply the policy to.
+    #[must_use]
+    pub(crate) fn with_egress(
+        mut self,
+        egress: http_egress::Egress,
+        on_origin_change: http_egress::OnOriginChange,
+    ) -> Self {
+        self.egress = egress;
+        self.on_origin_change = on_origin_change;
+        self
     }
 
     /// The error for a response body that could not be read: a failed read is reported as
@@ -1294,11 +1316,20 @@ impl GraphQLClient {
         // A transport/timeout/connection error is a failure signal for adaptive
         // rate control: the origin is unreachable or too slow, so admit fewer
         // requests until it recovers.
-        let response = request
-            .send()
-            .await
-            .inspect_err(|_| self.record_adaptive_outcome(RequestOutcome::Failure))
-            .context(ReqwestInternalSnafu)?;
+        let request = request.build().context(ReqwestInternalSnafu)?;
+        let response =
+            http_egress::send(&self.client, request, &self.egress, self.on_origin_change)
+                .await
+                .map_err(|error| match error {
+                    http_egress::SendError::Http { source } => {
+                        self.record_adaptive_outcome(RequestOutcome::Failure);
+                        Error::ReqwestInternal { source }
+                    }
+                    http_egress::SendError::Redirect { source } => Error::RedirectRefused {
+                        endpoint: self.endpoint.origin().ascii_serialization(),
+                        source,
+                    },
+                })?;
 
         if let Some(permit) = permit {
             drop(permit);

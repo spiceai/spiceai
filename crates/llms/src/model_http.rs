@@ -74,13 +74,14 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// A `reqwest` client with these timeouts and the [`http_retry`] policy.
+    /// A `reqwest` client with these timeouts, under the egress policy and the [`http_retry`]
+    /// policy of [`crate::provider::guarded_client_builder`].
     #[expect(
         clippy::expect_used,
-        reason = "timeouts and the retry policy add no failure: the build fails only where `reqwest::Client::new()` panics"
+        reason = "the egress policy, the retry policy and the timeouts add no failure: the build fails only where `reqwest::Client::new()` panics"
     )]
     pub(crate) fn http_client(&self) -> reqwest::Client {
-        http_retry::client_builder()
+        crate::provider::guarded_client_builder()
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .build()

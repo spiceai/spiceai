@@ -28,7 +28,6 @@ use data_connector_api::ConnectorContext;
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DEFAULT_SPICE_CLIENT_TIMEOUT, DataConnector,
     DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    RedirectScope, default_spice_client_builder,
 };
 use data_http_rate_control as http_rate_control;
 use data_http_rate_control::{
@@ -165,7 +164,51 @@ impl DataConnectorFactory for GraphQLFactory {
     }
 }
 
+/// Redirects a GraphQL request follows before it fails.
+const MAX_REDIRECTS: usize = 10;
+
+/// The HTTP client builder GraphQL requests are sent with: `default_spice_client`'s settings,
+/// with the egress policy's resolver and no redirect followed by `reqwest` itself.
+fn graphql_http_client(egress: &http_egress::Egress, https_only: bool) -> reqwest::ClientBuilder {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    http_egress::configure(
+        reqwest::Client::builder()
+            .user_agent(util::spiceai_user_agent())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
+            .default_headers(headers)
+            .https_only(https_only),
+        egress,
+    )
+}
+
 impl GraphQL {
+    /// Which redirects off `endpoint`'s origin the dataset's requests refuse, for the credentials
+    /// they carry. A token sent in a custom header is a credential only the endpoint's origin may
+    /// receive, so a redirect that leaves that origin fails the request rather than being
+    /// followed without the header. A token, a user name, or user info in the endpoint URL
+    /// travels in the `Authorization` header: the request follows a redirect off the origin,
+    /// which carries none of its headers, but not a redirect chain that continues on the host it
+    /// moved to.
+    fn on_origin_change(&self, endpoint: &Url) -> http_egress::OnOriginChange {
+        let token = self.params.get("auth_token").ok().is_some();
+        if token && self.params.get("auth_header").expose().ok().is_some() {
+            return http_egress::OnOriginChange::Refuse;
+        }
+        let credentials = token
+            || self.params.get("auth_user").expose().ok().is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some();
+        if credentials {
+            http_egress::OnOriginChange::FollowWithCredentials
+        } else {
+            http_egress::OnOriginChange::Follow
+        }
+    }
+
     /// The client for `dataset`, whose response bodies are charged to `memory_pool`.
     async fn get_client(
         &self,
@@ -244,20 +287,16 @@ impl GraphQL {
             });
         }
 
-        // A token sent in a custom header is a credential reqwest does not remove when a redirect
-        // leaves the endpoint's origin.
-        let redirects = if auth_header.is_some() && token.is_some() {
-            RedirectScope::RequestOrigin
-        } else if token.is_some()
-            || user.is_some()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-        {
-            RedirectScope::PublicHostsWithCredentials
-        } else {
-            RedirectScope::PublicHosts
-        };
-        let client = default_spice_client_builder("application/json", redirects);
+        // The endpoint's host is trusted as its first DNS answer leaves it, every host a
+        // redirect introduces is checked, and `reqwest` follows no redirect itself: the client
+        // follows them through `http_egress::send`, which keeps the configured credentials on
+        // the endpoint's origin. An `https` endpoint never makes a plaintext request.
+        let egress = http_egress::Egress::new(
+            Some(runtime_object_store::ssrf::connector_redirect_guard("GraphQL").redirects_only()),
+            MAX_REDIRECTS,
+        );
+        let on_origin_change = self.on_origin_change(&endpoint);
+        let client = graphql_http_client(&egress, endpoint.scheme() == "https");
 
         let mut rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
@@ -265,8 +304,8 @@ impl GraphQL {
             &ConnectorComponent::from(dataset),
             "graphql",
         )?;
-        // The GraphQL client is `default_spice_client_builder`'s, so its request timeout
-        // is the `client_timeout` equivalent the acquire bound defaults to.
+        // The GraphQL client times out after `DEFAULT_SPICE_CLIENT_TIMEOUT`, so its request
+        // timeout is the `client_timeout` equivalent the acquire bound defaults to.
         rate_control.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
         let rate_limiter = self
             .rate_control_registry
@@ -298,6 +337,7 @@ impl GraphQL {
         .with_rate_limiter(Some(rate_limiter))
         .with_rate_controller(rate_controller.shared().controller.clone())
         .with_auth_header(auth_header)
+        .with_egress(egress, on_origin_change)
         .with_source(dataset.name.to_string(), "graphql")
         .build(client, memory_pool)
         .boxed();
@@ -720,9 +760,10 @@ mod tests {
         };
 
         assert!(
-            error
-                .to_string()
-                .contains(&format!("Refused to follow the redirect to {target_url}")),
+            error.to_string().contains(&format!(
+                "Refused to connect to {target_url}: the GraphQL data connector does not follow a \
+                 redirect to a private, loopback, or link-local address"
+            )),
             "unexpected error: {error}"
         );
         let target_requests = target
@@ -733,6 +774,55 @@ mod tests {
             target_requests.is_empty(),
             "the redirect target must receive no request"
         );
+    }
+
+    /// A target that does not look internal until it resolves (`localhost.`, with its trailing
+    /// dot) isolates the origin rule from the destination check: a custom-header token refuses
+    /// the redirect before the target is resolved, whatever the redirect status.
+    #[tokio::test]
+    async fn a_custom_auth_header_refuses_a_redirect_off_the_endpoint_origin_before_resolving_it() {
+        for status in [302, 307] {
+            let target = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(users_response())
+                .mount(&target)
+                .await;
+            let target_origin = format!("http://localhost.:{}", target.address().port());
+            let endpoint = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::any())
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status)
+                        .insert_header("location", format!("{target_origin}/graphql")),
+                )
+                .mount(&endpoint)
+                .await;
+
+            let Err(error) =
+                query_users(&CUSTOM_HEADER_AUTH, &format!("{}/graphql", endpoint.uri())).await
+            else {
+                panic!("a {status} redirect off the endpoint origin must be refused");
+            };
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Failed to send the GraphQL request to {endpoint}: the server redirected to \
+                     another origin, {target_origin}, and this request carries a credential that \
+                     is sent only to {endpoint}. Point the dataset at the URL the server \
+                     redirects to. See: https://spiceai.org/docs/components/data-connectors/graphql",
+                    endpoint = endpoint.uri(),
+                ),
+                "{status}"
+            );
+            let target_requests = target
+                .received_requests()
+                .await
+                .expect("requests are recorded");
+            assert!(
+                target_requests.is_empty(),
+                "the redirect target must receive no request"
+            );
+        }
     }
 
     #[tokio::test]
@@ -760,8 +850,13 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
+    /// A dataset without a token in a custom header is not held to its endpoint's origin: a
+    /// `302` to another origin is followed as a `GET` without the request's headers, up to that
+    /// origin's destination check, which refuses `localhost.` once it resolves to loopback. Its
+    /// credential is one `send` never carries off the origin, so the origin rule is not
+    /// applied.
     #[tokio::test]
-    async fn a_dataset_without_a_custom_header_token_follows_a_redirect_to_another_port() {
+    async fn a_dataset_without_a_custom_header_token_is_not_held_to_the_endpoint_origin() {
         for params in [
             &[
                 ("graphql_auth_token", "test-token"),
@@ -780,22 +875,40 @@ mod tests {
                 .await;
             let endpoint = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::any())
-                .respond_with(redirect_response(&format!("{}/graphql", target.uri())))
+                .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+                    "location",
+                    format!("http://localhost.:{}/graphql", target.address().port()),
+                ))
                 .mount(&endpoint)
                 .await;
 
-            let result = query_users(params, &format!("{}/graphql", endpoint.uri()))
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("the redirect is followed with {params:?}: {error}")
-                });
+            let Err(error) = query_users(params, &format!("{}/graphql", endpoint.uri())).await
+            else {
+                panic!("the redirect target is refused once it resolves to loopback");
+            };
 
-            let rows: usize = result
-                .records
-                .iter()
-                .map(arrow::array::RecordBatch::num_rows)
-                .sum();
-            assert_eq!(rows, 1);
+            let chain =
+                std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            assert!(
+                chain.contains(
+                    "Refused to connect to localhost.: the GraphQL data connector does not follow \
+                     a redirect to a private, loopback, or link-local address"
+                ),
+                "{params:?}: unexpected error: {chain}"
+            );
+            let target_requests = target
+                .received_requests()
+                .await
+                .expect("requests are recorded");
+            assert!(
+                target_requests.is_empty(),
+                "the redirect target must receive no request"
+            );
         }
     }
 
@@ -829,95 +942,69 @@ mod tests {
         assert!(inferred.is_retriable());
     }
 
-    /// An endpoint that redirects to `/a` on another port, whose server redirects `/a` to its own
-    /// `/b` and serves users at `/b`. Returns the endpoint URL and both servers.
-    async fn redirect_chain() -> (String, wiremock::MockServer, wiremock::MockServer) {
-        let target = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::path("/a"))
-            .respond_with(redirect_response("/b"))
-            .mount(&target)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::path("/b"))
-            .respond_with(users_response())
-            .mount(&target)
-            .await;
-        let endpoint = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(redirect_response(&format!("{}/a", target.uri())))
-            .mount(&endpoint)
-            .await;
-        (format!("{}/graphql", endpoint.uri()), endpoint, target)
-    }
-
-    async fn requests_for(server: &wiremock::MockServer, path: &str) -> usize {
-        server
-            .received_requests()
-            .await
-            .expect("requests are recorded")
-            .iter()
-            .filter(|request| request.url.path() == path)
-            .count()
-    }
-
+    /// A token in a custom header refuses every redirect off the endpoint's origin, credentials in
+    /// the `Authorization` header refuse a redirect chain that continues on the host it moved to,
+    /// and a dataset without credentials follows both. A chain off the origin cannot be reached
+    /// through the connector's own client between local servers, whose addresses are internal,
+    /// so `http-egress` tests what each choice refuses.
     #[tokio::test]
-    async fn a_dataset_with_credentials_does_not_follow_a_redirect_chain_that_continues_on_another_host()
-     {
-        for (userinfo, params) in [
+    async fn a_datasets_credentials_choose_which_redirects_off_its_origin_are_refused() {
+        use http_egress::OnOriginChange::{Follow, FollowWithCredentials, Refuse};
+
+        for (endpoint, params, expected) in [
+            ("https://api.example.com/graphql", &[][..], Follow),
             (
-                "",
-                &[
-                    ("graphql_auth_token", "test-token"),
-                    ("json_pointer", "/data/users"),
-                ][..],
+                "https://api.example.com/graphql",
+                &[("graphql_auth_header", "x-api-key")][..],
+                Follow,
             ),
             (
-                "",
+                "https://api.example.com/graphql",
+                &CUSTOM_HEADER_AUTH[..],
+                Refuse,
+            ),
+            (
+                "https://svc:s3cret@api.example.com/graphql",
+                &CUSTOM_HEADER_AUTH[..],
+                Refuse,
+            ),
+            (
+                "https://api.example.com/graphql",
+                &[("graphql_auth_token", "test-token")][..],
+                FollowWithCredentials,
+            ),
+            (
+                "https://api.example.com/graphql",
+                &[("graphql_auth_user", "user")][..],
+                FollowWithCredentials,
+            ),
+            (
+                "https://api.example.com/graphql",
                 &[
+                    ("graphql_auth_header", "x-api-key"),
                     ("graphql_auth_user", "user"),
-                    ("json_pointer", "/data/users"),
                 ][..],
+                FollowWithCredentials,
             ),
-            ("svc:s3cret@", &[("json_pointer", "/data/users")][..]),
+            (
+                "https://svc:s3cret@api.example.com/graphql",
+                &[][..],
+                FollowWithCredentials,
+            ),
+            (
+                "https://svc@api.example.com/graphql",
+                &[][..],
+                FollowWithCredentials,
+            ),
         ] {
-            let (endpoint_url, _endpoint, target) = redirect_chain().await;
-            let endpoint_url = endpoint_url.replacen("://", &format!("://{userinfo}"), 1);
-
-            let Err(error) = query_users(params, &endpoint_url).await else {
-                panic!("the redirect chain must be refused with {params:?}");
-            };
-
-            assert!(
-                error.to_string().contains(&format!(
-                    "Refused to follow the redirect to {}/b",
-                    target.uri()
-                )),
-                "unexpected error with {params:?}: {error}"
-            );
-            assert_eq!(requests_for(&target, "/a").await, 1);
+            let connector = test_connector(params).await;
+            let endpoint = Url::parse(endpoint).expect("valid URL");
             assert_eq!(
-                requests_for(&target, "/b").await,
-                0,
-                "the second hop on the target must not be requested with {params:?}"
+                connector.on_origin_change(&endpoint),
+                expected,
+                "{endpoint} {params:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn a_dataset_without_credentials_follows_a_redirect_chain_that_continues_on_another_host()
-    {
-        let (endpoint_url, _endpoint, target) = redirect_chain().await;
-
-        let result = query_users(&[("json_pointer", "/data/users")], &endpoint_url)
-            .await
-            .expect("the redirect chain is followed");
-
-        let rows: usize = result
-            .records
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum();
-        assert_eq!(rows, 1);
-        assert_eq!(requests_for(&target, "/b").await, 1);
     }
 }
 

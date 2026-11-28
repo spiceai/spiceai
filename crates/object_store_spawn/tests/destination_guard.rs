@@ -35,7 +35,7 @@ use axum::{
     routing::get as route_get,
 };
 use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, http::HttpBuilder, path::Path};
-use object_store_spawn::{DestinationGuard, REDIRECT_CHAIN_REFUSED, SpawnedReqwestConnector};
+use object_store_spawn::{DestinationGuard, SpawnedReqwestConnector};
 use tokio::{net::TcpListener, runtime::Handle};
 
 const BODY: &str = "id\n1\n";
@@ -274,6 +274,37 @@ async fn redirects_only_guard_refuses_a_redirect_to_another_host() {
     assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
 }
 
+/// A redirect to another port on the store's own host is a new destination. A guard that
+/// trusts the store's own host still refuses it when that host answered with a blocked
+/// address, so a redirect cannot open another service on an internal host.
+#[tokio::test]
+async fn redirects_only_guard_refuses_another_port_on_its_own_internal_host() {
+    let (target_port, target_hits) = target().await;
+    let location = format!("http://localhost:{target_port}/data.csv");
+    let (origin_port, origin_hits) = redirecting_origin(location.clone()).await;
+
+    let guard = DestinationGuard::new(
+        |address| address.is_loopback(),
+        |_| false,
+        "loopback is blocked",
+    )
+    .redirects_only();
+    let connector = SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(guard);
+    let message = get(&store_on("localhost", origin_port, connector))
+        .await
+        .expect_err("the redirect to another port is refused")
+        .to_string();
+
+    assert!(
+        message.contains(&format!(
+            "Refused to connect to {location}: loopback is blocked"
+        )),
+        "unexpected error: {message}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
+}
+
 /// The redirect names another host that resolves to a blocked address, which only the
 /// resolver can see.
 #[tokio::test]
@@ -353,10 +384,11 @@ async fn chained_target() -> (u16, Arc<AtomicUsize>) {
 }
 
 /// Reads through an origin that redirects to another port, whose `/a` redirects to its `/b`,
-/// with `headers` as the client's default headers.
+/// with `headers` as the client's default headers. Returns the result, the requests for `/b`,
+/// and the origin and target ports.
 async fn get_through_a_redirect_chain(
     headers: HeaderMap,
-) -> (object_store::Result<String>, Arc<AtomicUsize>) {
+) -> (object_store::Result<String>, Arc<AtomicUsize>, u16, u16) {
     let (target_port, target_hits) = chained_target().await;
     let (origin_port, _) = redirecting_origin(format!("http://127.0.0.1:{target_port}/a")).await;
     let connector =
@@ -373,7 +405,7 @@ async fn get_through_a_redirect_chain(
             .build()
             .expect("the HTTP store builds"),
     );
-    (get(&store).await, target_hits)
+    (get(&store).await, target_hits, origin_port, target_port)
 }
 
 #[tokio::test]
@@ -384,13 +416,18 @@ async fn guard_with_credentials_refuses_a_redirect_chain_that_continues_on_anoth
         HeaderValue::from_static("Basic dXNlcjpwYXNz"),
     );
 
-    let (result, target_hits) = get_through_a_redirect_chain(headers).await;
+    let (result, target_hits, origin_port, target_port) =
+        get_through_a_redirect_chain(headers).await;
 
     let message = result
         .expect_err("the redirect chain is refused")
         .to_string();
     assert!(
-        message.contains(REDIRECT_CHAIN_REFUSED),
+        message.contains(&format!(
+            "the redirect chain left http://127.0.0.1:{origin_port} and continued on \
+             http://127.0.0.1:{target_port}, and a request that carries credentials does not \
+             follow a redirect chain that continues on another host"
+        )),
         "unexpected error: {message}"
     );
     assert_eq!(
@@ -402,7 +439,7 @@ async fn guard_with_credentials_refuses_a_redirect_chain_that_continues_on_anoth
 
 #[tokio::test]
 async fn guard_without_credentials_follows_a_redirect_chain_that_continues_on_another_host() {
-    let (result, target_hits) = get_through_a_redirect_chain(HeaderMap::new()).await;
+    let (result, target_hits, _, _) = get_through_a_redirect_chain(HeaderMap::new()).await;
 
     assert_eq!(result.expect("the redirect chain is followed"), BODY);
     assert_eq!(target_hits.load(Ordering::SeqCst), 1);

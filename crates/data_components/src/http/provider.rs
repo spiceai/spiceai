@@ -82,6 +82,16 @@ pub enum Error {
         refusal: String,
     },
 
+    #[snafu(display(
+        "Failed to fetch {endpoint} for {dataset}: {source}. Point the dataset at the URL the \
+         server redirects to. See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    RedirectRefused {
+        endpoint: String,
+        dataset: String,
+        source: http_egress::RedirectRefused,
+    },
+
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
@@ -433,6 +443,8 @@ impl From<Error> for DataFusionError {
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
+            // `Plan`, so a refresh does not re-ask: the origin will redirect the same way.
+            err @ Error::RedirectRefused { .. } => DataFusionError::Plan(err.to_string()),
             // The pool's own error kind, so the query fails as any other that ran out of
             // query memory does.
             err @ Error::ResponseMemory { .. } => {
@@ -952,6 +964,12 @@ pub struct HttpTableProvider {
     table_ref: Option<TableReference>,
     base_url: Url,
     client: Client,
+    /// The egress policy every request follows its redirects under; see
+    /// [`HttpTableProvider::with_egress`].
+    egress: http_egress::Egress,
+    /// Which redirects off the dataset's origin are refused; see
+    /// [`HttpTableProvider::with_egress`].
+    on_origin_change: http_egress::OnOriginChange,
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
@@ -1013,6 +1031,8 @@ impl HttpTableProvider {
             table_ref: None,
             base_url,
             client,
+            egress: http_egress::Egress::default(),
+            on_origin_change: http_egress::OnOriginChange::Follow,
             file_format,
             schema: Arc::new(Self::base_table_schema()),
             // No primary key constraints - HTTP responses can contain multiple rows
@@ -1365,6 +1385,22 @@ impl HttpTableProvider {
         self
     }
 
+    /// Follow redirects under `egress`, the state the client's resolver was built with by
+    /// [`http_egress::configure`], refusing those `on_origin_change` refuses for the dataset's
+    /// credentials. Every request is sent through [`http_egress::send`], so the dataset's
+    /// headers and credentials reach only its origin; with a client that follows redirects
+    /// itself, `send` sees no redirect to apply the policy to.
+    #[must_use]
+    pub fn with_egress(
+        mut self,
+        egress: http_egress::Egress,
+        on_origin_change: http_egress::OnOriginChange,
+    ) -> Self {
+        self.egress = egress;
+        self.on_origin_change = on_origin_change;
+        self
+    }
+
     #[must_use]
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.custom_headers = headers;
@@ -1573,7 +1609,12 @@ impl HttpTableProvider {
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
-        match self.client.get(test_url.clone()).send().await {
+        let probe = self
+            .client
+            .get(test_url.clone())
+            .build()
+            .map_err(|e| Error::http_request(&self.base_url, e))?;
+        match http_egress::send(&self.client, probe, &self.egress, self.on_origin_change).await {
             Ok(response) => {
                 self.update_rate_limiter_from_headers(response.headers())
                     .await;
@@ -1600,10 +1641,19 @@ impl HttpTableProvider {
                 }
                 Ok(())
             }
-            Err(e) => {
-                // Check the error type to provide more specific messages and just return the error
-                Err(Error::http_request(&self.base_url, e))
-            }
+            Err(e) => Err(self.send_error(e)),
+        }
+    }
+
+    /// The error a failed [`http_egress::send`] becomes.
+    fn send_error(&self, error: http_egress::SendError) -> Error {
+        match error {
+            http_egress::SendError::Http { source } => Error::http_request(&self.base_url, source),
+            http_egress::SendError::Redirect { source } => Error::RedirectRefused {
+                endpoint: endpoint_label(&self.base_url),
+                dataset: self.dataset_subject(),
+                source,
+            },
         }
     }
 
@@ -2032,16 +2082,28 @@ impl HttpTableProvider {
             request_builder = auth.apply(request_builder);
         }
 
+        let request = request_builder
+            .build()
+            .map_err(|e| RetryError::Permanent(Error::http_request(&self.base_url, e)))?;
         // Waiting on the origin: a distributed task can lend its slot meanwhile.
-        let response = request_builder.send().io_wait().await.map_err(|e| {
-            let err = Error::http_request(&self.base_url, e);
-            tracing::debug!("{err}");
-            // A timeout or connection error is a failure signal for adaptive
-            // rate control: the origin is unreachable or too slow, so admit
-            // fewer requests until it recovers.
-            self.record_request_outcome(RequestOutcome::Failure);
-            RetryError::transient(err)
-        })?;
+        let response =
+            http_egress::send(&self.client, request, &self.egress, self.on_origin_change)
+                .io_wait()
+                .await
+                .map_err(|e| {
+                    let refused_redirect = e.as_http().is_none();
+                    let err = self.send_error(e);
+                    tracing::debug!("{err}");
+                    if refused_redirect {
+                        // The origin answered; asking again gets the same redirect.
+                        return RetryError::Permanent(err);
+                    }
+                    // A timeout or connection error is a failure signal for adaptive
+                    // rate control: the origin is unreachable or too slow, so admit
+                    // fewer requests until it recovers.
+                    self.record_request_outcome(RequestOutcome::Failure);
+                    RetryError::transient(err)
+                })?;
 
         let status = response.status();
         let status_code = status.as_u16();

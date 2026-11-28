@@ -27,7 +27,7 @@ use llms::embeddings::{Embed, Error as EmbedError};
 use opentelemetry::KeyValue;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
-use spicepod::component::embeddings::Embeddings;
+use spicepod::component::embeddings::{EmbeddingPrefix, Embeddings};
 
 /// How long a Spicepod change waits for each model it loads before it applies the rest of the
 /// change. The datasets that use a model still loading retry until it loads; the views fail.
@@ -102,6 +102,20 @@ impl Runtime {
             }
             Err(e) => {
                 metrics::embeddings::LOAD_ERROR.add(1, &[]);
+                if let Some(refused) = http_egress::refused_redirect(&e) {
+                    let message = super::model::endpoint_redirect_message(
+                        "embedding model",
+                        &in_embed.name,
+                        embedding_endpoint_param(in_embed),
+                        refused,
+                    );
+                    self.status.update_embedding(
+                        &in_embed.name,
+                        status::ComponentStatus::error_with_message(message.clone()),
+                    );
+                    tracing::warn!("{message}");
+                    return Err(e);
+                }
                 self.status.update_embedding(
                     &in_embed.name,
                     status::ComponentStatus::error_with_message(e.to_string()),
@@ -223,9 +237,23 @@ fn embedding_labels(in_embed: &Embeddings) -> [KeyValue; 2] {
     ]
 }
 
+/// What sets the endpoint of `embedding` (see [`super::model::endpoint_param`]).
+fn embedding_endpoint_param(embedding: &Embeddings) -> &'static str {
+    match embedding.get_prefix() {
+        Some(EmbeddingPrefix::SpiceAi) => "`spiceai_endpoint`",
+        Some(EmbeddingPrefix::Databricks) => "`databricks_endpoint`",
+        Some(EmbeddingPrefix::Google) => "the service account key's `token_uri`",
+        _ => "`endpoint`",
+    }
+}
+
 /// Returns `true` when an embedding model load failure is a mistake in the Spicepod, which no
 /// retry can clear. A Spicepod change loads the model again.
 fn is_permanent_embedding_failure(err: &crate::Error) -> bool {
+    // Only a new endpoint clears a refused redirect.
+    if http_egress::refused_redirect(err).is_some() {
+        return true;
+    }
     let crate::Error::UnableToInitializeEmbeddingModel { source } = err else {
         return false;
     };

@@ -51,7 +51,8 @@ async fn xai_answering(route: &str, status: u16, body: &str) -> (MockServer, Xai
         )
         .mount(&server)
         .await;
-    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri());
+    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri())
+        .expect("the client builds");
     (server, xai)
 }
 
@@ -198,7 +199,8 @@ async fn xai_looking_up_model(status: u16, body: &str) -> (MockServer, Xai) {
         .expect(1)
         .mount(&server)
         .await;
-    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri());
+    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri())
+        .expect("the client builds");
     (server, xai)
 }
 
@@ -269,7 +271,8 @@ async fn successful_responses_are_unchanged() {
         ))
         .mount(&server)
         .await;
-    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri());
+    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri())
+        .expect("the client builds");
     let chunks: Vec<_> = xai
         .chat_stream(chat_request(true))
         .await

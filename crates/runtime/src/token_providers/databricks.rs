@@ -48,6 +48,13 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication: {source}. A token request is sent only to the workspace's own origin, so it does not follow this redirect. Set `databricks_endpoint` to the workspace URL the token endpoint redirects to."
+    ))]
+    TokenEndpointRedirected {
+        source: http_egress::RedirectRefused,
+    },
+
     /// A mistake in the parameters of workload identity federation: `parameter` is the one to
     /// change.
     #[snafu(display("{message}"))]
@@ -112,7 +119,7 @@ impl DatabricksM2MTokenProvider {
             ..
         } = get_m2m_access_token(&client, &endpoint, &client_id, &client_secret)
             .await
-            .map_err(|e| Error::UnableToGetToken { source: e })?;
+            .map_err(token_error)?;
 
         // create watch channel
         let (tx, rx) = watch::channel(access_token);
@@ -159,7 +166,7 @@ impl DatabricksM2MTokenProvider {
                             backoff.next_duration().unwrap_or(Duration::from_mins(5));
                         tracing::error!(
                             "Databricks M2M token refresh failed: {}. Retrying in {:.2?}",
-                            e,
+                            token_error(e),
                             backoff_duration
                         );
                         next_wait = backoff_duration;
@@ -266,12 +273,28 @@ async fn get_m2m_access_token(
     Ok(token_response)
 }
 
+/// The error a failed token request becomes: [`Error::TokenEndpointRedirected`] when the
+/// workspace's token endpoint redirected to another origin, which names the fix.
+fn token_error(error: Box<dyn std::error::Error + Send + Sync>) -> Error {
+    match http_egress::refused_redirect(error.as_ref()) {
+        Some(refused) => Error::TokenEndpointRedirected {
+            source: refused.clone(),
+        },
+        None => Error::UnableToGetToken { source: error },
+    }
+}
+
 fn build_m2m_token_client() -> Result<reqwest::Client, reqwest::Error> {
     // Token responses are read through `http_body_limit`, which decodes them while
-    // refusing decompression amplification.
-    http_body_limit::decode_manually(configure_client_builder(reqwest::Client::builder()))
-        .user_agent(util::spiceai_user_agent())
-        .build()
+    // refusing decompression amplification. A token request carries the service principal's
+    // secret, and its answer is the token every later request sends, so it never follows the
+    // workspace's token endpoint to another origin.
+    http_body_limit::decode_manually(configure_client_builder(http_egress::origin_bound(
+        reqwest::Client::builder(),
+        "a Databricks token request follows a redirect only within the workspace's origin",
+    )))
+    .user_agent(util::spiceai_user_agent())
+    .build()
 }
 
 fn databricks_token_endpoint_url(
