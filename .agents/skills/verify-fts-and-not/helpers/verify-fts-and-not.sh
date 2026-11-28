@@ -38,7 +38,7 @@ sql() {
   local q="$1"
   curl -sS --max-time 30 -X POST "$URL/v1/sql" \
     -H 'Content-Type: application/json' -H 'Accept: application/json' \
-    --data-binary "$(python3 -c 'import json,sys; print(json.dumps({"sql": sys.argv[1]}))' "$q")"
+    --data-binary "$(python3 -c 'import json,sys; print(json.dumps({"sql": sys.argv[1], "parameters": []}))' "$q")"
 }
 
 search() {
