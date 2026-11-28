@@ -63,10 +63,14 @@ pub enum Error {
     #[snafu(display("Missing the required `field` name"))]
     MissingFieldName,
 
-    #[snafu(display("Missing the required field {field_name} in {value}"))]
+    /// The row is deliberately not carried or displayed: change events hold
+    /// source data (including credentials) that must never reach logs.
+    #[snafu(display(
+        "Missing the required field '{field_name}' in a change event row. The row's values are not shown. Make the column nullable or resnapshot the source so every change event carries it"
+    ))]
     MissingFieldInValue {
         field_name: String,
-        value: serde_json::Value,
+        value: RowNotShown,
     },
 
     #[snafu(display(
@@ -145,6 +149,25 @@ pub enum Error {
         See: https://spiceai.org/docs/components/data-connectors/debezium"
     ))]
     DecimalPrecisionExceeded { value: i128, precision: u8 },
+}
+
+/// Takes the place of a change event row in an error, keeping none of it.
+///
+/// Rows hold source data (including credentials) and errors are logged, so an
+/// error built from a row (`value: row`) stores and prints nothing of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RowNotShown;
+
+impl From<serde_json::Value> for RowNotShown {
+    fn from(_row: serde_json::Value) -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for RowNotShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<row not shown>")
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -883,12 +906,8 @@ mod tests {
         let err = append_value_to_struct_builder(value, &mut builder)
             .expect_err("Should fail when required field is missing");
         assert!(
-            matches!(
-                &err,
-                Error::MissingFieldInValue { field_name, value }
-                    if field_name == "status" && *value == json!({"id": 42})
-            ),
-            "the missing non-nullable `status` column must be named, with the message it was missing from, got: {err:?}"
+            matches!(&err, Error::MissingFieldInValue { field_name, .. } if field_name == "status"),
+            "the missing non-nullable `status` column must be named, got: {err:?}"
         );
         assert_eq!(err.kind(), "missing_required_field");
         assert!(
@@ -896,6 +915,32 @@ mod tests {
             "kind must not carry the row or field values, got: {}",
             err.kind()
         );
+    }
+
+    /// A change event that fails to decode must never put the row's values in
+    /// the error: rows carry source data such as API keys, and stream errors
+    /// are logged verbatim. Only the column name may appear.
+    #[test]
+    fn decode_errors_never_show_row_values() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        const FAKE_SECRET: &str = "FAKE-api-key-do-not-log-0000";
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("api_key", DataType::Utf8, false),
+            Field::new("ip_allow_list_enabled", DataType::Boolean, false),
+        ]);
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+        let row = json!({"id": "app-1", "api_key": FAKE_SECRET, "api_key_2": FAKE_SECRET});
+        let err = append_value_to_struct_builder(row, &mut builder)
+            .expect_err("a row without a required column must fail");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "row value leaked: {rendered}"
+            );
+            assert!(rendered.contains("ip_allow_list_enabled"), "{rendered}");
+        }
     }
 
     #[test]
