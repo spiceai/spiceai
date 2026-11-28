@@ -164,6 +164,115 @@ impl TableFunctionArguments {
     }
 }
 
+/// A function a SQL statement calls: its name as the planner looks it up, and the
+/// arguments in SQL order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionCall {
+    pub name: String,
+    arguments: Vec<CallArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallArgument {
+    name: Option<String>,
+    string_literal: Option<String>,
+}
+
+impl FunctionCall {
+    /// The string literal bound to a named parameter or its positional equivalent.
+    #[must_use]
+    pub fn string_argument(&self, parameter: &str, position: Option<usize>) -> Option<&str> {
+        let (_, argument) = self
+            .arguments
+            .iter()
+            .enumerate()
+            .find(|(index, argument)| match &argument.name {
+                Some(name) => name.eq_ignore_ascii_case(parameter),
+                None => Some(*index) == position,
+            })?;
+        argument.string_literal.as_deref()
+    }
+}
+
+/// Returns the scalar and table functions the statement calls, including calls in
+/// subqueries and calls nested in another call's arguments.
+#[must_use]
+pub fn function_calls(statement: &parser::Statement) -> Vec<FunctionCall> {
+    let parser::Statement::Statement(statement) = statement else {
+        return vec![];
+    };
+    let mut calls = FunctionCalls::default();
+    let _ = statement.visit(&mut calls);
+    calls.0
+}
+
+#[derive(Default)]
+struct FunctionCalls(Vec<FunctionCall>);
+
+impl Visitor for FunctionCalls {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &ast::Expr) -> ControlFlow<()> {
+        if let ast::Expr::Function(call) = expr {
+            let args = match &call.args {
+                ast::FunctionArguments::List(list) => list.args.as_slice(),
+                _ => &[],
+            };
+            self.push(&call.name, args);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &ast::TableFactor) -> ControlFlow<()> {
+        match table_factor {
+            ast::TableFactor::Table {
+                name,
+                args: Some(args),
+                ..
+            } => self.push(name, &args.args),
+            ast::TableFactor::Function { name, args, .. } => self.push(name, args),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl FunctionCalls {
+    fn push(&mut self, name: &ast::ObjectName, args: &[ast::FunctionArg]) {
+        // The planner looks a function up by the last part of its name, lowercased
+        // unless quoted.
+        let Some(ident) = name.0.last().and_then(ast::ObjectNamePart::as_ident) else {
+            return;
+        };
+        let name = if ident.quote_style.is_some() {
+            ident.value.clone()
+        } else {
+            ident.value.to_lowercase()
+        };
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                let (name, arg) = match arg {
+                    ast::FunctionArg::Unnamed(arg) => (None, arg),
+                    ast::FunctionArg::Named { name, arg, .. } => (Some(name.value.clone()), arg),
+                    ast::FunctionArg::ExprNamed { name, arg, .. } => (Some(name.to_string()), arg),
+                };
+                let string_literal = match arg {
+                    ast::FunctionArgExpr::Expr(ast::Expr::Value(value)) => {
+                        value.clone().into_string()
+                    }
+                    _ => None,
+                };
+                CallArgument {
+                    name,
+                    string_literal,
+                }
+            })
+            .collect();
+        self.0.push(FunctionCall { name, arguments });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
@@ -385,5 +494,22 @@ mod tests {
             let expected: Vec<TableReference> = expected.iter().map(|&t| t.into()).collect();
             assert_eq!(expected, table_function_arguments(&statements[0]), "{sql}");
         }
+    }
+
+    #[test]
+    fn test_function_calls() {
+        let sql = "SELECT \"MyFn\"(q) FROM rerank(text_search(docs, 'fox'), MODEL => 'ranker') WHERE id IN (SELECT UPPER(name) FROM u)";
+        let statements =
+            DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
+        let calls = function_calls(&statements[0]);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["MyFn", "rerank", "text_search", "upper"]
+        );
+        assert_eq!(calls[1].string_argument("model", None), Some("ranker"));
+        assert_eq!(calls[2].string_argument("query", Some(1)), Some("fox"));
     }
 }

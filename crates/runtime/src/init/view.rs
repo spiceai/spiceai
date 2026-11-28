@@ -186,6 +186,93 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
     )
 }
 
+/// The functions a view's SQL calls. Empty when the SQL does not parse, in which
+/// case registering the view reports the error.
+fn view_function_calls(sql: &str) -> Vec<view::FunctionCall> {
+    match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+        Ok(statements) if statements.len() == 1 => view::function_calls(&statements[0]),
+        _ => Vec::new(),
+    }
+}
+
+/// The model parameter name and optional positional index for a model function.
+fn model_parameter(name: &str) -> Option<(&'static str, Option<usize>)> {
+    #[cfg(feature = "models")]
+    if name == runtime_datafusion_udfs::ai::AI_UDF_NAME {
+        return Some(("model_name", Some(1)));
+    }
+    if name == runtime_search::rerank::RERANK_UDTF_NAME {
+        return Some(("model", None));
+    }
+    runtime_decide::model_parameter_position(name).map(|position| ("model", Some(position)))
+}
+
+/// The names of the components that `new` adds, removes or changes.
+fn changed_by_name<T: PartialEq>(
+    current: &[T],
+    new: &[T],
+    name: impl Fn(&T) -> &str,
+) -> HashSet<String> {
+    current
+        .iter()
+        .chain(new)
+        .filter(|c| {
+            current.iter().find(|o| name(o) == name(c)) != new.iter().find(|n| name(n) == name(c))
+        })
+        .map(|c| name(c).to_string())
+        .collect()
+}
+
+/// The user functions and the chat, decision and rerank models that a reload from
+/// `current_app` to `new_app` adds, removes or changes. A view that calls one of them
+/// registers again: its plan holds the user functions it called when it registered,
+/// and an accelerated view stores what the old model answered.
+struct ChangedCalls {
+    functions: HashSet<String>,
+    models: HashSet<String>,
+}
+
+impl ChangedCalls {
+    fn new(current_app: &App, new_app: &App) -> Self {
+        let functions =
+            if current_app.runtime.functions.enabled == new_app.runtime.functions.enabled {
+                changed_by_name(&current_app.functions, &new_app.functions, |f| &f.name)
+            } else {
+                current_app
+                    .functions
+                    .iter()
+                    .chain(&new_app.functions)
+                    .map(|f| f.name.clone())
+                    .collect()
+            };
+        let mut models = changed_by_name(&current_app.models, &new_app.models, |m| &m.name);
+        models.extend(changed_by_name(
+            &current_app.rerankers,
+            &new_app.rerankers,
+            |r| &r.name,
+        ));
+        Self { functions, models }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.functions.is_empty() && self.models.is_empty()
+    }
+
+    /// Whether `calls` call a changed user function, or a model function that names a
+    /// changed model or names no model. A call that names no model uses the one model
+    /// that can answer it, which any change to the models can replace.
+    fn affect(&self, calls: &[view::FunctionCall]) -> bool {
+        calls.iter().any(|call| {
+            self.functions.contains(&call.name)
+                || (!self.models.is_empty()
+                    && model_parameter(&call.name).is_some_and(|(name, position)| {
+                        call.string_argument(name, position)
+                            .is_none_or(|model| self.models.contains(model))
+                    }))
+        })
+    }
+}
+
 /// Whether `view` embeds a column with one of `models`.
 fn view_uses_embedding_model(view: &View, models: &HashSet<String>) -> bool {
     view.columns
@@ -949,9 +1036,11 @@ impl Runtime {
 
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
-    /// It will also update views that have dependencies that have changed, and views
+    /// It will also update views that have dependencies that have changed, views
     /// that read `reloaded_datasets`, the datasets the same change loaded, reloaded or
-    /// removed.
+    /// removed, and views that call a user function, chat, decision or rerank model that
+    /// the change added, removed or changed. Call it after the functions and models are
+    /// applied, so those views register with the new ones.
     pub(crate) async fn apply_view_diff(
         self: Arc<Self>,
         current_app: &Arc<App>,
@@ -984,9 +1073,11 @@ impl Runtime {
         // A view's plan holds the tables it read when it registered, so a view that
         // reads a dataset this change loads, reloads or removes registers again to read
         // the dataset the Spicepod now declares, or to fail when it is gone. A view that
-        // embeds with a changed embedding model registers again with the new model. The
-        // views that read it follow through the dependency order below.
+        // embeds with a changed embedding model registers again with the new model, and a
+        // view that calls a changed user function or model registers again with the new
+        // one. The views that read it follow through the dependency order below.
         let changed_embeddings = crate::init::embedding::changed_embeddings(current_app, new_app);
+        let changed_calls = ChangedCalls::new(current_app, new_app);
         let reads: HashMap<ResolvedTableReference, TablesRead> = {
             let state = self.df.ctx.state();
             validated_views
@@ -1006,7 +1097,9 @@ impl Runtime {
                     .is_some_and(|tables| {
                         tables.keys().any(|table| reloaded_datasets.contains(table))
                     })
-                    || view_uses_embedding_model(&vv.view, &changed_embeddings))
+                    || view_uses_embedding_model(&vv.view, &changed_embeddings)
+                    || (!changed_calls.is_empty()
+                        && changed_calls.affect(&view_function_calls(&vv.view.sql))))
             {
                 views_that_changed.push(vv.view.name.clone());
             }
@@ -1230,5 +1323,105 @@ mod startup_view_wait_tests {
             view_waiting_message(&view, &["bad".to_string()], ViewWait::EveryDataset(None)),
             "View 'v_bad' is still waiting for every dataset to load before it registers. Still loading: 'bad'."
         );
+    }
+}
+
+#[cfg(test)]
+mod changed_calls_tests {
+    use super::*;
+    use spicepod::component::model::Model;
+
+    fn names(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|&n| n.to_string()).collect()
+    }
+
+    fn changed(functions: &[&str], models: &[&str]) -> ChangedCalls {
+        ChangedCalls {
+            functions: names(functions),
+            models: names(models),
+        }
+    }
+
+    fn affects(changed: &ChangedCalls, sql: &str) -> bool {
+        changed.affect(&view_function_calls(sql))
+    }
+
+    #[test]
+    fn user_function_change_affects_views_that_call_it() {
+        let changed = changed(&["search_pipeline"], &[]);
+        assert!(affects(&changed, "SELECT search_pipeline(q) FROM t"));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM t WHERE id IN (SELECT search_pipeline(q) FROM u)"
+        ));
+        assert!(!affects(&changed, "SELECT upper(q) FROM t"));
+    }
+
+    // `ai` is registered only with the `models` feature.
+    #[cfg(feature = "models")]
+    #[test]
+    fn model_change_affects_views_that_name_it() {
+        let changed = changed(&[], &["luna"]);
+        assert!(affects(&changed, "SELECT ai('ranker')"));
+        assert!(!affects(&changed, "SELECT ai('luna', 'jev')"));
+        assert!(affects(&changed, "SELECT ai_if(body, 'ranker') FROM t"));
+        assert!(!affects(
+            &changed,
+            "SELECT ai_if(body, 'luna', 'jev') FROM t"
+        ));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM rerank(t, document => 'ranker')"
+        ));
+        assert!(affects(&changed, "SELECT ai(q, 'luna') FROM t"));
+        assert!(!affects(&changed, "SELECT ai(q, 'jev') FROM t"));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM t WHERE ai_if(body, 'is spam', model => 'luna')"
+        ));
+        assert!(!affects(
+            &changed,
+            "SELECT * FROM t WHERE ai_if(body, 'is spam', model => 'jev')"
+        ));
+        assert!(!affects(
+            &changed,
+            "SELECT * FROM rerank(text_search(docs, 'fox'), model => 'ranker')"
+        ));
+        // A string that names a model outside a model function is not a model call.
+        assert!(!affects(&changed, "SELECT upper('luna') FROM t"));
+    }
+
+    // `ai` is registered only with the `models` feature.
+    #[cfg(feature = "models")]
+    #[test]
+    fn model_change_affects_views_that_let_the_runtime_choose() {
+        let changed = changed(&[], &["ranker"]);
+        assert!(affects(&changed, "SELECT ai(q) FROM t"));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM t WHERE ai_if(body, 'is spam')"
+        ));
+        assert!(affects(
+            &changed,
+            "SELECT * FROM rerank(text_search(docs, 'fox'), document => 'body')"
+        ));
+        assert!(!affects(&changed, "SELECT ai(q, 'luna') FROM t"));
+    }
+
+    #[test]
+    fn changed_models_are_added_removed_or_changed() {
+        let current = app::AppBuilder::new("current")
+            .with_model(Model::new("openai:gpt-4o", "kept"))
+            .with_model(Model::new("openai:gpt-4o", "changed"))
+            .with_model(Model::new("openai:gpt-4o", "removed"))
+            .build();
+        let new = app::AppBuilder::new("new")
+            .with_model(Model::new("openai:gpt-4o", "kept"))
+            .with_model(Model::new("openai:gpt-4o-mini", "changed"))
+            .with_model(Model::new("openai:gpt-4o", "added"))
+            .build();
+        let changed = ChangedCalls::new(&current, &new);
+        assert_eq!(changed.models, names(&["changed", "removed", "added"]));
+        assert!(changed.functions.is_empty());
     }
 }

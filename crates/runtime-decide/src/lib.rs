@@ -84,6 +84,24 @@ pub const DECISION_FUNCTION_NAMES: [&str; 5] = [
     AI_DECIDE_NAME,
 ];
 
+/// Position of the model selector in a decision function's SQL signature.
+#[must_use]
+pub fn model_parameter_position(name: &str) -> Option<usize> {
+    let kind = [
+        Kind::If,
+        Kind::Probability,
+        Kind::Classify,
+        Kind::Score,
+        Kind::Decide,
+    ]
+    .into_iter()
+    .find(|kind| kind.name() == name)?;
+    kind.layout()
+        .params
+        .iter()
+        .position(|param| *param == "model")
+}
+
 /// The five decision functions over one model store, and the planner rule that goes
 /// with them.
 #[derive(Debug, Clone)]

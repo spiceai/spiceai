@@ -361,14 +361,15 @@ impl Runtime {
             let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
-            Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
-                .await;
             // Tools and functions first: a model gets its tools when it loads.
             let changed_tools = self.apply_tool_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
             let changed_function_tools = changed_function_tools(current_app, &new_app);
             let loaded_models = self.apply_model_diff(current_app, &new_app).await;
+            // After functions and models: a view that calls one registers with the new one.
+            Arc::clone(&self)
+                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
+                .await;
             let changed_embeddings =
                 crate::init::embedding::changed_embeddings(current_app, &new_app);
             models_to_reload = Some((
