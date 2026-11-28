@@ -170,13 +170,24 @@ pub fn unset_refresh_mode_for_connector(connector: &str) -> RefreshMode {
 /// slot alone, whatever the connection: two datasets naming one slot on
 /// different databases are then written together too, which is coarser than
 /// needed but never splits a consumer.
+///
+/// Only a dataset the object-native Cayenne metastore holds is named: a
+/// `cayenne` acceleration in a file mode without `partition_by`. A dataset
+/// accelerated elsewhere never opens in that metastore, so a write unit
+/// waiting for it would never open its writes.
 #[must_use]
 pub fn shared_change_consumer(dataset: &spicepod::component::dataset::Dataset) -> Option<String> {
-    let enabled = dataset
-        .acceleration
-        .as_ref()
-        .is_some_and(|acceleration| acceleration.enabled);
-    if !enabled || dataset.from.split_once(':').map(|(connector, _)| connector) != Some("postgres")
+    let in_object_native_metastore = dataset.acceleration.as_ref().is_some_and(|acceleration| {
+        acceleration.enabled
+            && matches!(
+                Engine::try_from(acceleration.engine_name()),
+                Ok(Engine::Cayenne)
+            )
+            && !matches!(acceleration.mode, spicepod_acceleration::Mode::Memory)
+            && acceleration.partition_by.is_empty()
+    });
+    if !in_object_native_metastore
+        || dataset.from.split_once(':').map(|(connector, _)| connector) != Some("postgres")
     {
         return None;
     }
@@ -1504,6 +1515,53 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use spicepod::param::ParamValue;
     use std::sync::Arc;
+
+    fn slot_dataset(acceleration: &serde_json::Value) -> spicepod::component::dataset::Dataset {
+        serde_json::from_value(serde_json::json!({
+            "from": "postgres:public.orders",
+            "name": "orders",
+            "params": { "pg_replication_slot": "orders_slot" },
+            "acceleration": acceleration,
+        }))
+        .expect("parse the dataset")
+    }
+
+    /// Only a dataset the object-native Cayenne metastore holds is grouped
+    /// on its replication slot: a unit waiting for any other would never open.
+    #[test]
+    fn only_an_object_native_cayenne_dataset_shares_its_slot_consumer() {
+        let cases = [
+            (serde_json::json!({ "enabled": true, "mode": "file" }), true),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "file_create" }),
+                true,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "memory" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "arrow", "mode": "file" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": false, "engine": "cayenne", "mode": "file" }),
+                false,
+            ),
+            (
+                serde_json::json!({ "enabled": true, "engine": "cayenne", "mode": "file", "partition_by": ["bucket(4, id)"] }),
+                false,
+            ),
+        ];
+        for (acceleration, grouped) in cases {
+            let expected = grouped.then(|| "postgres slot orders_slot".to_string());
+            assert_eq!(
+                shared_change_consumer(&slot_dataset(&acceleration)),
+                expected,
+                "{acceleration}"
+            );
+        }
+    }
 
     #[test]
     fn only_a_cayenne_acceleration_with_a_datalake_location_uses_the_datalake() {

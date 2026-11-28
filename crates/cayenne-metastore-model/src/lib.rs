@@ -2791,6 +2791,31 @@ fn additional_runs() -> Vec<Run> {
             failure,
         });
     }
+    // Instances that may disagree on a write unit's members.
+    for (name, failure) in [
+        ("write-units-grouping", ""),
+        (
+            "write-units-grouping-groups-unopened",
+            "every dataset that opens is written once the leases settle",
+        ),
+        (
+            "write-units-grouping-no-own-lease",
+            "at most one instance has data writes open on each dataset",
+        ),
+        (
+            "write-units-grouping-partial-own-lease",
+            "every dataset that opens is written once the leases settle",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "write-units-grouping",
+            mode: name,
+            bound: 0,
+            seed: None,
+            failure,
+        });
+    }
     // Persisted lookup-index runs, named for the data files they cover.
     for (name, failure) in [
         ("index-runs", ""),
@@ -3583,6 +3608,7 @@ fn dispatch(r: Run, v: &mut impl Visitor) -> Option<bool> {
         "source-positions" => v.visit(source_positions::Protocol::new(r.mode, r.bound), r, None),
         "standby" => v.visit(standby::Protocol::new(r.mode), r, None),
         "write-units" => v.visit(write_units::Protocol::new(r.mode), r, None),
+        "write-units-grouping" => v.visit(write_units::grouping::Protocol::new(r.mode), r, None),
         "object-names" => v.visit(object_names::Protocol::new(r.mode, r.bound), r, None),
         "reads" => v.visit(reads::Protocol::new(r.mode, r.bound), r, None),
         "data-files" => v.visit(data_files::Protocol::new(r.mode, r.bound), r, None),
@@ -4030,7 +4056,7 @@ mod explorer_tests {
             .filter(|f| !TEXT_ONLY.contains(f))
             .collect();
         assert_eq!(render.drawn, expected);
-        assert_eq!(render.families.len(), 27, "{:?}", render.families);
+        assert_eq!(render.families.len(), 28, "{:?}", render.families);
         assert!(
             render.steps > 10_000,
             "only {} steps rendered",

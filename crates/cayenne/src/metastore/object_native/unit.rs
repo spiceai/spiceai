@@ -28,6 +28,18 @@ limitations under the License.
 //!   own record), then takes every member's head over at exactly that number.
 //!   The lease's next generation always exceeds every member head's, so the
 //!   head refuses a writer the lease has moved past at its next publication.
+//!   The floor counts every member head this process has opened, as a writer
+//!   or as a replica.
+//! - **A dataset's own lease too.** The holder of a shared consumer's unit
+//!   also holds each member's own lease (`<log>/leases/writer.json`, the lease
+//!   an instance that does not share the consumer writes the dataset under),
+//!   and takes a member over only while it holds both. Instances that disagree
+//!   on which datasets share a consumer, as during a rollout of a Spicepod
+//!   edit, then never both write one dataset: the one that finds the
+//!   dataset's own lease held elsewhere stands by for the whole unit.
+//! - **An incomplete unit waits.** A unit whose members have not all opened
+//!   keeps its data writes closed, but neither takes its members over again on
+//!   each renewal nor ignores a handoff request.
 //! - **Handoff.** An instance that writes fewer units than its share asks the
 //!   instance writing the most for one, by writing a request object beside
 //!   that unit's lease. The holder reads it at its next renewal, stops the
@@ -152,6 +164,7 @@ impl Units {
     /// consumer's, when it shares one, or else its own. The registry (`""`)
     /// is a unit of its own that is never balanced.
     pub(super) fn unit_for(self: &Arc<Self>, dataset: &str, prefix: &Path) -> Arc<UnitLease> {
+        let shared = self.groups.consumer_of(dataset).is_some();
         let (key, path, expected, label, balanced) = match self.groups.consumer_of(dataset) {
             Some(consumer) => {
                 let file = consumer_file(consumer);
@@ -187,6 +200,9 @@ impl Units {
             expected,
             balanced,
             prefixes: Mutex::new(BTreeSet::new()),
+            member_leases: Mutex::new(BTreeMap::new()),
+            shared,
+            member_held_elsewhere: AtomicBool::new(false),
             members: Mutex::new(Vec::new()),
             held: tokio::sync::Mutex::new(Held::default()),
             holder: Mutex::new(None),
@@ -388,6 +404,16 @@ pub(super) struct UnitLease {
     balanced: bool,
     /// The log prefix of every member opened, for the generation's floor.
     prefixes: Mutex<BTreeSet<String>>,
+    /// Each member's own lease, by log prefix, held beside a shared
+    /// consumer's unit lease; empty for a dataset's own unit, whose lease
+    /// is that one.
+    member_leases: Mutex<BTreeMap<String, Lease>>,
+    /// Whether the unit is a shared consumer's, whose members' own leases it
+    /// holds too.
+    shared: bool,
+    /// Whether another instance writes a member under its own lease, as last
+    /// found, so the change is logged once.
+    member_held_elsewhere: AtomicBool,
     members: Mutex<Vec<Weak<Domain>>>,
     held: tokio::sync::Mutex<Held>,
     /// The instance that held the lease when it was last read.
@@ -568,6 +594,9 @@ impl UnitLease {
             return Ok(OpenAs::Replica);
         }
         let mut held = self.held.lock().await;
+        // Every member head counts toward the next generation, a replica's
+        // too: it may take the member over later.
+        self.prefixes.lock().insert(prefix.to_string());
         let usable =
             held.generation != 0 && held.valid_until.is_some_and(|until| until > Instant::now());
         let generation = if usable {
@@ -593,11 +622,113 @@ impl UnitLease {
             }
         };
         *self.holder.lock() = Some(self.identity().to_string());
-        self.prefixes.lock().insert(prefix.to_string());
+        if !self.take_member_leases().await? {
+            return Ok(OpenAs::Replica);
+        }
         Ok(OpenAs::Writer {
             generation,
             valid_until: held.valid_until.unwrap_or_else(Instant::now),
         })
+    }
+
+    /// The own lease of the member log at `prefix`, held beside a shared
+    /// consumer's unit lease.
+    fn member_lease(&self, prefix: &str) -> Lease {
+        self.member_leases
+            .lock()
+            .entry(prefix.to_string())
+            .or_insert_with(|| Lease::new(self.lease.holder().clone(), self.lease.duration()))
+            .clone()
+    }
+
+    /// Create, renew or take over the own lease of the member log at
+    /// `prefix`. Returns whether this process holds it: `false` when another
+    /// instance does, which writes that dataset without sharing this unit's
+    /// consumer. Always `true` for a dataset's own unit, whose lease it is.
+    async fn take_member_lease(&self, prefix: &str) -> CatalogResult<bool> {
+        if !self.shared {
+            return Ok(true);
+        }
+        let path = Path::from(prefix).join("leases").join("writer.json");
+        let role = self
+            .member_lease(prefix)
+            .acquire(
+                self.store.as_ref(),
+                &path,
+                &object_store_occ::ConflictRetry::default(),
+                |previous| async move {
+                    Ok::<_, std::convert::Infallible>(object_store_occ::lease::next_generation(
+                        previous,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| {
+                invalid(format!(
+                    "{} could not read or write the writer lease of its member at '{prefix}': {error}",
+                    self.subject()
+                ))
+            })?;
+        Ok(matches!(role, Role::Holder { .. }))
+    }
+
+    /// Take the own lease of every member log opened, all or none. When
+    /// another instance holds any of them, this process takes none and
+    /// releases those it holds, so that instance can write every dataset it
+    /// writes on its own rather than wait for this one. Returns whether this
+    /// process holds all of them.
+    async fn take_member_leases(&self) -> CatalogResult<bool> {
+        if !self.shared {
+            return Ok(true);
+        }
+        let prefixes: Vec<String> = self.prefixes.lock().iter().cloned().collect();
+        // Read every lease before taking any, so an instance writing one of
+        // the datasets on its own is never left waiting for another.
+        for prefix in &prefixes {
+            let path = Path::from(prefix.as_str())
+                .join("leases")
+                .join("writer.json");
+            let elsewhere = self
+                .member_lease(prefix)
+                .held_elsewhere(self.store.as_ref(), &path)
+                .await
+                .map_err(|error| {
+                    invalid(format!(
+                        "{} could not read the writer lease of its member at '{prefix}': {error}",
+                        self.subject()
+                    ))
+                })?;
+            if elsewhere.is_some() {
+                self.release_member_leases(None).await;
+                return Ok(false);
+            }
+        }
+        for prefix in &prefixes {
+            if !self.take_member_lease(prefix).await? {
+                // Taken by another instance since the read.
+                self.release_member_leases(None).await;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Release, or hand to `to`, every member's own lease this process wrote.
+    async fn release_member_leases(&self, to: Option<&str>) {
+        let leases: Vec<(String, Lease)> = self
+            .member_leases
+            .lock()
+            .iter()
+            .map(|(prefix, lease)| (prefix.clone(), lease.clone()))
+            .collect();
+        for (prefix, lease) in leases {
+            let path = Path::from(prefix.as_str())
+                .join("leases")
+                .join("writer.json");
+            if let Err(error) = lease.release_to(self.store.as_ref(), &path, to).await {
+                tracing::debug!("Failed to hand back writer lease {path}: {error}");
+            }
+        }
     }
 
     /// Record member `domain`, just opened, and open every member's data
@@ -681,6 +812,21 @@ impl UnitLease {
             .iter()
             .filter_map(Weak::upgrade)
             .collect()
+    }
+
+    /// Whether every member opened so far is written by this process at
+    /// `generation`: nothing to take over again, though the unit may still
+    /// lack members ([`Self::complete`]).
+    async fn written_at(&self, generation: u64) -> bool {
+        if generation == 0 {
+            return false;
+        }
+        for member in self.members() {
+            if member.writer_generation().await != Some(generation) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether every member is written by this process at `generation`.
@@ -769,6 +915,7 @@ impl UnitLease {
                 for member in self.members() {
                     member.step_down(holder.as_deref()).await;
                 }
+                self.release_member_leases(None).await;
             }
             Found::Holder {
                 generation,
@@ -776,8 +923,46 @@ impl UnitLease {
                 valid_until,
             } => {
                 *self.holder.lock() = Some(self.identity().to_string());
-                if !fresh && self.complete(generation).await {
-                    self.open_writes(Some(valid_until));
+                match self.take_member_leases().await {
+                    Ok(true) => {
+                        if self.member_held_elsewhere.swap(false, Ordering::AcqRel) {
+                            tracing::info!(
+                                "{} now holds the writer lease of each of its datasets, so this instance takes them over",
+                                self.subject()
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        // Another instance writes a member under that
+                        // dataset's own lease: it does not share this unit's
+                        // consumer. This instance writes none of the unit
+                        // until that lease is released or lapses.
+                        self.close_writes();
+                        for member in self.members() {
+                            member.step_down(None).await;
+                        }
+                        held.generation = generation;
+                        drop(held);
+                        if !self.member_held_elsewhere.swap(true, Ordering::AcqRel) {
+                            tracing::warn!(
+                                "{} is not written by this instance, so none of its datasets ingests here: another instance writes one of them under that dataset's own writer lease, as an instance whose Spicepod does not name the same `pg_replication_slot` for it does. Run the same Spicepod on every instance on this location",
+                                self.subject()
+                            );
+                        }
+                        self.answer_handoff_request().await;
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!("{error}");
+                        return;
+                    }
+                }
+                if !fresh && self.written_at(generation).await {
+                    // A unit that still lacks members keeps its writes closed,
+                    // and still answers handoff requests.
+                    if self.complete(generation).await {
+                        self.open_writes(Some(valid_until));
+                    }
                     drop(held);
                     self.answer_handoff_request().await;
                     return;
@@ -877,6 +1062,7 @@ impl UnitLease {
         held.valid_until = None;
         *self.deadline.lock() = None;
         *self.last_handoff.lock() = Some(Instant::now());
+        self.release_member_leases(to).await;
         match self
             .lease
             .release_to(self.store.as_ref(), &self.path, to)
@@ -919,5 +1105,281 @@ mod tests {
         assert_ne!(first, second);
         let read: HandoffRequest = serde_json::from_slice(&first).expect("parse");
         assert_eq!(read.requester, "b");
+    }
+
+    mod instances {
+        use super::super::super::{Access, Domain, LeaseSettings, NativeCatalogConfig, WriteUnits};
+        use super::super::{HandoffRequest, Units, request_path};
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
+        use std::sync::Arc;
+
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
+        fn config(identity: &'static str) -> NativeCatalogConfig {
+            NativeCatalogConfig {
+                access: Access::Leased(LeaseSettings {
+                    duration: LEASE,
+                    identity: Some(identity),
+                }),
+                ..NativeCatalogConfig::default()
+            }
+        }
+
+        fn units(
+            store: &Arc<dyn ObjectStore>,
+            identity: &'static str,
+            groups: WriteUnits,
+        ) -> Arc<Units> {
+            Units::new(
+                Arc::clone(store),
+                Path::from("leases"),
+                LeaseSettings {
+                    duration: LEASE,
+                    identity: Some(identity),
+                },
+                groups,
+            )
+        }
+
+        /// Dataset `dataset`'s log at its own prefix, opened (created when
+        /// `create`) by the instance `units` belongs to, and joined to its unit.
+        async fn open(
+            store: &Arc<dyn ObjectStore>,
+            units: &Arc<Units>,
+            identity: &'static str,
+            dataset: &str,
+            create: bool,
+        ) -> Arc<Domain> {
+            let prefix = Path::from(dataset);
+            let store = Arc::clone(store);
+            let opened = if create {
+                Domain::create_with_config(
+                    store,
+                    prefix,
+                    config(identity),
+                    true,
+                    None,
+                    dataset,
+                    Some(units),
+                )
+                .await
+            } else {
+                Domain::open_with_config(
+                    store,
+                    prefix,
+                    config(identity),
+                    true,
+                    None,
+                    dataset,
+                    Some(units),
+                )
+                .await
+            };
+            let domain = Arc::new(opened.expect("open the dataset log"));
+            domain.join_unit().await;
+            domain
+        }
+
+        async fn head(store: &Arc<dyn ObjectStore>, dataset: &str) -> Option<u64> {
+            object_store_occ::headlog::head_generation(store.as_ref(), &Path::from(dataset))
+                .await
+                .expect("read the head")
+        }
+
+        async fn keep(domain: &Domain) {
+            domain
+                .unit
+                .as_ref()
+                .expect("a leased log has a unit")
+                .keep()
+                .await;
+        }
+
+        /// A unit one of whose members never opens keeps its writes closed,
+        /// but does not take its open member over again on every renewal.
+        #[tokio::test]
+        async fn a_unit_missing_a_member_keeps_its_generation_and_its_writes_closed() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let units = units(
+                &store,
+                "w",
+                WriteUnits::default().with_consumer("s", &["a", "b"]),
+            );
+            let a = open(&store, &units, "w", "a", true).await;
+            let opened_at = a.writer_generation().await;
+            assert_eq!(opened_at, Some(1));
+            for tick in 1..=5 {
+                keep(&a).await;
+                assert_eq!(
+                    (
+                        a.data_writes.allows(),
+                        a.writer_generation().await,
+                        head(&store, "a").await
+                    ),
+                    (false, Some(1), Some(1)),
+                    "renewal {tick}"
+                );
+            }
+        }
+
+        /// A unit one of whose members never opens still hands itself to an
+        /// instance that asks for it.
+        #[tokio::test]
+        async fn a_unit_missing_a_member_answers_a_handoff_request() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let groups = WriteUnits::default().with_consumer("s", &["a", "b"]);
+            let holder_units = units(&store, "w", groups.clone());
+            let asker_units = units(&store, "r", groups);
+            let held = open(&store, &holder_units, "w", "a", true).await;
+            let asker = open(&store, &asker_units, "r", "a", false).await;
+            assert_eq!(asker.writer_generation().await, None);
+            let unit = held.unit.as_ref().expect("a leased log has a unit");
+            store
+                .put(
+                    &request_path(&unit.path),
+                    PutPayload::from(
+                        serde_json::to_vec(&HandoffRequest::new("r")).expect("serialize"),
+                    ),
+                )
+                .await
+                .expect("write the handoff request");
+            keep(&held).await;
+            keep(&asker).await;
+            assert_eq!(
+                (
+                    held.writer_generation().await,
+                    asker.writer_generation().await
+                ),
+                (None, Some(2)),
+                "the unit was not handed to the instance that asked for it"
+            );
+            let _ = (holder_units, asker_units);
+        }
+
+        /// Two instances that disagree on whether a dataset shares a consumer
+        /// never both write it, whichever opens it first, and stop retaking
+        /// it from each other.
+        #[tokio::test]
+        async fn instances_that_group_a_dataset_differently_never_both_write_it() {
+            for grouped_first in [false, true] {
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let own = units(&store, "own", WriteUnits::default());
+                let shared = units(
+                    &store,
+                    "shared",
+                    WriteUnits::default().with_consumer("s", &["a"]),
+                );
+                let (first, second) = if grouped_first {
+                    let s = open(&store, &shared, "shared", "a", true).await;
+                    (s, open(&store, &own, "own", "a", false).await)
+                } else {
+                    let o = open(&store, &own, "own", "a", true).await;
+                    (o, open(&store, &shared, "shared", "a", false).await)
+                };
+                let first_generation = first.writer_generation().await;
+                assert!(first_generation.is_some(), "grouped first: {grouped_first}");
+                for tick in 1..=4 {
+                    keep(&first).await;
+                    keep(&second).await;
+                    assert_eq!(
+                        (
+                            first.data_writes.allows(),
+                            first.writer_generation().await,
+                            second.data_writes.allows(),
+                            second.writer_generation().await,
+                            head(&store, "a").await,
+                        ),
+                        (true, first_generation, false, None, first_generation),
+                        "grouped first: {grouped_first}, renewal {tick}"
+                    );
+                }
+                first
+                    .set_sidecar_value("k", Some(b"v".to_vec()))
+                    .await
+                    .expect("the only writer commits");
+                let _ = (own, shared);
+            }
+        }
+
+        /// An instance that writes one dataset of a shared consumer on its own
+        /// (its Spicepod does not share it) is handed the dataset's slot-mates
+        /// the other instance had taken, rather than both waiting on each other.
+        #[tokio::test]
+        async fn an_instance_writing_a_dataset_on_its_own_is_left_its_slot_mates() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let own = units(&store, "own", WriteUnits::default());
+            let shared = units(
+                &store,
+                "shared",
+                WriteUnits::default().with_consumer("s", &["a", "b"]),
+            );
+            let shared_a = open(&store, &shared, "shared", "a", true).await;
+            let own_b = open(&store, &own, "own", "b", true).await;
+            let own_a = open(&store, &own, "own", "a", false).await;
+            let shared_b = open(&store, &shared, "shared", "b", false).await;
+            for tick in 1..=3 {
+                keep(&shared_a).await;
+                keep(&own_a).await;
+                keep(&own_b).await;
+                assert_eq!(
+                    (
+                        own_a.data_writes.allows(),
+                        own_b.data_writes.allows(),
+                        shared_a.data_writes.allows(),
+                        shared_b.data_writes.allows(),
+                        shared_a.writer_generation().await,
+                        shared_b.writer_generation().await,
+                    ),
+                    (true, true, false, false, None, None),
+                    "renewal {tick}"
+                );
+            }
+            let _ = (own, shared);
+        }
+
+        /// A member a shared unit's instance opened as a replica (another
+        /// instance held the unit) counts toward its next generation, so its
+        /// first takeover exceeds a head another lease raised meanwhile.
+        #[tokio::test]
+        async fn a_takeover_exceeds_the_head_of_a_member_opened_as_a_replica() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let groups = WriteUnits::default().with_consumer("s", &["a"]);
+            let own = units(&store, "own", WriteUnits::default());
+            let first_shared = units(&store, "z", groups.clone());
+            let second_shared = units(&store, "y", groups);
+            let alone = open(&store, &own, "own", "a", true).await;
+            let holder = open(&store, &first_shared, "z", "a", false).await;
+            let standby = open(&store, &second_shared, "y", "a", false).await;
+            assert_eq!(
+                (
+                    holder.writer_generation().await,
+                    standby.writer_generation().await
+                ),
+                (None, None)
+            );
+            alone.take_over_at(50).await.expect("raise the head");
+            alone
+                .unit
+                .as_ref()
+                .expect("a leased log has a unit")
+                .hand_over(None)
+                .await;
+            holder
+                .unit
+                .as_ref()
+                .expect("a leased log has a unit")
+                .hand_over(None)
+                .await;
+            keep(&standby).await;
+            assert_eq!(
+                (
+                    standby.writer_generation().await,
+                    standby.data_writes.allows(),
+                    head(&store, "a").await
+                ),
+                (Some(51), true, Some(51))
+            );
+            let _ = (own, first_shared, second_shared);
+        }
     }
 }

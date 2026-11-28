@@ -330,10 +330,16 @@ The writer holds its write unit's lease. A unit is one dataset, leased at its
 `leases/writer.json`, or every dataset that names one PostgreSQL replication slot
 (`pg_replication_slot`), leased together at
 `<catalog root>/leases/consumer-<slot>-<digest>.json` because one replication
-connection consumes them all; the groups are derived from the Spicepod
-(`metastore/object_native/unit.rs`). A new owner takes the
-lease at generation g + 1, then CASes the head to `lease: g + 1`, on every member
-of the unit; the unit's data writes open only once every member is taken over.
+connection consumes them all; the groups are derived from the Spicepod and hold
+only datasets this metastore opens (`metastore/object_native/unit.rs`). A new
+owner takes the lease at generation g + 1, above every member head it has opened,
+as a writer or a replica, then CASes the head to `lease: g + 1`, on every member
+of the unit; the unit's data writes open only once every member is taken over,
+and a unit still missing a member waits without taking the others over again.
+The holder of a slot's unit also holds each member's own `leases/writer.json`,
+all or none, so instances that disagree on the grouping never both write one
+dataset: the one that finds a member's own lease held elsewhere releases its own
+and writes none of the unit (model: `write-units-grouping`).
 An instance asks for a unit by writing `<lease>-request.json` beside it, and the
 holder hands it over at a commit boundary, naming the requester in the lease. Every older
 writer's CAS is conditioned on an earlier version and fails; on re-reading the

@@ -271,6 +271,281 @@ impl Model for Protocol {
     }
 }
 
+/// How instances that may disagree on a write unit's members decide who
+/// writes each dataset: two datasets that one Spicepod names on one
+/// replication slot, the second of which may never open in the object-native
+/// metastore (accelerated by another engine, say), and two instances, each
+/// of which groups the datasets on the slot or leases each on its own, as two
+/// Spicepods mid-rollout do. Every dataset has its own lease, and the slot's
+/// datasets share a unit lease. A renewal is one instance's `keep`: it takes
+/// what it may, and an instance writes a dataset while its leases allow it.
+/// Releases (a handoff, a shutdown, a lapse) are bounded so runs end.
+///
+/// The fixes: a unit groups only the datasets that open, and the holder of a
+/// unit takes each member's own lease as well, all or none, releasing those
+/// it holds while another instance holds any. The controls remove each
+/// (`-partial-own-lease` takes members' own leases one by one and keeps them,
+/// so two instances each wait for a lease the other holds):
+/// `-groups-unopened` groups the dataset that never opens, so a unit can
+/// never complete, and `-no-own-lease` writes a unit's members under the
+/// unit lease alone, so two instances write one dataset.
+pub(crate) mod grouping {
+    use stateright::{Model, Property};
+
+    const INSTANCES: usize = 2;
+    const DATASETS: usize = 2;
+    /// Lease releases, bounded so the runs stay finite.
+    const RELEASES: u8 = 2;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct Protocol {
+        mode: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct State {
+        /// Whether each instance's Spicepod puts both datasets on the slot.
+        grouped: [bool; INSTANCES],
+        /// Whether dataset 1 opens in the metastore; dataset 0 always does.
+        opens: bool,
+        /// The unit lease's holder.
+        unit: Option<usize>,
+        /// Each dataset's own lease's holder.
+        own: [Option<usize>; DATASETS],
+        releases: u8,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub(crate) enum Action {
+        /// Instance `.0` renews: a grouping instance its unit lease and the
+        /// members' own leases; any other the own lease of dataset `.1`,
+        /// which it keeps under that dataset's own unit, renewed on its own.
+        Renew(usize, usize),
+        /// Instance `.0` gives up every lease it holds.
+        Release(usize),
+    }
+
+    impl Protocol {
+        pub(crate) fn new(mode: &str) -> Self {
+            Self { mode: mode.into() }
+        }
+
+        fn opened(s: &State, d: usize) -> bool {
+            d == 0 || s.opens
+        }
+
+        /// The datasets a grouping instance's unit holds.
+        fn members(&self, s: &State) -> Vec<usize> {
+            (0..DATASETS)
+                .filter(|&d| self.mode.contains("groups-unopened") || Self::opened(s, d))
+                .collect()
+        }
+
+        fn own_lease(&self) -> bool {
+            !self.mode.contains("no-own-lease")
+        }
+
+        /// Whether instance `i` has data writes open on dataset `d`.
+        pub(crate) fn writes(&self, s: &State, i: usize, d: usize) -> bool {
+            if !Self::opened(s, d) {
+                return false;
+            }
+            if !s.grouped[i] {
+                return s.own[d] == Some(i);
+            }
+            let members = self.members(s);
+            s.unit == Some(i)
+                && members.contains(&d)
+                // A unit opens its writes once every member is open.
+                && members.iter().all(|&m| Self::opened(s, m))
+                && (!self.own_lease() || members.iter().all(|&m| s.own[m] == Some(i)))
+        }
+    }
+
+    impl Model for Protocol {
+        type State = State;
+        type Action = Action;
+
+        fn init_states(&self) -> Vec<State> {
+            let mut states = vec![];
+            for grouped in [[true, true], [true, false], [false, true]] {
+                for opens in [true, false] {
+                    states.push(State {
+                        grouped,
+                        opens,
+                        unit: None,
+                        own: [None; DATASETS],
+                        releases: 0,
+                    });
+                }
+            }
+            states
+        }
+
+        fn actions(&self, s: &State, a: &mut Vec<Action>) {
+            for i in 0..INSTANCES {
+                for d in 0..DATASETS {
+                    a.push(Action::Renew(i, d));
+                }
+                a.push(Action::Release(i));
+            }
+            crate::prune_for_simulation(self, s, a);
+        }
+
+        fn next_state(&self, s: &State, action: Action) -> Option<State> {
+            let mut next = s.clone();
+            match action {
+                Action::Renew(i, dataset) => {
+                    if s.grouped[i] {
+                        // One renewal per unit, not per dataset.
+                        if dataset != 0 {
+                            return None;
+                        }
+                        if next.unit.is_none() {
+                            next.unit = Some(i);
+                        }
+                        if next.unit == Some(i) && self.own_lease() {
+                            let members: Vec<usize> = self
+                                .members(s)
+                                .into_iter()
+                                .filter(|&d| Self::opened(s, d))
+                                .collect();
+                            if self.mode.contains("partial-own-lease") {
+                                // Take each free member lease and keep it.
+                                for d in members {
+                                    if next.own[d].is_none() {
+                                        next.own[d] = Some(i);
+                                    }
+                                }
+                            } else if members
+                                .iter()
+                                .any(|&d| next.own[d].is_some_and(|holder| holder != i))
+                            {
+                                for d in 0..DATASETS {
+                                    if next.own[d] == Some(i) {
+                                        next.own[d] = None;
+                                    }
+                                }
+                            } else {
+                                for d in members {
+                                    next.own[d] = Some(i);
+                                }
+                            }
+                        }
+                    } else if Self::opened(s, dataset) && next.own[dataset].is_none() {
+                        next.own[dataset] = Some(i);
+                    }
+                }
+                Action::Release(i) => {
+                    let holds = s.unit == Some(i) || s.own.contains(&Some(i));
+                    if !holds || s.releases >= RELEASES {
+                        return None;
+                    }
+                    if next.unit == Some(i) {
+                        next.unit = None;
+                    }
+                    for holder in &mut next.own {
+                        if *holder == Some(i) {
+                            *holder = None;
+                        }
+                    }
+                    next.releases += 1;
+                }
+            }
+            (next != *s).then_some(next)
+        }
+
+        fn format_action(&self, action: &Action) -> String {
+            match action {
+                Action::Renew(i, d) => {
+                    format!("instance {i} renews (its unit, or dataset {d}'s own lease)")
+                }
+                Action::Release(i) => format!("instance {i} releases every lease it holds"),
+            }
+        }
+
+        fn as_svg(&self, path: stateright::Path<State, Action>) -> Option<String> {
+            use crate::explorer::{Event, Timeline, Tone, state_and_trace, steps};
+            let last = path.last_state().clone();
+            let lanes: Vec<String> = (0..INSTANCES)
+                .map(|i| {
+                    let grouping = if last.grouped[i] {
+                        "groups the slot"
+                    } else {
+                        "leases each dataset"
+                    };
+                    format!("instance {i} ({grouping})")
+                })
+                .collect();
+            let mut events = vec![];
+            for (before, action, after) in steps(path) {
+                let writing = |i: usize| {
+                    (0..DATASETS)
+                        .filter(|&d| self.writes(&after, i, d))
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let ev = match action {
+                    Action::Renew(i, _) => {
+                        Event::on(i, format!("renew; writes datasets [{}]", writing(i)))
+                    }
+                    Action::Release(i) => Event::on(i, "release every lease").tone(Tone::Gone),
+                };
+                events.push(ev.breaking(&crate::explorer::broken(self, &before, &after)));
+            }
+            let boxes = vec![
+                (
+                    "LEASES".into(),
+                    vec![
+                        format!("unit {:?}", last.unit),
+                        format!("own {:?}", last.own),
+                        format!("dataset 1 opens: {}", last.opens),
+                    ],
+                    Tone::Actor,
+                ),
+                (
+                    "WRITES".into(),
+                    (0..DATASETS)
+                        .map(|d| {
+                            let writers: Vec<usize> = (0..INSTANCES)
+                                .filter(|&i| self.writes(&last, i, d))
+                                .collect();
+                            format!("dataset {d} written by {writers:?}")
+                        })
+                        .collect(),
+                    Tone::Live,
+                ),
+            ];
+            Some(state_and_trace(&boxes, &Timeline { lanes, events }))
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            vec![
+                Property::always(
+                    "at most one instance has data writes open on each dataset",
+                    |m: &Self, s: &State| {
+                        (0..DATASETS)
+                            .all(|d| (0..INSTANCES).filter(|&i| m.writes(s, i, d)).count() <= 1)
+                    },
+                ),
+                // Every path ends (releases are bounded, and a renewal that
+                // changes nothing is no step), so this is checked where it
+                // ends: once the instances stop releasing, every dataset that
+                // opens has one writer.
+                Property::eventually(
+                    "every dataset that opens is written once the leases settle",
+                    |m: &Self, s: &State| {
+                        (0..DATASETS)
+                            .filter(|&d| Self::opened(s, d))
+                            .all(|d| (0..INSTANCES).any(|i| m.writes(s, i, d)))
+                    },
+                ),
+            ]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Action, Protocol, State};

@@ -644,6 +644,35 @@ impl Lease {
         }
     }
 
+    /// Reads the lease at `path` without writing it, and returns `Some` with
+    /// the holder it names (when it names one) when this holder would stand
+    /// by: another instance holds it live, or it was handed to another. A
+    /// read counts toward the lapse clock as [`Self::acquire`]'s does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError`] when the read fails.
+    pub async fn held_elsewhere<I: LeaseIo + ?Sized>(
+        &self,
+        io: &I,
+        path: &Path,
+    ) -> Result<Option<Option<String>>, LeaseError<std::convert::Infallible>> {
+        let read_at = Instant::now();
+        let observed = self.read(io, path).await?;
+        let unchanged_for = self.unchanged_for(observed.as_ref(), read_at);
+        Ok(
+            match plan(
+                observed.as_ref(),
+                &self.holder,
+                self.duration,
+                unchanged_for,
+            ) {
+                Plan::Standby { holder, .. } => Some(holder),
+                _ => None,
+            },
+        )
+    }
+
     /// Lets the lease this holder last wrote lapse at once, so another holder
     /// can take it over at its next attempt. Returns `false` when this holder
     /// has written no lease since it last released one.
