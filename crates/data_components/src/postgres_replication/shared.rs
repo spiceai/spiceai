@@ -2499,6 +2499,9 @@ async fn attach_member(
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
     apply_slot_setup(source, &setup, &metrics).await;
+    if let Some(lookup) = &setup.rollback_slot {
+        super::rollback_slot::report_rollback_slot_lookup(&dataset_name, lookup, &metrics);
+    }
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
@@ -4859,6 +4862,7 @@ mod tests {
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
             ready_lag: crate::cdc::DEFAULT_READY_LAG,
+            rollback_slot_name: None,
         }
     }
 
@@ -4891,6 +4895,7 @@ mod tests {
             generated_columns: vec![],
             column_type_oids: HashMap::new(),
             publication_tables: tables.iter().map(|t| key(t)).collect(),
+            rollback_slot: None,
         }
     }
 

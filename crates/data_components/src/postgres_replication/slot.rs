@@ -211,6 +211,10 @@ pub struct SharedMemberSetup {
     /// us between the two reads is reported as the unfillable gap it is rather
     /// than silently compared against a fabricated position.
     pub slot_restart_lsn: Option<u64>,
+    /// What inspecting the `SQLite` rollback copy's generated slot found, when
+    /// [`super::config::ReplicationParams::rollback_slot_name`] names one. `None`
+    /// when there is no distinct leftover to look up. Inspection never fails setup.
+    pub rollback_slot: Option<super::RollbackSlotLookup>,
     /// The source's current WAL insert position (`pg_current_wal_lsn()`), read
     /// in the same setup session and before the slot is ensured. An applied
     /// position a previous process recorded can never legitimately be ahead of
@@ -273,6 +277,10 @@ pub async fn setup_shared_member(
                 let current_wal_lsn = current_wal_lsn(&client).await?;
                 let slot = ensure_slot(&client, params, &history).await?;
                 let slot_restart_lsn = read_slot_restart_lsn(&client, &params.slot_name).await?;
+                let rollback_slot = match params.rollback_slot_name.as_deref() {
+                    Some(name) => Some(super::inspect_inactive_rollback_slot(&client, name).await),
+                    None => None,
+                };
                 Ok(SharedMemberSetup {
                     slot,
                     table_added,
@@ -280,6 +288,7 @@ pub async fn setup_shared_member(
                     column_type_oids,
                     publication_tables,
                     slot_restart_lsn,
+                    rollback_slot,
                     current_wal_lsn,
                 })
             }

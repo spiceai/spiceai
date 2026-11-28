@@ -91,6 +91,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         // than waited on; the production default is coarse on purpose.
         watermark_flush_interval: Duration::from_secs(1),
         ready_lag: Duration::from_secs(2),
+        rollback_slot_name: None,
     }
 }
 

@@ -153,6 +153,17 @@ pub struct MetricsCollector {
     member_attached: AtomicU64,
     member_attached_known: AtomicBool,
 
+    // Leftover SQLite-rollback generated slot after an object-native upgrade.
+    // Observed only when inspect found that slot inactive: an absent series means
+    // "not applicable" (no distinct leftover, or it is still consumed), never a
+    // constant `0`. Retained WAL bytes stay unknown (series absent) when the
+    // role cannot compute `pg_current_wal_lsn() - restart_lsn`.
+    rollback_slot_name: RwLock<Option<String>>,
+    inactive_rollback_slots: AtomicU64,
+    inactive_rollback_slots_known: AtomicBool,
+    rollback_slot_retained_wal_bytes: AtomicU64,
+    rollback_slot_retained_wal_bytes_known: AtomicBool,
+
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
     last_commit_seen_at: RwLock<Option<SystemTime>>,
@@ -388,6 +399,28 @@ impl MetricsCollector {
         self.member_attached.store(0, Ordering::Relaxed);
         self.member_attached_known.store(true, Ordering::Release);
     }
+
+    /// Record an inactive leftover generated slot from the `SQLite` rollback copy.
+    /// `retained_wal_bytes` is `None` when the role cannot compute
+    /// `pg_current_wal_lsn() - restart_lsn`; the count still reports.
+    pub fn set_inactive_rollback_slot(&self, slot: String, retained_wal_bytes: Option<u64>) {
+        {
+            let mut guard = self
+                .rollback_slot_name
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(slot);
+        }
+        self.inactive_rollback_slots.store(1, Ordering::Relaxed);
+        self.inactive_rollback_slots_known
+            .store(true, Ordering::Release);
+        if let Some(bytes) = retained_wal_bytes {
+            self.rollback_slot_retained_wal_bytes
+                .store(bytes, Ordering::Relaxed);
+            self.rollback_slot_retained_wal_bytes_known
+                .store(true, Ordering::Release);
+        }
+    }
 }
 
 /// Read-only snapshot interface used by the `MetricsProvider` callbacks.
@@ -616,6 +649,54 @@ impl Metrics {
             .member_mailbox_coalesce_limited_total
             .load(Ordering::Relaxed)
     }
+
+    /// The leftover rollback slot's name, when inspect found it inactive.
+    #[must_use]
+    pub fn rollback_slot_name(&self) -> Option<String> {
+        self.collector
+            .rollback_slot_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// `Some(1)` when this dataset left an inactive generated slot from the
+    /// `SQLite` rollback copy, or `None` when there is no leftover to report.
+    #[must_use]
+    pub fn inactive_rollback_slots(&self) -> Option<u64> {
+        if self
+            .collector
+            .inactive_rollback_slots_known
+            .load(Ordering::Acquire)
+        {
+            Some(
+                self.collector
+                    .inactive_rollback_slots
+                    .load(Ordering::Relaxed),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// WAL bytes the leftover rollback slot still retains, or `None` when the
+    /// quantity could not be read (or there is no leftover).
+    #[must_use]
+    pub fn rollback_slot_retained_wal_bytes(&self) -> Option<u64> {
+        if self
+            .collector
+            .rollback_slot_retained_wal_bytes_known
+            .load(Ordering::Acquire)
+        {
+            Some(
+                self.collector
+                    .rollback_slot_retained_wal_bytes
+                    .load(Ordering::Relaxed),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -754,5 +835,32 @@ mod tests {
         assert_eq!(m.bootstrap_complete(), 0);
         c.mark_bootstrap_complete();
         assert_eq!(m.bootstrap_complete(), 1);
+    }
+
+    #[test]
+    fn inactive_rollback_slot_is_absent_until_inspect_finds_one() {
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        assert_eq!(m.inactive_rollback_slots(), None);
+        assert_eq!(m.rollback_slot_retained_wal_bytes(), None);
+        assert_eq!(m.rollback_slot_name(), None);
+
+        c.set_inactive_rollback_slot("spice_users_abc_def".into(), Some(4096));
+        assert_eq!(m.inactive_rollback_slots(), Some(1));
+        assert_eq!(m.rollback_slot_retained_wal_bytes(), Some(4096));
+        assert_eq!(
+            m.rollback_slot_name().as_deref(),
+            Some("spice_users_abc_def")
+        );
+
+        let c2 = MetricsCollector::new();
+        c2.set_inactive_rollback_slot("spice_users_abc_def".into(), None);
+        let m2 = Metrics::new(c2);
+        assert_eq!(m2.inactive_rollback_slots(), Some(1));
+        assert_eq!(
+            m2.rollback_slot_retained_wal_bytes(),
+            None,
+            "permission denied on WAL diff must not publish a bytes series"
+        );
     }
 }

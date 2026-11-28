@@ -665,6 +665,22 @@ metadata. Milestone 1 maps the tier as it is: a promotion is one record, the
 new cold manifest plus the removal of the promoted warm files, and its GC roots
 in the destination. Existing datalake locations keep working.
 
+## PostgreSQL CDC slots across the upgrade
+
+A dataset that uses a **generated** PostgreSQL logical replication slot (no
+`pg_replication_slot`) names that slot for the acceleration's state location
+once object-native Cayenne is in use. The SQLite copy kept for rollback still
+holds an instance-scoped generated slot. That leftover is inactive after the
+upgrade and retains WAL on the source until it is dropped. Startup inspects it,
+logs a WARN, and publishes
+`dataset_postgres_replication_inactive_rollback_slots` /
+`dataset_postgres_replication_rollback_slot_retained_wal_bytes`. Drop it only
+after the upgrade is committed: `SELECT pg_drop_replication_slot('<name>')`.
+An explicitly configured slot is shared by both copies; rolling back after the
+object-native copy has acknowledged past it forces a full re-read
+(`rebuild_cause=acknowledged_past`). Operator guidance is in
+[PostgreSQL logical replication](../features/postgres-replication.md#leftover-slots-after-upgrading-to-object-native-cayenne).
+
 ## Multi-region
 
 Not in any milestone. Replicating data, and the state one way, is Milestone 1

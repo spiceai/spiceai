@@ -861,6 +861,29 @@ const METRICS: &[MetricSpec] = &[
     )
     .auto_register(),
     MetricSpec::new(
+        "replication_inactive_rollback_slots",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 when this dataset left an inactive generated PostgreSQL replication slot \
+         from the SQLite rollback copy after upgrading to object-native Cayenne. That \
+         leftover retains WAL on the source until it is dropped. Absent when there is \
+         no distinct leftover (explicit `pg_replication_slot`, or the generated names \
+         coincide). Carries a `slot` label naming the leftover.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_rollback_slot_retained_wal_bytes",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "WAL bytes the leftover SQLite-rollback generated slot still retains \
+         (`pg_current_wal_lsn() - restart_lsn`). Absent when there is no leftover or \
+         the role cannot compute the difference. Carries a `slot` label naming the leftover.",
+    )
+    .unit("By")
+    .auto_register(),
+    MetricSpec::new(
         "replication_member_send_wait_micros_total",
         MetricType::ObservableCounterU64,
     )
@@ -1076,6 +1099,28 @@ impl MetricsProvider for PostgresMetricsProvider {
                     }
                 })))
             }
+            "replication_inactive_rollback_slots" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    if let Some(v) = m.inactive_rollback_slots() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.rollback_slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
+                    }
+                })))
+            }
+            "replication_rollback_slot_retained_wal_bytes" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    if let Some(v) = m.rollback_slot_retained_wal_bytes() {
+                        let mut attrs = attributes.clone();
+                        if let Some(slot) = m.rollback_slot_name() {
+                            attrs.push(KeyValue::new("slot", slot));
+                        }
+                        instrument.observe(v, &attrs);
+                    }
+                })))
+            }
             "replication_member_send_stalled_seconds_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
@@ -1255,6 +1300,11 @@ fn replication_params_from_connector_params(
             data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
         watermark_flush_interval:
             data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
+        rollback_slot_name: data_components::postgres_replication::generated_rollback_slot_name(
+            dataset_name,
+            shared_location,
+            shared,
+        ),
     })
 }
 
@@ -1917,5 +1967,51 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             .expect("valid slot must parse");
         assert_eq!(parsed.slot_name, "spice_hits_cdc");
         assert!(parsed.shared);
+    }
+
+    #[test]
+    fn location_scoped_generated_slot_names_the_instance_scoped_rollback() {
+        let parsed = replication_params_from_connector_params(
+            &replication_connection_params(None),
+            "hits",
+            Some("s3://bucket/spice"),
+        )
+        .expect("generated slot must parse");
+        let live = config::default_slot_name_on("hits", Some("s3://bucket/spice"));
+        let leftover = config::default_slot_name("hits");
+        assert_eq!(parsed.slot_name, live);
+        assert_eq!(
+            parsed.rollback_slot_name.as_deref(),
+            Some(leftover.as_str())
+        );
+        assert_ne!(
+            parsed.slot_name, leftover,
+            "the object-native slot must not be the SQLite rollback copy's slot"
+        );
+        assert!(!parsed.shared);
+    }
+
+    #[test]
+    fn explicit_slot_has_no_distinct_rollback_name() {
+        let parsed = replication_params_from_connector_params(
+            &replication_connection_params(Some("spice_hits_cdc")),
+            "hits",
+            Some("s3://bucket/spice"),
+        )
+        .expect("explicit slot must parse");
+        assert_eq!(parsed.rollback_slot_name, None);
+        assert!(parsed.shared);
+    }
+
+    #[test]
+    fn instance_scoped_generated_slot_has_no_distinct_rollback_name() {
+        let parsed = replication_params_from_connector_params(
+            &replication_connection_params(None),
+            "hits",
+            None,
+        )
+        .expect("generated slot must parse");
+        assert_eq!(parsed.rollback_slot_name, None);
+        assert_eq!(parsed.slot_name, config::default_slot_name("hits"));
     }
 }
