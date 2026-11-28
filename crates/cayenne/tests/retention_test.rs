@@ -288,13 +288,19 @@ async fn test_time_retention_cdc_stages_before_finalize_impl(
 /// is exercised — entire files are skipped when all their rows are expired,
 /// not just filtered row-by-row via `FilterExec`.
 ///
-/// - file 1: `event_time` = `now()`       (fresh)
-/// - file 2: `event_time` = `now()` - 2s  (within retention)
-/// - file 3: `event_time` = `now()` - 4s  (already expired with 3s retention)
+/// - file 1: `event_time` = `now()`        (fresh)
+/// - file 2: `event_time` = `now()` - 5s   (within the 10s retention)
+/// - file 3: `event_time` = `now()` - 30s  (already expired)
 ///
 /// 1. Immediately: files 1 + 2 visible (file 3 pruned)
-/// 2. Sleep 2s: file 1 visible (file 2 now expired)
-/// 3. Sleep 2s: nothing visible (file 1 now expired)
+/// 2. At `now()` + 6s: file 1 visible (file 2 now expired)
+/// 3. At `now()` + 11s: nothing visible (file 1 now expired)
+///
+/// Each check waits until a deadline measured from the `now()` the rows were
+/// stamped with, not for a fixed sleep after the previous check, so time spent
+/// inserting and querying on a slow object store cannot push a row across the
+/// retention boundary before the check that expects it. Check 1 has 5s from the
+/// stamp to complete and check 2 has 4s after its deadline.
 async fn test_time_retention_filter_scan_expiry_impl(
     fixture: TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -317,7 +323,7 @@ async fn test_time_retention_filter_scan_expiry_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let retention_builder = cayenne::TimeRetentionFilterBuilder::try_new("event_time", 3, &schema)
+    let retention_builder = cayenne::TimeRetentionFilterBuilder::try_new("event_time", 10, &schema)
         .expect("to create retention builder");
 
     let catalog_arc = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -332,11 +338,12 @@ async fn test_time_retention_filter_scan_expiry_impl(
     );
 
     // Insert each row as a separate batch → separate Vortex file.
+    let stamped_at = tokio::time::Instant::now();
     let now_us = chrono::Utc::now().timestamp_micros();
-    let two_sec_ago_us = now_us - 2_000_000;
-    let four_sec_ago_us = now_us - 4_000_000;
+    let five_sec_ago_us = now_us - 5_000_000;
+    let thirty_sec_ago_us = now_us - 30_000_000;
 
-    for (id, ts) in [(1i64, now_us), (2, two_sec_ago_us), (3, four_sec_ago_us)] {
+    for (id, ts) in [(1i64, now_us), (2, five_sec_ago_us), (3, thirty_sec_ago_us)] {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -372,28 +379,31 @@ async fn test_time_retention_filter_scan_expiry_impl(
         }
     };
 
-    // 1. Immediately: id=1 (now) and id=2 (2s ago) are within 3s retention,
-    //    id=3 (4s ago) is expired.
+    // 1. Immediately: id=1 (now) and id=2 (5s ago) are within the 10s
+    //    retention, id=3 (30s ago) is expired.
     let ids = query_ids(Arc::clone(&table_provider) as Arc<dyn TableProvider>).await?;
     assert_eq!(
         ids,
         vec![1, 2],
-        "Initially, only rows within 3s should be visible"
+        "Initially, only rows within 10s should be visible"
     );
 
-    // 2. Sleep 2s: id=2 is now ~4s old → expired. Only id=1 (~2s old) remains.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // 2. At stamp + 6s: id=2 is ~11s old → expired. Only id=1 (~6s old) remains.
+    tokio::time::sleep_until(stamped_at + std::time::Duration::from_secs(6)).await;
     let ids = query_ids(Arc::clone(&table_provider) as Arc<dyn TableProvider>).await?;
     assert_eq!(
         ids,
         vec![1],
-        "After 2s sleep, only the freshest row should remain"
+        "6s after the rows were stamped, only the freshest row should remain"
     );
 
-    // 3. Sleep 2s more: id=1 is now ~4s old → expired. No rows visible.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // 3. At stamp + 11s: id=1 is ~11s old → expired. No rows visible.
+    tokio::time::sleep_until(stamped_at + std::time::Duration::from_secs(11)).await;
     let ids = query_ids(Arc::clone(&table_provider) as Arc<dyn TableProvider>).await?;
-    assert!(ids.is_empty(), "After 4s total, all rows should be expired");
+    assert!(
+        ids.is_empty(),
+        "11s after the rows were stamped, all rows should be expired"
+    );
 
     Ok(())
 }
