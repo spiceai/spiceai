@@ -22,6 +22,7 @@ limitations under the License.
 )]
 
 mod mock_hub;
+mod redirects;
 mod snapshot;
 
 /// Fails the calling test unless it runs in a process of its own.

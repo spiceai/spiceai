@@ -41,10 +41,12 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use moka::future::Cache;
 use object_store::GetRange;
+use object_store_spawn::DestinationGuard;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_RANGE, HeaderMap, HeaderValue, LINK, LOCATION, RANGE, RETRY_AFTER,
 };
 use reqwest::{Method, StatusCode};
+use runtime_object_store::ssrf::{self, RedirectHostResolver};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use snafu::prelude::*;
@@ -68,6 +70,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 /// Redirects followed for one file read (resolve → resolve-cache or CDN).
 const MAX_REDIRECTS: usize = 5;
+/// Why a download redirect's host is refused when it resolves to an internal address.
+const INTERNAL_REDIRECT_REFUSED: &str = "a Hugging Face download does not follow a redirect to a private, loopback, or link-local address";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest wait for the next bytes of a response; a slow but progressing download never trips it.
@@ -486,6 +490,9 @@ pub struct Hub {
     /// `Authorization: Bearer {token}`, marked sensitive so it is never logged.
     authorization: Option<HeaderValue>,
     http: reqwest::Client,
+    /// Checks the addresses of the hosts download redirects name; `None` when
+    /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` lets a download reach internal addresses.
+    redirect_hosts: Option<RedirectHostResolver>,
     io_runtime: Handle,
     revisions: Cache<(RepoId, String), Commit>,
     commit_dates: Cache<(RepoId, String), DateTime<Utc>>,
@@ -531,10 +538,18 @@ impl Hub {
                 Ok::<_, Error>(value)
             })
             .transpose()?;
-        // Redirects are followed by hand: the CDN target of a file is cached, and the token is
-        // sent only to the Hub's own origin. Transparent decompression is off: a byte range
-        // must address the file as stored, and its length must be the file's.
-        let http = reqwest::Client::builder()
+        // Redirects are followed by hand: the CDN target of a file is cached, the token is sent
+        // only to the Hub's own origin, and a redirect off the endpoint's host is checked for
+        // internal addresses (see `Hub::check_redirect`). Transparent decompression is off: a
+        // byte range must address the file as stored, and its length must be the file's.
+        let redirect_hosts = (!ssrf::allow_private_hosts()).then(|| {
+            RedirectHostResolver::new(DestinationGuard::new(
+                ssrf::is_internal_ip,
+                ssrf::redirect_target_is_internal,
+                INTERNAL_REDIRECT_REFUSED,
+            ))
+        });
+        let mut http = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
@@ -542,9 +557,11 @@ impl Hub {
             .no_zstd()
             .no_deflate()
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .context(HttpClientSnafu)?;
+            .read_timeout(READ_TIMEOUT);
+        if let Some(hosts) = &redirect_hosts {
+            http = http.dns_resolver(Arc::new(hosts.clone()));
+        }
+        let http = http.build().context(HttpClientSnafu)?;
         let listing_weigher = |_: &ListingKey, entries: &Arc<[TreeEntry]>| {
             u32::try_from(entries.len()).unwrap_or(u32::MAX).max(1)
         };
@@ -552,6 +569,7 @@ impl Hub {
             config,
             authorization,
             http,
+            redirect_hosts,
             io_runtime,
             revisions: Cache::builder()
                 .max_capacity(MAX_CACHED_COMMITS)
@@ -938,7 +956,8 @@ impl Hub {
                     url.clone(),
                     range_header.clone(),
                 )
-                .await?;
+                .await
+                .map_err(|error| refused_download(error, repo, path, &url))?;
             if let Some(linked) = header_str(response.headers(), "x-linked-etag")
                 .or_else(|| header_str(response.headers(), "etag"))
             {
@@ -965,6 +984,7 @@ impl Hub {
                     ),
                 }
             );
+            self.check_redirect(repo, path, &location)?;
             // Only a redirect off the Hub's origin is a CDN URL worth reusing: the Hub's own
             // `resolve-cache` redirects are cheap and not signed.
             if !self.is_endpoint_origin(&location) {
@@ -1041,6 +1061,27 @@ impl Hub {
 
     fn is_endpoint_origin(&self, url: &Url) -> bool {
         url.origin() == self.config.endpoint.origin()
+    }
+
+    /// Refuses a download redirect off the endpoint's host to an internal IP literal or a
+    /// well-known internal name, and has the addresses of any other host it names checked when
+    /// the download connects to it. Through a proxy, which resolves the host itself, only the
+    /// literal and name checks apply. The endpoint's own host is trusted, whatever it resolves to.
+    fn check_redirect(&self, repo: &RepoId, path: &str, location: &Url) -> Result<()> {
+        let Some(hosts) = &self.redirect_hosts else {
+            return Ok(());
+        };
+        let host = location.host_str().map(ssrf::redirect_host_key);
+        if host.is_some() && host == self.config.endpoint.host_str().map(ssrf::redirect_host_key) {
+            return Ok(());
+        }
+        if ssrf::redirect_target_is_internal(location) {
+            return Err(redirect_refused(repo, path, location));
+        }
+        if let Some(url::Host::Domain(domain)) = location.host() {
+            hosts.check_host(domain);
+        }
+        Ok(())
     }
 
     /// Where the token every request carries came from, which an error about access names.
@@ -1236,7 +1277,7 @@ impl Hub {
             let response = match outcome {
                 Ok(response) => response,
                 Err(source) => {
-                    if attempts.can_retry() && is_transient(&source) {
+                    if attempts.can_retry() && is_transient(&source) && !is_refused(&source) {
                         tracing::debug!(
                             "Retrying a request for Hugging Face {} '{repo}' after {source} (attempt {attempt} of {MAX_ATTEMPTS})",
                             repo.kind()
@@ -1761,6 +1802,36 @@ fn is_transient_status(status: StatusCode) -> bool {
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+/// Whether `error` comes from the redirect guard refusing an address a host resolved to.
+fn is_refused(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source())
+        .any(<dyn std::error::Error>::is::<ssrf::DestinationRefused>)
+}
+
+/// `error`, or the refusal of the download of `path` when the redirect guard refused to connect
+/// to the host of `url`.
+fn refused_download(error: Error, repo: &RepoId, path: &str, url: &Url) -> Error {
+    match &error {
+        Error::Request { source, .. } if is_refused(source.as_ref()) => {
+            redirect_refused(repo, path, url)
+        }
+        _ => error,
+    }
+}
+
+/// The refusal of the download of `path` from `url`, a private, loopback, or link-local address.
+/// It names only the origin: the rest of a CDN URL carries its signature.
+fn redirect_refused(repo: &RepoId, path: &str, url: &Url) -> Error {
+    Error::UnexpectedResponse {
+        repo: repo.clone(),
+        message: format!(
+            "the download of '{path}' redirected to {}, a private, loopback, or link-local address, which was not followed. If the Hub serves files from an internal host on purpose, set {}=true",
+            url.origin().ascii_serialization(),
+            ssrf::ALLOW_PRIVATE_HOSTS_ENV
+        ),
+    }
 }
 
 /// Whether a file read may follow a redirect to `location`: bytes from an https Hub are never

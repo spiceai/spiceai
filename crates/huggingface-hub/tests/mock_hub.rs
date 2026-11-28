@@ -169,8 +169,8 @@ impl MockHub {
         {
             let mut state = mock.0.lock();
             state.hub_base = format!("http://{hub}");
-            // A different origin: `localhost` rather than `127.0.0.1`.
-            state.cdn_base = format!("http://localhost:{}", cdn.port());
+            // A different origin on the Hub's own host, which a download may be redirected to.
+            state.cdn_base = format!("http://127.0.0.1:{}", cdn.port());
         }
         mock
     }
